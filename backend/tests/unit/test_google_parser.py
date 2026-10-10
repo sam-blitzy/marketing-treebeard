@@ -311,6 +311,7 @@ def _assert_validation_defect(defect: QueryDefect, surface: str, gaql_field: str
 
 
 def test_parsers_cover_exactly_the_row_surfaces_of_queries() -> None:
+    """``PARSERS`` covers exactly the eight row surfaces ``QUERIES`` names, each with a row type."""
     assert set(PARSERS) == {template.row_surface for template in QUERIES.values()}
     assert set(PARSERS) == set(ROW_SURFACES) == set(ROW_TYPES)
     assert len(PARSERS) == 8
@@ -320,6 +321,10 @@ def test_parsers_cover_exactly_the_row_surfaces_of_queries() -> None:
 def test_row_contract_describes_the_fields_its_template_selects(
     surface: str, contract: Callable[..., Contract]
 ) -> None:
+    """Each ``row_*`` contract's GAQL request matches its template's resource and SELECT list.
+
+    The template is the one the contract's query id names, and it reads that same surface.
+    """
     gaql = contract("google", surface).request.gaql
     assert gaql is not None
     template = QUERIES[gaql.query_id]
@@ -330,6 +335,7 @@ def test_row_contract_describes_the_fields_its_template_selects(
 
 @pytest.mark.parametrize("surface", ROW_SURFACES)
 def test_conforming_row_parses_into_its_row_type(surface: str, on_contract: RowCheck) -> None:
+    """Each surface's hand-built row is accepted by its contract and parses into its dataclass."""
     parsed = PARSERS[surface](on_contract(surface, _base(surface)))
     assert type(parsed) is ROW_TYPES[surface]
 
@@ -337,6 +343,10 @@ def test_conforming_row_parses_into_its_row_type(surface: str, on_contract: RowC
 def test_contract_gate_rejects_a_field_the_contract_does_not_define(
     on_contract: RowCheck,
 ) -> None:
+    """A ``campaign.startDate`` key, which ``row_campaign`` does not define, fails the gate.
+
+    The gate raises ``ContractViolation`` for the unknown field before any parser runs.
+    """
     row = _set(_base("row_campaign"), "campaign.start_date", "2026-09-01")
     with pytest.raises(ContractViolation, match="unknown field"):
         on_contract("row_campaign", row)
@@ -344,6 +354,10 @@ def test_contract_gate_rejects_a_field_the_contract_does_not_define(
 
 @pytest.mark.parametrize("surface", ROW_SURFACES)
 def test_documented_sample_parses_verbatim(surface: str, contract: Callable[..., Contract]) -> None:
+    """A documented sample passes its contract's schema, and each row parses verbatim to its type.
+
+    A contract whose v25 reference publishes no sample records ``null``, which passes.
+    """
     loaded = contract("google", surface)
     payloads.validate_documented_sample(loaded)
     sample = loaded.response.documented_sample
@@ -361,6 +375,10 @@ def test_documented_sample_parses_verbatim(surface: str, contract: Callable[...,
 
 
 def test_manifest_lists_one_snapshot_per_google_template() -> None:
+    """The manifest lists exactly the ``google__q_g*.json`` snapshot files on disk.
+
+    Their queries are exactly the ``QUERIES`` ids.
+    """
     on_disk = {path.name for path in FIXTURES_DIR.glob("google__q_g*.json")}
     assert set(GOOGLE_FIXTURES) == on_disk
     query_ids = set()
@@ -372,6 +390,11 @@ def test_manifest_lists_one_snapshot_per_google_template() -> None:
 
 @pytest.mark.parametrize("file_name", GOOGLE_FIXTURES)
 def test_snapshot_rows_parse_with_the_parser_of_their_query(file_name: str) -> None:
+    """Every committed snapshot row passes its contract and parses with its query's parser.
+
+    On Q-G3, Q-G5 and Q-G6 rows ``cost_micros`` is the wire ``costMicros``, ``cost`` exactly
+    a millionth of it, and ``conversions`` the wire decimal unrounded, each zero when omitted.
+    """
     snapshot = json.loads((FIXTURES_DIR / file_name).read_text(encoding="utf-8"))
     assert snapshot["source"] == "google"
     assert snapshot["surface"] == "google.search"
@@ -395,6 +418,7 @@ def test_snapshot_rows_parse_with_the_parser_of_their_query(file_name: str) -> N
 
 
 def test_snapshot_wrapped_in_a_one_element_array_parses_the_same() -> None:
+    """The Q-G6 snapshot wrapped in n8n's one-element array parses exactly as the bare envelope."""
     snapshot = json.loads((FIXTURES_DIR / "google__q_g6.json").read_text(encoding="utf-8"))
     query = snapshot["request"]["body"]["query"]
     body = snapshot["response"]["body"]
@@ -404,6 +428,7 @@ def test_snapshot_wrapped_in_a_one_element_array_parses_the_same() -> None:
 def test_captured_google_rows_parse_with_the_parser_of_their_query(
     captured_payloads: Callable[[str], list[dict[str, Any]]],
 ) -> None:
+    """Every redacted 2xx ``google.search`` capture validates and parses; having none yet passes."""
     # Zero captures is a valid state until `ads-engine capture-fixtures` has run with live
     # credentials; every capture recorded since then must parse like the snapshots do.
     for capture in captured_payloads("google"):
@@ -425,6 +450,11 @@ def test_captured_google_rows_parse_with_the_parser_of_their_query(
 def test_daily_budget_keeps_an_exact_amount_beside_its_native_micros(
     on_contract: RowCheck,
 ) -> None:
+    """A ``DAILY`` budget's ``amountMicros`` ``"12345678"`` parses to int micros and ``12.345678``.
+
+    The exact ``Decimal("12.345678")`` is both ``budget_amount`` and ``daily_budget``, with no
+    total; the INT64 ids become ``int``, and ``explicitlyShared: true`` is kept.
+    """
     campaign = parse_campaign(on_contract("row_campaign", _base("row_campaign")))
     assert campaign.campaign_id == int(CAMPAIGN_ID)
     assert campaign.name == "Brand - Search"
@@ -443,6 +473,7 @@ def test_daily_budget_keeps_an_exact_amount_beside_its_native_micros(
 def test_omitted_explicitly_shared_is_a_budget_of_the_campaign_alone(
     on_contract: RowCheck,
 ) -> None:
+    """An omitted ``explicitlyShared``, proto3's encoding of ``false``, parses as not shared."""
     # proto3 JSON omits an implicit-presence bool that is false.
     row = _drop(_base("row_campaign"), "campaign_budget.explicitly_shared")
     campaign = parse_campaign(on_contract("row_campaign", row))
@@ -450,6 +481,10 @@ def test_omitted_explicitly_shared_is_a_budget_of_the_campaign_alone(
 
 
 def test_custom_period_budget_reads_its_lifetime_total_amount(on_contract: RowCheck) -> None:
+    """A ``CUSTOM_PERIOD`` budget reads ``totalAmountMicros`` ``"500000000"`` as a total of ``500``.
+
+    The micros are kept, there is no daily amount, and an omitted ``explicitlyShared`` is false.
+    """
     row = _base("row_campaign")
     _drop(row, "campaign_budget.amount_micros")
     _drop(row, "campaign_budget.explicitly_shared")
@@ -464,6 +499,7 @@ def test_custom_period_budget_reads_its_lifetime_total_amount(on_contract: RowCh
 
 
 def test_daily_budget_without_its_amount_is_unknown_not_zero(on_contract: RowCheck) -> None:
+    """A ``DAILY`` budget omitting ``amountMicros`` keeps its id; its amount is ``None``, not 0."""
     row = _drop(_base("row_campaign"), "campaign_budget.amount_micros")
     campaign = parse_campaign(on_contract("row_campaign", row))
     assert campaign.budget_id == int(BUDGET_ID)
@@ -473,6 +509,7 @@ def test_daily_budget_without_its_amount_is_unknown_not_zero(on_contract: RowChe
 
 
 def test_campaign_without_a_budget_has_no_budget_fields(on_contract: RowCheck) -> None:
+    """A campaign row without ``campaignBudget`` has ``None`` budget fields and is not shared."""
     row = _base("row_campaign")
     del row["campaignBudget"]
     campaign = parse_campaign(on_contract("row_campaign", row))
@@ -486,6 +523,10 @@ def test_campaign_without_a_budget_has_no_budget_fields(on_contract: RowCheck) -
 
 
 def test_campaign_status_map_is_enabled_paused_removed() -> None:
+    """``CAMPAIGN_STATUS_MAP`` maps exactly three Google statuses to normalised ones.
+
+    ``ENABLED`` is ``active``, ``PAUSED`` is ``paused`` and ``REMOVED`` is ``ended``.
+    """
     assert dict(CAMPAIGN_STATUS_MAP) == {
         "ENABLED": "active",
         "PAUSED": "paused",
@@ -507,6 +548,10 @@ STATUS_FIELDS = (
 def test_status_is_normalised_and_kept_raw(
     surface: str, status_field: str, raw: str, normalised: str, on_contract: RowCheck
 ) -> None:
+    """A campaign, ad group or keyword status of ``ENABLED``, ``PAUSED`` or ``REMOVED`` is accepted.
+
+    It parses to ``active``, ``paused`` or ``ended``, with the wire name kept as ``raw_status``.
+    """
     row = on_contract(surface, _set(_base(surface), status_field, raw))
     parsed = PARSERS[surface](row)
     assert isinstance(parsed, CampaignRow | AdGroupRow | KeywordRow)
@@ -519,6 +564,10 @@ def test_status_is_normalised_and_kept_raw(
 def test_status_the_contract_allows_but_the_map_lacks_is_a_defect(
     surface: str, status_field: str, raw: str, on_contract: RowCheck
 ) -> None:
+    """An on-contract ``UNKNOWN`` or ``UNSPECIFIED`` status is a validation defect naming the field.
+
+    The contract's enum allows both, but the parser has no normalised status for either.
+    """
     # Both values are in the contract's enum, so the row is on contract; the parser refuses to
     # guess a normalised status for them.
     row = on_contract(surface, _set(_base(surface), status_field, raw))
@@ -528,6 +577,12 @@ def test_status_the_contract_allows_but_the_map_lacks_is_a_defect(
 
 
 def test_campaign_daily_converts_money_counts_shares_and_date(on_contract: RowCheck) -> None:
+    """A Q-G3 row parses ``costMicros`` ``"1500000"`` to ``Decimal("1.5")`` and keeps the micros.
+
+    The ``clicks`` string ``"12"`` becomes the ``int`` ``12`` and ``impressions`` parses to
+    ``340``; the DOUBLE conversions, conversion value and impression shares become exact
+    decimals, and ``segments.date`` a ``date``.
+    """
     daily = parse_campaign_daily(on_contract("row_campaign_daily", _base("row_campaign_daily")))
     assert daily.campaign_id == int(CAMPAIGN_ID)
     assert daily.cost == Decimal("1.5")
@@ -552,6 +607,11 @@ CONVERSION_SURFACES = ("row_campaign_daily", "row_keyword_view", "row_search_ter
 def test_fractional_conversions_are_kept_exact_whatever_their_encoding(
     surface: str, wire: object, on_contract: RowCheck
 ) -> None:
+    """``conversions`` of ``0.3`` parse to ``Decimal("0.3")``, never rounded to a whole count.
+
+    Holds on Q-G3, Q-G5 and Q-G6 rows for a ``Decimal`` and a ``float``, and for a numeric
+    string, which the contract does not define but the parser tolerates.
+    """
     # The row is validated with conversions as a JSON number; the decimal is what http.py
     # decodes that number to, the float what a plain json.loads gives, and the numeric string
     # an encoding the contract does not define but the parser tolerates.
@@ -568,6 +628,10 @@ def test_fractional_conversions_are_kept_exact_whatever_their_encoding(
 def test_conversions_decoded_from_wire_text_never_pass_through_a_binary_float(
     on_contract: RowCheck,
 ) -> None:
+    """A wire ``conversions`` of ``0.1`` arrives as ``Decimal("0.1")`` and parses to exactly that.
+
+    The result differs from ``Decimal.from_float(0.1)``, so no binary float was on the way.
+    """
     row = on_contract(
         "row_campaign_daily", _set(_base("row_campaign_daily"), "metrics.conversions", 0.1)
     )
@@ -580,6 +644,10 @@ def test_conversions_decoded_from_wire_text_never_pass_through_a_binary_float(
 def test_omitted_additive_metrics_are_zero_and_omitted_shares_unavailable(
     on_contract: RowCheck,
 ) -> None:
+    """Omitted ``conversions`` and ``clicks`` parse as zero, omitted impression shares as ``None``.
+
+    The cost and impressions still present parse unchanged.
+    """
     # REST JSON omits zero-valued fields, so an absent count is zero; an absent share is
     # unknown, never zero.
     row = _base("row_campaign_daily")
@@ -602,6 +670,7 @@ def test_omitted_additive_metrics_are_zero_and_omitted_shares_unavailable(
 def test_impression_share_finer_than_six_places_is_rounded_toward_zero(
     on_contract: RowCheck,
 ) -> None:
+    """An impression share of ``0.09999999`` is accepted and rounded toward zero to ``0.099999``."""
     # Google returns shares as full doubles; the stored six places never cross a threshold
     # such as the 10% capped-day test.
     row = _set(_base("row_campaign_daily"), "metrics.search_impression_share", 0.09999999)
@@ -610,6 +679,7 @@ def test_impression_share_finer_than_six_places_is_rounded_toward_zero(
 
 
 def test_campaign_day_without_metrics_has_zero_cost_and_counts(on_contract: RowCheck) -> None:
+    """A Q-G3 row without ``metrics`` has zero cost, counts and conversions, and shares ``None``."""
     row = _base("row_campaign_daily")
     del row["metrics"]
     daily = parse_campaign_daily(on_contract("row_campaign_daily", row))
@@ -633,11 +703,13 @@ def test_campaign_day_without_metrics_has_zero_cost_and_counts(on_contract: RowC
 def test_segments_date_is_the_native_day_as_written(
     wire: str, expected: date, on_contract: RowCheck
 ) -> None:
+    """A ``segments.date`` such as ``"2028-02-29"`` parses to that calendar day, as written."""
     row = _set(_base("row_campaign_daily"), "segments.date", wire)
     assert parse_campaign_daily(on_contract("row_campaign_daily", row)).date == expected
 
 
 def test_ad_group_reads_its_campaign_name_and_status(on_contract: RowCheck) -> None:
+    """A Q-G4 row parses both ids, its name, and status ``ENABLED`` to ``active``, raw kept."""
     ad_group = parse_ad_group(on_contract("row_ad_group", _base("row_ad_group")))
     assert ad_group.ad_group_id == int(AD_GROUP_ID)
     assert ad_group.campaign_id == int(CAMPAIGN_ID)
@@ -646,6 +718,12 @@ def test_ad_group_reads_its_campaign_name_and_status(on_contract: RowCheck) -> N
 
 
 def test_keyword_view_converts_score_cpc_and_metrics(on_contract: RowCheck) -> None:
+    """A Q-G5 row parses ``historicalQualityScore`` ``"7"`` to ``7`` and converts ``averageCpc``.
+
+    ``averageCpc`` ``2500000`` micros becomes ``Decimal("2.5")``, ``costMicros`` ``"30000000"``
+    becomes ``30`` beside its micros, ``clicks`` and ``impressions`` parse to ``12`` and
+    ``400``, and conversions stay decimal.
+    """
     view = parse_keyword_view(on_contract("row_keyword_view", _base("row_keyword_view")))
     assert view.ad_group_id == int(AD_GROUP_ID)
     assert view.criterion_id == int(CRITERION_ID)
@@ -660,6 +738,7 @@ def test_keyword_view_converts_score_cpc_and_metrics(on_contract: RowCheck) -> N
 
 
 def test_keyword_day_without_a_historical_quality_score_has_none(on_contract: RowCheck) -> None:
+    """An omitted ``historicalQualityScore`` is ``None``, not zero; ``averageCpc`` still parses."""
     row = _drop(_base("row_keyword_view"), "metrics.historical_quality_score")
     view = parse_keyword_view(on_contract("row_keyword_view", row))
     assert view.historical_quality_score is None
@@ -670,6 +749,10 @@ def test_keyword_day_without_a_historical_quality_score_has_none(on_contract: Ro
     "wire", [2500000, 2500000.0, "2500000"], ids=["json_integer", "json_number", "numeric_string"]
 )
 def test_average_cpc_micros_become_an_amount(wire: object, on_contract: RowCheck) -> None:
+    """An ``averageCpc`` of ``2500000`` micros parses to ``Decimal("2.5")`` in each encoding.
+
+    A JSON integer and a JSON number are on contract; a numeric string is tolerated off contract.
+    """
     # averageCpc is a DOUBLE in micros. The contract types it as a JSON number (an integer or a
     # number with a fraction, decoded as Decimal); a numeric string is tolerated off contract.
     row = on_contract("row_keyword_view", _base("row_keyword_view"))
@@ -678,6 +761,10 @@ def test_average_cpc_micros_become_an_amount(wire: object, on_contract: RowCheck
 
 
 def test_keyword_day_without_clicks_has_no_average_cpc(on_contract: RowCheck) -> None:
+    """A Q-G5 row with ``averageCpc``, ``clicks`` and ``costMicros`` omitted has no average CPC.
+
+    ``average_cpc`` is ``None``, never zero, while clicks and cost are zero.
+    """
     row = _base("row_keyword_view")
     for gaql_field in ("metrics.average_cpc", "metrics.clicks", "metrics.cost_micros"):
         _drop(row, gaql_field)
@@ -690,6 +777,10 @@ def test_keyword_day_without_clicks_has_no_average_cpc(on_contract: RowCheck) ->
 def test_search_term_takes_the_matched_criterion_from_its_resource_name(
     on_contract: RowCheck,
 ) -> None:
+    """A Q-G6 keyword segment ``adGroupCriteria/333~444`` parses to matched criterion ``"444"``.
+
+    The matched keyword text and match type, the term, ids, date, cost and counts parse too.
+    """
     term = parse_search_term(on_contract("row_search_term_view", _base("row_search_term_view")))
     assert CRITERION_RN == "customers/1234567890/adGroupCriteria/333~444"
     assert term.matched_criterion_id == "444"
@@ -709,6 +800,7 @@ def test_search_term_takes_the_matched_criterion_from_its_resource_name(
 def test_search_term_without_a_keyword_segment_matched_no_criterion(
     on_contract: RowCheck,
 ) -> None:
+    """A Q-G6 row omitting ``segments.keyword`` has criterion ``""`` and no matched text or type."""
     row = _drop(_base("row_search_term_view"), "segments.keyword")
     term = parse_search_term(on_contract("row_search_term_view", row))
     assert term.matched_criterion_id == ""
@@ -717,6 +809,10 @@ def test_search_term_without_a_keyword_segment_matched_no_criterion(
 
 
 def test_matched_criterion_of_another_ad_group_is_a_defect(on_contract: RowCheck) -> None:
+    """A matched criterion of ad group ``999``, not the row's ``333``, is a validation defect.
+
+    The row is on contract; the validation defect names ``segments.keyword.ad_group_criterion``.
+    """
     # A criterion id is unique only within its ad group, so the resource name must name the
     # row's own ad group.
     other = f"{CUSTOMER_RN}/adGroupCriteria/999~{CRITERION_ID}"
@@ -730,11 +826,13 @@ def test_matched_criterion_of_another_ad_group_is_a_defect(on_contract: RowCheck
 
 @pytest.mark.parametrize("status", ["ADDED", "EXCLUDED", "ADDED_EXCLUDED", "NONE"])
 def test_search_term_status_passes_through_raw(status: str, on_contract: RowCheck) -> None:
+    """A search term status ``ADDED``, ``EXCLUDED``, ``ADDED_EXCLUDED`` or ``NONE`` is kept raw."""
     row = _set(_base("row_search_term_view"), "search_term_view.status", status)
     assert parse_search_term(on_contract("row_search_term_view", row)).term_status == status
 
 
 def test_keyword_reads_text_match_type_and_quality_score(on_contract: RowCheck) -> None:
+    """A Q-G7 row parses its ids, text, ``EXACT`` match type and ``qualityScore`` ``8`` as int."""
     keyword = parse_keyword(on_contract("row_ad_group_criterion", _base("row_ad_group_criterion")))
     assert keyword.ad_group_id == int(AD_GROUP_ID)
     assert keyword.criterion_id == int(CRITERION_ID)
@@ -746,6 +844,7 @@ def test_keyword_reads_text_match_type_and_quality_score(on_contract: RowCheck) 
 
 
 def test_keyword_without_quality_info_has_an_unavailable_score(on_contract: RowCheck) -> None:
+    """A Q-G7 row with ``qualityInfo`` omitted has ``quality_score`` ``None``, never zero."""
     # Keywords with little or no traffic carry no quality info; that is unknown, never zero.
     row = _drop(_base("row_ad_group_criterion"), "ad_group_criterion.quality_info")
     keyword = parse_keyword(on_contract("row_ad_group_criterion", row))
@@ -762,6 +861,11 @@ def test_keyword_without_quality_info_has_an_unavailable_score(on_contract: RowC
 def test_conversion_action_keeps_its_counting_contract_raw(
     counting_type: str, attribution_model: str, included: bool, on_contract: RowCheck
 ) -> None:
+    """A Q-G8 row keeps ``countingType``, ``attributionModel`` and its include flag as returned.
+
+    Checked for an included last-click ``ONE_PER_CLICK`` and an excluded data-driven
+    ``MANY_PER_CLICK`` action.
+    """
     row = _base("row_conversion_action")
     _set(row, "conversion_action.counting_type", counting_type)
     _set(row, "conversion_action.attribution_model_settings.attribution_model", attribution_model)
@@ -776,6 +880,10 @@ def test_conversion_action_keeps_its_counting_contract_raw(
 
 
 def test_conversion_action_without_settings_has_an_unknown_model(on_contract: RowCheck) -> None:
+    """A Q-G8 row without ``attributionModelSettings`` has attribution model ``None``.
+
+    An omitted ``includeInConversionsMetric`` reads as ``False``.
+    """
     # B4 reads a missing attribution model as an unknown counting contract, never last click.
     row = _base("row_conversion_action")
     _drop(row, "conversion_action.attribution_model_settings")
@@ -786,6 +894,7 @@ def test_conversion_action_without_settings_has_an_unknown_model(on_contract: Ro
 
 
 def test_customer_gives_its_id_currency_and_time_zone(on_contract: RowCheck) -> None:
+    """A Q-G1 row parses ``id`` ``"1234567890"`` to ``int``, with its currency, zone and name."""
     customer = parse_customer(on_contract("row_customer", _base("row_customer")))
     assert customer.customer_id == int(CUSTOMER_ID)
     assert type(customer.customer_id) is int
@@ -795,6 +904,7 @@ def test_customer_gives_its_id_currency_and_time_zone(on_contract: RowCheck) -> 
 
 
 def test_int64_id_at_its_maximum_stays_exact(on_contract: RowCheck) -> None:
+    """A ``campaign.id`` of ``"9223372036854775807"`` (``INT64_MAX``) is accepted exactly."""
     row = _set(_base("row_campaign"), "campaign.id", "9223372036854775807")
     campaign = parse_campaign(on_contract("row_campaign", row))
     assert campaign.campaign_id == 9223372036854775807 == INT64_MAX
@@ -808,6 +918,10 @@ def test_int64_id_at_its_maximum_stays_exact(on_contract: RowCheck) -> None:
 def test_int64_id_given_as_a_json_integer_or_integral_decimal_is_accepted(
     wire: object, on_contract: RowCheck
 ) -> None:
+    """A ``campaign.id`` of ``111``, ``Decimal("111")`` or ``Decimal("111.0")`` parses to ``111``.
+
+    The contract types INT64 as a string; these number forms are tolerated off contract.
+    """
     # proto3 JSON writes INT64 as a string, as the contract says; parsers also accept the
     # number form, so an integer or an integral decimal is tolerated off contract.
     row = on_contract("row_campaign", _base("row_campaign"))
@@ -821,6 +935,7 @@ def test_int64_id_given_as_a_json_integer_or_integral_decimal_is_accepted(
 
 
 def test_rest_path_walks_each_snake_case_segment_as_lower_camel_case() -> None:
+    """``rest_path`` turns each snake_case GAQL segment into its lowerCamelCase REST key."""
     assert rest_path("campaign_budget.amount_micros") == ("campaignBudget", "amountMicros")
     assert rest_path("segments.keyword.info.match_type") == (
         "segments",
@@ -831,6 +946,7 @@ def test_rest_path_walks_each_snake_case_segment_as_lower_camel_case() -> None:
 
 
 def test_get_field_reads_the_nested_raw_value(on_contract: RowCheck) -> None:
+    """``get_field`` returns raw wire values, INT64 as strings; an absent field is ``None``."""
     row = on_contract("row_campaign_daily", _base("row_campaign_daily"))
     # int64 values are still the wire strings; the typed parsers convert them.
     assert get_field(row, "metrics.cost_micros") == "1500000"
@@ -840,6 +956,7 @@ def test_get_field_reads_the_nested_raw_value(on_contract: RowCheck) -> None:
 
 
 def test_get_field_rejects_an_explicit_json_null() -> None:
+    """``get_field`` treats ``"metrics": null`` as a validation defect, never as an absent key."""
     with pytest.raises(QueryDefect) as caught:
         get_field({"metrics": None}, "metrics.cost_micros")
     assert caught.value.code == "validation"
@@ -848,6 +965,10 @@ def test_get_field_rejects_an_explicit_json_null() -> None:
 def test_unwrap_single_item_returns_the_envelope_inside_n8ns_array(
     contract: Callable[..., Contract],
 ) -> None:
+    """``unwrap_single_item`` returns the envelope inside n8n's one-element array, a bare one as is.
+
+    The unwrapped Q-G1 envelope passes the ``search`` contract and parses to its customer.
+    """
     snapshot = json.loads((FIXTURES_DIR / "google__q_g1.json").read_text(encoding="utf-8"))
     envelope = snapshot["response"]["body"]
     # n8n's "all incoming items" response mode wraps the Google response in a one-element array.
@@ -876,6 +997,7 @@ CAMPAIGN_ID_SURFACES = (
 
 @pytest.mark.parametrize("surface", CAMPAIGN_ID_SURFACES)
 def test_row_without_campaign_id_is_a_validation_defect(surface: str) -> None:
+    """A row omitting ``campaign.id``, off contract, is a validation defect naming that field."""
     row = _drop(_base(surface), "campaign.id")
     with pytest.raises(QueryDefect) as caught:
         PARSERS[surface](_wire(row))
@@ -896,6 +1018,10 @@ def test_row_without_campaign_id_is_a_validation_defect(surface: str) -> None:
 def test_non_numeric_int64_string_is_a_validation_defect(
     surface: str, gaql_field: str, wire: str
 ) -> None:
+    """A malformed INT64 string is a validation defect that names the field, never the value.
+
+    Covered: ``"12a"``, ``"twelve"``, ``"12.5"``, ``"1e6"``, an empty string and a 20-digit id.
+    """
     row = _set(_base(surface), gaql_field, wire)
     with pytest.raises(QueryDefect) as caught:
         PARSERS[surface](_wire(row))
@@ -906,6 +1032,7 @@ def test_non_numeric_int64_string_is_a_validation_defect(
 
 
 def test_int64_id_beyond_the_range_is_a_validation_defect() -> None:
+    """A ``campaign.id`` string one above ``INT64_MAX`` is a validation defect naming the field."""
     row = _set(_base("row_campaign"), "campaign.id", str(INT64_MAX + 1))
     with pytest.raises(QueryDefect) as caught:
         parse_campaign(_wire(row))
@@ -915,6 +1042,10 @@ def test_int64_id_beyond_the_range_is_a_validation_defect() -> None:
 @pytest.mark.parametrize("surface", ROW_SURFACES)
 @pytest.mark.parametrize("row", [[], "row", 7, None], ids=["array", "string", "number", "null"])
 def test_row_that_is_not_an_object_is_a_validation_defect(surface: str, row: object) -> None:
+    """A row that is an array, string, number or ``null`` is a validation defect on every surface.
+
+    The defect expects a JSON object at every level of the key path.
+    """
     with pytest.raises(QueryDefect) as caught:
         PARSERS[surface](row)  # type: ignore[arg-type]
     defect = caught.value
@@ -965,6 +1096,13 @@ def test_row_that_is_not_an_object_is_a_validation_defect(surface: str, row: obj
 def test_malformed_field_value_is_a_validation_defect_naming_only_the_field(
     surface: str, gaql_field: str, wire: object
 ) -> None:
+    """A field value the parser cannot store faithfully is a validation defect naming the field.
+
+    The row skips the contract gate on purpose. Each value has the wrong type, is not finite or
+    lies outside its range, cannot be held by PostgreSQL text or exactly by ``numeric(18, 6)``,
+    is an invalid date, currency, zone, enum or criterion name, or is the other budget period's
+    amount. The message after the field never contains the value.
+    """
     # The value is set on the wire-decoded row, so decimals and lone surrogates reach the
     # parser exactly as given. Each one is a value the parser cannot store faithfully: the
     # wrong type, text PostgreSQL cannot hold, an amount outside numeric(18, 6), an enum name
@@ -977,6 +1115,10 @@ def test_malformed_field_value_is_a_validation_defect_naming_only_the_field(
 
 
 def test_explicitly_shared_lifetime_budget_is_a_validation_defect(on_contract: RowCheck) -> None:
+    """An on-contract ``CUSTOM_PERIOD`` budget with ``explicitlyShared: true`` is a defect.
+
+    The validation defect names ``campaign_budget.explicitly_shared``.
+    """
     # The row contract types each key on its own; Google never shares a CUSTOM_PERIOD budget.
     row = _base("row_campaign")
     _drop(row, "campaign_budget.amount_micros")
@@ -988,6 +1130,10 @@ def test_explicitly_shared_lifetime_budget_is_a_validation_defect(on_contract: R
 
 
 def test_get_field_rejects_a_name_that_is_not_a_gaql_field() -> None:
+    """``get_field`` rejects ``"Campaign.Id"``, not a snake_case GAQL name, as a validation defect.
+
+    The defect names the generic endpoint ``parse google_ads_row``.
+    """
     with pytest.raises(QueryDefect) as caught:
         get_field({"campaign": {"id": CAMPAIGN_ID}}, "Campaign.Id")
     assert caught.value.code == "validation"

@@ -362,6 +362,7 @@ def _email_leaks(node: object) -> list[str]:
 
 
 def test_the_fixed_catalogue_equals_payloads_surfaces() -> None:
+    """Inventory: ``SURFACES`` lists exactly the 26 expected surfaces per source, none twice."""
     surfaces = {source: tuple(names) for source, names in SURFACES.items()}
     assert set(surfaces) == set(EXPECTED_SURFACES)
     for source, names in surfaces.items():
@@ -373,6 +374,11 @@ def test_the_fixed_catalogue_equals_payloads_surfaces() -> None:
 def test_the_contract_files_on_disk_are_exactly_the_fixed_catalogue(
     iter_contract_paths: Callable[[], Iterator[Path]],
 ) -> None:
+    """Inventory: the files on disk are the 26 surfaces plus each source's ``captured/``, no more.
+
+    ``iter_contract_paths`` yields each contract once and never one under ``captured/``, and
+    ``tests/contracts/`` holds only the three source directories.
+    """
     yielded = [(path.parent.name, path.stem) for path in iter_contract_paths()]
     assert len(set(yielded)) == len(yielded), "a contract file is yielded twice"
     assert set(yielded) == EXPECTED_PAIRS
@@ -394,6 +400,7 @@ def test_the_contract_files_on_disk_are_exactly_the_fixed_catalogue(
 
 @pytest.mark.parametrize(("source", "name"), CONTRACT_PARAMS)
 def test_the_file_is_utf8_json_with_a_trailing_newline_and_no_tab(source: str, name: str) -> None:
+    """Shape: each file is BOM-free UTF-8 holding a JSON object, ends in a newline, has no tab."""
     data = _contract_path(source, name).read_bytes()
     try:
         text = data.decode("utf-8")
@@ -411,6 +418,7 @@ def test_the_file_is_utf8_json_with_a_trailing_newline_and_no_tab(source: str, n
 
 @pytest.mark.parametrize(("source", "name"), CONTRACT_PARAMS)
 def test_the_file_holds_exactly_the_documented_keys(source: str, name: str) -> None:
+    """Shape: the file, its ``request`` and its ``response`` hold exactly the documented keys."""
     raw = _read_raw(source, name)
     assert set(raw) == TOP_LEVEL_KEYS
     request, response = raw["request"], raw["response"]
@@ -424,6 +432,11 @@ def test_the_file_holds_exactly_the_documented_keys(source: str, name: str) -> N
 def test_the_file_names_its_surface_its_source_and_the_pinned_version(
     source: str, name: str
 ) -> None:
+    """Shape: the file names its own surface and source and carries its source's pinned version.
+
+    ``surface`` is ``source.name``, ``source`` matches its directory, and ``api_version`` is
+    ``v25``, ``202609`` or ``2026-09`` for Google, LinkedIn or HubSpot.
+    """
     raw = _read_raw(source, name)
     assert raw["surface"] == f"{source}.{name}"
     assert raw["source"] == source == _contract_path(source, name).parent.name
@@ -432,6 +445,10 @@ def test_the_file_names_its_surface_its_source_and_the_pinned_version(
 
 @pytest.mark.parametrize(("source", "name"), CONTRACT_PARAMS)
 def test_the_reference_url_is_an_https_official_page(source: str, name: str) -> None:
+    """Shape: ``reference_url`` is a non-empty ``https`` URL without whitespace.
+
+    A HubSpot contract's sits under the ``latest`` CRM reference (``HUBSPOT_REFERENCE_PREFIX``).
+    """
     url = _read_raw(source, name)["reference_url"]
     assert isinstance(url, str)
     assert url.startswith("https://")
@@ -443,6 +460,7 @@ def test_the_reference_url_is_an_https_official_page(source: str, name: str) -> 
 
 @pytest.mark.parametrize(("source", "name"), CONTRACT_PARAMS)
 def test_last_modified_is_null_or_an_iso_calendar_date(source: str, name: str) -> None:
+    """Shape: ``last_modified`` is ``null`` or a real ``YYYY-MM-DD`` calendar date."""
     value = _read_raw(source, name)["last_modified"]
     if value is None:
         return
@@ -452,6 +470,7 @@ def test_last_modified_is_null_or_an_iso_calendar_date(source: str, name: str) -
 
 
 def test_the_associations_contract_records_its_reference_page_date() -> None:
+    """Shape: the HubSpot associations contract records its reference page's date, 2026-09-09."""
     assert _read_raw("hubspot", "associations_batch_read")["last_modified"] == (
         ASSOCIATIONS_LAST_MODIFIED
     )
@@ -486,6 +505,11 @@ def test_association_object_type_ids_admit_the_live_null_and_reject_an_integer(
 
 @pytest.mark.parametrize(("source", "name"), CONTRACT_PARAMS)
 def test_method_statuses_and_gaql_placement(source: str, name: str) -> None:
+    """Shape: the method is GET or POST, statuses are valid and ``gaql`` marks the Google rows.
+
+    ``status`` is a non-empty list of distinct integers (no boolean) within 100-599, and
+    ``gaql`` is set exactly on the Google ``row_*`` contracts.
+    """
     raw = _read_raw(source, name)
     request, response = raw["request"], raw["response"]
     assert request["method"] in {"GET", "POST"}
@@ -503,6 +527,11 @@ def test_method_statuses_and_gaql_placement(source: str, name: str) -> None:
 def test_the_simulator_loader_reads_the_file_as_written(
     contract: ContractLoader, source: str, name: str
 ) -> None:
+    """Shape: the simulator's loader reads each file from its own path, as written.
+
+    Surface, source, name, reference URL, API version, last-modified date, request method, URL,
+    fields and required headers, response statuses and documented sample equal the raw file's.
+    """
     loaded = contract(source, name)
     raw = _read_raw(source, name)
     assert loaded.path.resolve() == _contract_path(source, name).resolve()
@@ -520,6 +549,7 @@ def test_the_simulator_loader_reads_the_file_as_written(
 
 @pytest.mark.parametrize("version", ["v24", "202608", "2026-03", "v3"])
 def test_the_simulator_loader_accepts_only_the_settings_pins(version: str) -> None:
+    """Shape: ``Contract.from_json`` refuses any ``api_version`` but the three ``settings`` pins."""
     raw = _read_raw("hubspot", "crm_search")
     raw["api_version"] = version
     with pytest.raises(ContractViolation) as caught:
@@ -536,6 +566,11 @@ def test_the_simulator_loader_accepts_only_the_settings_pins(version: str) -> No
 def test_the_documented_sample_satisfies_the_response_schema(
     contract: ContractLoader, source: str, name: str
 ) -> None:
+    """Samples: the documented sample validates; without one, the minimal required body does.
+
+    Both are checked at the first listed status. The minimal body (required members only) must
+    pass ``check_schema`` and ``validate_response``, so every response schema is satisfiable.
+    """
     loaded = contract(source, name)
     status = loaded.response.status[0]
     sample = loaded.response.documented_sample
@@ -553,6 +588,7 @@ def test_the_documented_sample_satisfies_the_response_schema(
 def test_an_undeclared_top_level_key_breaks_the_contract(
     contract: ContractLoader, source: str, name: str
 ) -> None:
+    """Strictness: an undeclared top-level key in a valid body raises an unknown-field violation."""
     loaded = contract(source, name)
     status = loaded.response.status[0]
     body = _valid_body(loaded)
@@ -568,6 +604,10 @@ def test_an_undeclared_top_level_key_breaks_the_contract(
 def test_dropping_a_required_top_level_key_breaks_the_contract(
     contract: ContractLoader, source: str, name: str
 ) -> None:
+    """Strictness: dropping any required top-level member raises a missing-field violation.
+
+    Every success body must require at least one member.
+    """
     loaded = contract(source, name)
     status = loaded.response.status[0]
     required = loaded.response.body.get("required")
@@ -586,6 +626,7 @@ def test_dropping_a_required_top_level_key_breaks_the_contract(
 def test_a_status_the_contract_does_not_list_is_rejected(
     contract: ContractLoader, source: str, name: str
 ) -> None:
+    """Strictness: a valid body answered with an unlisted HTTP status (418) is rejected."""
     loaded = contract(source, name)
     assert UNLISTED_STATUS not in loaded.response.status
     with pytest.raises(ContractViolation, match=f"HTTP {UNLISTED_STATUS}"):
@@ -899,6 +940,10 @@ def _omitted(source: str, name: str, kind: str, member: str) -> tuple[httpx.Requ
 
 
 def test_every_request_surface_has_one_baseline() -> None:
+    """Requests: each of the 18 request surfaces has a baseline request.
+
+    Exactly the ``TEMPLATE_DONORS`` surfaces have no manifest record.
+    """
     request_surfaces = {
         (source, name)
         for source, names in SURFACES.items()
@@ -915,12 +960,20 @@ def test_every_request_surface_has_one_baseline() -> None:
 def test_the_baseline_request_passes_its_contract_and_names_its_surface(
     contract: ContractLoader, source: Source, name: str
 ) -> None:
+    """Requests: each baseline request is identified as its own surface and passes its contract."""
     request = _build_request(_baseline(source, name))
     assert identify_surface(source, request) == name
     validate_request(contract(source, name), request)
 
 
 def test_the_omission_matrix_is_every_required_request_member(contract: ContractLoader) -> None:
+    """Request omissions: the matrix is every required request member, once, in contract order.
+
+    Re-derived from the loaded contracts: each required header, query parameter and body
+    member, nested ones in objects and array items included; a required member under a map's
+    value schema fails, having no omission path. Per-kind counts equal
+    ``EXPECTED_OMISSION_COUNTS``, every request surface has a case and every case id is unique.
+    """
     derived: list[tuple[str, str, str, str]] = []
     for source, name in REQUEST_PAIRS:
         spec = contract(source, name).request
@@ -963,6 +1016,11 @@ def test_the_omission_matrix_is_every_required_request_member(contract: Contract
 
 
 def test_the_webhook_secret_header_placeholder_resolves_to_the_settings_name() -> None:
+    """Requests: the webhook secret-header placeholder resolves to the settings' header name.
+
+    ``google/search`` requires ``{N8N_WEBHOOK_SECRET_HEADER}``; under the isolated settings it
+    resolves to ``X-Webhook-Secret``, which the baseline carries.
+    """
     headers = _read_raw("google", "search")["request"]["required_headers"]
     assert SECRET_HEADER_PLACEHOLDER in headers
     assert get_settings().n8n_webhook_secret_header == WEBHOOK_SECRET_HEADER
@@ -974,6 +1032,12 @@ def test_the_webhook_secret_header_placeholder_resolves_to_the_settings_name() -
 def test_omitting_a_required_request_member_raises_a_field_specific_violation(
     contract: ContractLoader, source: Source, name: str, kind: str, member: str
 ) -> None:
+    """Request omissions: dropping any required member raises a violation naming that field.
+
+    The intact baseline passes ``validate_request`` first; without one required header, query
+    parameter or body member (nested ones included) it raises ``ContractViolation`` for its
+    surface, and the errors name the missing field.
+    """
     loaded = contract(source, name)
     validate_request(loaded, _build_request(_baseline(source, name)))
     request, expected = _omitted(source, name, kind, member)
@@ -990,6 +1054,11 @@ def test_the_contract_checked_transport_hands_a_baseline_to_its_handler_once(
     source: Source,
     name: str,
 ) -> None:
+    """Transport: an intact baseline reaches the handler once, unchanged, and its answer returns.
+
+    The handler sees the request's method, URL and content, and the client receives the
+    contract-valid control response's status and body.
+    """
     loaded = contract(source, name)
     calls: list[httpx.Request] = []
 
@@ -1021,6 +1090,11 @@ def test_the_contract_checked_transport_refuses_an_omission_before_its_handler(
     kind: str,
     member: str,
 ) -> None:
+    """Transport: a request missing any required member is refused before its handler runs.
+
+    ``contract_checked_transport`` raises ``AssertionError`` (a contract breach, or no matching
+    surface when a routing selector was dropped) and the handler records no call.
+    """
     loaded = contract(source, name)
     calls: list[httpx.Request] = []
 
@@ -1050,6 +1124,11 @@ def test_the_contract_checked_transport_refuses_an_omission_before_its_handler(
 def test_each_google_row_contract_selects_exactly_its_gaql_template(
     contract: ContractLoader, name: str
 ) -> None:
+    """GAQL: each row contract's ``gaql`` equals its ``QUERIES`` template, which reads that row.
+
+    The file's ``gaql`` holds exactly ``query_id``, ``resource`` and ``select``; it and the
+    loaded contract match the template's, whose row surface is this contract.
+    """
     gaql = _read_raw("google", name)["request"]["gaql"]
     assert isinstance(gaql, dict)
     assert set(gaql) == GAQL_KEYS
@@ -1071,6 +1150,7 @@ def test_each_google_row_contract_selects_exactly_its_gaql_template(
 def test_each_selected_field_is_declared_by_its_row_schema(
     contract: ContractLoader, name: str
 ) -> None:
+    """GAQL: every SELECT field of a row contract is declared by its row response schema."""
     loaded = contract("google", name)
     assert loaded.request.gaql is not None
     undeclared = [
@@ -1082,6 +1162,7 @@ def test_each_selected_field_is_declared_by_its_row_schema(
 
 
 def test_every_gaql_template_reads_rows_of_a_contract_with_its_select() -> None:
+    """GAQL: each template's row contract shares its SELECT and resource; no row goes unread."""
     for query_id, template in QUERIES.items():
         assert template.row_surface in GOOGLE_ROW_NAMES, query_id
         gaql = _read_raw("google", template.row_surface)["request"]["gaql"]
@@ -1091,6 +1172,11 @@ def test_every_gaql_template_reads_rows_of_a_contract_with_its_select() -> None:
 
 
 def test_the_campaign_row_selects_the_lifetime_budget_and_q_g2b_shares_its_select() -> None:
+    """GAQL: ``row_campaign`` selects daily and lifetime budget micros, shared by Q-G2 and Q-G2b.
+
+    Its SELECT equals both templates', Q-G2b reads ``row_campaign``, and ``campaignBudget``
+    declares ``totalAmountMicros``.
+    """
     raw = _read_raw("google", "row_campaign")
     select = raw["request"]["gaql"]["select"]
     assert "campaign_budget.amount_micros" in select
@@ -1104,6 +1190,11 @@ def test_the_campaign_row_selects_the_lifetime_budget_and_q_g2b_shares_its_selec
 
 
 def test_the_webhook_body_is_exactly_customer_id_query_and_page_token() -> None:
+    """Webhook: the search body is a closed object requiring exactly the three prescribed keys.
+
+    Sent by POST with no ``gaql``; ``customer_id`` and ``query`` are strings, ``page_token`` a
+    string or null, and no additional property is allowed.
+    """
     request = _read_raw("google", "search")["request"]
     assert request["method"] == "POST"
     assert request["gaql"] is None
@@ -1120,6 +1211,11 @@ def test_the_webhook_body_is_exactly_customer_id_query_and_page_token() -> None:
 
 
 def test_the_webhook_limits_match_the_connector_constants() -> None:
+    """Webhook: the contract's limits equal the connector constants and its timeout is 120 s.
+
+    ``page_size`` 10,000 (``PAGE_SIZE``), ``keyset_limit`` 9,999 (``KEYSET_LIMIT``) and
+    ``in_list_max`` 1,000 (``MAX_IDS_PER_IN``).
+    """
     limits = _read_raw("google", "search")["request"]["limits"]
     assert limits["page_size"] == 10_000 == PAGE_SIZE
     assert limits["keyset_limit"] == 9_999 == KEYSET_LIMIT
@@ -1133,6 +1229,7 @@ def test_the_webhook_limits_match_the_connector_constants() -> None:
 def test_the_lead_sync_projection_equals_lead_fields_and_the_aap_literal(
     contract: ContractLoader, name: str
 ) -> None:
+    """Lead Sync: the lead-response projection equals ``LEAD_FIELDS`` and the guide's literal."""
     fields = _read_raw("linkedin", name)["request"]["fields"]
     assert fields == LEAD_FIELDS_LITERAL
     assert LEAD_FIELDS == LEAD_FIELDS_LITERAL
@@ -1143,6 +1240,11 @@ def test_the_lead_sync_projection_equals_lead_fields_and_the_aap_literal(
     "name", VERSIONED_LINKEDIN_NAMES, ids=[f"linkedin/{n}" for n in VERSIONED_LINKEDIN_NAMES]
 )
 def test_versioned_linkedin_surfaces_require_the_version_headers(name: str) -> None:
+    """LinkedIn headers: every versioned surface requires both Rest.li version headers.
+
+    ``Linkedin-Version`` and ``X-Restli-Protocol-Version``, on every LinkedIn surface but the
+    ``access_token`` exchange.
+    """
     headers = _read_raw("linkedin", name)["request"]["required_headers"]
     for header in VERSION_HEADERS:
         assert header in headers, f"linkedin/{name}: {header} is not required"
@@ -1152,6 +1254,7 @@ def test_versioned_linkedin_surfaces_require_the_version_headers(name: str) -> N
     "name", EXPECTED_SURFACES["hubspot"], ids=[f"hubspot/{n}" for n in EXPECTED_SURFACES["hubspot"]]
 )
 def test_hubspot_paths_are_dated_2026_09_and_never_numbered(name: str) -> None:
+    """HubSpot paths: every contract URL holds ``/2026-09/`` and no numbered ``/vN/`` segment."""
     url = _read_raw("hubspot", name)["request"]["url"]
     assert "/2026-09/" in url
     assert "/v3/" not in url
@@ -1165,6 +1268,11 @@ def test_hubspot_paths_are_dated_2026_09_and_never_numbered(name: str) -> None:
 
 
 def test_the_email_guard_flags_plaintext_and_accepts_the_marker() -> None:
+    """Captures: the email guard accepts ``<redacted>`` and flags each plaintext address by path.
+
+    A list value, a percent-encoded URL value and an object key are flagged, the key as
+    ``[email-like key]`` so no reported path repeats the address.
+    """
     redacted = {
         "request": {"url": f"https://example.invalid/x?email={REDACTION_MARKER}"},
         "response": {"body": {"email": REDACTION_MARKER, "note": f"from {REDACTION_MARKER}"}},
@@ -1188,6 +1296,14 @@ def test_every_capture_names_its_surface_satisfies_its_contract_and_holds_no_ema
     contract: ContractLoader,
     source: str,
 ) -> None:
+    """Captures: each live capture names its surface, satisfies its contract and holds no email.
+
+    ``captured/`` holds only ``.gitkeep`` and ``*.json`` files. Each capture has exactly the
+    four capture keys, a file stem naming a surface of its source, a matching ``surface``, a
+    timezone-aware ``captured_at`` and an integer status; its response passes
+    ``validate_response`` (a 2xx Google search also ``validate_google_rows`` against its
+    query), and no address is left unredacted. Zero captures pass.
+    """
     directory = CONTRACTS_DIR / source / "captured"
     assert directory.is_dir(), f"{source}: captured/ must exist (it holds .gitkeep when empty)"
     strays = sorted(

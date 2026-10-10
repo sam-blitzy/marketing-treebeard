@@ -2365,7 +2365,6 @@ def _digest(*parts: object) -> str:
 
 
 def _uuid_like(digest: str) -> str:
-    """Format 32 hex characters of a digest as a UUID."""
     return f"{digest[:8]}-{digest[8:12]}-{digest[12:16]}-{digest[16:20]}-{digest[20:32]}"
 
 
@@ -2481,7 +2480,6 @@ _DEFAULT_MESSAGES: Final[Mapping[int, str]] = MappingProxyType(
 
 
 def _default_message(status: int) -> str:
-    """A platform-style message for a status without one."""
     return _DEFAULT_MESSAGES.get(status, "The request failed.")
 
 
@@ -3313,7 +3311,6 @@ def _owner_id(ctx: _Ctx) -> str:
 
 
 def _audit(created: datetime, modified: datetime) -> JSONObject:
-    """``changeAuditStamps`` with both stamps."""
     return {"created": {"time": _ms(created)}, "lastModified": {"time": _ms(modified)}}
 
 
@@ -3579,7 +3576,6 @@ def _analytics_window(ctx: _Ctx) -> tuple[date, date]:
 
 
 def _restli_date(day: date) -> JSONObject:
-    """``{year, month, day}``."""
     return {"year": day.year, "month": day.month, "day": day.day}
 
 
@@ -3797,7 +3793,6 @@ def _lead_lookups(ctx: _Ctx, account: LinkedInAccountRecord) -> _LeadLookups:
 
 
 def _versioned_form_urn(form_id: int, version: int) -> str:
-    """``urn:li:versionedLeadGenForm:(urn:li:leadGenForm:{id},{version})``."""
     return f"urn:li:versionedLeadGenForm:(urn:li:leadGenForm:{form_id},{version})"
 
 
@@ -4128,7 +4123,6 @@ def _fault_error(fault: Fault, context: JSONObject, message: str) -> JSONObject:
 
 
 def _normalise_email(value: str) -> str:
-    """Trim and lowercase an address, as the lead pipeline normalises it before hashing."""
     return value.strip().lower()
 
 

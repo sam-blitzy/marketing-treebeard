@@ -171,17 +171,19 @@ function focusedElement(): FocusableElement | null {
  * GAP: bind to Blitzy OS on source arrival.
  *
  * @example
+ * `DecisionForm` renders its own "Save decision" and "Cancel" buttons, so its dialog takes no
+ * `footer`; a footer is for content whose actions sit outside the body.
+ *
  * ```tsx
  * const [open, setOpen] = useState(false);
  *
  * <Button variant="primary" onClick={() => setOpen(true)}>Record decision</Button>
- * <Dialog
- *   open={open}
- *   title="Record decision"
- *   onClose={() => setOpen(false)}
- *   footer={<Button type="submit" form="decision-form" variant="primary">Save decision</Button>}
- * >
- *   <DecisionForm id="decision-form" subject={subject} onSaved={() => setOpen(false)} />
+ * <Dialog open={open} title="Record decision" onClose={() => setOpen(false)}>
+ *   <DecisionForm
+ *     subject={subject}
+ *     onDone={() => setOpen(false)}
+ *     onCancel={() => setOpen(false)}
+ *   />
  * </Dialog>
  * ```
  */

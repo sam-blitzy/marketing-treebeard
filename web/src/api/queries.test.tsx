@@ -928,7 +928,6 @@ describe('useDefaultRun', () => {
     expect(result.current.isStale).toBe(false);
     expect(queryClient.getQueryState(queryKeys.runs.latest)?.dataUpdatedAt).toBe(pageUpdatedAt);
     expect(mock).not.toHaveBeenCalled();
-    // It still polls like any default-run read.
     expect(pollInterval(queryClient, queryKeys.runs.latest)).toBe(CURRENT_STATE_POLL_MS);
   });
 
@@ -2819,7 +2818,6 @@ describe('useResolveDiscrepancy', () => {
       resolved = await resolving;
     });
     expect(resolved).toEqual(closed);
-    // The one loaded page as the refetch re-read it, which the hook shows as an empty list.
     expect(cachedOnResolve).toMatchObject({ pages: [{ discrepancies: [], total: 0 }] });
     expect(sentPaths(mock)).toEqual([list, `POST ${path}`, list]);
     await waitFor(() => expect(result.current.list.data).toEqual({ discrepancies: [], total: 0 }));
@@ -2946,4 +2944,3 @@ describe('useRequestSync', () => {
     expect(invalidated(queryClient, queryKeys.sources)).toBe(false);
   });
 });
-

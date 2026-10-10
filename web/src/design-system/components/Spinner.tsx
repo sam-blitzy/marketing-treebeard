@@ -36,8 +36,9 @@ import './Spinner.css';
  * Props of {@link Spinner}.
  *
  * The interface is deliberately closed: there is no `className` or `style` prop, because
- * feature code must not restyle a wrapper (AAP 0.4.4). Size, colours and motion come only from
- * the tokens `Spinner.css` reads.
+ * feature code must not restyle a wrapper (AAP 0.4.4). Size and colours come only from the
+ * tokens `Spinner.css` reads; the ring's `1s linear` rotation timing is the placeholder motion
+ * literal that `../GAPS.md` lists, because `tokens.css` has no motion tokens.
  *
  * GAP: bind to Blitzy OS on source arrival. These are product-level props, not Blitzy OS
  * props; on binding, they map onto the Blitzy OS loading indicator.

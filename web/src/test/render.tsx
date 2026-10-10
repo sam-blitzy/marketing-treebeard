@@ -4,13 +4,15 @@
  * two providers every feature component needs, and resolves once the router is idle and the
  * component has mounted.
  *
- * The test router mirrors the app's paths and search keys (`src/router.tsx`) without importing
- * it, because that module imports every feature page and features are what the tests render:
- * `/`, `/login` with a string `redirect`, `/actions` with a `run` id coerced as the app coerces
- * it, `/decisions`, `/sources` and `/settings`. It has no auth guard and no redirects. The
- * component under test renders in the root route, beside an `Outlet` whose routes render
- * nothing, so `Link`, `useNavigate` and `useSearch({ strict: false })` work and every
- * navigation is visible in `router.state`.
+ * The test router mirrors the app's paths and search keys (`src/router.tsx`): `/`, `/login`
+ * with a string `redirect`, `/actions` with a `run` id coerced as the app coerces it,
+ * `/decisions`, `/sources` and `/settings`. It does not import that module: its static imports
+ * would pull the `ActionsPage` and `LoginPage` graphs into every test, its `/decisions`,
+ * `/sources` and `/settings` routes would load their code-split screens, and its
+ * `GET /auth/me` guard and `AppLayout` shell would wrap the component under test, which a test
+ * renders on its own. It has no auth guard and no redirects. The component under test renders
+ * in the root route, beside an `Outlet` whose routes render nothing, so `Link`, `useNavigate`
+ * and `useSearch({ strict: false })` work and every navigation is visible in `router.state`.
  *
  * Only test files import this module; application code never does. It renders nothing but the
  * two providers, the component under test and the `Outlet`, and it never fetches: stub the
@@ -18,7 +20,10 @@
  *
  * @example
  * ```tsx
- * const { router } = await renderWithProviders(<WindowPicker />, { path: '/actions?run=202' });
+ * const { router } = await renderWithProviders(
+ *   <WindowPicker run={makeRun({ id: 202, kind: 'custom' })} />,
+ *   { path: '/actions?run=202' },
+ * );
  * expect(router.state.location.search).toEqual({ run: 202 });
  * ```
  *
@@ -231,8 +236,12 @@ export interface RenderWithProvidersResult extends RenderResult {
  *
  * @example
  * ```tsx
- * mockApi({ 'GET /runs': json(200, [makeRun({ id: 202, kind: 'custom' })]) });
- * const { router } = await renderWithProviders(<WindowPicker />);
+ * mockApi({
+ *   'GET /config': json(200, makeConfig()),
+ *   'GET /runs/latest': json(200, makeRun()),
+ *   'GET /runs': json(200, [makeRun({ id: 202, kind: 'custom' })]),
+ * });
+ * const { router } = await renderWithProviders(<WindowPicker run={makeRun()} />);
  * // … pick the custom run …
  * expect(router.state.location.search).toEqual({ run: 202 });
  * ```

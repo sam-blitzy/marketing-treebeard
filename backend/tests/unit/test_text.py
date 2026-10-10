@@ -58,12 +58,14 @@ ONE_STRING: Any = "crm tool pricing"
 
 
 def test_tokenize_lowercases_and_removes_stopwords() -> None:
+    """K2 and C3b: a term's tokens are its lowercased words, stopwords such as "best" removed."""
     assert tokenize("Best B2B Attribution Software") == frozenset(
         {"attribution", "b2b", "software"}
     )
 
 
 def test_tokenize_drops_best_and_for_as_stopwords_and_strips_trailing_punctuation() -> None:
+    """The stopword list drops "best" and "for", and trailing punctuation leaves no token."""
     # "best" is in STOPWORDS on purpose: it is a search-intent modifier with no topic, and
     # kept it would give unrelated terms ("best crm", "best laptop") a shared token. The
     # module's documented stopword list is the contract, so the expected set leaves "best"
@@ -75,6 +77,7 @@ def test_tokenize_drops_best_and_for_as_stopwords_and_strips_trailing_punctuatio
 
 
 def test_tokenize_splits_on_every_punctuation_and_underscore_run_and_keeps_digits() -> None:
+    """Every run of punctuation, underscores or whitespace splits tokens, and digits are kept."""
     assert tokenize("CRM-tool_pricing (2026)!") == frozenset({"2026", "crm", "pricing", "tool"})
     assert tokenize("crm/tool,pricing;guide\tdemo\nfree...") == frozenset(
         {"crm", "tool", "pricing", "guide", "demo", "free"}
@@ -82,10 +85,12 @@ def test_tokenize_splits_on_every_punctuation_and_underscore_run_and_keeps_digit
 
 
 def test_tokenize_keeps_b2b_as_one_lowercase_token() -> None:
+    """A mixed letter-and-digit word such as "B2B" stays one token, lowercased to "b2b"."""
     assert tokenize("B2B") == frozenset({"b2b"})
 
 
 def test_tokenize_counts_a_repeated_word_once() -> None:
+    """Tokens form a frozenset, so a word repeated in any case is one token."""
     tokens = tokenize("CRM crm Crm tool TOOL")
 
     assert isinstance(tokens, frozenset)
@@ -99,10 +104,12 @@ def test_tokenize_counts_a_repeated_word_once() -> None:
 def test_tokenize_gives_an_empty_set_for_text_of_only_stopwords_or_punctuation(
     value: str,
 ) -> None:
+    """Text that is empty or holds only whitespace, stopwords or punctuation has no tokens."""
     assert tokenize(value) == frozenset()
 
 
 def test_tokenize_never_returns_a_stopword() -> None:
+    """No token is ever a stopword, and text made of every stopword has no tokens."""
     tokens = tokenize(
         "What is the best CRM for a small team near me vs HubSpot, and how do I use it?"
     )
@@ -113,6 +120,7 @@ def test_tokenize_never_returns_a_stopword() -> None:
 
 
 def test_tokenize_drops_the_clitic_fragments_apostrophes_leave() -> None:
+    """Apostrophes split words, and the clitic fragments "s" and "t" they leave are stopwords."""
     assert tokenize("Women's leadership") == frozenset({"women", "leadership"})
     assert tokenize("why don't attribution tools work") == frozenset(
         {"don", "attribution", "tools", "work"}
@@ -121,6 +129,7 @@ def test_tokenize_drops_the_clitic_fragments_apostrophes_leave() -> None:
 
 @pytest.mark.parametrize("word", ["it", "its", "us", "will", "not"])
 def test_tokenize_keeps_topic_words_that_generic_stopword_lists_drop(word: str) -> None:
+    """Words generic stopword lists drop, such as "it", "us" and "not", stay lowercased tokens."""
     assert word not in STOPWORDS
     assert tokenize(f"{word.upper()} services") == frozenset({word, "services"})
 
@@ -138,10 +147,20 @@ def test_tokenize_keeps_topic_words_that_generic_stopword_lists_drop(word: str) 
 def test_tokenize_normalises_unicode_to_its_compatibility_caseless_form(
     raw: str, expected: set[str]
 ) -> None:
+    """Tokens are the Unicode compatibility-caseless form of the text, accents kept in words.
+
+    Full-width letters and ligatures fold to plain letters, the sharp s casefolds to "ss" and a
+    decomposed accent composes, so every spelling of a word gives the same token.
+    """
     assert tokenize(raw) == frozenset(expected)
 
 
 def test_stopwords_are_a_fixed_set_of_lowercase_words_that_tokenize_removes() -> None:
+    """``STOPWORDS`` is a frozenset of lowercase ASCII words, each dropped in lower or upper case.
+
+    It includes the search-intent modifiers "best", "near", "me", "vs" and "versus", the clitic
+    fragments "s" and "t", and the function words "the", "and" and "for".
+    """
     assert isinstance(STOPWORDS, frozenset)
     assert {"best", "near", "me", "vs", "versus", "s", "t", "the", "and", "for"} <= STOPWORDS
     for word in STOPWORDS:
@@ -154,6 +173,7 @@ def test_stopwords_are_a_fixed_set_of_lowercase_words_that_tokenize_removes() ->
 
 
 def test_jaccard_is_intersection_over_union_at_28_significant_digits() -> None:
+    """Jaccard is a Decimal of intersection over union, rounded at 28 significant digits."""
     value = jaccard(frozenset({"a", "b"}), frozenset({"b", "c"}))
 
     assert isinstance(value, Decimal)
@@ -162,6 +182,7 @@ def test_jaccard_is_intersection_over_union_at_28_significant_digits() -> None:
 
 
 def test_jaccard_reports_terminating_fractions_exactly() -> None:
+    """A terminating fraction such as 2/4 is reported exactly and prints as "0.5"."""
     value = jaccard({"crm", "tool", "pricing"}, {"tool", "pricing", "guide"})
 
     assert value == HALF
@@ -169,23 +190,27 @@ def test_jaccard_reports_terminating_fractions_exactly() -> None:
 
 
 def test_jaccard_of_identical_sets_is_one_and_of_disjoint_sets_is_zero() -> None:
+    """Identical token sets have Jaccard 1 and disjoint token sets have Jaccard 0."""
     assert jaccard({"crm", "tool"}, frozenset({"tool", "crm"})) == Decimal(1)
     assert jaccard({"crm", "tool"}, {"project", "management"}) == Decimal(0)
 
 
 def test_jaccard_of_two_empty_sets_is_zero_without_dividing_by_zero() -> None:
+    """Jaccard is 0 when either set or both are empty, with no division by zero."""
     assert jaccard(frozenset(), frozenset()) == Decimal(0)
     assert jaccard(frozenset(), {"crm"}) == Decimal(0)
     assert jaccard({"crm"}, frozenset()) == Decimal(0)
 
 
 def test_jaccard_is_symmetric() -> None:
+    """Jaccard is symmetric in its two arguments."""
     left, right = tokenize(B), tokenize(C)
 
     assert jaccard(left, right) == jaccard(right, left) == HALF
 
 
 def test_jaccard_ignores_the_callers_decimal_context() -> None:
+    """The caller's decimal context changes neither the precision nor the rounding of Jaccard."""
     with localcontext() as context:
         context.prec = 3
         context.rounding = ROUND_DOWN
@@ -195,6 +220,12 @@ def test_jaccard_ignores_the_callers_decimal_context() -> None:
 
 
 def test_thresholds_compare_the_exact_fraction_never_the_rounded_jaccard() -> None:
+    """K2 and C3b thresholds compare the exact Jaccard fraction, never its rounded value.
+
+    Exact 2/3 lies between its two 28-digit roundings, and ``jaccard`` reports the upper one. At
+    a threshold equal to that value no adjacent term, cluster link or 2-of-3 head token
+    qualifies; at the lower rounding all three do.
+    """
     # Exact J(A, B) = 2/3 lies between the two 28-digit roundings of two thirds, and the
     # reported value is the upper one, so a cut-off tested against it would link A and B.
     assert jaccard(tokenize(A), tokenize(B)) == TWO_THIRDS_ROUNDED_UP
@@ -216,10 +247,12 @@ def test_thresholds_compare_the_exact_fraction_never_the_rounded_jaccard() -> No
 
 
 def test_head_tokens_are_the_tokens_in_at_least_half_of_the_members() -> None:
+    """C3b: head tokens are the tokens in at least the minimum share of the member terms."""
     assert head_tokens([A, B, C], min_share=HALF) == frozenset({"crm", "tool", "pricing"})
 
 
 def test_head_tokens_include_a_token_in_exactly_the_minimum_share() -> None:
+    """C3b: the head-token share is inclusive, so a token in exactly 2 of 4 members meets 0.5."""
     members = ["crm tool", "crm pricing", "tool demo", "guide software"]
 
     assert head_tokens(members, min_share=HALF) == frozenset({"crm", "tool"})
@@ -227,6 +260,7 @@ def test_head_tokens_include_a_token_in_exactly_the_minimum_share() -> None:
 
 
 def test_head_tokens_count_each_distinct_member_once() -> None:
+    """C3b: a repeated member string counts once in head-token shares, in a list or a tuple."""
     # With the repeat counted, "crm" would be in 2 of 3 members and meet 0.6.
     assert head_tokens(["crm tool", "crm tool", "pricing guide"], min_share=Decimal("0.6")) == (
         frozenset()
@@ -237,14 +271,17 @@ def test_head_tokens_count_each_distinct_member_once() -> None:
 
 
 def test_head_tokens_count_a_token_once_per_member() -> None:
+    """C3b: a token repeated within one member counts once toward its head-token share."""
     assert head_tokens(["crm crm crm", "tool"], min_share=Decimal("0.6")) == frozenset()
 
 
 def test_head_tokens_at_a_share_of_one_are_the_tokens_every_member_has() -> None:
+    """C3b: at a share of 1 the head tokens are exactly the tokens every member contains."""
     assert head_tokens([A, B, C], min_share=Decimal(1)) == frozenset({"tool"})
 
 
 def test_head_tokens_of_no_members_or_tokenless_members_are_empty() -> None:
+    """C3b: no members, or members of only stopwords, give no head tokens."""
     assert head_tokens([], min_share=HALF) == frozenset()
     assert head_tokens(["the best", "for the"], min_share=HALF) == frozenset()
 
@@ -253,6 +290,11 @@ def test_head_tokens_of_no_members_or_tokenless_members_are_empty() -> None:
 
 
 def test_term_cluster_sorts_and_deduplicates_members_and_freezes_head_tokens() -> None:
+    """A ``TermCluster`` normalises its members to a sorted tuple of distinct terms.
+
+    Its head tokens become a frozenset, ``size`` counts the distinct members, and
+    ``sorted_head`` and ``label`` read the normalised fields.
+    """
     raw_members: Any = ["crm tool pricing", "crm tool", "crm tool pricing"]
     raw_head: Any = {"tool", "crm"}
 
@@ -267,6 +309,7 @@ def test_term_cluster_sorts_and_deduplicates_members_and_freezes_head_tokens() -
 
 
 def test_term_clusters_built_differently_compare_and_hash_equal() -> None:
+    """Clusters built from the same members in any order or repetition compare and hash equal."""
     first = TermCluster((B, A, B), frozenset({"tool", "crm"}))
     second = TermCluster((A, B), frozenset({"crm", "tool"}))
 
@@ -276,6 +319,7 @@ def test_term_clusters_built_differently_compare_and_hash_equal() -> None:
 
 
 def test_term_cluster_label_lists_the_head_tokens_in_the_members_word_order() -> None:
+    """C3b: ``label`` follows the members' word order while ``sorted_head`` stays alphabetical."""
     # "tool pricing guide" lacks "crm", so it votes only on the (tool, pricing) pair; the
     # points are crm 3, tool 2, pricing 0. ``sorted_head`` stays alphabetical.
     cluster = TermCluster((A, B, C), frozenset({"tool", "pricing", "crm"}))
@@ -327,6 +371,7 @@ def test_term_cluster_label_lists_the_head_tokens_in_the_members_word_order() ->
 def test_term_cluster_label_follows_how_the_terms_are_searched(
     members: tuple[str, ...], head: set[str], label: str, alphabetical: tuple[str, ...]
 ) -> None:
+    """C3b: labels read as the terms are searched, unlike the alphabetical ``sorted_head``."""
     cluster = TermCluster(members, frozenset(head))
 
     assert cluster.label == label
@@ -334,6 +379,11 @@ def test_term_cluster_label_follows_how_the_terms_are_searched(
 
 
 def test_term_cluster_label_reads_each_member_with_tokenize_rules() -> None:
+    """C3b: the label reads each member's word order by the rules of ``tokenize``.
+
+    Stopwords, punctuation and case move no head token, and a repeated word keeps its first
+    position.
+    """
     # Stopwords, punctuation and case do not move a head token: "the" and "for" are dropped,
     # "Revenue-Forecasting" splits as tokenize splits it, and a repeated word keeps its first
     # position, so every member places "revenue" before "forecasting".
@@ -348,6 +398,10 @@ def test_term_cluster_label_reads_each_member_with_tokenize_rules() -> None:
 
 
 def test_term_cluster_label_breaks_a_tie_in_points_alphabetically() -> None:
+    """C3b: head tokens tied on word-order points are listed alphabetically.
+
+    A head token that no member contains earns no point and ties with the last-placed token.
+    """
     # One member puts "crm" first and the other "tool" first: one point each.
     tied = TermCluster(("tool crm", "crm tool"), frozenset({"crm", "tool"}))
     # A head token no member contains earns no point and ties with the last-placed token.
@@ -358,6 +412,7 @@ def test_term_cluster_label_breaks_a_tie_in_points_alphabetically() -> None:
 
 
 def test_term_cluster_label_ranks_by_points_across_members_lacking_some_head_tokens() -> None:
+    """C3b: points from word order, not the alphabet, rank head tokens that some members lack."""
     # "zeta" leads in two members, "alpha" in one, and the third member lacks "zeta": points
     # are zeta 2, alpha 1, beta 0, so word order beats alphabetical order.
     cluster = TermCluster(
@@ -369,6 +424,7 @@ def test_term_cluster_label_ranks_by_points_across_members_lacking_some_head_tok
 
 
 def test_term_cluster_label_is_independent_of_the_order_members_are_given_in() -> None:
+    """C3b: every order of the same members gives the same label."""
     labels = {
         TermCluster(order, frozenset({"tool", "pricing", "crm"})).label
         for order in itertools.permutations([A, B, C])
@@ -391,6 +447,7 @@ def test_term_cluster_label_is_independent_of_the_order_members_are_given_in() -
     ],
 )
 def test_ordered_tokens_are_the_tokenize_set_in_first_use_order(value: str) -> None:
+    """The word-order tokens the label reads are exactly the tokens of ``tokenize``, each once."""
     ordered = text._ordered_tokens(value)
 
     assert len(ordered) == len(set(ordered))
@@ -398,10 +455,12 @@ def test_ordered_tokens_are_the_tokenize_set_in_first_use_order(value: str) -> N
 
 
 def test_ordered_tokens_keep_the_word_order_and_the_first_position_of_a_repeat() -> None:
+    """Ordered tokens follow the text's word order, and a repeated word keeps its first position."""
     assert text._ordered_tokens("Tool for CRM, tool pricing") == ("tool", "crm", "pricing")
 
 
 def test_term_cluster_without_head_tokens_has_an_empty_label() -> None:
+    """A cluster without head tokens has an empty ``sorted_head`` and an empty label."""
     cluster = TermCluster(("the best",), frozenset())
 
     assert cluster.sorted_head == ()
@@ -409,6 +468,7 @@ def test_term_cluster_without_head_tokens_has_an_empty_label() -> None:
 
 
 def test_term_cluster_is_immutable() -> None:
+    """A ``TermCluster`` is frozen: assigning to a field raises ``FrozenInstanceError``."""
     cluster = TermCluster((A,), frozenset({"crm", "tool"}))
 
     with pytest.raises(FrozenInstanceError):
@@ -416,6 +476,7 @@ def test_term_cluster_is_immutable() -> None:
 
 
 def test_term_cluster_rejects_an_empty_member_list() -> None:
+    """Building a ``TermCluster`` with no members raises ``ValueError``."""
     with pytest.raises(ValueError, match=r"^a term cluster needs at least one member$"):
         TermCluster((), frozenset())
 
@@ -428,6 +489,10 @@ def _members(clusters: Sequence[TermCluster]) -> list[tuple[str, ...]]:
 
 
 def test_cluster_terms_links_a_chain_by_single_linkage_at_an_inclusive_threshold() -> None:
+    """C3b: single linkage at an inclusive 0.5 joins A and C through B, although J(A, C) = 0.25.
+
+    The unrelated D stays a singleton, and each cluster carries its head tokens and label.
+    """
     assert jaccard(tokenize(A), tokenize(C)) == Decimal("0.25")
     assert jaccard(tokenize(B), tokenize(C)) == HALF
 
@@ -443,6 +508,7 @@ def test_cluster_terms_links_a_chain_by_single_linkage_at_an_inclusive_threshold
 
 
 def test_cluster_terms_breaks_the_chain_when_the_link_falls_below_the_threshold() -> None:
+    """C3b: at 0.51 the chain breaks at its 0.5 link, and equal sizes sort by first member."""
     clusters = cluster_terms([A, B, C, D], threshold=Decimal("0.51"), min_head_share=HALF)
 
     # Equal sizes are ordered by first member: "project management" < "tool pricing guide".
@@ -450,6 +516,7 @@ def test_cluster_terms_breaks_the_chain_when_the_link_falls_below_the_threshold(
 
 
 def test_cluster_terms_does_not_join_a_pair_at_jaccard_point_four_under_point_five() -> None:
+    """C3b: a pair at Jaccard 0.4 stays apart at threshold 0.5 and joins at threshold 0.4."""
     left, right = "crm tool pricing guide", "crm tool demo"
     assert jaccard(tokenize(left), tokenize(right)) == Decimal("0.4")
 
@@ -463,6 +530,7 @@ def test_cluster_terms_does_not_join_a_pair_at_jaccard_point_four_under_point_fi
 
 
 def test_cluster_terms_keeps_unlinked_and_tokenless_terms_as_singletons() -> None:
+    """C3b: unlinked and tokenless terms are singletons, and tokenless ones have no head token."""
     clusters = cluster_terms(["the best", "crm", "for the"], threshold=HALF, min_head_share=HALF)
 
     assert clusters == [
@@ -473,6 +541,7 @@ def test_cluster_terms_keeps_unlinked_and_tokenless_terms_as_singletons() -> Non
 
 
 def test_cluster_terms_does_not_link_terms_through_a_token_they_all_share() -> None:
+    """C3b: a token all five terms share (pairwise J = 1/3) links none at 0.5 but all at 0.3."""
     terms = [f"crm {word}" for word in ("pricing", "demo", "guide", "software", "free")]
 
     singletons = cluster_terms(terms, threshold=HALF, min_head_share=HALF)
@@ -483,6 +552,7 @@ def test_cluster_terms_does_not_link_terms_through_a_token_they_all_share() -> N
 
 
 def test_cluster_terms_deduplicates_identical_terms() -> None:
+    """C3b: identical terms are clustered, and counted in head-token shares, only once."""
     clusters = cluster_terms([A, B, A, B], threshold=HALF, min_head_share=HALF)
 
     # Counted once each, "pricing" is in 1 of 2 members (a head token at 0.5); with the
@@ -494,10 +564,12 @@ def test_cluster_terms_deduplicates_identical_terms() -> None:
 
 
 def test_cluster_terms_of_no_terms_is_empty() -> None:
+    """C3b: clustering no terms gives no clusters."""
     assert cluster_terms([], threshold=HALF, min_head_share=HALF) == []
 
 
 def test_cluster_terms_gives_identical_clusters_in_identical_order_for_every_input_order() -> None:
+    """C3b: every ordering of the terms, as a tuple or list, gives the same clusters in order."""
     expected = cluster_terms([A, B, C, D], threshold=HALF, min_head_share=HALF)
 
     for order in itertools.permutations([A, B, C, D]):
@@ -506,6 +578,7 @@ def test_cluster_terms_gives_identical_clusters_in_identical_order_for_every_inp
 
 
 def test_cluster_terms_is_repeatable() -> None:
+    """C3b: two calls on the same terms return equal clusters in distinct lists."""
     first = cluster_terms([A, B, C, D], threshold=HALF, min_head_share=HALF)
     second = cluster_terms([A, B, C, D], threshold=HALF, min_head_share=HALF)
 
@@ -576,6 +649,11 @@ def _reference_clusters(
 def test_cluster_terms_matches_a_brute_force_single_linkage_over_every_pair(
     sample: str, threshold: str
 ) -> None:
+    """C3b: the indexed clustering equals a brute-force single linkage over every pair.
+
+    Over varied samples and thresholds from 0.25 to 1, index pruning skips no linkable pair,
+    and each distinct term lands in exactly one cluster.
+    """
     terms = _SAMPLES[sample]
 
     clusters = cluster_terms(terms, threshold=Decimal(threshold), min_head_share=HALF)
@@ -587,6 +665,7 @@ def test_cluster_terms_matches_a_brute_force_single_linkage_over_every_pair(
 
 
 def test_cluster_head_tokens_are_what_head_tokens_computes_for_the_members() -> None:
+    """C3b: each cluster's head tokens equal ``head_tokens`` over its members at the same share."""
     share = Decimal("0.6")
 
     clusters = cluster_terms(_GENERATED_TERMS[::5], threshold=HALF, min_head_share=share)
@@ -600,10 +679,12 @@ def test_cluster_head_tokens_are_what_head_tokens_computes_for_the_members() -> 
 
 
 def test_contains_tokens_finds_head_tokens_in_an_ad_group_name() -> None:
+    """C3b: head tokens present in an ad group name are found, whatever its case."""
     assert contains_tokens(["Brand", "CRM Tool Ad Group"], frozenset({"crm", "tool"})) is True
 
 
 def test_contains_tokens_is_false_when_no_token_appears_in_any_text() -> None:
+    """C3b: the result is False when no token appears in any of the texts."""
     assert contains_tokens(["Brand", "Competitors"], frozenset({"pricing", "guide"})) is False
 
 
@@ -619,27 +700,32 @@ def test_contains_tokens_needs_only_one_token_in_one_text() -> None:
 
 
 def test_contains_tokens_matches_whole_tokens_only() -> None:
+    """C3b: matching is by whole token, so neither a prefix nor a plural form matches."""
     assert contains_tokens(["CRM Tool Ad Group"], frozenset({"too"})) is False
     assert contains_tokens(["CRMs and tools"], frozenset({"crm", "tool"})) is False
 
 
 def test_contains_tokens_normalises_the_tokens_it_looks_for() -> None:
+    """C3b: sought tokens are normalised like text, whatever their case, width or hyphens."""
     assert contains_tokens(["crm tool"], frozenset({"CRM"})) is True
     assert contains_tokens(["crm tool"], frozenset({"\uff23\uff32\uff2d"})) is True
     assert contains_tokens(["CRM Tool Ad Group"], frozenset({"crm-tool"})) is True
 
 
 def test_contains_tokens_never_matches_a_stopword() -> None:
+    """C3b: a stopword is never found, even in a text that contains it."""
     assert contains_tokens(["The Best CRM"], frozenset({"best", "the"})) is False
 
 
 def test_contains_tokens_is_false_for_no_tokens_or_no_texts() -> None:
+    """C3b: no tokens, empty or punctuation-only tokens, or no texts give False."""
     assert contains_tokens(["CRM Tool Ad Group"], frozenset()) is False
     assert contains_tokens(["CRM Tool Ad Group"], frozenset({"", "--"})) is False
     assert contains_tokens([], frozenset({"crm"})) is False
 
 
 def test_contains_tokens_accepts_any_iterable_of_texts() -> None:
+    """C3b: texts may be any iterable, a one-shot generator included."""
     names = (name for name in ["Brand", "CRM Tool Ad Group"])
 
     assert contains_tokens(names, frozenset({"tool"})) is True
@@ -649,12 +735,14 @@ def test_contains_tokens_accepts_any_iterable_of_texts() -> None:
 
 
 def test_adjacent_terms_returns_candidates_at_or_above_the_threshold() -> None:
+    """K2: adjacent terms are the other candidates at or above the Jaccard threshold."""
     candidates = ["crm tool", "CRM Tool Pricing", "tool pricing guide", "project management"]
 
     assert adjacent_terms(B, candidates, threshold=HALF) == ["crm tool", "tool pricing guide"]
 
 
 def test_adjacent_terms_threshold_is_inclusive() -> None:
+    """K2: a candidate at Jaccard exactly 0.5 is adjacent at threshold 0.5 but not at 0.51."""
     assert jaccard(tokenize(B), tokenize(C)) == HALF
 
     assert adjacent_terms(B, [C], threshold=HALF) == [C]
@@ -662,6 +750,7 @@ def test_adjacent_terms_threshold_is_inclusive() -> None:
 
 
 def test_adjacent_terms_drops_a_candidate_at_jaccard_point_four_under_point_five() -> None:
+    """K2: a candidate at Jaccard 0.4 is dropped at threshold 0.5 and kept at threshold 0.4."""
     term, candidate = "crm tool pricing guide", "crm tool demo"
 
     assert adjacent_terms(term, [candidate], threshold=HALF) == []
@@ -669,12 +758,14 @@ def test_adjacent_terms_drops_a_candidate_at_jaccard_point_four_under_point_five
 
 
 def test_adjacent_terms_excludes_the_term_itself_in_any_case_or_spacing() -> None:
+    """K2: the term itself is never adjacent, however a candidate cases or spaces it."""
     candidates = [B, "CRM Tool Pricing", "  crm   TOOL\tpricing ", A]
 
     assert adjacent_terms(B, candidates, threshold=HALF) == [A]
 
 
 def test_adjacent_terms_returns_a_repeated_candidate_once_in_first_occurrence_order() -> None:
+    """K2: a repeated candidate is returned once, in the order candidates first occur."""
     candidates = [C, A, C, A, D]
 
     assert adjacent_terms(B, candidates, threshold=HALF) == [C, A]
@@ -682,16 +773,19 @@ def test_adjacent_terms_returns_a_repeated_candidate_once_in_first_occurrence_or
 
 
 def test_adjacent_terms_are_uncapped_and_unranked() -> None:
+    """K2: all seven matching candidates are returned in input order, with no cap or ranking."""
     candidates = [f"crm tool {word}" for word in ("a1", "b2", "c3", "d4", "e5", "f6", "g7")]
 
     assert adjacent_terms(A, candidates, threshold=HALF) == candidates
 
 
 def test_adjacent_terms_skips_tokenless_candidates() -> None:
+    """K2: an empty or stopword-only candidate is never adjacent, even at a 0.25 threshold."""
     assert adjacent_terms(A, ["the best", "", "for the", C], threshold=Decimal("0.25")) == [C]
 
 
 def test_adjacent_terms_of_a_term_without_tokens_is_empty() -> None:
+    """K2: a term of only stopwords has no adjacent terms."""
     assert adjacent_terms("the best", ["the best", "best of", A], threshold=HALF) == []
 
 
@@ -717,6 +811,7 @@ def _parameter_name(case: str) -> str:
 @pytest.mark.parametrize("value", [0.5, 1, "0.5", None, Fraction(1, 2), True])
 @pytest.mark.parametrize("case", sorted(_THRESHOLD_PARAMETERS))
 def test_thresholds_must_be_decimals(case: str, value: Any) -> None:
+    """A K2 or C3b threshold that is not a Decimal raises TypeError naming it and its type."""
     message = f"^{_parameter_name(case)} must be a Decimal, got {type(value).__name__}$"
 
     with pytest.raises(TypeError, match=message):
@@ -731,6 +826,11 @@ def test_thresholds_must_be_decimals(case: str, value: Any) -> None:
 def test_thresholds_must_be_finite_and_in_the_half_open_unit_interval(
     case: str, value: str
 ) -> None:
+    """A K2 or C3b threshold that is not finite or lies outside (0, 1] raises ValueError.
+
+    Zero, negative zero, negatives, values above 1, NaN, sNaN and both infinities are refused,
+    and the message names the parameter and the value.
+    """
     message = (
         rf"^{_parameter_name(case)} must be a finite Decimal in \(0, 1\], got "
         f"{re.escape(str(Decimal(value)))}$"
@@ -832,6 +932,7 @@ def test_thresholds_accept_every_decimal_in_the_half_open_unit_interval_and_appl
 
 
 def test_threshold_validation_does_not_depend_on_the_input() -> None:
+    """Invalid thresholds are refused even for empty input or a term with no tokens."""
     float_half: Any = 0.5
 
     with pytest.raises(TypeError, match=r"^threshold must be a Decimal, got float$"):
@@ -876,6 +977,7 @@ def test_threshold_validation_does_not_depend_on_the_input() -> None:
 def test_a_single_string_is_refused_where_a_collection_of_strings_belongs(
     name: str, call: Callable[[], object]
 ) -> None:
+    """A bare string given for a collection of strings raises TypeError naming the parameter."""
     with pytest.raises(
         TypeError, match=f"^{name} must be a collection of strings, not a single string$"
     ):
@@ -888,11 +990,13 @@ def test_a_single_string_is_refused_where_a_collection_of_strings_belongs(
 
 
 def test_exact_threshold_test_never_links_two_empty_token_sets() -> None:
+    """Two empty token sets never meet even a tiny threshold, while equal non-empty sets meet 1."""
     assert text._meets(frozenset(), frozenset(), (1, 1_000_000)) is False
     assert text._meets({"crm"}, {"crm"}, (1, 1)) is True
 
 
 def test_union_of_two_terms_already_in_one_cluster_changes_nothing() -> None:
+    """A union of terms already in one cluster, or of a term with itself, changes nothing."""
     forest = text._DisjointSet(3)
     forest.union(0, 1)
     forest.union(1, 0)
@@ -905,6 +1009,7 @@ def test_union_of_two_terms_already_in_one_cluster_changes_nothing() -> None:
 
 
 def test_docstring_examples_hold() -> None:
+    """The doctest examples in the text module's docstrings exist and all pass."""
     results = doctest.testmod(text, report=False)
 
     assert results.attempted > 0
@@ -912,6 +1017,7 @@ def test_docstring_examples_hold() -> None:
 
 
 def test_module_is_pure_and_imports_only_the_standard_library() -> None:
+    """The text module imports only the standard library, by absolute import, and never logging."""
     imported: set[str] = set()
     for node in ast.walk(ast.parse(inspect.getsource(text))):
         if isinstance(node, ast.Import):
@@ -928,6 +1034,7 @@ def test_module_is_pure_and_imports_only_the_standard_library() -> None:
 
 
 def test_public_names_are_exactly_the_documented_api() -> None:
+    """The text module exports exactly its eight public names in ``__all__``."""
     assert sorted(text.__all__) == [
         "STOPWORDS",
         "TermCluster",

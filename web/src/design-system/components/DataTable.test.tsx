@@ -48,7 +48,7 @@ const ROWS: readonly AssetRow[] = [
 ];
 
 /**
- * The white-paper columns: an identifying row-header column, a rendered currency column, three
+ * The white-paper columns: an identifying row-header column, a rendered currency column, two
  * numeric default cells, a boolean and an object property, and a key no row carries.
  */
 const COLUMNS: readonly DataTableColumn<AssetRow>[] = [
@@ -106,10 +106,11 @@ function renderAssets({
 }
 
 /**
- * Whether an element is a stop in sequential focus navigation, judged as a browser judges it and
+ * Whether an element is a stop in the simplified Tab model these fixtures need, judged
  * independently of the component: a non-negative `tabIndex`, not a disabled control, a hidden
  * input or a link without `href` (which reports `tabIndex` 0 yet takes no focus), and not inside
- * a `hidden`, `inert` or `display: none` element.
+ * a `hidden`, `inert` or `display: none` element. Browser focus rules no fixture here exercises,
+ * such as `visibility: hidden`, a radio group's single stop and shadow roots, are not modelled.
  */
 function isTabStop(element: HTMLElement): boolean {
   if (element.tabIndex < 0 || element.matches(':disabled, input[type="hidden"]')) {
@@ -134,8 +135,9 @@ function isTabStop(element: HTMLElement): boolean {
 }
 
 /**
- * The document's sequential focus navigation order: stops with a positive `tabIndex` first, in
- * ascending order and tree order among equals, then stops with `tabIndex` 0 in tree order.
+ * The modelled Tab order of the rendered fixture's {@link isTabStop} stops: those with a positive
+ * `tabIndex` first, in ascending order and tree order among equals, then those with `tabIndex` 0
+ * in tree order.
  */
 function tabSequence(): HTMLElement[] {
   const stops = Array.from(document.body.querySelectorAll('*')).filter(
@@ -148,7 +150,7 @@ function tabSequence(): HTMLElement[] {
 }
 
 /**
- * The stop Tab (or Shift+Tab) moves focus to from an element, as a browser computes it.
+ * The stop Tab (or Shift+Tab) moves focus to from an element in the simplified Tab model.
  *
  * From the body the first stop is next (the last with Shift). From a stop it is the following
  * stop in {@link tabSequence} (the preceding one with Shift). From a focused element that is not
@@ -525,7 +527,6 @@ describe('DataTable', () => {
       const detailCell = detail?.querySelector('td');
       expect(detailCell?.getAttribute('colspan')).toBe(String(COLUMNS.length + 1));
       expect(renderExpanded).toHaveBeenCalledWith(ROWS[0]);
-      // The other row stays collapsed.
       expect(screen.getAllByRole('button', { name: 'Show details' })).toHaveLength(1);
 
       fireEvent.click(toggle);
@@ -540,7 +541,6 @@ describe('DataTable', () => {
       renderAssets({ renderExpanded: renderDetail });
       const region = screen.getByRole('region', { name: 'White papers · EUR' });
       expect(region.className).toBe('ds-datatable__region ds-datatable__region--expandable');
-      // Collapsed rows render no wrapper, so a hidden detail row stays empty.
       expect(document.querySelector('.ds-datatable__detail-content')).toBeNull();
 
       const toggle = at(screen.getAllByRole('button', { name: 'Show details' }), 0);
@@ -770,7 +770,6 @@ describe('DataTable', () => {
       expect(screen.queryByRole('button')).toBeNull();
       expect(document.querySelector('.ds-datatable__detail-row')).toBeNull();
       expect(screen.getAllByRole('columnheader')).toHaveLength(COLUMNS.length);
-      // A table that cannot expand keeps the plain region, with no expandable modifier or wrapper.
       expect(screen.getByRole('region', { name: 'White papers · EUR' }).className).toBe(
         'ds-datatable__region',
       );

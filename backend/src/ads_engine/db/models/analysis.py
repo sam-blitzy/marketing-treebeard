@@ -82,7 +82,9 @@ RUN_STATUSES: Final[tuple[str, ...]] = ("running", "succeeded", "failed")
 next process that takes the ``analysis`` lock (AAP 0.5.3 crash recovery)."""
 
 FEEDBACK_KINDS: Final[tuple[str, ...]] = ("dismiss", "snooze", "done")
-"""Feedback on an item: dismiss (30 days), snooze (7 days) or mark done (30 days)."""
+"""Feedback on an item: dismiss, snooze or mark done, suppressing it for
+``feedback.dismiss_days``, ``feedback.snooze_days`` or ``feedback.done_days`` (defaults 30, 7
+and 30 days)."""
 
 DATA_STATUSES: Final[tuple[str, ...]] = ("live", "simulated", "stale", "mixed")
 """Data status stored on every recommendation (AAP 0.3.3 labelling). ``mixed`` marks an item
@@ -453,7 +455,7 @@ class RunSuppression(IdPkMixin, Base):
         run_id: The :class:`AnalysisRun` that recorded the count.
         section: The section the suppressed items belonged to
             (:data:`RECOMMENDATION_SECTIONS`).
-        reason: The suppression reason, for example ``dismiss`` or ``g1_blocked``.
+        reason: The suppression reason, for example ``feedback_dismiss`` or ``g1_blocked``.
         count: How many items the reason suppressed.
     """
 
@@ -482,7 +484,8 @@ class RecommendationFeedback(IdPkMixin, Base):
 
     AAP 0.5.2 (``recommendation_feedback``), 0.5.3 (``POST /recommendations/{id}/feedback``)
     and 0.5.4.2 (feedback suppression). Feedback suppresses the same rule and entity in later
-    runs until ``until``: dismiss 30 days, snooze 7 days, done 30 days. The runner applies it
+    runs until ``until``: ``feedback.dismiss_days``, ``feedback.snooze_days`` or
+    ``feedback.done_days`` after it is given (defaults 30, 7 and 30 days). The runner applies it
     before ranking and the overlay applies it live. C0 discrepancy items are exempt; the API
     rejects feedback on them with 422 and on a historical item with 409 ``subject_retired``.
 

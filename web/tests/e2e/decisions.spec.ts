@@ -34,9 +34,11 @@
  * what this test changed and nothing else: it resolves the campaign's `status` and `budget`
  * discrepancies that were not unresolved before its first save, and records the campaign's
  * earlier decided state again when its newest decision differs from it. The next run of the
- * suite, a retry included, can therefore pause and resolve the same campaign again, and the run
- * leaves no decision or discrepancy of its own behind. On the happy path the teardown finds
- * nothing to do.
+ * suite, a retry included, can therefore pause and resolve the same campaign again: once the
+ * teardown settles, the campaign is back at the decided state it had before the first save, and
+ * none of the discrepancies the test raised is unresolved. The decisions the test and its
+ * teardown write stay in the append-only decision log, and those discrepancies stay on record
+ * as resolved. On the happy path the teardown finds nothing to do.
  *
  * Harness rules (`playwright.config.ts`): the session comes from the storage state that
  * `auth.setup.ts` saved, so this file never signs in; reads go through `page.request`, which
@@ -313,11 +315,14 @@ function nextPageLink(response: APIResponse): string | null {
 }
 
 /**
- * Every unresolved discrepancy of the active datasets, oldest first: `GET /discrepancies` with
- * its default states (`open`, `awaiting_platform`), following `Link: rel="next"` to the end.
+ * The unresolved discrepancies of the active datasets that the API lists, oldest first:
+ * `GET /discrepancies` with its default states (`open`, `awaiting_platform`), following
+ * `Link: rel="next"` to the end. The route leaves out a discrepancy whose subject it cannot load.
  *
  * @param page - The test's page.
- * @returns The live list; its length is the count the discrepancy banner reports.
+ * @returns The live list. Its length is the count the discrepancy banner reports only while every
+ *   unresolved discrepancy's subject loads: `X-Total-Count` and the banner count the left-out
+ *   ones too.
  */
 async function listUnresolvedDiscrepancies(page: Page): Promise<Discrepancy[]> {
   const all: Discrepancy[] = [];
@@ -1109,8 +1114,10 @@ test('records a decision and resolves the discrepancy it creates', async ({ page
   const raised = await test.step('sync the source and see the discrepancy it raises', async () => {
     await requestSyncThroughUi(page, source);
 
-    // The worker claims the request on its next 30 s wake, runs the entity sync and compares the
-    // platform's snapshot (still active) with the decision (paused).
+    // The worker picks the request up when its scheduling permits: once startup has finished, at a
+    // 30 s wake that finds the source's lane idle or, when a wake finds it busy, as soon as its
+    // pass ends. It then runs the entity sync and compares the platform's snapshot (still active)
+    // with the decision (paused).
     let found: Discrepancy | undefined;
     await expect
       .poll(

@@ -654,7 +654,6 @@ def contains_tokens(texts: Iterable[str], tokens: AbstractSet[str]) -> bool:
 
 
 def _term_key(term: str) -> str:
-    """Return the identity of a term: normalised, casefolded and whitespace-collapsed."""
     return " ".join(_normalise(term).split())
 
 

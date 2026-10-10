@@ -100,7 +100,7 @@
               },
               "submitter": {
                 "type": "string",
-                "description": "Member URN (urn:li:person:...). Unprojected only, and omitted for guest leads since 202408. Never stored; redacted in captures."
+                "description": "Member URN (urn:li:person:...). Unprojected only, and omitted for guest leads since 202408. Never read or stored. Capture redaction does not mask member URNs; captures lack this key only because request.fields does not project it."
               },
               "responseId": {
                 "type": "string",

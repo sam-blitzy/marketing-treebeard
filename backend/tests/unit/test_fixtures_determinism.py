@@ -70,7 +70,7 @@ from ads_engine.simulation import (
 )
 from ads_engine.simulation.generator import SimulatedWorld
 from ads_engine.simulation.payloads import JSONValue
-from ads_engine.simulation.scenarios import FIXED_CLOCK, SCENARIOS
+from ads_engine.simulation.scenarios import SCENARIOS, fixed_clock
 
 pytestmark = pytest.mark.contract
 
@@ -350,7 +350,7 @@ def build_request(entry: Mapping[str, Any]) -> httpx.Request:
 
 def _default_world() -> SimulatedWorld:
     """A fresh world of the manifest: the default scenario, seed 42, the fixed clock."""
-    return SimulatedWorld(DEFAULT_SEED, SCENARIOS[DEFAULT_SCENARIO], clock=FIXED_CLOCK)
+    return SimulatedWorld(DEFAULT_SEED, SCENARIOS[DEFAULT_SCENARIO], clock=fixed_clock)
 
 
 def _rendered_text(entry: Mapping[str, Any], world: SimulatedWorld) -> str:
@@ -410,7 +410,7 @@ def test_manifest_names_the_default_world() -> None:
     assert manifest["seed"] == DEFAULT_SEED == 42
     clock = datetime.fromisoformat(cast(str, manifest["clock"]))
     assert clock.utcoffset() == timedelta(0), "the manifest clock must be ISO-8601 UTC"
-    assert clock == FIXED_CLOCK()
+    assert clock == fixed_clock()
 
 
 def test_manifest_day_is_the_last_complete_day_the_dated_requests_read() -> None:
@@ -421,7 +421,7 @@ def test_manifest_day_is_the_last_complete_day_the_dated_requests_read() -> None
     """
     manifest = _manifest()
     day = date.fromisoformat(cast(str, manifest["day"]))
-    assert day == FIXED_CLOCK().astimezone(UTC).date() - timedelta(days=1)
+    assert day == fixed_clock().astimezone(UTC).date() - timedelta(days=1)
     ends: list[tuple[str, date]] = []
     for entry in _entries():
         recorded = entry["request"]
@@ -544,8 +544,8 @@ def test_independent_worlds_render_identical_bytes(entry: dict[str, Any]) -> Non
     into a later answer.
     """
     scenario = SCENARIOS[DEFAULT_SCENARIO]
-    direct = SimulatedWorld(DEFAULT_SEED, scenario, clock=FIXED_CLOCK)
-    via_scenario = scenario.world(DEFAULT_SEED, clock=FIXED_CLOCK)
+    direct = SimulatedWorld(DEFAULT_SEED, scenario, clock=fixed_clock)
+    via_scenario = scenario.world(DEFAULT_SEED, clock=fixed_clock)
     first = _rendered_text(entry, direct)
     texts = {
         "Scenario.world": _rendered_text(entry, via_scenario),

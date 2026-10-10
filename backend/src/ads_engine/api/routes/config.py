@@ -3,42 +3,14 @@
 AAP 0.5.3 (``GET /config``): read-only thresholds, including ``window.default_days``,
 ``window.trusted_min_days`` and ``window.presets``, the HubSpot mapping, the white paper
 registry, the resolved CRM stage properties and ``config_hash``, as
-:class:`~ads_engine.api.schemas.ConfigView`.
-
-Why the web client needs it (AAP 0.5.5, 0.5.4.1):
-
-* the window picker offers exactly ``window.presets`` and marks the preset equal to
-  ``window.default_days`` as "default", so no window length is hard-coded in the client;
-* the white-paper MQL column is headed with the bound stage label, which comes from the
-  resolved bindings (``crm_bindings.mql.label``) once the portal has been verified;
-* ``/settings`` shows the thresholds, the presets and default, the HubSpot mapping with its
-  resolved stage properties, the registry and ``config_hash``.
+:class:`~ads_engine.api.schemas.ConfigView`. The window picker offers ``window.presets`` and
+marks the one equal to ``window.default_days`` "default", and ``/settings`` displays the view.
 
 Every value comes from the loaded ``config/*.yaml`` (:data:`~ads_engine.api.deps.ThresholdsDep`)
-or from the database, never from a literal here, so a changed ``window.default_days`` is
-reported as configured.
-
-The resolved CRM bindings are a property of the HubSpot portal a dataset was read from. The
-worker verifies them against the portal's own property definitions and persists them on the
-HubSpot dataset as ``source_dataset.crm_bindings``; this route only reads them back. **The API
-never calls HubSpot**: this module imports nothing from ``connectors``, ``sync`` or
-``simulation``, and makes no outbound request.
-
-Example:
-    ``GET /api/v1/config`` with a session cookie returns, abridged::
-
-        {
-          "thresholds": {"window": {"default_days": 28, "presets": [14, 28, 56, 90], ...}, ...},
-          "window": {"default_days": 28, "trusted_min_days": 14, "presets": [14, 28, 56, 90],
-                     "max_days": 180, "sustained_min_days": 7},
-          "hubspot_mapping": {"mql": {...}, "ql": {...}, "booking_sources": ["MEETINGS_PUBLIC"],
-                              "meeting_outcome_exclusions": ["CANCELED"]},
-          "crm_bindings": {"mql": {"available": true, "property": "hs_v2_date_entered_...", ...},
-                           ...},
-          "companion_crm_bindings": null,
-          "content_assets": [{"slug": "b2b-pipeline-report-2026", ...}, ...],
-          "config_hash": "3f1c..."
-        }
+or from the database, never from a literal here. **The API never calls HubSpot**: the worker
+verifies the CRM bindings against the portal and persists them on the HubSpot dataset as
+``source_dataset.crm_bindings``, and this route only reads them back. The module imports
+nothing from ``connectors``, ``sync`` or ``simulation`` and makes no outbound request.
 """
 
 from collections.abc import Mapping
@@ -97,24 +69,14 @@ async def get_config(
 ) -> schemas.ConfigView:
     """Return the read-only configuration: thresholds, window, mapping, bindings, registry.
 
-    AAP 0.5.3 ``GET /config``. The response carries:
-
-    * ``thresholds``: every key of ``config/thresholds.yaml`` by namespace, with ``crm`` also
-      carrying the mapping's ``booking_sources`` and ``meeting_outcome_exclusions``;
-    * ``window``: ``window.default_days``, ``window.trusted_min_days``, ``window.presets``,
-      ``window.max_days`` and ``window.sustained_min_days``, each read from the loaded
-      configuration;
-    * ``hubspot_mapping``: the MQL and Qualified Lead bindings and the meeting rules as
-      configured in ``config/hubspot_mapping.yaml``;
-    * ``crm_bindings``: the bindings resolved against the portal of HubSpot's active primary
-      dataset, or ``None`` until the worker has verified them;
-    * ``companion_crm_bindings``: the bindings of the active companion CRM dataset (the
-      simulated portal read while LinkedIn is simulated), or ``None`` when there is none;
-    * ``content_assets``: the white paper registry, in file order;
-    * ``config_hash``: the hash of the three configuration files, as stored on every run.
-
-    The bindings are read from ``source_dataset.crm_bindings``, where the worker stores them;
-    this route never calls HubSpot. It is read-only and never commits.
+    The response carries ``thresholds`` (every namespace of ``config/thresholds.yaml``, with
+    ``crm`` also carrying the mapping's ``booking_sources`` and ``meeting_outcome_exclusions``),
+    ``window``, ``hubspot_mapping``, ``crm_bindings``, ``companion_crm_bindings``,
+    ``content_assets`` (the white paper registry, in file order) and ``config_hash``.
+    ``crm_bindings`` come from HubSpot's active primary dataset and ``companion_crm_bindings``
+    from the active companion CRM dataset, read while LinkedIn is simulated; each is ``None``
+    when that dataset is absent or its bindings are unverified. It is read-only and never
+    commits.
 
     Args:
         user: The signed-in user; the dependency enforces the session cookie.

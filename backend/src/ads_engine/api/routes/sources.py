@@ -10,9 +10,11 @@ repeating the check.
   health status and reason from ``source_connection``; the native day boundary of its
   coverage dates; the active primary dataset with the freshness, coverage and completeness of
   each of its named datasets; for HubSpot, the active companion CRM dataset of a simulated
-  LinkedIn dataset with its own freshness rows (AAP 0.3.3); the Google webhook calls counted
-  in the trailing 24 h against the product's own cap (``GOOGLE_DAILY_CALL_BUDGET``); whether
-  a "Sync now" request is pending; and the newest :data:`RECENT_RUNS_PER_SOURCE`
+  LinkedIn dataset with its own freshness rows (AAP 0.3.3); the Google webhook call
+  reservations still counting in the sliding 24 h window of the product's own cap
+  (``GOOGLE_DAILY_CALL_BUDGET``), a conservative upper bound on the calls admitted in the
+  trailing 24 h rather than an exact count of dispatched POSTs; whether a "Sync now"
+  request is pending; and the newest :data:`RECENT_RUNS_PER_SOURCE`
   ``sync_run`` rows. It is read-only.
 * ``POST /sources/{source}/sync`` queues a ``sync_request`` row. The worker picks it up on
   its next 30 s wake (AAP 0.3.2); the API itself never calls LinkedIn, n8n or HubSpot. The
@@ -476,9 +478,10 @@ async def list_sources(
     ``UTC`` for LinkedIn and HubSpot), the active primary dataset with the freshness,
     coverage and completeness of each named dataset (``stale`` when it last succeeded more
     than ``sources.stale_after_hours`` ago or never; ``incomplete`` when not ``complete``),
-    whether a "Sync now" request is pending, and the newest sync runs. Google adds the webhook
-    calls counted in the trailing 24 h against the product's own cap; HubSpot adds the active
-    companion CRM dataset of a simulated LinkedIn dataset, with its own freshness rows.
+    whether a "Sync now" request is pending, and the newest sync runs. Google adds the
+    product's own call cap and the webhook call reservations still counting in its sliding
+    24 h window, an upper bound on the calls admitted in the trailing 24 h; HubSpot adds the
+    active companion CRM dataset of a simulated LinkedIn dataset, with its own freshness rows.
     Read-only: nothing is written or synced.
 
     Args:

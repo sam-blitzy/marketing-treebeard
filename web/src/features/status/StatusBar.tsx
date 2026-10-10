@@ -13,7 +13,8 @@
  *    day boundary, so the bar states both. When the sources end their days at different
  *    boundaries it also says so, so misaligned daily buckets are never read as one common day.
  * 3. **Source chips** ({@link SourceChips}): Live, Simulated, Stale or Incomplete per source,
- *    with its last successful sync, from the read-time overlay.
+ *    from the read-time overlay in the `overlay` prop, and each source's last successful sync,
+ *    from `GET /sources`, which `SourceChips` reads itself through `useSources`.
  *
  * Rules this file keeps:
  * - **Presentational.** It calls no data hook. The children fetch what they need through the

@@ -25,9 +25,10 @@ Wire encoding (proto3 JSON, as relayed by n8n):
       finer than six places, is a defect, because rounding could turn a fractional count whole
       or a converting day into a zero outcome. Impression shares, returned as full doubles, are
       rounded toward zero to six places, which leaves every comparison with a six-place
-      threshold (the 0.10 capped-day test) unchanged, and a positive share below ``0.000001``
-      is a defect. ``averageCpc`` is rounded half-even to the micro, and one that rounds to
-      ``10**12`` or more, or a positive one that rounds to zero, is a defect.
+      threshold (such as the ``budget.capped_lost_is_share`` capped-day test, default 0.10)
+      unchanged, and a positive share below ``0.000001`` is a defect. ``averageCpc`` is rounded
+      half-even to the micro, and one that rounds to ``10**12`` or more, or a positive one that
+      rounds to zero, is a defect.
     * Enums arrive as their names (``"ENABLED"``, ``"CUSTOM_PERIOD"``).
     * Zero-valued and unset fields may be omitted.
     * Booleans come in two presence kinds. An implicit-presence ``bool``
@@ -662,7 +663,8 @@ class _RowReader:
         # Google returns impression shares as full doubles, most of them finer than six places,
         # so they are rounded rather than rejected. Rounding toward zero keeps every comparison
         # with a six-place threshold t unchanged: x >= t exactly when the stored value >= t, so
-        # the 0.10 capped-day test on the budget-lost share reads the same on the stored value.
+        # the capped-day test against budget.capped_lost_is_share (default 0.10) on the
+        # budget-lost share reads the same on the stored value.
         stored = number.quantize(_AMOUNT_QUANTUM, rounding=ROUND_DOWN, context=_DECIMAL_CONTEXT)
         if stored == number:
             return number
@@ -919,9 +921,10 @@ class CampaignDailyRow:
             bounded as ``conversions``.
         search_budget_lost_impression_share: Fraction from 0 to 1 inclusive, as returned
             (Google reports "> 90%" as ``0.9001``) or rounded toward zero to six places when
-            finer, so a comparison with ``0.10`` reads the same as on the value returned;
-            never zero when Google reports a positive value; ``None`` when unavailable. Stored
-            as ``budget_lost_is``.
+            finer, so a comparison with a threshold of at most six places, such as
+            ``budget.capped_lost_is_share`` (default 0.10), reads the same as on the value
+            returned; never zero when Google reports a positive value; ``None`` when
+            unavailable. Stored as ``budget_lost_is``.
         search_impression_share: Fraction from 0 to 1 inclusive, as returned (Google reports
             "< 10%" as ``0.0999``) or rounded toward zero to six places when finer; never zero
             when Google reports a positive value; ``None`` when unavailable. Stored as

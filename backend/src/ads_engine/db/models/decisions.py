@@ -295,19 +295,24 @@ class Discrepancy(IdPkMixin, DatasetScopedMixin, Base):
         kind: ``status``, ``budget``, ``untracked`` or ``missing``
             (:data:`DISCREPANCY_KINDS`).
         decided_value: The decided side of the comparison as a JSON object; ``None`` for
-            ``untracked``, which has no decision.
+            ``untracked``, which has no decision, until ``record_intended`` writes the
+            intended state as one and moves the row to ``awaiting_platform``; it then holds
+            that state, or a decision recorded since.
         platform_value: The platform side of the comparison as a JSON object; ``None`` for
             ``missing``, where the platform no longer returns the entity.
         snapshot_id: The :class:`~ads_engine.db.models.snapshots.EntitySnapshot` of the
             discrepancy's own dataset the comparison read; ``None`` for ``missing``.
         decision_id: The :class:`Decision` of the discrepancy's own dataset the comparison
-            read; ``None`` for ``untracked``.
+            read; ``None`` for ``untracked`` until ``record_intended`` writes its decision.
         detected_at: When the discrepancy was detected, set by the writer with
             :func:`ads_engine.db.base.utcnow`.
         state: ``open``, ``awaiting_platform`` or ``resolved`` (:data:`DISCREPANCY_STATES`).
         resolved_at: When the row was resolved; ``None`` until then.
-        resolution: The resolution applied (:data:`DISCREPANCY_RESOLUTIONS`); ``None`` while
-            unresolved and for a row that auto-resolved without one.
+        resolution: The resolution last applied (:data:`DISCREPANCY_RESOLUTIONS`); ``None``
+            while ``open``. ``decision_correct`` and ``record_intended`` set it as they move
+            the row to ``awaiting_platform``, and the resolutions that close at once set it
+            on closing. Auto-resolution keeps it, so a row that closed from ``open`` on its
+            own stays ``None``.
     """
 
     __tablename__ = "discrepancy"

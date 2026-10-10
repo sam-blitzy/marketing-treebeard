@@ -791,7 +791,6 @@ class LoginRequest(RequestModel):
     @field_validator("email", mode="before")
     @classmethod
     def _normalise_email(cls, value: object) -> object:
-        """Trim and lowercase the email; non-strings fall through to the type check."""
         return value.strip().lower() if isinstance(value, str) else value
 
 
@@ -1186,8 +1185,11 @@ class ItemOverlay(ApiModel):
     true, a dataset the item read is no longer active: every action on the card is disabled.
 
     Attributes:
-        held_now: Whether an open discrepancy holds the item now, including one detected
-            after the run.
+        held_now: Whether the item is held now, for any of three causes: it is
+            ``historical`` (a dataset it read is no longer active, or its provenance cannot
+            be verified); it was ``held`` at compute time, a frozen hold the overlay never
+            lifts; or, for every rule but C0, a subject it depends on has an ``open`` or
+            ``awaiting_platform`` discrepancy now, including one detected after the run.
         held_reason_now: Why it is held now.
         historical: Whether the item was computed from data that has since been replaced.
         data_status_now: The data status of the datasets the item reads, as they are now.
@@ -1230,8 +1232,11 @@ class Item(ApiModel):
         data_status: The data status at compute time.
         held: Whether the item was held at compute time.
         held_reason: Why it was held.
-        decision_subject: The subject a decision on it writes; ``None`` for items that offer
-            only "Mark done".
+        decision_subject: The subject a "Record decision" on it writes, carried only by C1,
+            C1b, C2 "Scale", B1, B2 and B3 items. ``None`` means no "Record decision": a C0
+            discrepancy shows its resolver instead of feedback actions, and any other item
+            offers "Mark done" in its place. On a historical item (``current.historical``)
+            every action is disabled, the C0 resolver included.
         current: The read-time overlay.
     """
 
@@ -1880,8 +1885,10 @@ class Discrepancy(ApiModel):
         subject: The subject.
         shape: The subject's current decision shape, which fixes the intended-state fields.
         kind: ``status``, ``budget``, ``untracked`` or ``missing``.
-        decided_value: The decided side (:class:`DiscrepancyValue`); ``None`` for
-            ``untracked``.
+        decided_value: The decided side (:class:`DiscrepancyValue`). ``None`` for an
+            ``untracked`` discrepancy until ``record_intended`` records an intended state
+            and moves it to ``awaiting_platform``; it then shows that state, or a decision
+            recorded since.
         platform_value: The platform side (:class:`DiscrepancyValue`); ``None`` for
             ``missing``.
         detected_at: When it was detected; the oldest are shown first.
@@ -2009,8 +2016,9 @@ class DatasetFreshnessView(ApiModel):
         covered_through: Last native date covered.
         completeness: ``complete``, ``incomplete`` or ``unknown``.
         reason: Why it is not complete.
-        stale: Whether it last succeeded more than ``sources.stale_after_hours`` ago, decided
-            by the route from the configuration.
+        stale: Whether it never succeeded (``last_success_at`` is ``None``) or last succeeded
+            more than ``sources.stale_after_hours`` ago, decided by the route from the
+            configuration.
     """
 
     dataset: str
@@ -2130,7 +2138,13 @@ class Source(ApiModel):
         datasets: Freshness of the active dataset's named datasets.
         companion_datasets: Freshness of the companion's named datasets.
         last_attempt_at: When a sync job or a live probe last called the source.
-        calls_24h: Google webhook calls counted in the trailing 24 h.
+        calls_24h: The product's own ``GOOGLE_DAILY_CALL_BUDGET`` usage: the Google webhook
+            call reservations still counting in its sliding 24 h window. A call is booked
+            once admitted, in the minute by which its POST has started (up to the 140 s
+            dispatch bound ahead), and counts until 24 h after that minute ends; a call that
+            had to be reserved again may count twice. So this is a conservative upper bound
+            on the calls admitted in the trailing 24 h, not an exact count of dispatched
+            POSTs.
         call_cap: The product's Google webhook call cap.
         sync_pending: Whether a "Sync now" request is pending.
         recent_runs: The newest sync runs, newest first.

@@ -567,7 +567,6 @@ def _blocked_campaigns(ctx: AnalysisContext, campaign_ids: tuple[int, ...]) -> f
 
 
 def _campaign_refs(ctx: AnalysisContext, campaign_ids: tuple[int, ...]) -> list[dict[str, Any]]:
-    """Return ``[{id, name}]`` for evidence, in id order."""
     return [{"id": cid, "name": ctx.campaign_name(cid)} for cid in campaign_ids]
 
 
@@ -880,7 +879,23 @@ def _candidate(
     settings: _Settings,
     decision: _Decision,
 ) -> Candidate:
-    """Build one asset row's item: its metrics in column order, the row detail and its flags."""
+    """Build one asset row's item: its metrics in column order, the row detail and its flags.
+
+    ``decision`` holds the row's rule, decided by :func:`evaluate`: an action rule, ``W1``
+    Double down or ``W2`` Retire or rework, or rule ``W`` for a row that shows "No change
+    warranted" or, in a cohort whose median cannot be compared against, "Insufficient data".
+    Only a W1 item raises spend (``increases_spend_on``), on the campaigns G1 left unblocked.
+
+    Threshold keys: :data:`THRESHOLD_KEYS` (the ``w.*`` decision keys, the attribution floor
+    ``attribution.floor_share`` and the ``crm.*`` booked-meeting keys), plus
+    :data:`~ads_engine.analysis.metrics.G1_THRESHOLD_KEYS` when the decision ran G1 over a
+    contributing campaign.
+
+    Rationale (AAP 0.5.4.7): every comparison stays within one currency cohort, so the item sits
+    in its currency's group with that cohort's median, when it has one, as its baseline, and no
+    amount of another currency is mixed in. Counts and costs keep the floors attribution
+    computed ("≥ N", "≤ X") with their flags, so a partial CRM match is never shown as exact.
+    """
     median = cohort.median_cost_per_ql
     baselines = (
         ()
@@ -930,7 +945,6 @@ def _candidate(
 
 
 def _section_finding(finding: Finding) -> Finding:
-    """Return an attribution finding filed under the White papers section."""
     return finding if finding.section == WHITE_PAPERS else replace(finding, section=WHITE_PAPERS)
 
 

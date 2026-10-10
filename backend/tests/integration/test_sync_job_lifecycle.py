@@ -58,7 +58,7 @@ from ads_engine.db.models import (
 )
 from ads_engine.settings import Source, get_settings
 from ads_engine.simulation.generator import Fault, SimulatedWorld
-from ads_engine.simulation.scenarios import FIXED_CLOCK, FIXED_NOW, SCENARIOS
+from ads_engine.simulation.scenarios import FIXED_NOW, SCENARIOS, fixed_clock
 from ads_engine.sync import jobs
 from ads_engine.sync.budget_guard import GoogleCallBudget
 from ads_engine.sync.freshness import FreshnessOutcome
@@ -334,14 +334,14 @@ def lab(
 ) -> Lab:
     """The lab on the emptied test database, with ``BACKFILL_DAYS`` set to a short span."""
     set_env(BACKFILL_DAYS=str(BACKFILL_DAYS))
-    return Lab(sessions=db, world=make_world(SCENARIO, clock=FIXED_CLOCK))
+    return Lab(sessions=db, world=make_world(SCENARIO, clock=fixed_clock))
 
 
 def _faulted_world(*faults: Fault) -> SimulatedWorld:
     """The :data:`SCENARIO` world with ``faults`` added: the same entities, misbehaving."""
     entry = SCENARIOS[SCENARIO]
     return dataclasses.replace(entry, spec=entry.spec.adding(faults=faults)).world(
-        42, clock=FIXED_CLOCK
+        42, clock=fixed_clock
     )
 
 

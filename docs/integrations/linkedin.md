@@ -142,9 +142,9 @@ handles a posts failure as follows:
   read posts, so the probe can pass while the live build's entity sync is denied. The build then
   fails, and LinkedIn stays on its simulated dataset rather than flipping back and forth.
 
-The contract records the remedy as an open decision for the connector and sync owners: request
-post read access, or treat a posts 403 as a missing headline per creative. The product grants no
-extra scope.
+The product requests no extra scope. The operator either grants post read access to the token's
+member or accepts simulated LinkedIn data, as the "Creative text" item under
+[LinkedIn token bootstrap](../runbook.md#linkedin-token-bootstrap) says.
 
 ## Request encoding
 

@@ -19,7 +19,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { Select, type SelectOption } from './Select';
 
-/** The decision form's campaign status, the select's typed value. */
+/** The test-only union typing the select's value; `removed` carries the disabled option. */
 type Status = 'active' | 'paused' | 'removed';
 
 /** The status choices, with one option shown but not choosable. */

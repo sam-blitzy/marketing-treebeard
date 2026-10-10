@@ -643,7 +643,6 @@ class GoogleCallBudget:
         return instant.astimezone(UTC)
 
     def _sessions(self) -> async_sessionmaker[AsyncSession]:
-        """Return the injected session factory, or the process-wide one."""
         return self._sessionmaker if self._sessionmaker is not None else get_sessionmaker()
 
     def _log_usage(self, used: int) -> None:

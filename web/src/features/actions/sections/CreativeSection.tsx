@@ -10,11 +10,15 @@
  * 1. the variants table ({@link VariantsTable}): one row per variant (a creative of the campaign
  *    with at least the configured impression minimum) with its impressions, click rate, open
  *    rate, completion rate and leads (AAP 0.5.5 Copy field set). The rows are the frozen
- *    `extra.variants` of the group's first item, which the analysis always ranks first (the CR3
- *    next test). The table is evidence, so it is read even when feedback hides that card;
- * 2. the frame's default body: the cards in API order. That is the CR3 card first, carrying the
- *    CR2 weak stage as its reason and the next test as its action, then one CR1 card per variant
- *    pair, then held cards behind the "Held until discrepancies are resolved" disclosure.
+ *    `extra.variants` of the group's first item. Only the CR3 next test carries them, and when
+ *    the campaign has one the analysis ranks it first. A group that holds only CR1 pairs (no
+ *    stage could be measured against a baseline, or feedback dropped the CR3 before the run)
+ *    shows no table. The table is evidence, so it is read even when feedback given since the
+ *    run hides that card;
+ * 2. the frame's default body: the cards in API order. When the campaign has a CR3 next test,
+ *    that card comes first, carrying the CR2 weak stage as its reason and the next test as its
+ *    action; then one CR1 card per variant pair, then held cards behind the "Held until
+ *    discrepancies are resolved" disclosure.
  *
  * Every list is bounded (`../batches`; AAP 0.1.1 "the five sections render from precomputed
  * runs in under 2 s"): the variants table shows `ROW_BATCH_SIZE` rows at a time, the cards,
@@ -315,10 +319,11 @@ function campaignNameOf(group: Group): string {
 /**
  * One campaign block's body: the variants table, then the frame's cards in API order.
  *
- * The rows come from the group's first item in API order (the CR3 next test the analysis ranks
- * first), whether or not that card is visible now: feedback hides an action, not the evidence
- * the block's numbers rest on. A group without variants rows, such as a campaign whose only
- * items are CR1 pairs, shows its cards without a table.
+ * The rows come from the group's first item in API order, whether or not that card is visible
+ * now: feedback hides an action, not the evidence the block's numbers rest on. When the
+ * campaign has a CR3 next test, the analysis ranks it first and its evidence carries the
+ * variants. A group without variants rows, such as a campaign whose only items are CR1 pairs,
+ * shows its cards without a table.
  */
 function renderCampaignBlock(group: Group, parts: GroupParts): ReactElement {
   return (
@@ -331,9 +336,10 @@ function renderCampaignBlock(group: Group, parts: GroupParts): ReactElement {
 
 /**
  * The "Copy/creative changes" section (AAP 0.5.5): one block per LinkedIn campaign, each with
- * its variants table followed by its cards in API order (the CR3 next test with the CR2 weak
- * stage first, then the CR1 pair labels), inside the shared {@link SectionFrame}, which adds
- * the section's findings, held disclosure, empty state, withheld lines and suppression counts.
+ * its variants table when its first item carries variants, followed by its cards in API order
+ * (the CR3 next test with the CR2 weak stage first when the campaign has one, then the CR1 pair
+ * labels), inside the shared {@link SectionFrame}, which adds the section's findings, held
+ * disclosure, empty state, withheld lines and suppression counts.
  *
  * Cards render with `headingLevel={4}`, below each block's `<h3>`, so no heading level is
  * skipped.

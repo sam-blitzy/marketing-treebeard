@@ -980,4 +980,3 @@ export async function apiFetchPage<T>(
   const { response, data } = await send<T>(path, init);
   return { data, next: nextPage(response), total: totalCount(response) };
 }
-

@@ -18,11 +18,13 @@
  *      server. A 4xx answer (401, 404 `not_found`, 409 `run_not_ready`, 422 …) is final and
  *      shown at once. See {@link isRetryableQueryError}.
  *    - Mutations are never retried: a write is not idempotent from the UI's point of view.
- *    - An expired session (a 401 from any query or mutation outside `/login`) clears the cache
- *      and opens `/login?redirect=<the current href>`, so sign-in returns the user to the
- *      screen they were on. The session cookie lives 12 h, so this happens to any tab left open.
- *      Every other error is left to the screen that made the request. See
- *      {@link redirectToLoginIfSessionExpired}.
+ *    - An expired session (a 401 from any mutation, or from any query except the auth guard's
+ *      `GET /auth/me`, outside `/login`) clears the cache and opens
+ *      `/login?redirect=<the current href>`, so sign-in returns the user to the screen they were
+ *      on. The session cookie lives 12 h, so this happens to any tab left open. The router's auth
+ *      guard handles that read's 401 itself, during a hover preload too; see
+ *      {@link isAuthGuardQuery}. Every other error is left to the screen that made the request.
+ *      See {@link redirectToLoginIfSessionExpired}.
  * 3. **The router**, from {@link createAppRouter}, with the query client as every route's
  *    context.
  * 4. **The render**: `StrictMode`, then `QueryClientProvider`, then `RouterProvider`. The router
@@ -143,11 +145,13 @@ function isLoginPath(pathname: string): boolean {
 }
 
 /**
- * Sends the user to sign in when `error` says the session has ended: a 401 from any query or
- * mutation, while the app is not on `/login`. It clears the whole cache, so no data of the
- * ended session survives, and opens `/login` with the current href (path, search and hash) as
- * `redirect`, which the login route accepts only as a same-origin path. Every other error is
- * left to the screen that made the request.
+ * Sends the user to sign in when `error` says the session has ended: a 401, while the app is not
+ * on `/login`. The query cache does not call it for the `queryKeys.me` read, whose 401 the
+ * router's auth guard owns (see {@link isAuthGuardQuery}), so it sees every mutation's 401 and
+ * every other query's. It clears the whole cache, so no data of the ended session survives, and
+ * opens `/login` with the current href (path, search and hash) as `redirect`, which the login
+ * route accepts only as a same-origin path. Every other error is left to the screen that made
+ * the request.
  *
  * On `/login` a 401 is a wrong email or password, which the sign-in form shows itself.
  *

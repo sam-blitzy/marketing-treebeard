@@ -8,8 +8,10 @@
 #   and, below it, to the creative that produced them.
 #
 # Loading
-#   - Read with PyYAML safe_load by backend/src/ads_engine/analysis/thresholds.py,
-#     together with thresholds.yaml and hubspot_mapping.yaml in this directory.
+#   - Read by backend/src/ads_engine/analysis/thresholds.py with a strict PyYAML
+#     SafeLoader subclass that rejects duplicate keys, together with
+#     thresholds.yaml and hubspot_mapping.yaml in this directory. A key repeated
+#     within one mapping fails config load.
 #   - Part of config_hash: the hash covers the parsed contents of all three
 #     files, so editing a value changes the hash stored on every analysis run,
 #     while editing only comments does not.

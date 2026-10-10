@@ -37,15 +37,16 @@
  * - The worker reruns the default analysis after every sync, decision and feedback write, so
  *   item ids and counts change under the spec. Every UI-versus-API comparison therefore runs in
  *   an `expect(...).toPass()` block that reloads the page and re-reads the API.
- * - With one worker, specs run in file order and this one runs first, possibly before the
- *   worker's first default run exists, so every test waits for that run itself.
+ * - Specs never run concurrently (`workers: 1`), but this spec relies on no order among them:
+ *   any test may start before the worker's first default run exists, so every test waits for a
+ *   succeeded default run itself (`openActions`).
  *
  * The spec never signs in (the API allows 5 sign-ins per minute per IP; `auth.setup.ts` signs in
  * once) and makes its product writes only through the UI, which adds the CSRF header. It writes
  * one custom run and one snooze, of an item without a decision subject in a section that keeps
- * at least one item, so the later specs still find every section populated and their
- * Record-decision candidates untouched; the snooze's own teardown, below, is the one write that
- * bypasses the UI.
+ * at least one item, so the other specs, in whatever order they run, still find every section
+ * populated and their Record-decision candidates untouched; the snooze's own teardown, below, is
+ * the one write that bypasses the UI.
  *
  * The API cannot withdraw feedback, so the snooze test undoes its own snooze through the stack's
  * database. Before it snoozes, it proves that the database command reaches this stack. Each
@@ -417,7 +418,14 @@ function isHidden(item: Item): boolean {
   return item.current.hidden_by !== null && item.current.hidden_by !== undefined;
 }
 
-/** Whether a discrepancy holds the item, as recorded or read now. */
+/**
+ * Whether any hold, recorded or read now, applies to the item: `held`, set when the run computed
+ * it, or `current.held_now`, which the overlay sets for that frozen hold (it never lifts one), for
+ * a discrepancy now unresolved on a subject a non-C0 item depends on, and for an item whose
+ * provenance is replaced or unverifiable (`current.historical`). Unlike `isHeld` in
+ * `SectionFrame.tsx`, it counts historical items as held; callers that need the held
+ * disclosure's items exclude historical ones themselves.
+ */
 function isHeld(item: Item): boolean {
   return item.held || item.current.held_now;
 }
@@ -514,7 +522,12 @@ function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
 }
 
-/** An attribute selector matching `value` exactly, whatever characters it holds. */
+/**
+ * An attribute selector matching `value` exactly, for the generated ids, anchors and hrefs this
+ * spec passes. `JSON.stringify` quotes `value` as a CSS string, which is exact only while it holds
+ * no control character (U+0000–U+001F) and no lone surrogate: JSON escapes those in forms CSS
+ * reads differently.
+ */
 function attributeSelector(attribute: string, value: string): string {
   return `[${attribute}=${JSON.stringify(value)}]`;
 }

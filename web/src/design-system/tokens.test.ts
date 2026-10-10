@@ -1,6 +1,6 @@
 // @vitest-environment node
 /**
- * Structural tests for tokens.css, the one stylesheet that holds literal design values, and
+ * Structural tests for tokens.css, the stylesheet that holds every placeholder token value, and
  * for its typed mirror, tokens.ts.
  *
  * The file is read as text and split into blocks and declarations by a small scanner that
@@ -317,4 +317,3 @@ describe('tokens.ts', () => {
     expect(tokenLeaves(tokens)).toEqual(TOKEN_NAMES.map((name) => `var(${name})`));
   });
 });
-

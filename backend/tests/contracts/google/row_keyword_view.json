@@ -109,7 +109,7 @@
           "properties": {
             "historicalQualityScore": {
               "type": "string",
-              "description": "metrics.historical_quality_score, INT64 1-10 as a string. Absent on days without a score, which is common; never defaulted to 0. Feeds the K3 first-7-days versus last-7-days quality-score comparison."
+              "description": "metrics.historical_quality_score, INT64 1-10 as a string. Absent on days without a score, which is common; never defaulted to 0. Feeds the K3 quality-score comparison of the window's first and last spans, each k3.qs_span_days in config/thresholds.yaml (default 7) days long."
             },
             "averageCpc": {
               "type": "number",

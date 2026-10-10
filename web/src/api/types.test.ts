@@ -3,9 +3,12 @@
  * Contract-type tests for src/api/types.ts, the mirror of
  * `backend/src/ads_engine/api/schemas.py` (AAP 0.5.3).
  *
- * The assertions are compile-time: `npm run typecheck` (`tsc --noEmit`) compiles this file, so a
- * mirrored type that drifts from its schema fails the typecheck, and an `@ts-expect-error` that
- * no longer meets an error fails it as well. Vitest runs the same assertions as no-ops.
+ * The assertions are compile-time: `npm run typecheck` (`tsc --noEmit`) compiles this file, so
+ * it pins the mirrored types in `types.ts` to the wire shapes written out here by hand from
+ * `schemas.py`. A change to `types.ts` that departs from them fails the typecheck, and an
+ * `@ts-expect-error` that no longer meets an error fails it as well; a change to `schemas.py`
+ * alone goes unseen until the mirror and this file's expected type are updated with it. Vitest
+ * runs the same assertions as no-ops.
  */
 import { describe, expectTypeOf, it } from 'vitest';
 

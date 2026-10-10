@@ -78,10 +78,13 @@ type MaybeSource = EvidenceSource | null | undefined;
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Whether `value` is a plain JSON object: non-null, not an array.
+ * Whether `value` is a non-null, non-array object. The check is shallow and structural: it does
+ * not inspect the prototype, so a class instance, a `Date` or a `Map` passes as well as a JSON
+ * object.
  *
  * @param value - Any value, typically a node of `Evidence.extra`.
- * @returns `true` for an object whose string keys may be read as `unknown`.
+ * @returns `true` for any non-null, non-array object, whose own string keys may then be read as
+ *   `unknown`; no prototype or plain-JSON validation is made.
  */
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);

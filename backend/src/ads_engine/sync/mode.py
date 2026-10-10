@@ -743,7 +743,7 @@ class SourceModeController:
             controller = SourceModeController(
                 settings,
                 sessionmaker=sessionmaker,
-                clock=lambda: FIXED_CLOCK,
+                clock=fixed_clock,
                 transports={"google": mock_transport("google", world, settings=settings)},
                 retry=RetryPolicy(sleep=no_sleep),
             )
@@ -898,7 +898,6 @@ class SourceModeController:
             yield session
 
     def _fallback_possible(self, source: Source) -> bool:
-        """Whether ``source`` can be in automatic fallback: ``auto`` with credentials."""
         return self._settings.data_mode == "auto" and self._settings.has_credentials(source)
 
     # -- mode resolution ---------------------------------------------------------------------
@@ -3076,12 +3075,10 @@ def _listing_check(name: str, interrupted_by: TransientError | None) -> ProbeChe
 
 
 def _check_reason(check: ProbeCheck) -> str:
-    """Return a failed check as ``"<name>: <reason>"``, the form :attr:`ProbeReport.reason` uses."""
     return f"{check.name}: {check.reason}" if check.reason else check.name
 
 
 def _failed_check(name: str, error: ConnectorError) -> ProbeCheck:
-    """Return the failed check ``name`` with ``error``'s reason, endpoint, kind and query id."""
     return ProbeCheck(
         name,
         False,

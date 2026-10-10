@@ -2,7 +2,10 @@
  * `Card`: the product's recommendation card, with `Card.Header`, `Card.Body` and `Card.Footer`
  * slots (AAP 0.4.2, status GAP).
  *
- * Every action on `/actions` renders as one card (AAP 0.5.5):
+ * In the Keywords, Campaigns, Budget and Copy/creative sections of `/actions`, every action
+ * renders as one card, through `RecommendationCard` (AAP 0.5.5). White-paper actions are the
+ * exception: each is a row of a per-currency `DataTable` that expands to its details, not a card.
+ * A card's slots hold:
  *
  * - `Card.Header`: the rank, the action as the headline, the headline number that justifies it
  *   (AAP 0.1.2: every card leads with one headline number), and the entity name with its

@@ -779,8 +779,9 @@ async def _serve_openapi(request: Request) -> JSONResponse:
 
 # Error types whose message pydantic renders from its own template, which never quotes the
 # input. Any other type's message is a validator's own text (``value_error``,
-# ``assertion_error`` or a custom type), which may quote its input, as the DISPLAY_TIMEZONE
-# and LINKEDIN_AD_ACCOUNT_IDS validators do ("...; got 'x'").
+# ``assertion_error`` or a custom type), which may quote its input. The Settings validators
+# raise only fixed, value-free text (``settings.VALIDATOR_MESSAGES``); every quoted literal in
+# such a message is withheld all the same, as a safeguard.
 _TEMPLATE_ERROR_TYPES: Final[frozenset[str]] = frozenset(get_args(ErrorType)) - {
     "value_error",
     "assertion_error",

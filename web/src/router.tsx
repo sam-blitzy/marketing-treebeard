@@ -40,8 +40,10 @@
  * Code splitting (AAP 0.1.1: the five sections render from precomputed runs in under 2 s): the
  * entry bundle carries only the screens a first load can show, `/actions` (the landing page)
  * and `/login`. `DecisionsPage`, `SourcesPage` and `SettingsPage` are `lazyRouteComponent`s over
- * a dynamic `import()`, so each screen's module graph is a chunk of its own that a first
- * `/actions` or `/login` load neither downloads nor parses. The chunk loads:
+ * a dynamic `import()`, so each screen's page module, with the modules only that screen reaches,
+ * forms a chunk that a first `/actions` or `/login` load neither downloads nor parses. Modules a
+ * screen shares with the entry bundle stay in that bundle: `/actions` imports `DecisionForm` and
+ * `DiscrepancyResolver` too, so the `/decisions` chunk reuses them from it. The chunk loads:
  * - **On intent**: `defaultPreload: 'intent'` preloads a route, chunk included, when its link is
  *   hovered, focused or touched, so a click usually finds the screen loaded.
  * - **On navigation** otherwise: the route stays pending until its chunk has loaded, and a load

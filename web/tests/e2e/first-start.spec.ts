@@ -454,7 +454,12 @@ function normalizeText(text: string): string {
   return text.replace(/\s+/gu, ' ').trim();
 }
 
-/** An attribute selector matching `value` exactly, whatever characters it holds. */
+/**
+ * An attribute selector matching `value` exactly, for the generated ids this spec passes.
+ * `JSON.stringify` quotes `value` as a CSS string, which is exact only while it holds no control
+ * character (U+0000–U+001F) and no lone surrogate: JSON escapes those in forms CSS reads
+ * differently.
+ */
 function attributeSelector(attribute: string, value: string): string {
   return `[${attribute}=${JSON.stringify(value)}]`;
 }
@@ -955,8 +960,8 @@ test('a wrong password is refused, leaves no session, and the correct one then s
     }
   });
 
-  // No sign-out afterwards: logging out revokes every session, the one auth.setup.ts saved for
-  // the later specs included.
+  // No sign-out afterwards: logging out revokes every session, the suite's saved auth.setup.ts
+  // session included, which the other specs start from.
   await test.step('the correct password then signs in on the same form', async () => {
     await enterPassword(passwordField, password);
     const response = await submitSignIn(page, 'The sign-in with the correct password');

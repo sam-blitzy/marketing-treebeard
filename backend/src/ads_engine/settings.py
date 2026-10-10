@@ -53,6 +53,7 @@ __all__ = [
     "HUBSPOT_API_VERSION",
     "LINKEDIN_API_VERSION",
     "SOURCES",
+    "VALIDATOR_MESSAGES",
     "ConfigurationError",
     "DataMode",
     "Settings",
@@ -121,6 +122,63 @@ _UNSAFE_BASE_URL_MESSAGE: Final = (
     "terminate TLS in front of nginx (see docs/runbook.md)"
 )
 _SESSION_KEY_UNSET_MESSAGE: Final = "SESSION_SECRET is not set; run make init"
+
+# The messages the Settings validators raise. Each is fixed text that never quotes the value
+# it rejects: a failed load is reported before the environment's secrets are known to the
+# log redactor, so a value written into a message would reach the log unredacted.
+_ACCOUNT_IDS_TYPE_MESSAGE: Final = (
+    "LINKEDIN_AD_ACCOUNT_IDS must be a comma-separated list of ad account ids"
+)
+_ACCOUNT_ID_ENTRY_MESSAGE: Final = (
+    "LINKEDIN_AD_ACCOUNT_IDS entries must be numeric ad account ids or "
+    f"{_LINKEDIN_ACCOUNT_URN_PREFIX}<digits>"
+)
+_CUSTOMER_ID_MESSAGE: Final = "GOOGLE_ADS_CUSTOMER_ID must be 10 digits"
+_DISPLAY_TIMEZONE_MESSAGE: Final = (
+    "DISPLAY_TIMEZONE must be an IANA time zone name such as UTC or America/New_York"
+)
+_APP_BASE_URL_MESSAGE: Final = (
+    "APP_BASE_URL must be an absolute http:// or https:// URL with a host, "
+    "such as http://localhost:8080"
+)
+_WEBHOOK_URL_FORM_MESSAGE: Final = (
+    "N8N_GOOGLE_ADS_WEBHOOK_URL must be an absolute https:// URL "
+    "(plain http:// only on localhost or 127.0.0.1)"
+)
+_WEBHOOK_URL_PLAIN_HTTP_MESSAGE: Final = (
+    "N8N_GOOGLE_ADS_WEBHOOK_URL must use https:// unless it is a localhost or 127.0.0.1 URL"
+)
+_WEBHOOK_HEADER_NAME_MESSAGE: Final = (
+    "N8N_WEBHOOK_SECRET_HEADER must be an HTTP header name made of RFC 7230 "
+    "token characters, such as X-Webhook-Secret"
+)
+_ADMIN_EMAIL_MESSAGE: Final = "APP_ADMIN_EMAIL must be an email address such as admin@example.com"
+
+VALIDATOR_MESSAGES: Final[frozenset[str]] = frozenset(
+    {
+        _ACCOUNT_IDS_TYPE_MESSAGE,
+        _ACCOUNT_ID_ENTRY_MESSAGE,
+        _CUSTOMER_ID_MESSAGE,
+        _DISPLAY_TIMEZONE_MESSAGE,
+        _APP_BASE_URL_MESSAGE,
+        _WEBHOOK_URL_FORM_MESSAGE,
+        _WEBHOOK_URL_PLAIN_HTTP_MESSAGE,
+        _WEBHOOK_HEADER_NAME_MESSAGE,
+        _ADMIN_EMAIL_MESSAGE,
+    }
+)
+"""The closed set of messages the :class:`Settings` validators raise.
+
+None holds the value it rejects: each names the environment variable and the accepted form,
+with no part of the input. A process that reports a :class:`pydantic.ValidationError` from
+:class:`Settings` may therefore show a ``value_error`` whose message is in this set, and
+withhold any other, which did not come from these validators and may quote its input.
+
+Example::
+
+    message = str(error["ctx"]["error"])  # one entry of ValidationError.errors()
+    shown = message if message in VALIDATOR_MESSAGES else "message withheld"
+"""
 
 
 class ConfigurationError(RuntimeError):
@@ -321,9 +379,7 @@ class Settings(BaseSettings):
         elif isinstance(value, list | tuple):
             raw_items = [str(item) for item in value]
         else:
-            raise ValueError(
-                "LINKEDIN_AD_ACCOUNT_IDS must be a comma-separated list of ad account ids"
-            )
+            raise ValueError(_ACCOUNT_IDS_TYPE_MESSAGE)
         account_ids: list[str] = []
         for raw in raw_items:
             entry = raw.strip()
@@ -331,10 +387,8 @@ class Settings(BaseSettings):
                 continue
             account_id = entry.removeprefix(_LINKEDIN_ACCOUNT_URN_PREFIX)
             if not _DIGITS_RE.fullmatch(account_id):
-                raise ValueError(
-                    "LINKEDIN_AD_ACCOUNT_IDS entries must be numeric ad account ids or "
-                    f"{_LINKEDIN_ACCOUNT_URN_PREFIX}<digits>; got {entry!r}"
-                )
+                # The entry is not quoted: a mis-pasted token would reach the log with it.
+                raise ValueError(_ACCOUNT_ID_ENTRY_MESSAGE)
             if account_id not in account_ids:
                 account_ids.append(account_id)
         return account_ids
@@ -351,7 +405,7 @@ class Settings(BaseSettings):
             return value  # blank: left to _blank_is_unset
         customer_id = value.strip().replace("-", "")
         if not _CUSTOMER_ID_RE.fullmatch(customer_id):
-            raise ValueError("GOOGLE_ADS_CUSTOMER_ID must be 10 digits")
+            raise ValueError(_CUSTOMER_ID_MESSAGE)
         return customer_id
 
     @field_validator("display_timezone", mode="after")
@@ -366,10 +420,8 @@ class Settings(BaseSettings):
         try:
             ZoneInfo(name)
         except ZoneInfoNotFoundError, ValueError, OSError:
-            raise ValueError(
-                "DISPLAY_TIMEZONE must be an IANA time zone name such as UTC or "
-                f"America/New_York; got {name!r}"
-            ) from None
+            # The name is not quoted: a value pasted into the wrong variable would reach the log.
+            raise ValueError(_DISPLAY_TIMEZONE_MESSAGE) from None
         return name
 
     @field_validator("app_base_url", mode="after")
@@ -387,10 +439,7 @@ class Settings(BaseSettings):
         candidate = value.strip().rstrip("/")
         parts = _split_http_url(candidate)
         if parts is None:
-            raise ValueError(
-                "APP_BASE_URL must be an absolute http:// or https:// URL with a host, "
-                "such as http://localhost:8080"
-            )
+            raise ValueError(_APP_BASE_URL_MESSAGE)
         # urlsplit lowercases the scheme; store it lowercased so prefix checks hold.
         return parts.scheme + candidate[len(parts.scheme) :]
 
@@ -412,16 +461,10 @@ class Settings(BaseSettings):
         candidate = value.strip()
         parts = _split_http_url(candidate)
         if parts is None:
-            raise ValueError(
-                "N8N_GOOGLE_ADS_WEBHOOK_URL must be an absolute https:// URL "
-                "(plain http:// only on localhost or 127.0.0.1)"
-            )
+            raise ValueError(_WEBHOOK_URL_FORM_MESSAGE)
         # urlsplit lowercases the scheme and host, so HTTP://LOCALHOST counts as local.
         if parts.scheme == "http" and parts.hostname not in _LOCAL_HOSTS:
-            raise ValueError(
-                "N8N_GOOGLE_ADS_WEBHOOK_URL must use https:// unless it is a localhost or "
-                "127.0.0.1 URL"
-            )
+            raise ValueError(_WEBHOOK_URL_PLAIN_HTTP_MESSAGE)
         return candidate
 
     @field_validator("n8n_webhook_secret_header", mode="after")
@@ -434,10 +477,7 @@ class Settings(BaseSettings):
         """
         name = value.strip()
         if not _HEADER_TOKEN_RE.fullmatch(name):
-            raise ValueError(
-                "N8N_WEBHOOK_SECRET_HEADER must be an HTTP header name made of RFC 7230 "
-                "token characters, such as X-Webhook-Secret"
-            )
+            raise ValueError(_WEBHOOK_HEADER_NAME_MESSAGE)
         return name
 
     @field_validator("app_admin_email", mode="after")
@@ -451,7 +491,7 @@ class Settings(BaseSettings):
         email = value.strip().lower()
         local, separator, domain = email.rpartition("@")
         if not separator or not local or not domain or any(ch.isspace() for ch in email):
-            raise ValueError("APP_ADMIN_EMAIL must be an email address such as admin@example.com")
+            raise ValueError(_ADMIN_EMAIL_MESSAGE)
         return email
 
     # ------------------------------------------------------------------

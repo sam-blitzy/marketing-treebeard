@@ -657,7 +657,6 @@ _NO_KEYS: Final = _TypedKeys()
 
 
 def _first_part(external_id: str) -> str:
-    """The leading ``|``-separated part of a composite entity key."""
     return external_id.split("|", 1)[0]
 
 

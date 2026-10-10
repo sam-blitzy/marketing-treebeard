@@ -321,7 +321,6 @@ _PERIOD_LABELS: Final[Mapping[BudgetPeriod, str]] = MappingProxyType(
 
 
 def _is_subject_type(value: object) -> TypeIs[SubjectType]:
-    """Return whether ``value`` is a decision subject type."""
     return isinstance(value, str) and value in SUBJECT_TYPES
 
 
@@ -331,7 +330,6 @@ def _is_shape(value: object) -> TypeIs[DecisionShape]:
 
 
 def _is_kind(value: object) -> TypeIs[DiscrepancyKind]:
-    """Return whether ``value`` is a discrepancy kind."""
     return isinstance(value, str) and value in DISCREPANCY_KINDS
 
 
@@ -341,22 +339,18 @@ def _is_resolution(value: object) -> TypeIs[Resolution]:
 
 
 def _is_origin(value: object) -> TypeIs[Origin]:
-    """Return whether ``value`` is a decision origin."""
     return isinstance(value, str) and value in DECISION_ORIGINS
 
 
 def _is_campaign_status(value: object) -> TypeIs[CampaignStatus]:
-    """Return whether ``value`` is a normalised campaign status."""
     return isinstance(value, str) and value in CAMPAIGN_STATUSES
 
 
 def _is_period(value: object) -> TypeIs[BudgetPeriod]:
-    """Return whether ``value`` is a Google budget period."""
     return isinstance(value, str) and value in BUDGET_PERIODS
 
 
 def _is_decision_source(value: object) -> TypeIs[DecisionSource]:
-    """Return whether ``value`` is a source that has decision subjects."""
     return value in ("google", "linkedin")
 
 
@@ -1767,7 +1761,6 @@ def apply_patch(state: SubjectState, current: ExpectedState, patch: DecisionPatc
 
 
 def _intended_invalid(message: str, **details: object) -> InvalidResolution:
-    """Build the ``intended_state_invalid`` rejection."""
     return InvalidResolution("intended_state_invalid", message, details=details)
 
 
@@ -2231,7 +2224,6 @@ async def _budget_currencies(
 
 
 def _subject_table(subject_type: SubjectType) -> type[Campaign] | type[Budget]:
-    """Return the entity table of a subject type."""
     return Campaign if subject_type == "campaign" else Budget
 
 
@@ -2984,7 +2976,6 @@ discrepancy, and :func:`resolve_discrepancy` refuses any other combination with 
 
 
 def _already_resolved(discrepancy_id: int) -> DiscrepancyClosed:
-    """Return the 409 refusing a resolution of an already resolved discrepancy."""
     return DiscrepancyClosed(
         "discrepancy_resolved", f"Discrepancy {discrepancy_id} is already resolved."
     )

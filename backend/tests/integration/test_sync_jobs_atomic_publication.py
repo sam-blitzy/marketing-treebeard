@@ -74,7 +74,7 @@ from ads_engine.db.models import (
 )
 from ads_engine.settings import Source, get_settings
 from ads_engine.simulation.generator import SimulatedWorld
-from ads_engine.simulation.scenarios import FIXED_CLOCK, FIXED_NOW
+from ads_engine.simulation.scenarios import FIXED_NOW, fixed_clock
 from ads_engine.sync import jobs
 from ads_engine.sync.budget_guard import GoogleCallBudget
 from ads_engine.sync.mode import SourceModeController
@@ -264,7 +264,7 @@ def labs(
     set_env(BACKFILL_DAYS=str(BACKFILL_DAYS))
 
     def make(scenario: str) -> Lab:
-        return Lab(sessions=db, world=make_world(scenario, clock=FIXED_CLOCK))
+        return Lab(sessions=db, world=make_world(scenario, clock=fixed_clock))
 
     return make
 

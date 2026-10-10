@@ -238,7 +238,7 @@ function SwappableCampaigns({ initial, handle }: SwappableCampaignsProps): React
   return <CampaignsSection section={section} run={makeRun()} overlay={makeOverlay()} />;
 }
 
-/** The accessible names of every button inside `scope`, in document order. */
+/** The text labels (`textContent`) of every button inside `scope`, in document order. */
 function buttonNames(scope: HTMLElement): string[] {
   return within(scope)
     .queryAllByRole('button')
@@ -1213,8 +1213,9 @@ function c2Thresholds(veto: boolean): Record<string, unknown> {
 
 /**
  * A C2 "Scale" on the LinkedIn campaign "Lead Gen — Benchmarks US"
- * ({@link FIXTURE_CAMPAIGN_IDS}.benchmarksUs, own daily budget USD 60.00), as
- * `campaigns._c2_candidate` writes it when the cap gate holds and the pipeline veto passes
+ * ({@link FIXTURE_CAMPAIGN_IDS}.benchmarksUs, own daily budget USD 60.00): a selected
+ * display-contract example modelled on the own-budget "Scale" shape of `campaigns._c2_candidate`,
+ * not the exact payload it writes, with the cap gate holding and the pipeline veto passing
  * (6 Qualified Leads): the veto counts beside the outcomes, its B1 item's proposed daily budget
  * (USD 72.00, +20%) as a metric and in `extra.b1_link`, its campaign group, and the campaign as
  * its decision subject.
@@ -1303,7 +1304,9 @@ function ownBudgetScaleItem(): Item {
           role: 'companion',
         },
       ],
-      // mirrors backend/src/ads_engine/analysis/campaigns.py (_c2_candidate, "Scale" outcome)
+      // Modelled on the "Scale" extra of backend/src/ads_engine/analysis/campaigns.py
+      // (_c2_candidate), not its exact payload: `capped_share` carries ratios here, where
+      // `metrics.cap_constrained` records capped days against whole days (21 of ⌈0.7 × 26⌉ = 19).
       extra: {
         outcome: 'Scale',
         b1: true,
@@ -1357,8 +1360,9 @@ const SEARCH_BUDGET_MEMBERS = [
 
 /**
  * A C2 "Scale" on the Google explicitly shared "Search Shared Budget"
- * ({@link FIXTURE_BUDGET_IDS}.search, daily budget USD 500.00), as `campaigns._c2_candidate`
- * writes it when the cap gate holds over its budget-active days and no Google CRM link exists
+ * ({@link FIXTURE_BUDGET_IDS}.search, daily budget USD 500.00): a selected display-contract
+ * example modelled on the shared-budget "Scale" shape of `campaigns._c2_candidate`, not the exact
+ * payload it writes, with the cap gate holding over its budget-active days and no Google CRM link
  * (no veto read, flagged `no_crm_link`): its B1 item's proposed daily budget (USD 600.00, +20%),
  * every member campaign, and the budget, never a member, as its decision subject (AAP 0.5.4.5).
  */
@@ -1409,8 +1413,10 @@ function sharedBudgetScaleItem(): Item {
       sample: { observed: 20, required: 7, unit: 'budget-active days', projected: null },
       thresholds: c2Thresholds(false),
       datasets: coverage('google.metrics_daily', 'google.entities'),
-      // mirrors backend/src/ads_engine/analysis/campaigns.py (_c2_candidate, "Scale" outcome on a
-      // shared budget)
+      // Modelled on the shared-budget "Scale" extra of
+      // backend/src/ads_engine/analysis/campaigns.py (_c2_candidate), not its exact payload:
+      // `capped_share` carries ratios here, where `metrics.cap_constrained` records capped days
+      // against whole days (16 of ⌈0.7 × 20⌉ = 14).
       extra: {
         outcome: 'Scale',
         b1: true,
@@ -1976,7 +1982,10 @@ describe('a long discrepancy group', () => {
     Reflect.deleteProperty(Element.prototype, 'scrollIntoView');
   });
 
-  /** 45 C0 cards (ids 7001–7045) followed by 5 visible C1 cards (ids 7101–7105), API order. */
+  /**
+   * 5 visible C1 cards (ids 7101–7105) listed before 45 C0 cards (ids 7001–7045), so the tests
+   * prove the group pins every C0 card first, in the C0 cards' own order.
+   */
   function longDiscrepancyGroup(): Section {
     const c0 = pageItem(FIXTURE_ITEM_IDS.c0);
     const pinned = Array.from({ length: 45 }, (_, index) => ({

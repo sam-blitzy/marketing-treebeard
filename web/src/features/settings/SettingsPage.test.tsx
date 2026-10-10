@@ -121,7 +121,10 @@ function subsection(title: string): HTMLElement {
   return section;
 }
 
-/** The fixture's resolved bindings with `changes` applied (shallow per binding). */
+/**
+ * The fixture's resolved bindings with `changes` applied: each binding `changes` supplies replaces
+ * the fixture's binding of that name whole, and each binding it omits is kept from the fixture.
+ */
 function bindings(changes: Partial<CrmBindingsView>): CrmBindingsView {
   const base = makeConfig().crm_bindings;
   if (base === null) {

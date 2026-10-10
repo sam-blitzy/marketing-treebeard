@@ -9,7 +9,8 @@
  *
  * - the status line: mode (Live, Simulated, or none yet) with its reason, connection status,
  *   the derived "Stale" badge and the last attempt in the display time zone;
- * - the Google webhook calls of the last 24 h against the product's own cap;
+ * - the Google webhook call count of the last 24 h against the product's own cap: its
+ *   conservative reservation counter, an upper bound rather than the exact calls dispatched;
  * - the active primary and companion datasets, and each dataset's freshness, coverage and
  *   completeness exactly as stored;
  * - each source's native day boundary above its freshness tables and on every covered date

@@ -48,6 +48,7 @@ from ads_engine.analysis.attribution import (
     shared_budget_veto,
 )
 from ads_engine.analysis.context import (
+    B1,
     C1,
     C1B,
     C2,
@@ -401,7 +402,6 @@ def _singular(label: str) -> str:
 
 
 def _days(count: int) -> str:
-    """A day count with its unit in number: ``1 day``, ``13 days``."""
     return "1 day" if count == 1 else f"{count} days"
 
 
@@ -411,7 +411,6 @@ def _days(count: int) -> str:
 
 
 def _campaign_ref(campaign: CampaignInfo) -> EntityRef:
-    """The entity reference of a campaign."""
     return EntityRef(
         campaign.source, ENTITY_CAMPAIGN, campaign.id, campaign.external_id, campaign.name
     )
@@ -505,7 +504,6 @@ def _depends_on(
 
 
 def _ad_datasets(source: Source) -> tuple[str, str]:
-    """An ad source's entity and daily metrics datasets."""
     return (f"{source}.entities", _METRICS_DATASETS[source])
 
 
@@ -1240,7 +1238,6 @@ class _Notes:
 
 
 def _value(evidence: Evidence, key: str) -> Decimal | int | str | None:
-    """The value of one of an item's own metrics, for its reason sentence."""
     return evidence.metric(key).value
 
 
@@ -1251,7 +1248,6 @@ def _money_of(evidence: Evidence, key: str) -> str:
 
 
 def _required(*groups: Iterable[str]) -> tuple[str, ...]:
-    """Dataset names in order, repeats dropped."""
     return tuple(dict.fromkeys(name for group in groups for name in group))
 
 
@@ -1341,6 +1337,21 @@ def _c2_candidate(
     spend, outcomes, expected outcomes and CRM QL"). A shared budget lists its members in
     ``extra.members``; a LinkedIn campaign subject names its campaign group in
     ``extra.campaign_group`` (:func:`_campaign_group_extra`), and a Google campaign has none.
+
+    Rule C2 Scale or Hold (AAP 0.5.4.4), judged by :func:`scale_outcomes` and emitted by
+    :func:`_c2`. Eligibility is the same evaluation as B1: the cap-constrained gate
+    (``budget.*``), at least ``scale.min_outcomes`` (5) outcomes, cost per outcome at most
+    ``scale.max_cpa_ratio`` (1.0) x the baseline, and G1 not blocking (applied by the
+    precedence post-filter; a blocked Scale records ``extra.g1_blocked``). A "Scale" links
+    its B1 item in ``extra.b1_link``, whose amount is the daily budget raised by ``b1.step``;
+    a "Hold" means the pipeline veto fired, so it declares no spend increase and has no B1.
+
+    Threshold keys: :data:`C2_THRESHOLD_KEYS`, plus :data:`VETO_THRESHOLD_KEYS` when the
+    outcome carries a veto population (always for a Hold).
+
+    Rationale: eligibility and veto are evaluated separately, so the Hold is always emitted
+    when the veto fires: a budget capped with good platform output is not scaled while its
+    eligible contacts reach no Qualified Lead.
     """
     history = outcome.history
     currency = outcome.currency
@@ -1388,7 +1399,7 @@ def _c2_candidate(
     }
     if scale:
         extra["b1_link"] = {
-            "rule_id": "B1",
+            "rule_id": B1,
             "subject": {"type": outcome.subject[0], "id": outcome.subject[1]},
             "current_daily_budget": outcome.current_daily_budget,
             "proposed_daily_budget": outcome.proposed_daily_budget,
@@ -1443,7 +1454,20 @@ def _c2_candidate(
 
 
 def _c2_reason(evidence: Evidence, label: str, scale: bool, known_label: str) -> str:
-    """C2's reason, filled from its evidence only."""
+    """C2's reason, filled from its evidence only.
+
+    Rule C2 Scale or Hold (AAP 0.5.4.4), for the item :func:`_c2_candidate` builds from
+    :func:`scale_outcomes`. The sentence states the capped days out of the known days, the
+    outcomes and cost per outcome beside the account baseline when there is one, then either
+    the B1 raise of the daily budget ("Scale") or the eligible contacts and Qualified Leads
+    the veto found ("Hold").
+
+    Threshold keys: those of the evidence it reads, :data:`C2_THRESHOLD_KEYS` plus
+    :data:`VETO_THRESHOLD_KEYS` when a veto was read (always for a Hold).
+
+    Rationale: every number is read back from the item's own evidence, never recomputed, so
+    the sentence cannot drift from the metrics and baselines the card shows.
+    """
     capped = (
         f"Capped on {_value(evidence, 'capped_days')} of {_value(evidence, 'known_days')} "
         f"{known_label} with {_count(_value(evidence, 'outcomes'))} {label} at "
@@ -1624,6 +1648,18 @@ def _c1_candidate(
     Shows spend, days with spend, outcomes, expected outcomes and the baseline, plus the
     linked CRM QL. A LinkedIn campaign's card also names its campaign group in
     ``extra.campaign_group`` (:func:`_campaign_group_extra`); a Google card has none.
+
+    Rule C1 Pause (AAP 0.5.4.4), for a campaign that passed :func:`_c1`'s gates: a window of
+    at least ``c1.min_window_days`` (14) and the sustained minimum, spend on at least
+    ``c1.min_spend_day_share`` (70%) of the window days, 0 outcomes, and ``expected`` at
+    least ``c1.min_expected_outcomes`` (3).
+
+    Threshold keys: :data:`C1_THRESHOLD_KEYS`, plus :data:`VETO_THRESHOLD_KEYS` when the
+    campaign has a pipeline population whose QL is shown.
+
+    Rationale: a 70% spend-day share is what "spending steadily" means, and at a Poisson mean
+    of 3 expected outcomes the chance of observing none is about 5%, so the zero is unlikely
+    to be bad luck.
     """
     currency = ctx.account_currency(campaign.id)
     label = OUTCOME_LABELS[campaign.objective_group]
@@ -1830,6 +1866,21 @@ def _c1b_candidate(
 
     The card shows spend beside the veto counts and names the campaign's campaign group in
     ``extra.campaign_group`` (:func:`_campaign_group_extra`).
+
+    Rule C1b Pipeline pause (AAP 0.5.4.4), for a campaign that passed :func:`_c1b` and
+    :func:`_c1b_shortfall`: a window of at least ``c1b.min_window_days`` (28) and the
+    sustained minimum, at least ``crm.veto_min_leads`` (20) eligible contacts from the
+    matured population, Qualified Leads and meetings both 0, the pipeline available, the
+    unresolved share below ``attribution.floor_share`` and no eligible contact's CRM evidence
+    unknown.
+
+    Threshold keys: :data:`C1B_THRESHOLD_KEYS` (``c1b.min_window_days``,
+    :data:`VETO_THRESHOLD_KEYS` and ``window.sustained_min_days``).
+
+    Rationale: platform leads that never reach Qualified Lead or a meeting are not pipeline.
+    Under an attribution floor or unknown CRM evidence the zero may be an artefact of
+    unmatched contacts or failed association reads, so such a campaign is withheld instead
+    and never reaches this item.
     """
     veto = view.veto
     if veto is None:
@@ -2298,7 +2349,20 @@ def _c3b_candidate(
     conversions: Decimal,
     flags: tuple[Flag, ...],
 ) -> Candidate:
-    """The C3b launch idea of one uncovered converting cluster, carrying ``flags``."""
+    """The C3b launch idea of one uncovered converting cluster, carrying ``flags``.
+
+    Rule C3b Launch: keyword cluster without a campaign (AAP 0.5.4.4), for a cluster that
+    passed :func:`_c3b`: single linkage at token Jaccard ≥ ``c3b.jaccard`` (0.5), at least
+    ``c3b.min_terms`` (3) converting search terms with at least ``c3b.min_conversions`` (5)
+    conversions in total, and head tokens (in at least ``c3b.head_token_share`` (50%) of the
+    members) that appear in no keyword text, ad group name or campaign name.
+
+    Threshold keys: :data:`C3B_THRESHOLD_KEYS`.
+
+    Rationale: converting queries sharing words that no keyword, ad group or campaign
+    targets are proven demand the account structure does not cover, the specific data gap a
+    launch idea needs.
+    """
     members = sorted(
         cluster.members, key=lambda term: (-by_term[term].conversions, -by_term[term].clicks, term)
     )

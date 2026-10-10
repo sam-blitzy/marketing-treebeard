@@ -117,12 +117,10 @@ _SUBJECT_TYPES: Final[tuple[str, ...]] = get_args(SubjectType)
 
 
 def _is_kind(value: str) -> TypeIs[DiscrepancyKind]:
-    """Return whether a stored ``discrepancy.kind`` is one of the C0 kinds."""
     return value in _KINDS
 
 
 def _is_subject_type(value: str) -> TypeIs[SubjectType]:
-    """Return whether a stored ``discrepancy.subject_type`` is a decision subject type."""
     return value in _SUBJECT_TYPES
 
 

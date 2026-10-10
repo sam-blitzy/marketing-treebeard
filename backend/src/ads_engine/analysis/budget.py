@@ -439,7 +439,6 @@ def _singular(label: str) -> str:
 
 
 def _days(count: int) -> str:
-    """A day count with its unit in number: ``1 day``, ``6 days``."""
     return "1 day" if count == 1 else f"{count} days"
 
 
@@ -558,7 +557,6 @@ def render_b3_allocation(allocation: Decimal, receiver_name: str, currency: str)
 
 
 def _campaign_ref(campaign: CampaignInfo) -> EntityRef:
-    """The entity reference of a campaign."""
     return EntityRef(
         campaign.source, ENTITY_CAMPAIGN, campaign.id, campaign.external_id, campaign.name
     )
@@ -630,12 +628,10 @@ def _depends_on(
 
 
 def _ad_datasets(source: Source) -> tuple[str, str]:
-    """An ad source's entity and daily metrics datasets."""
     return (f"{source}.entities", _METRICS_DATASETS[source])
 
 
 def _required(*groups: Iterable[str]) -> tuple[str, ...]:
-    """Dataset names in order, repeats dropped."""
     return tuple(dict.fromkeys(name for group in groups for name in group))
 
 
@@ -1068,12 +1064,10 @@ def _subject_flags(ctx: AnalysisContext, subject: SubjectKey, view: BudgetCrm) -
 
 
 def _datasets_of(evidence: Evidence) -> tuple[str, ...]:
-    """The dataset names an item read: exactly those its evidence records."""
     return tuple(status.dataset for status in evidence.datasets)
 
 
 def _value(evidence: Evidence, key: str) -> Decimal | int | str | None:
-    """The value of one of an item's own metrics, for its reason sentence."""
     return evidence.metric(key).value
 
 
@@ -1231,7 +1225,19 @@ def _b1(ctx: AnalysisContext, settings: _Settings) -> RuleResult:
 
 
 def _b1_candidate(ctx: AnalysisContext, settings: _Settings, outcome: ScaleOutcome) -> Candidate:
-    """The B1 item of one C2 "Scale" outcome."""
+    """The B1 item of one C2 "Scale" outcome (AAP 0.5.4.5 B1 row).
+
+    B1 exists only for a ``scale`` outcome, never under a veto "Hold". It raises the latest
+    effective daily budget by ``b1.step`` (0.20) to the outcome's proposal, already rounded to
+    the currency's minor unit. A G1-blocked outcome still yields its item, marked
+    ``g1_blocked`` and declaring its targets, so the precedence G1 post-filter removes it.
+
+    Threshold keys: :data:`B1_THRESHOLD_KEYS`, which holds ``b1.step``, the C2 eligibility
+    keys ``scale.min_outcomes`` and ``scale.max_cpa_ratio`` (also the evidence's highest cost
+    per outcome allowed to scale), ``window.sustained_min_days`` and the ``budget.*`` gate keys.
+
+    Rationale: a bounded step lets the next window measure the response.
+    """
     current = outcome.current_daily_budget
     proposed = outcome.proposed_daily_budget
     increase = proposed - current
@@ -1614,7 +1620,23 @@ def _side(days: Sequence[DayFact], group: str) -> _Side:
 def _b4_withheld(
     entity: EntityRef, reason: str, observed: Number | None, required: Number | None, unit: str
 ) -> Withheld:
-    """One B4 withheld line for a campaign."""
+    """One B4 withheld line for a campaign (AAP 0.5.4.5 B4 row).
+
+    P6: a pattern B4 cannot trust is listed under ``withheld`` with its sample size,
+    ``observed`` against ``required`` in ``unit``, and never becomes an item. Callers pass a
+    shortfall against the sample minimums, outcomes unreported on some days, a rate test that
+    is not estimable or has p ≥ ``b4.alpha``, "no exposure" and the count-validity reasons.
+
+    Threshold keys: :data:`B4_THRESHOLD_KEYS`. Its minimums ``b4.min_weekend_days``,
+    ``b4.min_weekdays`` and ``b4.min_outcomes`` decide the sample lines and ``b4.alpha`` the
+    failed-test line; ``budget.max_observation_gap_hours`` judges whether Google's counting
+    contract is whole-day known.
+
+    Rationale: the two-sample Poisson rate test is valid only on unweighted event counts, so
+    weighted attribution, an unknown counting contract and fractional conversions are
+    withheld, never rounded; "no exposure" is withheld because zero spend on a side leaves no
+    rate to compare.
+    """
     return Withheld(
         rule_id=B4,
         section=BUDGET,

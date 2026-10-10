@@ -83,9 +83,10 @@ function entityLabel(entity: EntityView | string | null | undefined): string {
  * - The entity is its display name; an account-wide withholding (`entity: null`) reads
  *   "Account-wide".
  * - The sample segment is `formatSample(w.sample)`: the recorded sizes as counts with grouping
- *   (`"1,234"`), a fraction kept rather than rounded, a missing size as "unavailable" and the
- *   unit appended when present. A withheld sample has no projection, so this is exactly the
- *   "observed / required unit" form.
+ *   (`"1,234"`), a fractional size never shown as an integer but at `formatCount`'s two-place
+ *   precision (a tiny nonzero one as a bound such as `"< 0.01"`), a missing size as "unavailable"
+ *   and the unit appended when present. A withheld sample has no projection, so this is exactly
+ *   the "observed / required unit" form.
  * - When neither size is recorded, no sample applies (for example C3a's
  *   `segment_window_unavailable`), and the line ends at the reason rather than showing
  *   "unavailable / unavailable".

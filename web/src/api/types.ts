@@ -228,8 +228,10 @@ export type Resolution =
 export type ResolutionKey = Resolution;
 
 /**
- * Feedback on an item (`schemas.FeedbackKind`; AAP 0.5.2): `dismiss` and `done` suppress the
- * rule and entity for 30 days, `snooze` for 7. C0 items accept none of them.
+ * Feedback on an item (`schemas.FeedbackKind`; AAP 0.5.2): each kind suppresses the rule and
+ * entity until the returned {@link Feedback.until}, which is authoritative. The lengths are
+ * configurable as `feedback.dismiss_days`, `feedback.snooze_days` and `feedback.done_days` in
+ * `config/thresholds.yaml`, with defaults of 30, 7 and 30 days. C0 items accept none of them.
  */
 export type FeedbackKind = 'dismiss' | 'snooze' | 'done';
 
@@ -656,7 +658,13 @@ export interface Evidence {
  * done, Dismiss, Snooze and the C0 resolver).
  */
 export interface ItemOverlay {
-  /** Whether an open discrepancy holds the item now, including one detected after the run. */
+  /**
+   * Whether the item is held now, for any of three causes: it is `historical` (a dataset it
+   * read is no longer active, or its provenance cannot be verified); it was `held` at compute
+   * time, a frozen hold the overlay never lifts; or, for every rule but C0, a subject it
+   * depends on has an `open` or `awaiting_platform` discrepancy now, including one detected
+   * after the run.
+   */
   held_now: boolean;
   /** Why it is held now, for example "Resolve discrepancy first". */
   held_reason_now: string | null;
@@ -706,7 +714,12 @@ export interface Item {
   held: boolean;
   /** Why it was held. */
   held_reason: string | null;
-  /** The subject a decision on it writes; `null` when only "Mark done" is offered. */
+  /**
+   * The subject a "Record decision" on it writes, carried only by C1, C1b, C2 "Scale", B1, B2
+   * and B3 items. `null` means no "Record decision": a C0 discrepancy shows its resolver instead
+   * of feedback actions, and any other item offers "Mark done" in its place. On a historical
+   * item (`current.historical`) every action is disabled, the C0 resolver included.
+   */
   decision_subject: DecisionSubjectRef | null;
   /** The read-time overlay. */
   current: ItemOverlay;
@@ -1106,7 +1119,11 @@ export interface Discrepancy {
   shape: DecisionShape;
   /** `status`, `budget`, `untracked` or `missing`. */
   kind: DiscrepancyKind;
-  /** The decided side; `null` for `untracked`. */
+  /**
+   * The decided side. `null` for an `untracked` discrepancy until `record_intended` records an
+   * intended state and moves it to `awaiting_platform`; it then shows that state, or a decision
+   * recorded since.
+   */
   decided_value: DiscrepancyValue | null;
   /** The platform side; `null` for `missing`. */
   platform_value: DiscrepancyValue | null;
@@ -1166,7 +1183,10 @@ export interface DatasetFreshnessView {
   completeness: Completeness;
   /** Why it is not complete. */
   reason: string | null;
-  /** Whether it last succeeded more than `sources.stale_after_hours` ago. */
+  /**
+   * Whether it never succeeded (`last_success_at` is `null`) or last succeeded more than
+   * `sources.stale_after_hours` ago.
+   */
   stale: boolean;
   /** Whether it is not `complete` (`incomplete` or `unknown`); derived from `completeness`. */
   incomplete: boolean;
@@ -1230,7 +1250,14 @@ export interface Source {
   companion_datasets: DatasetFreshnessView[];
   /** When a job last called the source. */
   last_attempt_at: IsoDateTime | null;
-  /** Google webhook calls counted in the trailing 24 h. */
+  /**
+   * The product's own `GOOGLE_DAILY_CALL_BUDGET` usage: the Google webhook call reservations
+   * still counting in its sliding 24 h window. A call is booked once admitted, in the minute by
+   * which its POST has started (up to the 140 s dispatch bound ahead), and counts until 24 h
+   * after that minute ends; a call that had to be reserved again may count twice. So this is a
+   * conservative upper bound on the calls admitted in the trailing 24 h, not an exact count of
+   * dispatched POSTs.
+   */
   calls_24h: number | null;
   /** The product's Google webhook call cap. */
   call_cap: number | null;

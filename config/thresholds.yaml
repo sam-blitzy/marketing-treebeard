@@ -5,8 +5,10 @@
 # and a missing key fails config load.
 #
 # Loading:
-#   backend/src/ads_engine/analysis/thresholds.py (Thresholds.load) reads this file with
-#   PyYAML safe_load, together with config/hubspot_mapping.yaml and config/content_assets.yaml.
+#   backend/src/ads_engine/analysis/thresholds.py (Thresholds.load) reads this file with a
+#   strict PyYAML SafeLoader subclass that rejects duplicate keys, together with
+#   config/hubspot_mapping.yaml and config/content_assets.yaml. A key repeated within one
+#   mapping fails config load instead of silently replacing the earlier value.
 #   In containers the directory is bind-mounted read-only at /app/config; on the host the
 #   backend resolves ../config from backend/.
 #

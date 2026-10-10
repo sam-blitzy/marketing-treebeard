@@ -935,7 +935,6 @@ def _check_field_mask(
 
 
 def _plural(count: int, singular: str, plural: str) -> str:
-    """Return ``singular`` for a count of one, else ``plural``."""
     return singular if count == 1 else plural
 
 

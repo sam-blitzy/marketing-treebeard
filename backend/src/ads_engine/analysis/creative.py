@@ -321,7 +321,6 @@ def _p_relation(value: Decimal) -> str:
 
 
 def _count(value: int) -> str:
-    """Render a count with thousands separators."""
     return f"{value:,}"
 
 
@@ -883,7 +882,6 @@ class _Campaign:
 
 
 def _urn_tail(urn: str) -> str:
-    """Return the id part of a URN (``urn:li:sponsoredCreative:42`` → ``42``)."""
     return urn.rsplit(":", 1)[-1]
 
 
@@ -1012,7 +1010,6 @@ def _variant_row(creative: _Creative, objective: str, currency: str) -> dict[str
 
 
 def _excluded_row(creative: _Creative) -> dict[str, Any]:
-    """Return one row of ``evidence.extra.excluded``: a creative under the variant minimum."""
     return {
         "creative_id": creative.creative_id,
         "urn": creative.key,
@@ -1094,7 +1091,18 @@ def _compare(a: _Creative, b: _Creative, objective: str, config: CreativeConfig)
 
 
 def _pairs(campaign: _Campaign, config: CreativeConfig) -> list[_Pair]:
-    """Compare every pair of variants, then Holm-adjust the compared pairs together."""
+    """Rule CR1: compare every pair of variants, then Holm-adjust the compared pairs together.
+
+    Threshold keys: :data:`CR1_THRESHOLD_KEYS`. ``cr.min_impressions`` and ``cr.min_variants``
+    admitted the variants before this step. Each pair's end-to-end rate is tested with Fisher's
+    exact test when any expected cell is below ``cr.fisher_min_expected``, otherwise with the
+    two-proportion z-test (:func:`_compare`). A pair that cannot be tested gets no adjusted
+    p-value and takes no part in the correction.
+
+    Rationale (AAP 0.5.4.6): the p-values of every compared pair of the campaign are adjusted
+    together, so comparing many pairs cannot manufacture one whose adjusted p falls below
+    ``cr.alpha`` (:func:`_pair_candidate`); :func:`evaluate` documents the rule.
+    """
     objective = campaign.info.objective_group
     variants = campaign.variants
     pairs = [
@@ -1123,6 +1131,17 @@ def _pair_candidate(
     config: CreativeConfig,
 ) -> Candidate:
     """Build one CR1 item: "Distinguishable (adjusted p = …)" or "{A} ahead, not yet …".
+
+    Threshold keys: :data:`CR1_THRESHOLD_KEYS`, copied into ``evidence.thresholds``. The pair is
+    distinguishable only when its Holm-adjusted p-value is below ``cr.alpha``. Otherwise it is
+    "not yet distinguishable", flagged ``not_distinguishable``, and states the variant ahead,
+    if either is, with the additional impressions per variant the observed difference needs at
+    ``cr.alpha`` and ``cr.power``, or "not estimable" with its reason. Its sample is the smaller
+    variant's impressions against ``cr.min_impressions``.
+
+    Rationale (AAP 0.5.4.6): a lead that is uncorrected or rests on a small sample is not a
+    result, so it is reported as "ahead, not yet distinguishable" and never as a winner;
+    :func:`evaluate` documents the rule.
 
     P7: neither the action nor the reason calls a variant a winner, better or best; a
     distinguishable pair states only which observed rate is higher.

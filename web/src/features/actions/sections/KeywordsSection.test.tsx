@@ -111,7 +111,7 @@ function metric(
   };
 }
 
-/** A K1 item with the given id, metrics and `extra`, named `name`. */
+/** A K1 item with the given id, evidence metrics and `extra`, its entity named `term {id}`. */
 function k1With(id: number, metrics: Metric[], extra: Record<string, unknown> | null): Item {
   const base = makeItem();
   return makeItem({

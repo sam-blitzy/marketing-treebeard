@@ -626,7 +626,6 @@ def _require(condition: bool, message: str) -> None:
 
 
 def _frozen[K, V](mapping: Mapping[K, V]) -> Mapping[K, V]:
-    """Return a read-only copy of ``mapping`` that keeps its insertion order."""
     return MappingProxyType(dict(mapping))
 
 
@@ -3115,7 +3114,6 @@ def _dp(
 
 
 def _q(question_id: int, name: str, predefined: str | None, text: str) -> QuestionSpec:
-    """Build a :class:`QuestionSpec`."""
     return QuestionSpec(question_id=question_id, name=name, predefined_field=predefined, text=text)
 
 
@@ -3762,7 +3760,6 @@ def _default_linkedin() -> LinkedInSpec:
 
 
 def _default_spec() -> WorldSpec:
-    """Build :data:`DEFAULT_SPEC`."""
     return WorldSpec(
         name="default",
         google=_default_google(),
@@ -4127,7 +4124,6 @@ type _IdRangeFilter = tuple[int, int] | None
 
 
 def _in_range(value: int, bounds: _IdRangeFilter) -> bool:
-    """Whether ``value`` lies in the inclusive ``bounds`` (always when ``None``)."""
     return bounds is None or bounds[0] <= value <= bounds[1]
 
 

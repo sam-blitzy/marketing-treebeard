@@ -783,7 +783,6 @@ def urn_id(urn: str, prefix: str) -> str:
 
 
 def _is_urn(value: str, prefix: str) -> bool:
-    """Whether ``value`` is ``{prefix}{digits}``."""
     return value.startswith(prefix) and _DIGITS_RE.fullmatch(value[len(prefix) :]) is not None
 
 

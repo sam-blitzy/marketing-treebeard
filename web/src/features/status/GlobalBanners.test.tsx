@@ -11,12 +11,13 @@
  * The fixed order is checked against {@link AAP_BANNER_ORDER}, the six known banner codes
  * written out here in that order, rather than against the component's own `BANNER_ORDER`: an
  * expectation read from the constant under test passes whatever order the constant holds, so
- * it cannot catch a reorder. The written-out codes stay checked against the API's `BannerCode`
- * union, so a code the backend renames or drops still fails the typecheck, and `BANNER_ORDER`,
- * the mirror of the backend's `analysis.context.BANNER_ORDER`, must equal the oracle. The
- * fixture banners carry no stale-datasets banner, so the stale slot uses a local one worded as
- * the backend words it. The codes the client must not know, the "later" codes of the
- * unknown-code cases, are literals too.
+ * it cannot catch a reorder. The written-out codes stay checked against the `BannerCode` union
+ * in `types.ts`, the client's hand mirror of the API's codes, so a code renamed or dropped there
+ * fails the typecheck; a backend rename or removal reaches this check only once that mirror is
+ * updated. `BANNER_ORDER`, the mirror of the backend's `analysis.context.BANNER_ORDER`, must
+ * equal the oracle. The fixture banners carry no stale-datasets banner, so the stale slot uses a
+ * local one worded as the backend words it. The codes the client must not know, the "later"
+ * codes of the unknown-code cases, are literals too.
  *
  * The component is presentational and calls no data hook, so it renders without providers and
  * no request is stubbed.
@@ -35,8 +36,9 @@ import { BANNER_ORDER, GlobalBanners, orderBanners } from './GlobalBanners';
  *
  * Written out here deliberately, independently of the component's {@link BANNER_ORDER}: an
  * expectation derived from the constant under test cannot catch a reorder of it. `satisfies`
- * checks each literal against the API's `BannerCode` union, so a code the backend renames or
- * drops still fails the typecheck.
+ * checks each literal against `types.ts`' hand-mirrored `BannerCode` union, so a code renamed or
+ * dropped there fails the typecheck; a backend rename or removal reaches this check only once
+ * that mirror is updated.
  */
 const AAP_BANNER_ORDER = Object.freeze([
   'open_discrepancies',
@@ -79,7 +81,7 @@ interface NamedFixtureBanners {
  * Fresh copies of the fixture banners by name: open discrepancies, tracking absent, simulated
  * sources, incomplete datasets and short window, the order `FIXTURE_BANNERS` documents.
  *
- * @throws Error when `FIXTURE_BANNERS` no longer holds five banners.
+ * @throws Error when `FIXTURE_BANNERS` holds fewer than five banners.
  */
 function namedFixtureBanners(): NamedFixtureBanners {
   const [discrepancies, tracking, simulated, incomplete, shortWindow] = fixtureBanners();
@@ -90,7 +92,7 @@ function namedFixtureBanners(): NamedFixtureBanners {
     incomplete === undefined ||
     shortWindow === undefined
   ) {
-    throw new Error('FIXTURE_BANNERS no longer holds five banners.');
+    throw new Error('FIXTURE_BANNERS holds fewer than five banners.');
   }
   return { discrepancies, tracking, simulated, incomplete, shortWindow };
 }

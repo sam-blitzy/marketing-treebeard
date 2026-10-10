@@ -105,7 +105,7 @@
               "properties": {
                 "type": "object",
                 "additionalProperties": true,
-                "description": "Open map: property name to string value or null; an unrequested or valueless property may be absent. Parsers read contacts: email, lifecyclestage, hs_v2_date_entered_{stage id}, the configured Google campaign and touch-date properties; meetings: hs_createdate, hs_timestamp, hs_meeting_start_time, hs_meeting_end_time, hs_meeting_outcome, meeting source; deals: createdate, dealstage, pipeline, amount."
+                "description": "Open map: property name to string value or null; an unrequested or valueless property may be absent. Parsers read contacts: email, hs_additional_emails, lifecyclestage, the bound MQL and QL date properties (each hs_v2_date_entered_{stage id} in stage-label mode, or the configured datetime property in property mode), the configured Google campaign and touch-date properties; meetings: hs_createdate, hs_timestamp, hs_meeting_start_time, hs_meeting_outcome, hs_meeting_source; deals: createdate, dealstage, pipeline, amount."
               },
               "propertiesWithHistory": {
                 "type": "object",

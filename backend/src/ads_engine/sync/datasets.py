@@ -271,7 +271,6 @@ def _google_link_verified(document: Mapping[str, object] | None) -> bool:
 
 
 def _plural(count: int, singular: str, plural: str) -> str:
-    """Return ``"<count> <noun>"`` with the noun agreeing in number."""
     return f"{count} {singular if count == 1 else plural}"
 
 
@@ -477,7 +476,6 @@ class DatasetManager:
     # -- infrastructure ----------------------------------------------------------------
 
     def _sessions(self) -> async_sessionmaker[AsyncSession]:
-        """Return the injected session factory, or the process-wide one."""
         return self._sessionmaker if self._sessionmaker is not None else get_sessionmaker()
 
     def _now(self) -> datetime:

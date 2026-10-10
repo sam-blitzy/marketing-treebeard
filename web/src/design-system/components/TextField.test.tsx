@@ -6,8 +6,8 @@
  * changes the wrapper's internals must still pass them:
  * - the visible label is the control's accessible name, also when the field is required, whose
  *   asterisk stays out of the name;
- * - a field is found by its label text (`getByLabelText`), the lookup the login form and the
- *   end-to-end specs depend on, for inputs and text areas alike;
+ * - a field is found by its label text (`getByLabelText`), the lookup the login form's unit tests
+ *   depend on, for inputs and text areas alike;
  * - the hint and error are described by `aria-describedby` in the order hint, error, extra ids,
  *   each id once, and only content-bearing slots render;
  * - `aria-invalid="true"` appears only while an error message is shown;

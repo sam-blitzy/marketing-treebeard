@@ -421,8 +421,8 @@ export function meQueryOptions() {
 }
 
 /**
- * The signed-in user: `GET /auth/me` → {@link Me}, for the top bar's email. See
- * {@link meQueryOptions} for caching, retries and status codes.
+ * The signed-in user: `GET /auth/me` → {@link Me}. See {@link meQueryOptions} for caching,
+ * retries and status codes.
  *
  * @returns The query result; `error` is a 401 `unauthenticated` {@link ApiError} when
  *   signed out.
@@ -492,9 +492,8 @@ export function useDefaultRun() {
 }
 
 /**
- * One run by id, default or custom, in any status: `GET /runs/{id}` → {@link Run}. The
- * `/actions?run=<id>` page reads a custom run's header through it. With `runId` `undefined`
- * the query is disabled and sends nothing.
+ * One run by id, default or custom, in any status: `GET /runs/{id}` → {@link Run}. With
+ * `runId` `undefined` the query is disabled and sends nothing.
  *
  * Status codes: 200, with `status` `running`, `succeeded` or `failed`; 404 `not_found` for
  * an unknown id; 422 `validation_error` for an id outside 1 to 2^63 − 1. {@link useCreateRun}
@@ -1217,8 +1216,8 @@ export function useLogout() {
  * {@link CreateRunRequest} → {@link Run} (201, `kind=custom`, AAP 0.5.3). The window is
  * calendar dates applied to each source's native days.
  *
- * On success the run is written into `queryKeys.runs.byId(run.id)`, so `/actions?run=<id>`
- * opens without another request, and `queryKeys.runs.customAll` is invalidated. The run never
+ * On success the run is written into `queryKeys.runs.byId(run.id)`, so a {@link useRun} read
+ * of it starts from that copy, and `queryKeys.runs.customAll` is invalidated. The run never
  * becomes `/runs/latest`, so the default run and its page stay as they are.
  *
  * Status codes: 201; 409 `run_in_progress` while any process holds the analysis lock; 422
@@ -1298,8 +1297,10 @@ export function useResolveDiscrepancy() {
 /**
  * Dismisses, snoozes or marks one item done: `POST /recommendations/{id}/feedback` with a
  * {@link FeedbackRequest} → {@link Feedback} (201). It suppresses the item's rule and entity
- * in later runs until `until` (dismiss 30 days, snooze 7, done 30), and hides the item at
- * once through the overlay. "Mark done" is feedback only and never writes a decision.
+ * in later runs until the response's `until`, which is authoritative: the lengths are the
+ * configurable `feedback.dismiss_days`, `feedback.snooze_days` and `feedback.done_days`
+ * (defaults 30, 7 and 30 days). It also hides the item at once through the overlay. "Mark
+ * done" is feedback only and never writes a decision.
  *
  * On success it invalidates `queryKeys.recommendationsAll`.
  *
@@ -1323,8 +1324,10 @@ export function useFeedback() {
 
 /**
  * Requests a sync of one source ("Sync now"): `POST /sources/{source}/sync` →
- * {@link SyncRequestView} (202). The worker picks the request up on its next 30 s wake; the
- * API itself calls no platform.
+ * {@link SyncRequestView} (202). The worker checks for pending requests at every 30 s wake and
+ * claims this one once the source's lane can run, so the worker's startup, or a lane still busy
+ * with an earlier pass such as a long backfill or Google request, can defer it. The API itself
+ * calls no platform.
  *
  * On success it invalidates `queryKeys.sources`, so the source shows its pending request.
  *

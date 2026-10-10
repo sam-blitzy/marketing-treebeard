@@ -534,12 +534,11 @@ function bindingRows(bindings: CrmBindingsView): readonly BindingRow[] {
  * "—" for the matched label, stage id and property, and the API's reason: never `0` and never an
  * empty cell (AAP 0.5.4.7).
  *
- * The "Matched label" column goes beyond the five columns the screen's plan lists. Each row shows
- * the label its own binding resolved: MQL's for MQL and Qualified Lead's for Qualified Lead, or
- * "—" for the Google link and for a property binding that keeps no display label. Qualified Lead
- * tries its configured labels in order, so its row states which one the portal resolved. The two
- * bindings resolve independently, and only the MQL binding's label heads the white-paper MQL
- * column.
+ * The "Matched label" column shows, in each row, the label its own binding resolved: MQL's for MQL
+ * and Qualified Lead's for Qualified Lead, or "—" for the Google link and for a property binding
+ * that keeps no display label. Qualified Lead tries its configured labels in order, so its row
+ * states which one the portal resolved. The two bindings resolve independently, and only the MQL
+ * binding's label heads the white-paper MQL column.
  */
 const BINDING_COLUMNS: readonly DataTableColumn<BindingRow>[] = [
   { key: 'binding', header: 'Binding', isRowHeader: true },

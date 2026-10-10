@@ -29,8 +29,12 @@ Module map:
 
 I/O boundary:
     Only `runner`, `lock`, `overlay` and the SQL loaders in `metrics` touch the database.
-    Every other module is pure: a rule receives an aggregated `AnalysisContext`, performs no
-    I/O and returns a `RuleResult`, so it is deterministic and testable without a database.
+    Only `thresholds` reads files, and only configuration, never the database:
+    `Thresholds.load` parses config/thresholds.yaml, config/hubspot_mapping.yaml and
+    config/content_assets.yaml, and `config_fingerprint` hashes their bytes.
+    Every rule evaluator, and every other module, is pure: a rule receives an aggregated
+    `AnalysisContext`, performs no I/O and returns a `RuleResult`, so it is deterministic and
+    testable without a database.
 
 This initialiser deliberately imports nothing. Importing `ads_engine.analysis` reads no
 settings, creates no engine and loads neither SciPy nor SQLAlchemy; import the submodule

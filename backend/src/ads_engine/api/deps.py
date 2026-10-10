@@ -415,7 +415,6 @@ class CurrentUser:
 
 
 def _unauthenticated() -> ApiError:
-    """Build the 401 every authentication failure returns, whatever its cause."""
     return ApiError(401, _UNAUTHENTICATED_CODE, _UNAUTHENTICATED_MESSAGE)
 
 

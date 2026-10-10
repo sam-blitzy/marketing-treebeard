@@ -724,7 +724,6 @@ class AnalysisWindow:
         config: Thresholds,
         sources: SourceDayInfo,
     ) -> AnalysisWindow:
-        """Assemble a window from the loaded configuration and the sources' boundaries."""
         return cls._assemble(start, end, latest, config, sources.boundaries())
 
     @classmethod

@@ -3,8 +3,11 @@
  * focus themselves, such as `Dialog`'s focus trap.
  *
  * This module is internal to `src/design-system/components`: it is not re-exported from the
- * design-system index, and feature code never imports it, because feature code never manages
- * focus itself (AAP 0.4.2, 0.4.4).
+ * design-system index, and feature code never imports it (AAP 0.4.2). Tab-order reasoning and
+ * focus traps belong to the wrappers that own that behaviour, such as `Dialog`'s trap. Feature
+ * code still moves focus to its own content (an error message after a failed save, a Retry
+ * button, the control that opened a dialog) by calling `focus()` on those elements directly,
+ * and needs none of these helpers.
  *
  * A tab stop is an element the browser visits with Tab:
  * - it is focusable: natively (`a[href]`, `area[href]`, `button`, `input` other than

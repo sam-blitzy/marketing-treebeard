@@ -302,7 +302,6 @@ def _normalise_ids(ids: Iterable[str], what: str) -> tuple[str, ...]:
 
 
 def _chunks[T](items: Sequence[T], size: int) -> list[Sequence[T]]:
-    """Split ``items`` into consecutive slices of at most ``size``."""
     return [items[start : start + size] for start in range(0, len(items), size)]
 
 
@@ -736,7 +735,6 @@ def _match_option(options: Sequence[PropertyOption], label: str) -> PropertyOpti
 
 
 def _quoted(labels: Sequence[str]) -> str:
-    """Render labels for a reason: ``'A'`` or ``'A', 'B'``."""
     return ", ".join(f"'{label}'" for label in labels)
 
 

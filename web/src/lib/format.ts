@@ -1157,4 +1157,3 @@ export function formatInstant(
   const { formatter, label } = instantFormat(textOrNull(displayTimezone) ?? '');
   return normalizeSpaces(`${formatter.format(instant)} ${label}`);
 }
-

@@ -472,9 +472,7 @@ describe('formatCost', () => {
   it('renders an out-of-range operand or quotient as unavailable', () => {
     // format.ts checks each operand's places against MAX_EXACT_PLACE on its digit text before
     // any BigInt is built, so an out-of-range operand is refused after a scan and a quotient
-    // is only ever divided from in-range operands. No assertion reads a clock: building
-    // 10n ** 999999999n instead runs for over 20 s, and Vitest fails a test whose body
-    // outlasts its per-test timeout (5 s by default) even when the body is synchronous.
+    // is only ever divided from in-range operands.
     expect(formatCost('1e999999999', 3, 'USD')).toBe(UNAVAILABLE);
     expect(formatCost('300', '1e999999999', 'USD')).toBe(UNAVAILABLE);
     expect(formatCost('1e-999999999', 3, 'USD')).toBe(UNAVAILABLE);

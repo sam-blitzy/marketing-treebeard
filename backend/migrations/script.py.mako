@@ -8,7 +8,9 @@
 ## `ruff check` under backend/pyproject.toml ([tool.ruff] line-length 100, double quotes,
 ## isort; "migrations/**" ignores D and N999), whatever the -m text and revision identifiers:
 ## * the -m text is normalised into docstring lines by _summary();
-## * identifiers are written as double-quoted literals by _literal(), never repr();
+## * identifiers are quoted by _literal() through _string() as ruff format quotes them, never
+##   by repr(): double quotes unless single quotes need fewer escapes, backslashes and the
+##   chosen quote escaped, and non-printable characters escaped as repr() would escape them;
 ## * `sa` and `op` are imported only when the body uses them, so an empty revision has no
 ##   unused import (F401), and the import block is followed by exactly one blank line (I001);
 ## * an empty upgrade() or downgrade() keeps only its docstring, so no `pass` and no
@@ -29,12 +31,12 @@ _LINE_LENGTH = 100
 _OPENING_QUOTES = '"""'
 
 
-def _width(text):
+def _width(text: str) -> int:
     """Return the display width ruff measures: East Asian wide and full-width count as 2."""
     return sum(2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in text)
 
 
-def _wrap(line, width):
+def _wrap(line: str, width: int) -> list[str]:
     """Split ``line`` on spaces into lines no wider than ``width``, keeping its indent.
 
     A line that already fits is returned unchanged. A single word wider than ``width`` stays
@@ -43,7 +45,7 @@ def _wrap(line, width):
     if _width(line) <= width:
         return [line]
     indent = line[: len(line) - len(line.lstrip(" "))]
-    lines = []
+    lines: list[str] = []
     current = ""
     for word in line.split():
         candidate = f"{current} {word}" if current else indent + word
@@ -55,36 +57,48 @@ def _wrap(line, width):
     return lines
 
 
-def _summary(message):
-    """Render the -m text as module docstring lines that ruff leaves unchanged.
+def _summary(message: object) -> str:
+    r"""Render the -m text as module docstring lines that ruff leaves unchanged.
 
-    The text keeps its words and line breaks; only its form changes:
+    Preserved: the words, their order, the line breaks inside the text (a blank line between
+    two non-blank lines stays) and the indent of every line after the first. Escaping changes
+    only the source form, so the docstring's value is the normalised text:
 
-    * surrounding whitespace and blank lines are stripped (ruff format, W291), and an empty
-      text becomes "empty message", Alembic's own default for a revision without -m;
-    * backslashes are doubled, so a path such as C:\\temp neither becomes an escape sequence
-      nor an invalid one (W605); the docstring's value is still the original text;
+    * backslashes are doubled, so a path such as C:\temp neither becomes an escape sequence
+      nor an invalid one (W605);
     * a run of three double quotes is escaped so it cannot close the docstring, and a
-      leading double quote is escaped so it does not merge with the opening quotes;
-    * tabs and other whitespace become spaces and trailing whitespace is dropped (W291);
-    * lines wider than the line length are wrapped on spaces (E501).
+      leading double quote is escaped so it does not merge with the opening quotes.
+
+    Normalised:
+
+    * surrounding whitespace is stripped (ruff format), which removes leading and trailing
+      blank lines and the first line's indent, and a text left empty becomes
+      "empty message", Alembic's own default for a revision without -m;
+    * lines end wherever str.splitlines() splits, which includes carriage returns, vertical
+      tabs, form feeds and Unicode line and paragraph separators;
+    * tabs are expanded, every other whitespace character becomes a space, and trailing
+      whitespace is dropped (W291);
+    * a line wider than 97 columns as _width() measures them, the line length less the
+      opening quotes, is wrapped on spaces with its indent kept (E501); _wrap() splits it on
+      whitespace, so wrapping can add line breaks and collapses each run of spaces in that
+      line to one.
     """
     text = str(message).strip() or "empty message"
     text = text.replace("\\", "\\\\").replace('"""', '\\"\\"\\"')
     if text.startswith('"'):
         text = "\\" + text
     width = _LINE_LENGTH - len(_OPENING_QUOTES)
-    lines = []
+    lines: list[str] = []
     for raw in text.splitlines():
         line = re.sub(r"\s", " ", raw.expandtabs()).rstrip()
         lines.extend(_wrap(line, width) if line else [""])
     return "\n".join(lines)
 
 
-def _string(value):
+def _string(value: str) -> str:
     """Quote ``value`` as ruff format does: double quotes, unless single need fewer escapes."""
     quote = "'" if value.count('"') > value.count("'") else '"'
-    parts = []
+    parts: list[str] = []
     for char in value:
         if char == "\\":
             parts.append("\\\\")
@@ -98,12 +112,14 @@ def _string(value):
     return quote + "".join(parts) + quote
 
 
-def _literal(value):
+def _literal(value: object) -> str:
     """Render a revision identifier (None, a string, or a sequence of strings) as Python.
 
     A sequence of two or more identifiers (a merge revision's down_revision, several
     depends_on revisions) is written one per line with a trailing comma, the layout ruff
     format keeps for any length. A single-item sequence stays on one line as ("x",).
+    Any other value, such as an int, raises TypeError instead of being rendered, which is
+    why ``value`` is typed ``object``.
     """
     if value is None:
         return "None"
@@ -120,15 +136,16 @@ def _literal(value):
     return f"({body}\n)"
 
 
-def _references(name, *bodies):
+def _references(name: str, *bodies: object) -> bool:
     """Return whether rendered code refers to module ``name``, as in ``sa.Column`` or ``op.f``.
 
     ``upgrades``, ``downgrades`` and ``imports`` reach the template only from autogenerate;
-    otherwise they are Mako's UNDEFINED, which is falsy and must not be converted to str.
+    otherwise they are Mako's UNDEFINED, which is falsy, is not a str and must not be
+    converted to one (its str() raises NameError), so only non-empty strings are searched.
     The look-behind keeps ``visa.`` or ``postgresql.op.`` from counting as a use.
     """
     pattern = re.compile(rf"(?<![\w.]){re.escape(name)}\.")
-    return any(pattern.search(body) for body in bodies if body)
+    return any(pattern.search(body) for body in bodies if isinstance(body, str) and body)
 %>\
 <%
     uses_sa = _references("sa", upgrades, downgrades)

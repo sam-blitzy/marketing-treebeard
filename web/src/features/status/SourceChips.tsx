@@ -232,7 +232,9 @@ function SourceChip({ source, mode, stale, incomplete, lastSync }: SourceChipPro
  * dataset; "Stale" (warning) when any entry of `overlay.stale_datasets` starts with
  * `{source}.`; "Incomplete" (warning) likewise for `overlay.incomplete_datasets`; and
  * "Last sync {instant in displayTimezone}", "Never synced" or "Last sync unknown" (see
- * {@link latestSuccess}). The last-sync text is absent until `GET /sources` first answers.
+ * {@link latestSuccess}). The last-sync text is absent while the first `GET /sources` read is
+ * pending and reads "Last sync unknown" if that read fails; a later failed poll keeps the last
+ * answer ({@link lastSyncText}).
  *
  * The component reads server state only through {@link useSources}, so it must render inside
  * the app's `QueryClientProvider`. It announces nothing: the chips are static content read in

@@ -52,9 +52,11 @@
  *   navigation, so the page renders its own "Primary" `SideNav`. It holds one link, "Sign in",
  *   to this screen and nothing else: a signed-out visitor is never shown which signed-in
  *   screens exist.
- * - **The password never leaves the form state**: it is measured and sent as typed (never
- *   trimmed), never rendered, logged or echoed in a message, and cleared after an attempt the
- *   API refused for any reason but a field validation error.
+ * - **The password is sent only in the sign-in request**: {@link useLogin} posts it to
+ *   `POST /api/v1/auth/login` and no other request carries it. It is measured and sent exactly
+ *   as typed (never trimmed), never rendered outside its masked field, logged or echoed in a
+ *   message, and cleared after an attempt the API refused for any reason but a field validation
+ *   error.
  * - **No router import**: `src/router.tsx` imports this page, so `useNavigate` and `Link` come
  *   straight from `@tanstack/react-router`.
  * - **Fixed strings**: the e2e specs (`web/tests/e2e/auth.setup.ts`, `first-start.spec.ts`)
@@ -636,4 +638,3 @@ export function LoginPage({ redirectTo }: LoginPageProps) {
     </PageShell>
   );
 }
-

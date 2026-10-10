@@ -6,10 +6,12 @@
 # stages, so none of this is hard-coded.
 #
 # Loading
-# - Read by backend/src/ads_engine/analysis/thresholds.py with PyYAML
-#   safe_load, together with config/thresholds.yaml and
-#   config/content_assets.yaml. All three files feed config_hash, which every
-#   analysis run stores, so a change here shows up in run history.
+# - Read by backend/src/ads_engine/analysis/thresholds.py with a strict
+#   PyYAML SafeLoader subclass that rejects duplicate keys, together with
+#   config/thresholds.yaml and config/content_assets.yaml. A key repeated
+#   within one mapping fails config load. All three files feed
+#   config_hash, which every analysis run stores, so a change here shows
+#   up in run history.
 # - Mounted read-only into the api and worker containers at /app/config.
 # - Shown read-only by GET /api/v1/config and the /settings screen, beside
 #   the stage properties resolved at startup.
@@ -26,8 +28,11 @@
 #   options. Default stages have internal names such as
 #   marketingqualifiedlead; custom stages have numeric ids. The count then
 #   uses that stage's "date entered" property, hs_v2_date_entered_{stage id},
-#   after the properties API confirms that property exists. A label must
-#   equal the option's label exactly.
+#   after the properties API confirms that property exists. A label matches
+#   an option whose label equals it once both are trimmed of surrounding
+#   whitespace and case-folded. Among matching options, an exact match is
+#   preferred, then a visible option over a hidden one, then the first in
+#   the order the properties API returns them.
 # - property: the property key names a contact date or datetime property
 #   that records the event directly, for example a custom "first meeting
 #   booked" date. The properties API must confirm it at startup. The label
@@ -81,8 +86,10 @@ crm:
   # meeting record's creation (hs_createdate), labelled "booked (record
   # created)". For these sources the booking itself creates the record, so
   # creation is the booking instant; MEETINGS_PUBLIC is a scheduling-page
-  # booking. Such a meeting counts only when its creation and its
-  # hs_meeting_start_time are both at or after the contact's touch.
+  # booking. Such a meeting counts only when its creation and its start time
+  # are both at or after the contact's touch. The start time is
+  # hs_meeting_start_time, or hs_timestamp when hs_meeting_start_time is
+  # empty; a meeting with no creation or no start time is not counted.
   # Meetings from any other source (imported, synced from a calendar, logged
   # by hand) may be created after the real booking. They pass the same time
   # checks but go to "Other meetings (ordering unverified)", carry the

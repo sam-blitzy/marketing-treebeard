@@ -1862,8 +1862,9 @@ class Candidate:
             and ``incomplete`` flags derive; repeats are dropped.
         increases_spend_on: The campaigns and budgets whose spend this item would raise (C2
             Scale, B1, a B3 receiver, a W1 double down); G1 removes it when any is blocked.
-        decision_subject: The campaign or budget a "Record decision" on this item would write;
-            ``None`` for items that only offer "Mark done".
+        decision_subject: The campaign or budget a "Record decision" on this item would write,
+            carried only by C1, C1b, C2 "Scale", B1, B2 and B3 items; ``None`` for every other
+            item: C0 offers its resolver instead, and the rest offer "Mark done".
         depends_on: Subjects whose unresolved discrepancy holds this item (P1).
         held: Whether the item is held.
         held_reason: Why; required exactly when :attr:`held`.
@@ -3235,8 +3236,10 @@ class DiscrepancyInfo:
         source: ``google`` or ``linkedin``.
         shape: The subject's decision shape, which fixes the offered resolutions.
         kind: ``status``, ``budget``, ``untracked`` or ``missing``.
-        decided_value: The decided state compared; ``None`` for ``untracked``. Deep-copied on
-            construction into a read-only tree.
+        decided_value: The decided state compared; ``None`` for ``untracked`` until
+            ``record_intended`` records an intended state and moves it to
+            ``awaiting_platform``, after which it holds that state, or a decision recorded
+            since. Deep-copied on construction into a read-only tree.
         platform_value: The platform state; ``None`` for ``missing``. Deep-copied on
             construction into a read-only tree.
         detected_at: When it was detected; C0 items are ordered oldest first.

@@ -17,6 +17,12 @@
  *   deliberately not `VITE_`-prefixed, so Vite does not expose it through `import.meta.env`, and
  *   this config has no `define`. No container reads it, so it is not in the root `.env.example`.
  *
+ *   An `https://` target's certificate chain and its own hostname are always verified, and no
+ *   setting disables that. To trust a development CA or a self-signed upstream certificate, name
+ *   its PEM file in Node's own `NODE_EXTRA_CA_CERTS` when starting the dev server (see the
+ *   example below): Node reads it once at start-up and adds it to its bundled roots. This config
+ *   never reads it.
+ *
  * The bundle carries no build-time configuration at all. The client calls the relative path
  * `/api/v1`, served by nginx in the stack and by the proxy below in development, and every window
  * length, preset and threshold comes from `GET /api/v1/config` at run time. No secret can
@@ -34,10 +40,14 @@
  * ```sh
  * npm run dev                                          # http://localhost:5173, /api -> :8080
  * WEB_DEV_API_PROXY=http://localhost:9999 npm run dev  # /api -> :9999
+ * NODE_EXTRA_CA_CERTS=./dev-ca.pem WEB_DEV_API_PROXY=https://api.dev.example:8443 npm run dev
  * npm run build                                        # dist/index.html and dist/assets/*
  * npm test                                             # Vitest in jsdom, with coverage/
  * ```
  */
+import { Agent as HttpsAgent } from 'node:https';
+import { isIP } from 'node:net';
+
 import react from '@vitejs/plugin-react';
 import { defineConfig } from 'vitest/config';
 
@@ -90,6 +100,37 @@ function resolveApiProxyTarget(value: string | undefined): string {
 /** Where `npm run dev` sends `/api` requests. Read once, in Node, when the config loads. */
 const apiProxyTarget = resolveApiProxyTarget(process.env.WEB_DEV_API_PROXY);
 
+/**
+ * The TLS agent for an `https://` proxy target, which makes Node verify the upstream certificate
+ * against the target's own hostname; `undefined` for an `http://` target, which needs none.
+ *
+ * Without it, Node derives both the SNI name and the name it checks the certificate against from
+ * the forwarded Host header, which the proxy keeps as the dev origin's (`localhost:5173`, see
+ * `changeOrigin` below). Every https:// upstream would then be verified as `localhost`: its own
+ * valid certificate would be rejected, and any trusted certificate issued for `localhost` would
+ * be accepted in its place. An IP-address target sends no SNI, since RFC 6066 allows no address
+ * there, and its certificate must list that address.
+ *
+ * @param target - The proxy target, an absolute http(s) URL from {@link resolveApiProxyTarget}.
+ * @returns An agent pinned to the target's hostname, or `undefined` for a plain http target.
+ */
+function resolveApiProxyAgent(target: string): HttpsAgent | undefined {
+  const url = new URL(target);
+  if (url.protocol !== 'https:') {
+    return undefined;
+  }
+  // URL keeps an IPv6 literal in brackets, while Node's TLS checks expect the bare address.
+  const hostname =
+    url.hostname.startsWith('[') && url.hostname.endsWith(']')
+      ? url.hostname.slice(1, -1)
+      : url.hostname;
+  // An empty servername sends no SNI and makes Node check the certificate against the address.
+  return new HttpsAgent({ servername: isIP(hostname) === 0 ? hostname : '' });
+}
+
+/** The TLS agent for {@link apiProxyTarget}, created once with it when the config loads. */
+const apiProxyAgent = resolveApiProxyAgent(apiProxyTarget);
+
 // ---------------------------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------------------------
@@ -113,13 +154,22 @@ export default defineConfig({
     proxy: {
       // The session cookie is host-scoped to `localhost`, so the browser sends it to the dev
       // origin (localhost:5173) and to the stack (localhost:8080) alike, and it is not Secure on
-      // the local http:// base URL. The proxy therefore forwards requests as they are: the Host
-      // header is kept (`changeOrigin: false`), and a self-signed https:// target is accepted
-      // (`secure: false`), because this proxy exists only on a developer's machine.
+      // the local http:// base URL. The proxy therefore forwards requests with their Host header
+      // kept (`changeOrigin: false`).
+      //
+      // An https:// target's certificate chain is verified against Node's trust store
+      // (`secure: true`), and its hostname against the target's own name, not the kept Host
+      // header (`agent`, see resolveApiProxyAgent). Running this proxy on a developer's machine
+      // does not secure its hop to the upstream, which carries the login, the session cookie and
+      // every API response. A development CA or a self-signed upstream certificate is trusted
+      // explicitly, by naming its PEM file in Node's NODE_EXTRA_CA_CERTS when starting the dev
+      // server. A request whose upstream fails verification gets 502, and the dev-server log
+      // shows the TLS error.
       '/api': {
         target: apiProxyTarget,
         changeOrigin: false,
-        secure: false,
+        secure: true,
+        agent: apiProxyAgent,
       },
     },
   },

@@ -283,11 +283,13 @@ export const FIXTURE_RESOLUTIONS: Readonly<Record<DiscrepancyKind, readonly Reso
   });
 
 /**
- * One banner of each kind, in the API's fixed order (`analysis.context.BANNER_ORDER`;
- * AAP 0.5.5), with the tones of `BANNER_TONES` and the texts `analysis/overlay.py` renders:
- * open discrepancies, tracking absent, simulated sources, incomplete datasets and short window.
- * The default page shows the first four; a short-window test adds the fifth. Builders copy these
- * objects, so mutating a page never changes this constant.
+ * Five selected banner cases, not one of every kind, in the API's fixed order
+ * (`analysis.context.BANNER_ORDER`; AAP 0.5.5), with the tones of `BANNER_TONES` and the texts
+ * `analysis/overlay.py` renders: open discrepancies, tracking absent, simulated sources,
+ * incomplete datasets and short window. No `stale_datasets` banner is among them; the complete
+ * six-code order, stale slot included, is checked in `features/status/GlobalBanners.test.tsx`
+ * (`AAP_BANNER_ORDER`, `staleBanner`). The default page shows the first four; a short-window test
+ * adds the fifth. Builders copy these objects, so mutating a page never changes this constant.
  */
 export const FIXTURE_BANNERS: readonly Readonly<Banner>[] = Object.freeze([
   Object.freeze({
@@ -1126,7 +1128,7 @@ function crmBindings(verifiedAt: string): CrmBindingsView {
  * {@link FIXTURE_CONFIG_HASH}.
  *
  * @param overrides - fields to replace (shallow), for example
- *   `{ window: { ...makeConfig().window, default_days: 21 } }`
+ *   `{ window: { ...makeConfig().window, default_days: 21, presets: [14, 21, 28, 56, 90] } }`
  * @returns a fresh `ConfigView`
  */
 export function makeConfig(overrides: Partial<ConfigView> = {}): ConfigView {
@@ -2253,8 +2255,10 @@ function budgetSection(): Section {
         'window.sustained_min_days',
       ),
       datasets: coverage('google.metrics_daily', 'google.entities'),
-      // mirrors backend/src/ads_engine/analysis/budget.py (budget_evidence, _b1_candidate)
-      // and analysis/precedence.py (_with_b1_funding)
+      // Modelled on the B1 extra of backend/src/ads_engine/analysis/budget.py (budget_evidence,
+      // _b1_candidate) and analysis/precedence.py (_with_b1_funding), not its exact payload:
+      // `capped_share` carries ratios here, where `metrics.cap_constrained` records capped days
+      // against whole days (22 of ⌈0.7 × 26⌉ = 19).
       extra: {
         subject: { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.pipelineSearch },
         subject_type: 'campaign',
@@ -2369,8 +2373,12 @@ function budgetSection(): Section {
         'window.sustained_min_days',
       ),
       datasets: coverage('google.metrics_daily', 'google.entities'),
-      // mirrors backend/src/ads_engine/analysis/budget.py (budget_evidence, B3) and
-      // analysis/precedence.py (_with_b3_allocations)
+      // Modelled on the B3 extra of backend/src/ads_engine/analysis/budget.py (budget_evidence,
+      // _b3) and analysis/precedence.py (_with_b3_allocations), not its exact payload:
+      // `under_utilized_share` carries ratios here, where `metrics.under_utilized` records
+      // under-utilized days as `under_utilized_days` against whole days (20 of ⌈0.7 × 24⌉ = 17),
+      // and `day_counts` keys the budget-active days `known_budget_days`, where
+      // `BudgetHistory.counts()` writes `known_active`.
       extra: {
         subject: { type: 'budget', id: FIXTURE_BUDGET_IDS.display },
         subject_type: 'budget',
@@ -3548,4 +3556,3 @@ export function findPageItem(page: RecommendationsPage, id: Item['id']): Item {
   }
   return item;
 }
-

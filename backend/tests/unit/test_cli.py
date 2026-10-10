@@ -94,7 +94,7 @@ from ads_engine.decisions import SubjectRetired
 from ads_engine.settings import ConfigurationError, Settings, get_settings
 from ads_engine.simulation.generator import SimulatedWorld
 from ads_engine.simulation.payloads import canonical_json, validate_capture
-from ads_engine.simulation.scenarios import FIXED_CLOCK
+from ads_engine.simulation.scenarios import fixed_clock
 from ads_engine.simulation.transport import mock_transport
 from ads_engine.sync import budget_guard, jobs, mode
 from ads_engine.sync import scheduler as scheduler_module
@@ -2613,10 +2613,10 @@ EXPECTED_SURFACES = {
 def capture_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A working directory with the contracts and config, and live (fake) credentials.
 
-    The capture's request windows end at :func:`FIXED_CLOCK`, the clock of every world
+    The capture's request windows end at :func:`fixed_clock`, the clock of every world
     :func:`_capture_world` builds, so each window selects the same records at any host time.
     """
-    monkeypatch.setattr(cli, "_capture_now", FIXED_CLOCK)
+    monkeypatch.setattr(cli, "_capture_now", fixed_clock)
     shutil.copytree(CONTRACTS, tmp_path / "tests" / "contracts")
     for stale in (tmp_path / "tests" / "contracts").glob("*/captured/*.json"):
         stale.unlink()
@@ -2638,7 +2638,7 @@ def capture_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 def _capture_world(settings: Settings) -> SimulatedWorld:
     """The simulated platform a capture reads, on the clock ``capture_dir`` gives the capture."""
-    return SimulatedWorld.from_settings(settings, clock=FIXED_CLOCK)
+    return SimulatedWorld.from_settings(settings, clock=fixed_clock)
 
 
 @pytest.fixture
@@ -3199,7 +3199,7 @@ def test_capture_google_stops_at_a_reservation_the_database_cannot_make(
 # capture-fixtures: Google queries pointed at data that delivered
 # ---------------------------------------------------------------------------
 
-YESTERDAY = FIXED_CLOCK().date() - timedelta(days=1)
+YESTERDAY = fixed_clock().date() - timedelta(days=1)
 """The day every Google capture window ends on."""
 
 GoogleAnswers = dict[str, tuple[Any, list[dict[str, Any]]]]

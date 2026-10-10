@@ -500,6 +500,7 @@ def _check_item_shape(run: _Run) -> None:
 def test_catalogue_guard_evaluate_matches_every_creative_expectation(
     scenario: Scenario, make_context: ContextFactory
 ) -> None:
+    """Catalogue guard: each creative scenario's expectation, withheld line and item shape hold."""
     run = _evaluate(make_context, scenario)
     expect = scenario.expect
     assert expect.rule_id in _CHECKS, f"{scenario.name}: {expect.rule_id} is not a copy rule"
@@ -512,6 +513,7 @@ def test_catalogue_guard_evaluate_matches_every_creative_expectation(
 
 
 def test_catalogue_offers_one_input_twins_for_cr1_and_cr2() -> None:
+    """Catalogue pairs: each fires scenario (CR1 and CR2 among them) has a one-input twin."""
     twins = [scenario for scenario in CREATIVE_SCENARIOS if scenario.variant == "fires"]
     assert {scenario.expect.rule_id for scenario in twins} >= {CR1, CR2}
     for fires in twins:
@@ -555,6 +557,7 @@ def _end_to_end(run: _Run, item: Candidate) -> tuple[int, int, int, int]:
 def test_cr1_distinguishable_pair_is_labelled_with_its_adjusted_p_and_test(
     make_context: ContextFactory,
 ) -> None:
+    """CR1 distinguishable: a z-test pair at adjusted p < alpha is labelled "Distinguishable"."""
     run = _evaluate(make_context, "cr1.distinguishable.fires")
     cr = run.cr
     item = run.pair("cr-a", "cr-b")
@@ -584,6 +587,7 @@ def test_cr1_distinguishable_pair_is_labelled_with_its_adjusted_p_and_test(
 def test_cr1_ahead_but_not_distinguishable_states_the_impressions_still_needed(
     make_context: ContextFactory,
 ) -> None:
+    """CR1 ahead, not distinguishable: adjusted p >= alpha; the label states impressions needed."""
     run = _evaluate(make_context, "cr1.distinguishable.does_not_fire")
     cr = run.cr
     item = run.pair("cr-a", "cr-b")
@@ -621,6 +625,7 @@ def test_cr1_ahead_but_not_distinguishable_states_the_impressions_still_needed(
 def test_cr1_holm_adjustment_flips_a_raw_significant_pair_to_not_distinguishable(
     make_context: ContextFactory,
 ) -> None:
+    """CR1 Holm flip: raw p < alpha, Holm-adjusted p >= alpha over 3 pairs: not distinguishable."""
     run = _evaluate(make_context, "cr1.holm_flip.case")
     cr = run.cr
     assert len(run.variant_totals()) == 3
@@ -655,6 +660,7 @@ def test_cr1_holm_adjustment_flips_a_raw_significant_pair_to_not_distinguishable
 def test_cr1_significance_level_is_read_from_the_configuration(
     make_context: ContextFactory, make_thresholds: ThresholdsFactory
 ) -> None:
+    """CR1 alpha from configuration: cr.alpha 0.2 makes the Holm-flip pair distinguishable."""
     loosened = make_thresholds({"cr.alpha": Decimal("0.2")})
     run = _evaluate(make_context, "cr1.holm_flip.case", thresholds=loosened)
     item = run.pair("cr-a", "cr-b")
@@ -681,6 +687,7 @@ def test_cr1_significance_level_is_read_from_the_configuration(
 def test_cr1_uses_fisher_below_five_expected_and_the_z_test_otherwise(
     make_context: ContextFactory, name: str, method: str, label: str, below_minimum: bool
 ) -> None:
+    """CR1 test choice: Fisher's exact below cr.fisher_min_expected expected, else the z-test."""
     run = _evaluate(make_context, name)
     cr = run.cr
     item = run.single_pair()
@@ -702,6 +709,7 @@ def test_cr1_uses_fisher_below_five_expected_and_the_z_test_otherwise(
 def test_cr1_identical_rates_leave_the_impressions_needed_not_estimable(
     make_context: ContextFactory,
 ) -> None:
+    """CR1 identical rates: no leader; impressions needed not estimable (no observed difference)."""
     run = _evaluate(make_context, "cr1.identical_rates.case")
     cr = run.cr
     item = run.single_pair()
@@ -722,6 +730,7 @@ def test_cr1_identical_rates_leave_the_impressions_needed_not_estimable(
 def test_cr1_zero_impression_creative_is_excluded_and_its_comparison_not_estimable(
     make_context: ContextFactory,
 ) -> None:
+    """CR1 zero impressions: the creative is excluded, and a pair with it is not estimable."""
     run = _evaluate(make_context, "cr1.zero_impressions.case")
     cr = run.cr
     item = run.single_pair()
@@ -766,6 +775,7 @@ def test_cr1_zero_impression_creative_is_excluded_and_its_comparison_not_estimab
 def test_p7_no_cr1_item_calls_a_variant_a_winner_before_it_is_distinguishable(
     make_context: ContextFactory,
 ) -> None:
+    """P7: every non-distinguishable CR1 item is flagged and free of winner wording."""
     names = [scenario.name for scenario in CREATIVE_SCENARIOS] + [P7_CASE, DEFAULT]
     checked: dict[str, int] = dict.fromkeys(names, 0)
     for name in names:
@@ -790,6 +800,7 @@ def test_p7_no_cr1_item_calls_a_variant_a_winner_before_it_is_distinguishable(
 
 
 def test_cr2_stage_definitions_match_the_aap_funnel() -> None:
+    """CR2 stages: click, open and completion rates use the AAP's counts and units."""
     assert [stage.key for stage in STAGES] == list(AAP_STAGE_COUNTS)
     for stage in STAGES:
         assert (stage.numerator, stage.denominator) == AAP_STAGE_COUNTS[stage.key]
@@ -807,6 +818,7 @@ def test_cr2_stage_definitions_match_the_aap_funnel() -> None:
 def test_cr2_stage_rates_use_each_stage_own_denominator_against_the_account_baseline(
     make_context: ContextFactory, name: str
 ) -> None:
+    """CR2 stage rates: pooled in each stage's own denominator, against the account baseline."""
     run = _evaluate(make_context, name)
     item = run.cr3()
     rows = _stage_rows(item)
@@ -829,6 +841,7 @@ def test_cr2_stage_rates_use_each_stage_own_denominator_against_the_account_base
 def test_cr2_non_lead_gen_campaign_uses_the_click_rate_only(
     make_context: ContextFactory,
 ) -> None:
+    """CR2 non-lead-gen: only the click rate is staged, and CR1 compares clicks / impressions."""
     run = _evaluate(make_context, "cr2.click_only.case")
     campaign = run.ctx.campaigns[run.campaign_id()]
     assert campaign.objective_group != OBJ_LINKEDIN_LEAD_GEN
@@ -862,6 +875,7 @@ def test_cr2_non_lead_gen_campaign_uses_the_click_rate_only(
 def test_cr2_weak_stage_has_its_wilson_upper_bound_below_the_account_baseline(
     make_context: ContextFactory,
 ) -> None:
+    """CR2 weak stage: its Wilson upper bound is below the account baseline, as its reason says."""
     run = _evaluate(make_context, "cr2.weak_stage.fires")
     cr = run.cr
     item = run.cr3()
@@ -897,6 +911,7 @@ def test_cr2_weak_stage_has_its_wilson_upper_bound_below_the_account_baseline(
 def test_cr2_twin_with_no_stage_below_its_baseline_reports_none(
     make_context: ContextFactory,
 ) -> None:
+    """CR2 none: no upper bound below baseline gives "No stage measurably below baseline"."""
     run = _evaluate(make_context, "cr2.weak_stage.does_not_fire")
     item = run.cr3()
     assert item.reason == NO_WEAK_STAGE_TEXT == "No stage measurably below baseline"
@@ -912,6 +927,7 @@ def test_cr2_twin_with_no_stage_below_its_baseline_reports_none(
 def test_cr2_reports_the_largest_relative_shortfall_among_weak_stages(
     make_context: ContextFactory,
 ) -> None:
+    """CR2 several weak stages: the stage with the largest relative shortfall is reported."""
     order = list(AAP_STAGE_COUNTS)
     several_weak = 0
     not_first_weak = 0
@@ -957,6 +973,7 @@ def _required(cr: _Cr, baseline: Decimal) -> int | None:
 
 
 def test_cr3_stage_variables_are_the_aap_mapping() -> None:
+    """CR3 mapping: click -> headline, open -> CTA label, completion -> number of form questions."""
     assert dict(STAGE_VARIABLE) == AAP_STAGE_VARIABLE
     labels = dict(TEST_ELEMENTS)
     assert {key: labels[key] for key in STAGE_VARIABLE_KEY.values()} == {
@@ -977,6 +994,7 @@ def test_cr3_stage_variables_are_the_aap_mapping() -> None:
 def test_cr3_next_test_changes_exactly_one_variable_for_its_stage(
     make_context: ContextFactory, name: str, stage: str
 ) -> None:
+    """CR3 one variable per stage: only it changes; an open-rate test changes only the CTA label."""
     run = _evaluate(make_context, name)
     item = run.cr3()
     next_test = item.evidence.extra["next_test"]
@@ -1006,6 +1024,7 @@ def test_cr3_next_test_changes_exactly_one_variable_for_its_stage(
 def test_cr3_without_a_weak_stage_tests_the_lowest_stage_relative_to_baseline_as_exploratory(
     make_context: ContextFactory, name: str
 ) -> None:
+    """CR3 exploratory: with no weak stage, the stage lowest relative to baseline is tested."""
     run = _evaluate(make_context, name)
     item = run.cr3()
     rows = item.evidence.extra["stages"]
@@ -1032,6 +1051,7 @@ def test_cr3_without_a_weak_stage_tests_the_lowest_stage_relative_to_baseline_as
 def test_cr3_click_and_open_rate_tests_are_sized_in_impressions_per_variant(
     make_context: ContextFactory, name: str
 ) -> None:
+    """CR3 units: click- and open-rate tests are sized in impressions per variant, then days."""
     run = _evaluate(make_context, name)
     cr = run.cr
     _aap_levels(cr)
@@ -1058,6 +1078,7 @@ def test_cr3_click_and_open_rate_tests_are_sized_in_impressions_per_variant(
 def test_cr3_completion_rate_test_is_sized_in_form_opens_and_projected_to_impressions(
     make_context: ContextFactory,
 ) -> None:
+    """CR3 units: a completion-rate sample is in form opens, projected to impressions, then days."""
     run = _evaluate(make_context, "cr3.completion.case")
     cr = run.cr
     _aap_levels(cr)
@@ -1115,6 +1136,7 @@ def test_cr3_completion_rate_test_is_sized_in_form_opens_and_projected_to_impres
 def test_cr3_sample_is_not_estimable_with_its_reason(
     make_context: ContextFactory, name: str, reason: str
 ) -> None:
+    """CR3 not estimable: zero baseline or target above 100% replaces the sample with its reason."""
     run = _evaluate(make_context, name)
     cr = run.cr
     item = run.cr3()
@@ -1135,6 +1157,7 @@ def test_cr3_sample_is_not_estimable_with_its_reason(
 
 
 def test_cr3_stage_with_zero_exposure_is_never_tested(make_context: ContextFactory) -> None:
+    """CR3 zero exposure: the stage without form opens is not tested; sizing it is not estimable."""
     run = _evaluate(make_context, "cr3.zero_exposure.case")
     item = run.cr3()
     rows = _stage_rows(item)
@@ -1166,6 +1189,7 @@ def test_cr3_stage_with_zero_exposure_is_never_tested(make_context: ContextFacto
 
 
 def test_cr3_sizing_helper_names_every_missing_input(thresholds: Thresholds) -> None:
+    """CR3 sizing: a missing baseline, open rate or delivery names its not-estimable reason."""
     config = CreativeConfig.from_thresholds(thresholds)
     baseline = Decimal("0.2")
     needed = stats.required_n(
@@ -1233,6 +1257,7 @@ def test_cr3_sizing_helper_names_every_missing_input(thresholds: Thresholds) -> 
 def test_variants_minimum_admits_1000_impressions_and_excludes_999(
     make_context: ContextFactory,
 ) -> None:
+    """Variants: 1,000 impressions admit a creative; 999 exclude it and the campaign is withheld."""
     admitted = _evaluate(make_context, "cr.variants.fires")
     excluded = _evaluate(make_context, "cr.variants.does_not_fire")
     cr = admitted.cr
@@ -1255,6 +1280,7 @@ def test_variants_minimum_admits_1000_impressions_and_excludes_999(
 def test_variants_minimum_is_read_from_the_configuration(
     make_context: ContextFactory, make_thresholds: ThresholdsFactory
 ) -> None:
+    """Variants minimum from configuration: cr.min_impressions 999 admits 999 impressions."""
     lowered = make_thresholds({"cr.min_impressions": 999})
     run = _evaluate(make_context, "cr.variants.does_not_fire", thresholds=lowered)
     assert run.cr.min_impressions == 999
@@ -1268,6 +1294,7 @@ def test_variants_minimum_is_read_from_the_configuration(
 def test_campaign_with_one_variant_has_no_group_and_is_withheld(
     scenario: Scenario, make_context: ContextFactory
 ) -> None:
+    """Variants: a one-variant campaign has no items and CR1 withheld at 1 of cr.min_variants."""
     run = _evaluate(make_context, scenario)
     assert run.items(campaign=BASELINE_CAMPAIGN) == []
     (line,) = run.withheld(BASELINE_CAMPAIGN)
@@ -1283,6 +1310,7 @@ def test_campaign_with_one_variant_has_no_group_and_is_withheld(
 def test_campaign_block_holds_its_cr3_item_first_then_every_variant_pair(
     make_context: ContextFactory, name: str
 ) -> None:
+    """CR3/CR1 order: a campaign block holds its CR3 item first, then each CR1 variant pair once."""
     run = _evaluate(make_context, name)
     groups: dict[str, list[Candidate]] = {}
     for item in run.result.candidates:
@@ -1323,6 +1351,7 @@ def test_campaign_block_holds_its_cr3_item_first_then_every_variant_pair(
 def test_variants_table_lists_impressions_stage_rates_and_leads_per_variant(
     make_context: ContextFactory, name: str
 ) -> None:
+    """Variants table: each variant's impressions, clicks, form opens, leads and stage rates."""
     run = _evaluate(make_context, name)
     item = run.cr3()
     lead_gen = run.ctx.campaigns[run.campaign_id()].objective_group == OBJ_LINKEDIN_LEAD_GEN
@@ -1369,6 +1398,7 @@ def _with_totals(run: _Run, changes: Mapping[str, Mapping[str, Any]]) -> _Run:
 def test_unreported_form_opens_leave_their_stages_unmeasured_never_zero(
     make_context: ContextFactory,
 ) -> None:
+    """CR2 unreported form opens: the open and completion stages are unmeasured, never 0."""
     run = _with_totals(
         _evaluate(make_context, "cr3.completion.case"), {"cr-a": {"form_opens": None}}
     )
@@ -1403,6 +1433,7 @@ def test_unreported_form_opens_leave_their_stages_unmeasured_never_zero(
 def test_unreported_leads_make_the_pair_untestable_and_say_why(
     make_context: ContextFactory,
 ) -> None:
+    """CR1 unreported leads: the pair is untested and not estimable, citing "leads not reported"."""
     run = _with_totals(
         _evaluate(make_context, "cr1.distinguishable.fires"), {"cr-b": {"leads": None}}
     )
@@ -1422,6 +1453,7 @@ def test_unreported_leads_make_the_pair_untestable_and_say_why(
 
 
 def test_inconsistent_counts_are_never_compared(make_context: ContextFactory) -> None:
+    """CR1/CR2 inconsistent counts: leads above impressions are never compared or measured."""
     base = _evaluate(make_context, "cr1.distinguishable.fires")
     impressions = base.totals("cr-a").impressions
     run = _with_totals(base, {"cr-a": {"leads": impressions + 1}})
@@ -1439,6 +1471,7 @@ def test_inconsistent_counts_are_never_compared(make_context: ContextFactory) ->
 def test_next_test_is_withheld_when_no_stage_can_be_compared_with_a_baseline(
     make_context: ContextFactory,
 ) -> None:
+    """CR3 withheld: no CR3 item when no stage can be measured against an account baseline."""
     base = _evaluate(make_context, "cr1.distinguishable.fires")
     pooled_impressions = sum(row.impressions for row in base.variant_totals())
     run = _with_totals(base, {"cr-a": {"clicks": pooled_impressions + 1, "form_opens": None}})
@@ -1454,6 +1487,7 @@ def test_next_test_is_withheld_when_no_stage_can_be_compared_with_a_baseline(
 def test_delivery_projection_is_not_estimable_without_delivery_days(
     make_context: ContextFactory,
 ) -> None:
+    """CR3 projection: without delivery days the sample stands but the days are not estimable."""
     run = _with_totals(
         _evaluate(make_context, "cr3.click.case"),
         {"cr-a": {"delivery_days": 0}, "cr-b": {"delivery_days": 0}},
@@ -1472,6 +1506,7 @@ def test_delivery_projection_is_not_estimable_without_delivery_days(
 def test_cr3_sample_is_not_estimable_when_no_sample_reaches_the_power(
     thresholds: Thresholds,
 ) -> None:
+    """CR3 power: a 1E-200 baseline no sample can test is not estimable; 0.012 is estimable."""
     config = CreativeConfig.from_thresholds(thresholds)
     reachable = plan_next_test(
         "click_rate",
@@ -1507,6 +1542,7 @@ _VALID_CONFIG: Final[Mapping[str, Any]] = {
 
 
 def test_creative_config_reads_the_shipped_cr_thresholds(thresholds: Thresholds) -> None:
+    """Config: CreativeConfig reads the shipped cr.* thresholds at their expected values."""
     assert CreativeConfig.from_thresholds(thresholds) == CreativeConfig(**_VALID_CONFIG)
 
 
@@ -1525,5 +1561,6 @@ def test_creative_config_reads_the_shipped_cr_thresholds(thresholds: Thresholds)
 def test_creative_config_rejects_values_the_statistics_cannot_use(
     field: str, value: object, key: str
 ) -> None:
+    """Config: each cr.* value the statistics cannot use raises ValueError naming its key."""
     with pytest.raises(ValueError, match=re.escape(key)):
         CreativeConfig(**{**_VALID_CONFIG, field: value})

@@ -1259,7 +1259,6 @@ def _dependent_subjects(item: Recommendation) -> frozenset[SubjectRef]:
 
 
 def _dataset_source(name: str) -> str:
-    """Return the source prefix of a dataset name (``google.metrics_daily`` → ``google``)."""
     return name.split(".", 1)[0]
 
 
@@ -1398,7 +1397,6 @@ def _item_view(
 
 
 def _banner(code: str, message: str, count: int | None = None) -> BannerView:
-    """Build a banner with its code's tone."""
     return BannerView(code=code, tone=BANNER_TONES[code], message=message, count=count)
 
 

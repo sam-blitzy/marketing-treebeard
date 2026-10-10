@@ -506,11 +506,13 @@ function escapeRegExp(text: string): string {
 }
 
 /**
- * An attribute selector matching `value` exactly, whatever characters it holds, such as the
- * colons of a React-generated id.
+ * An attribute selector matching `value` exactly, for the generated ids this spec passes, such as
+ * a React `useId` id or a sanitized group anchor. `JSON.stringify` quotes `value` as a CSS string,
+ * which is exact only while it holds no control character (U+0000–U+001F) and no lone surrogate:
+ * JSON escapes those in forms CSS reads differently.
  *
  * @param attribute - The attribute name.
- * @param value - Its exact value.
+ * @param value - Its exact value: a generated id, never arbitrary text.
  * @returns For example `[id="item-12"]`.
  */
 function attributeSelector(attribute: string, value: string): string {

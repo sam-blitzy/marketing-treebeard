@@ -67,6 +67,7 @@ from datetime import UTC, datetime
 from typing import Final
 
 from pydantic import ValidationError
+from pydantic_core import ErrorDetails
 
 from ads_engine import __version__
 from ads_engine.analysis.lock import RunInProgress
@@ -83,7 +84,7 @@ from ads_engine.analysis.window import AnalysisWindow
 from ads_engine.db.repositories import enqueue_analysis_request, sync_content_assets
 from ads_engine.db.session import dispose_engine, session_scope
 from ads_engine.logging import configure_logging, get_logger, logged_as
-from ads_engine.settings import SOURCES, Settings, get_settings
+from ads_engine.settings import SOURCES, VALIDATOR_MESSAGES, Settings, get_settings
 from ads_engine.sync.mode import BootstrapReport, bootstrap_sources
 from ads_engine.sync.scheduler import JOB_FAILURES, Scheduler
 
@@ -119,6 +120,27 @@ EXIT_FAILURE: Final = 1
 """Exit code of an invalid environment, an invalid configuration file or a fatal defect."""
 
 _STOP_SIGNALS: Final[tuple[signal.Signals, ...]] = (signal.SIGTERM, signal.SIGINT)
+
+# The pydantic error types a Settings field produces whose message pydantic renders from its
+# own template and the field's declared constraints alone (``ge``, the allowed literals), so
+# it never carries the input; for example "Input should be greater than or equal to 1".
+_TEMPLATE_ERROR_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        "missing",
+        "string_type",
+        "int_type",
+        "int_parsing",
+        "int_parsing_size",
+        "int_from_float",
+        "greater_than_equal",
+        "literal_error",
+        "list_type",
+    }
+)
+# Pydantic's prefix of a ``value_error`` message, kept so the text reads as it always has.
+_VALUE_ERROR_PREFIX: Final = "Value error, "
+# The problem of any other error: a validator's own text that may quote the value it rejects.
+_WITHHELD_PROBLEM: Final = "Invalid value; its message is withheld because it may quote the value"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -533,15 +555,51 @@ async def _run(settings: Settings) -> int:
     return EXIT_OK
 
 
+def _settings_problem(error: ErrorDetails) -> str:
+    """Return the value-free ``problem`` text of one settings validation error.
+
+    Only allowlisted text is returned, never an arbitrary message:
+
+    * pydantic's own message for a type in :data:`_TEMPLATE_ERROR_TYPES`, rendered from its
+      template and the field's declared constraints;
+    * ``"Value error, "`` and the validator's message for a ``value_error`` whose message is
+      one of :data:`~ads_engine.settings.VALIDATOR_MESSAGES`;
+    * :data:`_WITHHELD_PROBLEM` for anything else (another ``value_error``, an
+      ``assertion_error`` or a custom type), whose text may quote the value it rejects.
+
+    Example::
+
+        _settings_problem(error)  # 'Value error, GOOGLE_ADS_CUSTOMER_ID must be 10 digits'
+
+    Args:
+        error: One entry of :meth:`pydantic.ValidationError.errors`.
+
+    Returns:
+        The problem to log for ``error``.
+    """
+    error_type = error["type"]
+    if error_type in _TEMPLATE_ERROR_TYPES:
+        return error["msg"]
+    if error_type == "value_error":
+        context = error.get("ctx") or {}
+        message = str(context.get("error", ""))
+        if message in VALIDATOR_MESSAGES:
+            return _VALUE_ERROR_PREFIX + message
+    return _WITHHELD_PROBLEM
+
+
 def _log_invalid_settings(exc: ValidationError) -> None:
     """Log an invalid environment as one ``worker_settings_invalid`` ERROR line on stdout.
 
     Logging is configured first from the documented defaults (``Settings.model_construct()``),
     so the environment that failed validation is not read again, and the line is written to
     stdout, the worker's log stream, as one redacted JSON object like every other worker line.
-    The event carries ``error_count`` and ``errors``: per error, the ``variable`` (the field
-    name upper-cased, as in the environment) and pydantic's ``problem`` text. The errors are
-    built with ``include_input=False`` and ``include_url=False``, so no value is ever echoed.
+    The redactor then knows none of the environment's secrets, so no supplied value may reach
+    the line. The event carries ``error_count`` and ``errors``: per error, the ``variable``
+    (the field name upper-cased, as in the environment) and a ``problem`` built only from
+    allowlisted, value-free text (:func:`_settings_problem`). An error's ``msg`` is never
+    passed through unchecked: ``include_input=False`` drops only pydantic's ``input`` field,
+    not text a validator wrote into its message.
 
     Args:
         exc: The settings validation error.
@@ -550,7 +608,7 @@ def _log_invalid_settings(exc: ValidationError) -> None:
     errors = [
         {
             "variable": (".".join(str(part) for part in error["loc"]) or "settings").upper(),
-            "problem": error["msg"],
+            "problem": _settings_problem(error),
         }
         for error in exc.errors(include_input=False, include_url=False)
     ]

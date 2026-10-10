@@ -74,7 +74,6 @@ _RATE_LIMITED_MESSAGE: Final = "Too many login attempts; try again later"
 
 
 def _invalid_credentials() -> ApiError:
-    """Build the single 401 every credential failure returns, whatever its cause."""
     return ApiError(401, _INVALID_CREDENTIALS_CODE, _INVALID_CREDENTIALS_MESSAGE)
 
 

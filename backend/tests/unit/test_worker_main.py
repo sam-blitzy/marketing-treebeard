@@ -14,7 +14,9 @@ database, a real signal, a sleep or the real scheduler:
   ``startup``, a failure before the scheduler task is awaited, and a scheduler that returns;
 * ``main``: invalid settings, ``_run``'s exit code and a fatal error mapped to the process
   exit, with ``configure_logging`` and ``_run`` replaced, so nothing is launched; and the
-  invalid-settings line through the real logging pipeline, as one JSON object on stdout.
+  invalid-settings line through the real logging pipeline, as one JSON object on stdout. A
+  value pasted into a validated variable is never logged, and an error message off the
+  value-free allowlist is withheld.
 
 Every wait on the code under test is bounded by :data:`STEP_TIMEOUT`, so a regression fails
 fast instead of hanging. The worker's ``worker_fatal`` ownership cases are in
@@ -23,6 +25,7 @@ fast instead of hanging. The worker's ``worker_fatal`` ownership cases are in
 
 import asyncio
 import json
+import secrets
 import shutil
 import signal
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
@@ -34,12 +37,14 @@ from typing import Any, NoReturn, cast
 import pytest
 import structlog
 import yaml
+from pydantic import ValidationError
+from pydantic_core import InitErrorDetails, PydanticCustomError
 from structlog.testing import capture_logs
 from structlog.typing import EventDict
 
 import ads_engine
 from ads_engine.analysis.thresholds import ConfigError
-from ads_engine.logging import get_logger
+from ads_engine.logging import get_logger, redact
 from ads_engine.settings import Settings, get_settings
 from ads_engine.worker import main as worker_main
 
@@ -72,7 +77,31 @@ INVALID_ENVIRONMENT_ERRORS = [
     },
 ]
 
+# The `errors` of `worker_settings_invalid` when a value is pasted into DISPLAY_TIMEZONE and
+# among LINKEDIN_AD_ACCOUNT_IDS: each validator's whole message, which quotes neither value.
+VALUE_FREE_VALIDATOR_ERRORS = [
+    {
+        "variable": "DISPLAY_TIMEZONE",
+        "problem": "Value error, DISPLAY_TIMEZONE must be an IANA time zone name such as UTC or "
+        "America/New_York",
+    },
+    {
+        "variable": "LINKEDIN_AD_ACCOUNT_IDS",
+        "problem": "Value error, LINKEDIN_AD_ACCOUNT_IDS entries must be numeric ad account ids "
+        "or urn:li:sponsoredAccount:<digits>",
+    },
+]
+
+WITHHELD_PROBLEM = "Invalid value; its message is withheld because it may quote the value"
+"""The ``problem`` of an error whose message is not on the worker's value-free allowlist."""
+
 Handler = Callable[..., object]
+
+
+@pytest.fixture
+def sentinel() -> str:
+    """A high-entropy value made at run time, so no fixed token sits in the source."""
+    return "-".join(("worker", "sentinel", secrets.token_hex(16)))
 
 
 @pytest.fixture
@@ -994,6 +1023,170 @@ def test_the_invalid_environment_line_is_one_redacted_json_object_on_stdout(
     assert record["timestamp"].endswith("Z")
     for leaked in (SENTINEL_WEBHOOK_URL, "sentinel-workflow", SENTINEL_CUSTOMER_ID, "SENTINEL"):
         assert leaked not in out
+
+
+def test_a_value_pasted_into_a_validated_variable_is_never_logged(
+    monkeypatch: pytest.MonkeyPatch,
+    set_env: Callable[..., None],
+    entry: EntryCalls,
+    capsys: pytest.CaptureFixture[str],
+    sentinel: str,
+) -> None:
+    """A token in ``LINKEDIN_AD_ACCOUNT_IDS`` or ``DISPLAY_TIMEZONE`` is named, never echoed.
+
+    Both validators reject the value with their whole, value-free message, so the line keeps
+    what is wrong with each variable and drops what was supplied.
+    """
+    _replace_run(monkeypatch, entry, worker_main.EXIT_OK)
+    set_env(
+        LINKEDIN_AD_ACCOUNT_IDS=f"500000001,{sentinel}",
+        DISPLAY_TIMEZONE=f"Mars/{sentinel}",
+    )
+
+    with pytest.raises(SystemExit) as exited:
+        worker_main.main()
+
+    assert exited.value.code == worker_main.EXIT_FAILURE
+    assert exited.value.__cause__ is None
+    assert exited.value.__suppress_context__ is True
+    assert entry.log == [
+        {
+            "event": "worker_settings_invalid",
+            "log_level": "error",
+            "error_count": 2,
+            "errors": VALUE_FREE_VALIDATOR_ERRORS,
+        }
+    ]
+    assert entry.run == []
+    assert sentinel not in repr(entry.log)
+    assert capsys.readouterr() == ("", "")
+
+
+def test_a_pasted_value_stays_off_the_redacted_json_line_on_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+    set_env: Callable[..., None],
+    captured_logs: object,
+    capsys: pytest.CaptureFixture[str],
+    sentinel: str,
+) -> None:
+    """Through the real logging pipeline, a pasted value reaches neither stdout nor stderr.
+
+    The redactor configured from the defaults keeps the sentinel, as it keeps any value it was
+    not told about, so only the value-free problems keep it off the line. ``captured_logs`` is
+    requested only to restore the global logging state afterwards.
+    """
+    real_configure_logging = worker_main.configure_logging
+
+    def configure_without_cache(**kwargs: Any) -> None:
+        real_configure_logging(**kwargs)
+        # A logger first used under this configuration must not keep it after the test.
+        structlog.configure(cache_logger_on_first_use=False)
+
+    async def refuse_to_run(settings: Settings) -> int:
+        raise AssertionError("the worker ran with an invalid environment")
+
+    monkeypatch.setattr(worker_main, "configure_logging", configure_without_cache)
+    monkeypatch.setattr(worker_main, "_log", get_logger("ads_engine.worker.main"))
+    monkeypatch.setattr(worker_main, "_run", refuse_to_run)
+    set_env(
+        LINKEDIN_AD_ACCOUNT_IDS=f"500000001,{sentinel}",
+        DISPLAY_TIMEZONE=f"Mars/{sentinel}",
+    )
+
+    with pytest.raises(SystemExit) as exited:
+        worker_main.main()
+
+    assert exited.value.code == worker_main.EXIT_FAILURE
+    out, err = capsys.readouterr()
+    assert err == ""
+    (record,) = [json.loads(line) for line in out.splitlines()]
+    assert record == {
+        "event": "worker_settings_invalid",
+        "level": "error",
+        "logger": "ads_engine.worker.main",
+        "timestamp": record["timestamp"],
+        "error_count": 2,
+        "errors": VALUE_FREE_VALIDATOR_ERRORS,
+    }
+    assert sentinel in str(redact(f"got {sentinel!r}"))
+    for written in (out, err, repr(record["errors"])):
+        assert sentinel not in written
+
+
+def test_a_message_off_the_allowlist_is_withheld(entry: EntryCalls, sentinel: str) -> None:
+    """Only allowlisted, value-free text becomes a ``problem``; any other message is withheld.
+
+    A ``value_error`` whose message is not one of the settings validators' own (even one that
+    starts like one), an ``assertion_error`` and a custom error type each carry the sentinel in
+    their message, and each is logged as the withheld problem. A pydantic template message and
+    an allowlisted validator message keep their text.
+    """
+    line_errors: list[InitErrorDetails] = [
+        {
+            "type": "value_error",
+            "loc": ("linkedin_ad_account_ids",),
+            "input": sentinel,
+            "ctx": {"error": ValueError(f"entry {sentinel!r} is not numeric")},
+        },
+        {
+            "type": "value_error",
+            "loc": ("google_ads_customer_id",),
+            "input": sentinel,
+            "ctx": {"error": ValueError(f"GOOGLE_ADS_CUSTOMER_ID must be 10 digits; {sentinel}")},
+        },
+        {
+            "type": "assertion_error",
+            "loc": ("display_timezone",),
+            "input": sentinel,
+            "ctx": {"error": AssertionError(f"zone {sentinel} is unknown")},
+        },
+        {
+            "type": PydanticCustomError("sentinel_echo", "rejected {value}", {"value": sentinel}),
+            "loc": ("app_admin_email",),
+            "input": sentinel,
+        },
+        {
+            "type": "greater_than_equal",
+            "loc": ("backfill_days",),
+            "input": 0,
+            "ctx": {"ge": 1},
+        },
+        {
+            "type": "value_error",
+            "loc": ("google_ads_customer_id",),
+            "input": sentinel,
+            "ctx": {"error": ValueError("GOOGLE_ADS_CUSTOMER_ID must be 10 digits")},
+        },
+    ]
+    error = ValidationError.from_exception_data("Settings", line_errors)
+    # Each withheld message really quotes the sentinel, so withholding is what keeps it out.
+    assert all(sentinel in detail["msg"] for detail in error.errors()[:4])
+
+    worker_main._log_invalid_settings(error)
+
+    assert len(entry.configure_logging) == 1
+    assert entry.log == [
+        {
+            "event": "worker_settings_invalid",
+            "log_level": "error",
+            "error_count": 6,
+            "errors": [
+                {"variable": "LINKEDIN_AD_ACCOUNT_IDS", "problem": WITHHELD_PROBLEM},
+                {"variable": "GOOGLE_ADS_CUSTOMER_ID", "problem": WITHHELD_PROBLEM},
+                {"variable": "DISPLAY_TIMEZONE", "problem": WITHHELD_PROBLEM},
+                {"variable": "APP_ADMIN_EMAIL", "problem": WITHHELD_PROBLEM},
+                {
+                    "variable": "BACKFILL_DAYS",
+                    "problem": "Input should be greater than or equal to 1",
+                },
+                {
+                    "variable": "GOOGLE_ADS_CUSTOMER_ID",
+                    "problem": "Value error, GOOGLE_ADS_CUSTOMER_ID must be 10 digits",
+                },
+            ],
+        }
+    ]
+    assert sentinel not in repr(entry.log)
 
 
 def test_a_graceful_run_returns_normally_after_logging_worker_starting(

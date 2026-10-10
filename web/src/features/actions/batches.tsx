@@ -280,9 +280,12 @@ export interface Batches<T> {
  * The state of one bounded list: which entries to render, how to reveal more and where focus and
  * scrolling go afterwards (see the module overview).
  *
- * The number of shown entries is always a whole number of batches. It never shrinks while the
- * list stays mounted: when the entries change, such as after a poll or once feedback hides a
- * card, the same number of leading entries stays shown.
+ * The hook keeps a reveal limit, a whole number of batches: one batch on mount, or every batch
+ * through the entry the hash names. While the list stays mounted the limit never shrinks; it
+ * grows by one batch per reveal and through the entry a `hashchange` names. The shown entries are
+ * the first `min(limit, entries.length)` of the current list, so the last batch can be short, and
+ * a list that shrinks, such as after a poll or once feedback hides a card, shows fewer entries.
+ * When the list grows again, up to the same limit is shown.
  *
  * @param entries - the list, in the order it must render (the API's rank order); never re-sorted
  * @param options - see {@link BatchOptions}

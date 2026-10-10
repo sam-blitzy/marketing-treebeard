@@ -373,8 +373,9 @@ export interface HistoricalItemsProps {
  * Renders a `Stack` with this `id`, exposed as a group named "Computed from replaced data
  * ({count})", whose first line shows that name, followed by the children. The block is never
  * collapsed. Each card inside keeps its own badge, original provenance and disabled actions,
- * which the card renders. The held disclosure therefore holds only items a discrepancy holds,
- * whose resolution can make them current again.
+ * which the card renders. The held disclosure therefore holds only non-historical items a
+ * discrepancy holds, which wait on that discrepancy's resolution, and the rerun it triggers,
+ * before they can be trusted.
  *
  * Exported so a section that builds a group body of its own (Campaigns' discrepancy group) uses
  * the same block.
@@ -449,8 +450,9 @@ export interface HeldDisclosureProps {
  * none of its cards. Once mounted they stay mounted, hidden, while the region is collapsed
  * again, so a held card keeps its local state across a collapse.
  *
- * Only items a discrepancy holds ({@link isHeld}) belong here, because resolving it can make
- * them current. Items computed from replaced data go in {@link HistoricalItems} instead.
+ * Only non-historical items a discrepancy holds ({@link isHeld}) belong here: they wait on that
+ * discrepancy's resolution, and the rerun it triggers, before they can be trusted. Items computed
+ * from replaced data go in {@link HistoricalItems} instead.
  *
  * Exported so a section that renders held rows in a table of their own (White papers) puts them
  * behind the same control.
@@ -922,11 +924,11 @@ export function SectionFrame({
         const content = renderGroup === undefined ? part.body : renderGroup(part.group, part);
         shownGroups.push({ part, content });
       } else {
-        // Empty groups are left out by default. renderEmptyGroup is an additive hook beyond the
-        // specified props: the overlay can report a discrepancy detected after the run while
-        // the run's discrepancy group is empty, and the section that holds the overlay
-        // (Campaigns) can then keep DISCREPANCY_GROUP_ANCHOR as the target of the banner's and
-        // held cards' links instead of leaving them pointing at nothing.
+        // Empty groups are left out by default; renderEmptyGroup lets a section render one anyway.
+        // The overlay can report a discrepancy detected after the run while the run's discrepancy
+        // group is empty, and the section that holds the overlay (Campaigns) can then keep
+        // DISCREPANCY_GROUP_ANCHOR as the target of the banner's and held cards' links instead of
+        // leaving them pointing at nothing.
         const fallback = renderEmptyGroup?.(part.group, part);
         if (hasContent(fallback)) {
           shownGroups.push({ part, content: fallback });

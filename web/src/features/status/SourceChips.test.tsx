@@ -90,7 +90,7 @@ describe('latestSuccess', () => {
     const source = makeSource('linkedin', {
       datasets: [
         freshnessRow('linkedin.entities', '2026-10-06T05:30:00Z'),
-        // 06:00 UTC: later in time, although it sorts before the first as a string.
+        // 06:00 UTC: the newest of the three in time.
         freshnessRow('linkedin.leads', '2026-10-06T08:00:00+02:00'),
         freshnessRow('linkedin.segments', '2026-10-06T07:00:00+02:00'),
       ],

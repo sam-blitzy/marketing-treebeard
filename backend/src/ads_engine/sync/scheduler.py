@@ -763,8 +763,10 @@ class TickReport:
         probed: The sources a recovery probe ran for.
         sync_requests: The sources whose pending ``sync_request`` was claimed.
         purged: The retired datasets the purge deleted.
-        google_calls_24h: The Google webhook calls counted in the sliding 24 h, or ``None``
-            when the refresh failed.
+        google_calls_24h: The Google webhook call reservations still counting in the call
+            budget's sliding 24 h window (``GoogleCallBudget.used_24h``), a conservative
+            upper bound on the calls admitted in the trailing 24 h; ``None`` when the
+            refresh failed.
         analysis_run_id: The default run computed from coalesced requests, or ``None``.
         analysis_deferred: Whether pending requests were left for the next tick because
             another process held the ``analysis`` lock.
@@ -899,7 +901,6 @@ def _join_reasons(reasons: Iterable[str]) -> str:
 
 
 def _truncate(value: str, limit: int = _ERROR_LIMIT) -> str:
-    """Cut ``value`` to ``limit`` characters for a ``sync_run.error``."""
     return value if len(value) <= limit else value[: limit - 1] + "…"
 
 
@@ -1952,7 +1953,6 @@ class Scheduler:
         return _aware(self._clock(), "the scheduler clock")
 
     def _sessions(self) -> async_sessionmaker[AsyncSession]:
-        """The controller's session factory (injected, or the process-wide one)."""
         return self._controller.sessionmaker
 
     # -- the loop ----------------------------------------------------------------------------

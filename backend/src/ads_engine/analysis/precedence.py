@@ -498,7 +498,6 @@ def _withheld_order(item: Withheld) -> tuple[Any, ...]:
 
 
 def _source_order(source: str) -> int:
-    """A source's position in :data:`_SOURCE_ORDER`."""
     return _SOURCE_ORDER.index(source) if source in _SOURCE_ORDER else len(_SOURCE_ORDER)
 
 
@@ -873,7 +872,6 @@ def _parties(
 
 
 def _subject_json(key: SubjectKey) -> dict[str, Any]:
-    """A subject key as ``{type, id}``, the shape the overlay and API read."""
     return {"type": key[0], "id": key[1]}
 
 
@@ -1051,7 +1049,6 @@ def _reallocate(
 
 
 def _first_part(external_id: str) -> str:
-    """The leading ``|``-separated part of a composite entity key."""
     return external_id.split("|", 1)[0]
 
 

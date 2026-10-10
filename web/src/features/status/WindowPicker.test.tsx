@@ -20,10 +20,12 @@
  * `router.state.location`. `mockApi` is imported before `../../test/render` and Testing Library,
  * so its unmatched-request check runs after Testing Library's cleanup.
  *
- * Window lengths appear in this file only as fixture inputs. Wherever a test asserts which
- * presets the picker offers, which one is the default, or which window a preset posts, the
- * expectation is derived from the fixture configuration ({@link fixtureWindow}) and the fixture
- * default run ({@link defaultRun}), never written as a UI default of its own.
+ * Most expectations about the default contract (which presets the picker offers, which one is
+ * the default, and which window a preset posts) are derived from the fixture configuration
+ * ({@link fixtureWindow}) and the fixture default run ({@link defaultRun}). Selected cases
+ * deliberately pin literal labels or hand-computed dates, so the labelling and the date
+ * arithmetic are checked independently of {@link presetLabel} and `presetWindow`. None of those
+ * literals is a UI default of the client.
  */
 import { apiError, html, json, mockApi } from '../../test/mockApi';
 import type { ApiMock, MockHandlers, MockResponse, RecordedCall } from '../../test/mockApi';
@@ -188,7 +190,7 @@ async function presetsShown(): Promise<void> {
   });
 }
 
-/** The accessible names of the preset group's buttons, in order. */
+/** The text labels (`textContent`) of the preset group's buttons, in order. */
 function presetNames(): string[] {
   const group = screen.getByRole('group', { name: 'Analysis window' });
   return within(group)

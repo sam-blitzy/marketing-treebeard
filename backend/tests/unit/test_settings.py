@@ -6,6 +6,7 @@ No test performs network or database I/O.
 """
 
 import os
+import secrets
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import cast, get_args
@@ -22,6 +23,7 @@ from ads_engine.settings import (
     HUBSPOT_API_VERSION,
     LINKEDIN_API_VERSION,
     SOURCES,
+    VALIDATOR_MESSAGES,
     ConfigurationError,
     DataMode,
     Settings,
@@ -83,6 +85,20 @@ def _set_env(monkeypatch: pytest.MonkeyPatch, env: Mapping[str, str]) -> None:
     """Export each variable in ``env`` for the current test only."""
     for name, value in env.items():
         monkeypatch.setenv(name, value)
+
+
+def _validator_messages(error: ValidationError) -> list[str]:
+    """Return the message each ``value_error`` of ``error`` was raised with, in order."""
+    return [
+        str(detail["ctx"]["error"])
+        for detail in error.errors(include_input=False, include_url=False)
+        if detail["type"] == "value_error"
+    ]
+
+
+def _sentinel() -> str:
+    """A high-entropy value made at run time, so no fixed token sits in the source."""
+    return "-".join(("settings", "sentinel", secrets.token_hex(16)))
 
 
 @pytest.fixture(autouse=True)
@@ -529,8 +545,32 @@ def test_linkedin_account_id_that_is_not_numeric_is_rejected(
 ) -> None:
     monkeypatch.setenv("LINKEDIN_AD_ACCOUNT_IDS", raw)
 
-    with pytest.raises(ValidationError, match="LINKEDIN_AD_ACCOUNT_IDS entries must be numeric"):
+    with pytest.raises(
+        ValidationError, match="LINKEDIN_AD_ACCOUNT_IDS entries must be numeric"
+    ) as excinfo:
         Settings()
+
+    # The whole message is the fixed text, so no part of the rejected entry is in it.
+    assert _validator_messages(excinfo.value) == [
+        "LINKEDIN_AD_ACCOUNT_IDS entries must be numeric ad account ids or "
+        "urn:li:sponsoredAccount:<digits>"
+    ]
+
+
+def test_linkedin_account_id_rejection_never_quotes_the_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = _sentinel()
+    monkeypatch.setenv("LINKEDIN_AD_ACCOUNT_IDS", f"500000001,{sentinel}")
+
+    with pytest.raises(ValidationError) as excinfo:
+        Settings()
+
+    rendered = (
+        f"{excinfo.value}\n{excinfo.value!r}\n"
+        f"{excinfo.value.errors(include_input=False, include_url=False)!r}"
+    )
+    assert sentinel not in rendered
 
 
 def test_linkedin_account_ids_accept_a_list_or_tuple() -> None:
@@ -582,8 +622,29 @@ def test_display_timezone_that_is_not_an_iana_name_is_rejected(
 ) -> None:
     monkeypatch.setenv("DISPLAY_TIMEZONE", raw)
 
-    with pytest.raises(ValidationError, match="DISPLAY_TIMEZONE must be an IANA time zone name"):
+    with pytest.raises(
+        ValidationError, match="DISPLAY_TIMEZONE must be an IANA time zone name"
+    ) as excinfo:
         Settings()
+
+    # The whole message is the fixed text, so no part of the rejected name is in it.
+    assert _validator_messages(excinfo.value) == [
+        "DISPLAY_TIMEZONE must be an IANA time zone name such as UTC or America/New_York"
+    ]
+
+
+def test_display_timezone_rejection_never_quotes_the_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    sentinel = _sentinel()
+    monkeypatch.setenv("DISPLAY_TIMEZONE", f"Mars/{sentinel}")
+
+    with pytest.raises(ValidationError) as excinfo:
+        Settings()
+
+    rendered = (
+        f"{excinfo.value}\n{excinfo.value!r}\n"
+        f"{excinfo.value.errors(include_input=False, include_url=False)!r}"
+    )
+    assert sentinel not in rendered
 
 
 # ---------------------------------------------------------------------------
@@ -1152,6 +1213,86 @@ def test_validation_error_on_a_secret_field_never_echoes_it() -> None:
 
     rendered = f"{excinfo.value}\n{excinfo.value!r}"
     assert "test-session-secret-input" not in rendered
+
+
+# One failure of each Settings validator, with the message it must raise.
+VALIDATOR_FAILURES = [
+    pytest.param(
+        {"linkedin_ad_account_ids": 500000001},
+        "LINKEDIN_AD_ACCOUNT_IDS must be a comma-separated list of ad account ids",
+        id="linkedin-account-ids-type",
+    ),
+    pytest.param(
+        {"linkedin_ad_account_ids": "500000001,abc"},
+        "LINKEDIN_AD_ACCOUNT_IDS entries must be numeric ad account ids or "
+        "urn:li:sponsoredAccount:<digits>",
+        id="linkedin-account-id-entry",
+    ),
+    pytest.param(
+        {"google_ads_customer_id": "123-456-789"},
+        "GOOGLE_ADS_CUSTOMER_ID must be 10 digits",
+        id="google-ads-customer-id",
+    ),
+    pytest.param(
+        {"display_timezone": "Mars/Olympus_Mons"},
+        "DISPLAY_TIMEZONE must be an IANA time zone name such as UTC or America/New_York",
+        id="display-timezone",
+    ),
+    pytest.param(
+        {"app_base_url": "ftp://ads.example.test"},
+        "APP_BASE_URL must be an absolute http:// or https:// URL with a host, "
+        "such as http://localhost:8080",
+        id="app-base-url",
+    ),
+    pytest.param(
+        {"n8n_google_ads_webhook_url": "ftp://n8n.example.test/webhook/x"},
+        "N8N_GOOGLE_ADS_WEBHOOK_URL must be an absolute https:// URL "
+        "(plain http:// only on localhost or 127.0.0.1)",
+        id="webhook-url-form",
+    ),
+    pytest.param(
+        {"n8n_google_ads_webhook_url": "http://n8n.example.test/webhook/x"},
+        "N8N_GOOGLE_ADS_WEBHOOK_URL must use https:// unless it is a localhost or 127.0.0.1 URL",
+        id="webhook-url-plain-http",
+    ),
+    pytest.param(
+        {"n8n_webhook_secret_header": "X Webhook Secret"},
+        "N8N_WEBHOOK_SECRET_HEADER must be an HTTP header name made of RFC 7230 token "
+        "characters, such as X-Webhook-Secret",
+        id="webhook-secret-header",
+    ),
+    pytest.param(
+        {"app_admin_email": "admin"},
+        "APP_ADMIN_EMAIL must be an email address such as admin@example.com",
+        id="app-admin-email",
+    ),
+]
+
+
+@pytest.mark.parametrize(("values", "message"), VALIDATOR_FAILURES)
+def test_every_validator_rejection_is_an_allowlisted_message(
+    values: Mapping[str, object], message: str
+) -> None:
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(**values)
+
+    (detail,) = excinfo.value.errors(include_input=False, include_url=False)
+    assert detail["type"] == "value_error"
+    assert _validator_messages(excinfo.value) == [message]
+    assert message in VALIDATOR_MESSAGES
+
+
+def test_validator_messages_are_exactly_the_messages_the_validators_raise() -> None:
+    raised = {param.values[1] for param in VALIDATOR_FAILURES}
+
+    assert raised == VALIDATOR_MESSAGES
+    assert len(VALIDATOR_MESSAGES) == 9
+
+
+def test_validator_messages_carry_no_quoted_value_or_placeholder() -> None:
+    for message in VALIDATOR_MESSAGES:
+        assert not set(message) & set("'\"{}"), message
+        assert message == message.strip()
 
 
 def test_secret_values_lists_each_set_secret_once_in_field_order(

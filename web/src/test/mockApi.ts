@@ -24,15 +24,15 @@
  *
  * @example
  * ```tsx
- * import { apiError, json, mockApi, noContent } from '../../test/mockApi';
+ * import { apiError, json, mockApi } from '../../test/mockApi';
  *
  * const api = mockApi({
  *   'GET /auth/me': json(200, makeMe()),
  *   'GET /recommendations?run_id=101': json(200, makeRecommendationsPage()),
- *   'POST /recommendations/:id/feedback': noContent(),
+ *   'POST /recommendations/:id/feedback': json(201, makeFeedback('dismiss')),
  * });
- * // … render the page and dismiss card 1101 …
- * expect(api.calls.at(-1)?.params).toEqual({ id: '1101' });
+ * // … add handlers for the page's other reads, render it and dismiss card 1001 …
+ * expect(api.calls.find((call) => call.method === 'POST')?.params).toEqual({ id: '1001' });
  * api.use({ 'POST /runs': apiError(409, 'run_in_progress', 'An analysis is already running.') });
  * ```
  *
@@ -702,16 +702,16 @@ const stub: FetchImpl = (input, init) => {
  * @example
  * ```tsx
  * const api = mockApi({
- *   'GET /auth/me': json(200, makeMe()),
+ *   'GET /config': json(200, makeConfig()),
  *   'GET /runs/latest': json(200, makeRun()),
  *   'POST /runs': json(201, makeRun({ id: 202, kind: 'custom' })),
  * });
- * const { router } = await renderWithProviders(<WindowPicker />);
+ * const { router } = await renderWithProviders(<WindowPicker run={makeRun()} />);
  * // … choose a custom window and submit …
+ * await waitFor(() => expect(router.state.location.search).toEqual({ run: 202 }));
  * const post = api.calls.find((call) => call.method === 'POST' && call.path === '/runs');
  * expect(post?.headers.get('X-Requested-With')).toBe('ads-engine');
  * expect(post?.body).toEqual({ window_start: '2026-08-01', window_end: '2026-08-30' });
- * await waitFor(() => expect(router.state.location.search).toEqual({ run: 202 }));
  * ```
  */
 export function mockApi(handlers: MockHandlers): ApiMock {

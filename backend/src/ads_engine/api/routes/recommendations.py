@@ -3,7 +3,8 @@
 AAP 0.5.3 (``GET /recommendations?run_id=`` returning ``RecommendationsPage``;
 ``POST /recommendations/{id}/feedback``; "Where outputs are frozen"), 0.3.2 (the current-state
 overlay; historical-only items; a feedback write enqueues a default-window ``analysis_request``),
-0.5.2 (``recommendation_feedback``: dismiss 30 days, snooze 7 days, done 30 days; C0 exempt),
+0.5.2 (``recommendation_feedback``: suppression for ``feedback.dismiss_days``,
+``feedback.snooze_days`` or ``feedback.done_days``, defaults 30, 7 and 30 days; C0 exempt),
 0.5.5 (the ``/actions`` page) and 0.1.1 (the five sections render from precomputed runs in under
 2 s). Paths are relative to ``/api/v1``; ``api/app.py`` includes :data:`router` with that prefix
 and with the CSRF dependency, so the ``POST`` needs ``X-Requested-With: ads-engine`` without this
@@ -245,7 +246,6 @@ def _extra(evidence: object) -> Mapping[str, Any]:
 
 
 def _text(value: object) -> str | None:
-    """Return ``value`` when it is a non-blank string, else ``None``."""
     return value if isinstance(value, str) and value.strip() else None
 
 
@@ -280,7 +280,6 @@ def _stored_flags(row: Recommendation, extra: Mapping[str, Any]) -> list[dict[st
 
 
 def _current_flags(flags: Sequence[Flag]) -> list[dict[str, Any]]:
-    """Return the overlay's current flags, each with the overlay's own message."""
     return [_flag(flag.code, flag.message) for flag in flags]
 
 

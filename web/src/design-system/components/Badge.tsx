@@ -58,8 +58,11 @@ export interface BadgeProps {
  * Status and flag chip: renders one `<span>` carrying `ds-badge` and the modifier for its tone.
  *
  * The chip is static text, so it takes no role and no live region: assistive technology reads
- * its label in document order, like any other inline text. Use `Banner` for messages that must
- * be announced.
+ * its label in document order, like any other inline text. A changing message that must be
+ * announced belongs in a polite `role="status"` region (the role `Spinner` renders) that stays
+ * mounted while its text changes, as `ActionsPage` keeps for its state notices. `Banner` is
+ * silent content unless its `alert` prop sets `role="alert"`, which is reserved for the
+ * open-discrepancies banner (AAP 0.5.5).
  *
  * The component holds no state and has no effects; its output depends only on its props.
  *

@@ -123,7 +123,11 @@ export type SpaceStep = (typeof SPACE_STEPS)[number];
 /**
  * The semantic tones shared by `Badge` and `Banner` (AAP 0.4.2).
  *
- * `neutral` maps to the text and border colours (`tokens.color.text`, `tokens.color.border`).
+ * `neutral` has no colour token of its own: each wrapper defines its own neutral palette.
+ * `Badge` pairs muted text with the standard border (`tokens.color.textMuted`,
+ * `tokens.color.border`), so a neutral chip reads quieter than the signalling tones; `Banner`
+ * draws its inline-start edge in the border colour and its title in the text colour
+ * (`tokens.color.border`, `tokens.color.text`).
  * Every other tone maps to the colour token of the same name, `--color-{tone}`
  * (`tokens.color.info`, `tokens.color.warning`, `tokens.color.critical`,
  * `tokens.color.success`). A tone conveys meaning only together with its text label, never

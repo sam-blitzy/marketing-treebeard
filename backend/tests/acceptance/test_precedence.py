@@ -155,12 +155,12 @@ from ads_engine.db.models.ops import AppUser, SourceDataset
 from ads_engine.simulation.generator import SimulatedWorld
 from ads_engine.simulation.scenarios import (
     FIXED_ANCHOR,
-    FIXED_CLOCK,
     FIXED_NOW,
     MODULE_PRECEDENCE,
     SCENARIOS,
     FreshnessOverride,
     Scenario,
+    fixed_clock,
 )
 from ads_engine.sync import freshness, scheduler
 from ads_engine.sync.jobs import JOB_ENTITIES, run_source_jobs
@@ -509,7 +509,7 @@ def _controller(
     """
     return SourceModeController(
         world=world,
-        clock=FIXED_CLOCK,
+        clock=fixed_clock,
         transports=transports,
         # Duck-typed throttle: see _Unthrottled for why the connector's limiter is not imported.
         hubspot_limiter=_Unthrottled(),  # type: ignore[arg-type]

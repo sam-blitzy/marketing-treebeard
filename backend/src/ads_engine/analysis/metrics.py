@@ -286,7 +286,6 @@ def _choice[T: str](value: object, allowed: tuple[T, ...], what: str) -> T:
 
 
 def _optional_choice[T: str](value: object, allowed: tuple[T, ...], what: str) -> T | None:
-    """Return ``None`` for ``None``, otherwise :func:`_choice`."""
     return None if value is None else _choice(value, allowed, what)
 
 
@@ -1623,7 +1622,6 @@ def _contact_info(
     campaign_ref: str | None,
     touch_at: datetime | None,
 ) -> ContactInfo:
-    """Build a :class:`ContactInfo` from ``crm_contact`` columns."""
     return ContactInfo(
         hs_id=hs_id,
         lifecycle_stage=stage,
@@ -3776,7 +3774,6 @@ def _share_note(config: GateConfig, history: BudgetHistory) -> str:
 
 
 def _resolve_config(history: BudgetHistory, thresholds: Thresholds | None) -> GateConfig:
-    """The gate minimums to apply: ``thresholds`` when given, else the history's own."""
     return history.config if thresholds is None else GateConfig.from_thresholds(thresholds)
 
 

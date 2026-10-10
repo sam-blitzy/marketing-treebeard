@@ -911,7 +911,6 @@ def _utc_midnight(day: date) -> datetime:
 
 
 def _truncate(text: str, limit: int = _ERROR_MAX) -> str:
-    """Shorten ``text`` to ``limit`` characters with an ellipsis."""
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
@@ -931,7 +930,6 @@ def _join_reasons(reasons: Iterable[str | None]) -> str | None:
 
 
 def _plural(count: int, singular: str, plural: str) -> str:
-    """Return ``"<count> <noun>"`` with the noun agreeing in number."""
     return f"{count} {singular if count == 1 else plural}"
 
 
@@ -3413,7 +3411,6 @@ class _LinkedInAccountRead:
 
 
 def _amount(money: Money | None) -> Decimal | None:
-    """Return a LinkedIn ``Money``'s exact amount, or ``None`` when there is no budget."""
     return None if money is None else money.amount
 
 
@@ -3564,7 +3561,6 @@ def _scope_day(scope: Mapping[str, object], key: str) -> date:
 
 
 def _date_scope(start: date, end: date) -> Mapping[str, object]:
-    """Return the immutable dated scope ``{start, end}``."""
     return MappingProxyType({_SCOPE_START: start, _SCOPE_END: end})
 
 

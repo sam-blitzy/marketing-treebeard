@@ -9,9 +9,9 @@
  * own, so a Tab the dialog leaves to the browser shows as a keydown that is not prevented, and
  * the browser's step is simulated by focusing where the browser would go.
  *
- * The last block repeats the core contract with a `TextField` body and a footer action, the
- * shape `DecisionForm` gives the dialog on "Record decision", so the wrapper is also proven with
- * a real design-system field rather than a raw input alone.
+ * The last block repeats the core contract on a generic fixture, a `TextField` body plus a footer
+ * action, so the wrapper is also proven with a real design-system field rather than a raw input
+ * alone.
  *
  * @packageDocumentation
  */
@@ -940,9 +940,9 @@ describe('Dialog keyboard focus trap', () => {
 
 describe('Dialog with a TextField body (the DecisionForm case)', () => {
   /**
-   * A parent shaped like "Record decision": an opener outside the dialog, a `TextField` as the
-   * body's only tab stop and a submit action in the footer. The parent owns `open`, and
-   * `onClose` closes the dialog, as the usage contract requires.
+   * A generic parent: an opener outside the dialog, a `TextField` as the body's only tab stop and
+   * a plain button as the footer action. The parent owns `open`, and `onClose` closes the dialog,
+   * as the usage contract requires.
    */
   function DecisionFormHarness() {
     const [open, setOpen] = useState(false);

@@ -149,10 +149,11 @@ const IMPLICIT_SUBMISSION_TYPES: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Whether `element` is a stop in the page's sequential focus navigation order, judged as a
- * browser judges it and independently of the picker: a non-negative `tabIndex`, not a disabled
- * form control or a hidden input, and not inside a `[hidden]`, `[inert]` or `display: none`
- * subtree.
+ * Whether `element` is a stop in the simplified Tab model the picker fixtures need, judged
+ * independently of the picker: a non-negative `tabIndex`, not a disabled form control or a
+ * hidden input, and not inside a `[hidden]`, `[inert]` or `display: none` subtree. Browser focus
+ * rules no fixture here exercises, such as `visibility: hidden`, a radio group's single stop and
+ * shadow roots, are not modelled.
  */
 function isTabStop(element: HTMLElement): boolean {
   if (element.tabIndex < 0 || element.matches(':disabled')) {
@@ -173,8 +174,8 @@ function isTabStop(element: HTMLElement): boolean {
 }
 
 /**
- * The page's sequential focus navigation order: positive `tabIndex` stops in ascending order
- * (ties in tree order), then the `tabIndex` 0 stops in tree order.
+ * The modelled Tab order of the rendered picker's {@link isTabStop} stops: positive `tabIndex`
+ * stops in ascending order (ties in tree order), then the `tabIndex` 0 stops in tree order.
  */
 function tabOrder(): HTMLElement[] {
   const stops = Array.from(document.body.querySelectorAll('*')).filter(
@@ -187,9 +188,10 @@ function tabOrder(): HTMLElement[] {
 }
 
 /**
- * The stop a browser's Tab (or Shift+Tab) moves to from `from`: from the body, the first (last)
- * stop; from a stop, the next (previous) one; from a focused element outside the order, the
- * neighbouring stops of its place in tree order, as if it had `tabIndex` 0.
+ * The stop Tab (or Shift+Tab) moves to from `from` in the simplified Tab model: from the body,
+ * the first (last) stop of {@link tabOrder}; from a stop, the next (previous) one; from a focused
+ * element outside the order, the neighbouring stops of its place in tree order, as if it had
+ * `tabIndex` 0.
  *
  * @param from - the focused element
  * @param backwards - `true` for Shift+Tab
@@ -216,8 +218,8 @@ function nextTabStop(from: Element, backwards: boolean): HTMLElement | null {
 /**
  * Presses Tab (or Shift+Tab) on the focused element. A keydown that no handler prevents leaves the
  * step to the browser, so the browser's step is simulated: focus moves to the next (previous)
- * stop of the page's sequential focus navigation order. The keyup goes to the element focused
- * afterwards, as in a browser.
+ * stop of the modelled {@link tabOrder}. The keyup goes to the element focused afterwards, as in
+ * a browser.
  *
  * @param shiftKey - `true` for Shift+Tab
  * @returns the newly focused element, or `null` when a handler prevented the keydown or the

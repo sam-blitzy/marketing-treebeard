@@ -2358,7 +2358,6 @@ def shared_budget_veto(
 
 
 def _campaigns(ctx: AnalysisContext, source: Source) -> list[CampaignInfo]:
-    """Return the context's campaigns of one source, by id."""
     return sorted(
         (campaign for campaign in ctx.campaigns.values() if campaign.source == source),
         key=lambda campaign: campaign.id,

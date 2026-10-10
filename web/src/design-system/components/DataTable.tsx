@@ -379,7 +379,12 @@ function unavailableReason(naming: CaptionNaming, hasColumns: boolean): string |
  * ```tsx
  * const columns: readonly DataTableColumn<AssetRow>[] = [
  *   { key: 'asset', header: 'Asset', isRowHeader: true },
- *   { key: 'spend', header: 'Spend', align: 'end', render: (r) => formatMoney(r.spend) },
+ *   {
+ *     key: 'spend',
+ *     header: 'Spend',
+ *     align: 'end',
+ *     render: (r) => formatMoney(r.spend, r.currency),
+ *   },
  *   { key: 'mql', header: 'MQL (First meeting booked)', align: 'end' },
  *   { key: 'ql', header: 'Qualified Lead', align: 'end' },
  * ];

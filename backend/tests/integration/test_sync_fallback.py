@@ -107,7 +107,7 @@ from ads_engine.simulation import (
     is_simulated_id,
 )
 from ads_engine.simulation.generator import Fault, SimulatedWorld
-from ads_engine.simulation.scenarios import FIXED_CLOCK, FIXED_NOW, SCENARIOS, Scenario
+from ads_engine.simulation.scenarios import FIXED_NOW, SCENARIOS, Scenario, fixed_clock
 from ads_engine.simulation.transport import JournalEntry
 from ads_engine.sync import freshness, jobs
 from ads_engine.sync.budget_guard import GoogleCallBudget
@@ -353,7 +353,7 @@ class Rig:
             spec = spec.with_hubspot(**hubspot)
         if spec is not entry.spec:
             entry = dataclasses.replace(entry, spec=spec)
-        return self.make_world(entry, seed, clock=FIXED_CLOCK)
+        return self.make_world(entry, seed, clock=fixed_clock)
 
     def live(
         self,
@@ -619,7 +619,7 @@ def rig(
         live_credentials=live_credentials,
         waits=_Waits(),
         limiter=_InstantLimiter(),
-        simulated=make_world(BASE, clock=FIXED_CLOCK),
+        simulated=make_world(BASE, clock=fixed_clock),
     )
 
 

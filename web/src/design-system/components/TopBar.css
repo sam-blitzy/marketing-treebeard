@@ -56,8 +56,7 @@
  * shared line the auto margin takes the same free space space-between would, so the wide layout
  * is unchanged. min-inline-size: 0 and overflow-wrap: anywhere (inherited by the email and other
  * text children) let a long unbroken value, such as a signed-in email, shrink and break inside
- * the bar instead of overflowing a 320 CSS px viewport (WCAG 1.4.10 reflow); a browser check
- * measured a 49-character email overflowing to 376px without them.
+ * the bar instead of overflowing a 320 CSS px viewport (WCAG 1.4.10 reflow).
  */
 .ds-topbar__actions {
   display: flex;

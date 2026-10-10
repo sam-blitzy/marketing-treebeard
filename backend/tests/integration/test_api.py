@@ -1972,14 +1972,14 @@ def test_unparseable_environment_logs_startup_failed(
     assert budget not in output
 
 
-def test_startup_failed_withholds_the_input_a_validator_quotes(
+def test_startup_failed_logs_each_validator_message_whole_and_never_the_value(
     set_env: Callable[..., None], capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A validator's own message keeps its text but not the input it quotes (``got '...'``).
+    """A settings validator's message is logged whole, since it never quotes the value.
 
-    ``DISPLAY_TIMEZONE`` and ``LINKEDIN_AD_ACCOUNT_IDS`` quote the rejected value; each quoted
-    literal of a validator's message becomes ``<value withheld>``. Pydantic's own template
-    messages never quote the input, so ``DATA_MODE`` keeps the allowed values it lists.
+    ``DISPLAY_TIMEZONE`` and ``LINKEDIN_AD_ACCOUNT_IDS`` reject their values with fixed text,
+    so nothing is withheld from it and neither value appears. Pydantic's own template messages
+    never quote the input either, so ``DATA_MODE`` keeps the allowed values it lists.
     """
     zone, account, mode = "Mars/Olympus-0451", "acct-not-numeric-0451", "bogus-mode-0451"
     set_env(DISPLAY_TIMEZONE=zone, LINKEDIN_AD_ACCOUNT_IDS=account, DATA_MODE=mode)
@@ -1989,19 +1989,71 @@ def test_startup_failed_withholds_the_input_a_validator_quotes(
         create_app()
 
     output = capsys.readouterr().out
-    (failure,) = startup_failures(output)
-    assert failure["error_type"] == "ValidationError"
-    assert failure["fields"] == ["data_mode", "display_timezone", "linkedin_ad_account_ids"]
-    message = failure["message"]
     # One entry per failure, in the order the settings declare the fields.
-    assert message.index("DISPLAY_TIMEZONE: Value error, DISPLAY_TIMEZONE must be") == 0
-    assert message.index("; DATA_MODE: Input should be 'auto' or 'simulated'") > 0
-    assert message.index(
-        "; LINKEDIN_AD_ACCOUNT_IDS: Value error, LINKEDIN_AD_ACCOUNT_IDS entries must be"
-    ) > message.index("; DATA_MODE: ")
-    assert message.count("got <value withheld>") == 2
+    assert_one_startup_failure(
+        output,
+        error_type="ValidationError",
+        fields=["data_mode", "display_timezone", "linkedin_ad_account_ids"],
+        message=(
+            "DISPLAY_TIMEZONE: Value error, DISPLAY_TIMEZONE must be an IANA time zone name "
+            "such as UTC or America/New_York; DATA_MODE: Input should be 'auto' or 'simulated'; "
+            "LINKEDIN_AD_ACCOUNT_IDS: Value error, LINKEDIN_AD_ACCOUNT_IDS entries must be "
+            "numeric ad account ids or urn:li:sponsoredAccount:<digits>"
+        ),
+    )
     for value in (zone, account, mode):
         assert value not in output
+
+
+def test_startup_failed_withholds_the_input_a_validator_quotes(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A validator message that quotes its input keeps its text but not the quoted literal.
+
+    No settings validator quotes its input, so the safeguard is proven on an injected
+    ``ValidationError``: each single- or double-quoted literal of a ``value_error`` or an
+    ``assertion_error`` message becomes ``<value withheld>``.
+    """
+    sentinel = "-".join(("api", "sentinel", uuid.uuid4().hex))
+    quoted = ValidationError.from_exception_data(
+        "Settings",
+        [
+            {
+                "type": "value_error",
+                "loc": ("linkedin_ad_account_ids",),
+                "input": sentinel,
+                "ctx": {"error": ValueError(f"entries must be numeric; got {sentinel!r}")},
+            },
+            {
+                "type": "assertion_error",
+                "loc": ("display_timezone",),
+                "input": sentinel,
+                "ctx": {"error": AssertionError(f'unknown zone "{sentinel}"')},
+            },
+        ],
+    )
+
+    def refuse_settings() -> Settings:
+        raise quoted
+
+    monkeypatch.setattr(api_app, "get_settings", refuse_settings)
+    capsys.readouterr()
+
+    with pytest.raises(ValidationError) as excinfo:
+        create_app()
+
+    assert excinfo.value is quoted
+    output = capsys.readouterr().out
+    assert_one_startup_failure(
+        output,
+        error_type="ValidationError",
+        fields=["display_timezone", "linkedin_ad_account_ids"],
+        message=(
+            "LINKEDIN_AD_ACCOUNT_IDS: Value error, entries must be numeric; got "
+            "<value withheld>; DISPLAY_TIMEZONE: Assertion failed, unknown zone <value withheld>"
+        ),
+    )
+    assert sentinel not in output
 
 
 @pytest.mark.parametrize(("database_url", "message"), UNUSABLE_DATABASE_URLS)

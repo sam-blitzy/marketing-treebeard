@@ -23,7 +23,7 @@ back", so rule tests need no database. ``backend/tests/integration/test_end_to_e
 cross-checks that the default world yields the same sections either way.
 
 Time: every scenario except ``default`` is anchored on :data:`FIXED_ANCHOR` and read at
-:data:`FIXED_NOW` (:func:`FIXED_CLOCK`), so fixtures and expected numbers are reproducible. At that
+:data:`FIXED_NOW` (:func:`fixed_clock`), so fixtures and expected numbers are reproducible. At that
 instant the default window ends on 2026-10-01 (yesterday in both New York and UTC) and spans
 2026-09-04 to 2026-10-01; day offsets in specs are relative to the anchor, so the window is
 offsets -28 to -1. The ``default`` scenario runs on the real clock unless the caller passes one.
@@ -271,6 +271,7 @@ __all__ = [
     "Scenario",
     "SubjectRef",
     "context_from_world",
+    "fixed_clock",
     "for_module",
     "input_differences",
     "pairs",
@@ -290,9 +291,13 @@ FIXED_NOW: Final = datetime(2026, 10, 2, 12, 0, tzinfo=UTC)
 """The instant every non-default scenario is read at (noon UTC on the anchor)."""
 
 
-def FIXED_CLOCK() -> datetime:  # noqa: N802 - a constant-like clock, named as the AAP brief does
+def fixed_clock() -> datetime:
     """Return :data:`FIXED_NOW`: the injected clock of every non-default scenario."""
     return FIXED_NOW
+
+
+FIXED_CLOCK: Final[Callable[[], datetime]] = fixed_clock
+"""Compatibility name of :func:`fixed_clock`; code in this repository uses ``fixed_clock``."""
 
 
 MODULE_KEYWORDS: Final = "acceptance/test_keywords_rules.py"
@@ -650,7 +655,6 @@ class FreshnessOverride(NamedTuple):
 
 
 def _frozen_mapping[K, V](value: Mapping[K, V]) -> Mapping[K, V]:
-    """Return a read-only copy of ``value`` in its insertion order."""
     return MappingProxyType(dict(value))
 
 
@@ -831,7 +835,7 @@ class Scenario:
 
     @property
     def fixed_time(self) -> bool:
-        """Whether the scenario runs on :data:`FIXED_CLOCK` (every scenario but ``default``)."""
+        """Whether the scenario runs on :func:`fixed_clock` (every scenario but ``default``)."""
         return self.spec.anchor is not None
 
     def world(
@@ -841,14 +845,14 @@ class Scenario:
 
         Args:
             seed: The world seed (``MOCK_SEED``).
-            clock: The world clock; :func:`FIXED_CLOCK` for fixed-time scenarios and the real
+            clock: The world clock; :func:`fixed_clock` for fixed-time scenarios and the real
                 clock for ``default`` when ``None``.
 
         Returns:
             The seeded world, with the scenario's white paper registry when it has one.
         """
         if clock is None and self.fixed_time:
-            clock = FIXED_CLOCK
+            clock = fixed_clock
         return SimulatedWorld(
             seed,
             self,
@@ -3372,7 +3376,6 @@ _LEAF_TYPES: Final = (ExplicitDays, DailyProfile, DayMetrics, QualityScoreProfil
 
 
 def _offsets(start: int, end: int) -> tuple[int, ...]:
-    """The day offsets ``start`` .. ``end``, both inclusive."""
     return tuple(range(start, end + 1))
 
 
@@ -3451,7 +3454,6 @@ def _spread(
 
 
 def _daily(offsets: Iterable[int], metrics: DayMetrics) -> ExplicitDays:
-    """The same day's ``metrics`` on every offset."""
     return ExplicitDays(dict.fromkeys(offsets, metrics))
 
 
@@ -6391,7 +6393,6 @@ _BOOKED_FUNNEL: Final = _funnel(
 
 
 def _ql_after(creative: str, hours: int = 48) -> CrmPatch:
-    """Every lead of ``creative`` reaches QL ``hours`` after its touch."""
     return CrmPatch(creative_key=creative, ql_after_touch_hours=hours)
 
 
@@ -7201,7 +7202,7 @@ def _precedence_scenarios() -> Iterator[Scenario]:
             Expectation(
                 K1,
                 False,
-                {"suppressed_rules": ("K1", "C1", "B2", "W2"), "source": "google"},
+                {"suppressed_rules": (K1, C1, B2, W2), "source": "google"},
                 finding=FINDING_CONVERSION_TRACKING_ABSENT,
             ),
         ),

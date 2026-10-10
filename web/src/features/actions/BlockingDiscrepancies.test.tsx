@@ -18,7 +18,9 @@
  *
  * The network is stubbed by `../../test/mockApi`, which fails a test on any request it has no
  * handler for, so a test without a `GET /discrepancies` handler also proves none was sent. It
- * is imported before `../../test/render` and Testing Library so its `afterEach` runs first.
+ * is imported before `../../test/render` and Testing Library so its unmatched-request check
+ * runs after Testing Library's automatic cleanup (Vitest runs after-hooks in reverse order of
+ * registration), and a check that throws cannot skip that cleanup.
  */
 import { apiError, json, mockApi, type MockResponse } from '../../test/mockApi';
 import { createTestQueryClient, renderWithProviders } from '../../test/render';

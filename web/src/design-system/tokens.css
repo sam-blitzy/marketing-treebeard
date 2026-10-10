@@ -9,9 +9,11 @@
  * name) rather than renaming anything in feature code. See GAPS.md for the full gap inventory
  * and the binding procedure.
  *
- * This is the only stylesheet in the SPA that holds literal design values; web/.stylelintrc.json
- * exempts it from the token-only value rules. main.tsx imports it once, before any component
- * renders. Feature code reads tokens through var() in component CSS and never imports this file.
+ * This file holds every placeholder token value, and it is the stylesheet web/.stylelintrc.json
+ * exempts from the token-only value rules. The few structural, reset, accessibility, motion and
+ * breakpoint literals in component CSS that GAPS.md lists are the documented exceptions to
+ * keeping design values here. main.tsx imports it once, before any component renders. Feature
+ * code reads tokens through var() in component CSS and never imports this file.
  *
  * Placeholder colours meet WCAG 2.2 AA: every text and tone colour is at least 4.5:1 on both
  * the surface and the page background, surface text on the accent is at least 4.5:1, and the

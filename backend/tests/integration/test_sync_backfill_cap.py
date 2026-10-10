@@ -29,7 +29,7 @@ from ads_engine.connectors.hubspot.client import RateLimiter
 from ads_engine.db.models import DatasetFreshness
 from ads_engine.settings import Source, get_settings
 from ads_engine.simulation.generator import SimulatedWorld
-from ads_engine.simulation.scenarios import FIXED_CLOCK, FIXED_NOW
+from ads_engine.simulation.scenarios import FIXED_NOW, fixed_clock
 from ads_engine.sync import jobs
 from ads_engine.sync.budget_guard import GoogleCallBudget
 from ads_engine.sync.mode import SourceModeController
@@ -67,8 +67,8 @@ def _controller(sessions: Sessions, world: SimulatedWorld) -> SourceModeControll
         settings,
         sessionmaker=sessions,
         world=world,
-        clock=FIXED_CLOCK,
-        budget=GoogleCallBudget(settings, sessionmaker=sessions, clock=FIXED_CLOCK),
+        clock=fixed_clock,
+        budget=GoogleCallBudget(settings, sessionmaker=sessions, clock=fixed_clock),
         retry=RetryPolicy(sleep=_no_sleep),
         hubspot_limiter=RateLimiter(4.0, clock=lambda: tick[0], sleep=advance),
     )
@@ -106,7 +106,7 @@ def world(
     """Simulated data with ``BACKFILL_DAYS=1200``; the world at its fixed clock."""
     set_env(DATA_MODE="simulated", BACKFILL_DAYS=BACKFILL_DAYS)
     assert get_settings().backfill_days == int(BACKFILL_DAYS)
-    return make_world(SCENARIO, clock=FIXED_CLOCK)
+    return make_world(SCENARIO, clock=fixed_clock)
 
 
 async def test_google_backfill_is_capped_at_180_days(db: Sessions, world: SimulatedWorld) -> None:

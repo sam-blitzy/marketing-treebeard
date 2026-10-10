@@ -230,7 +230,6 @@ _check_tables()
 
 
 def _is_int(value: object) -> bool:
-    """Return whether ``value`` is an ``int`` that is not a ``bool``."""
     return isinstance(value, int) and not isinstance(value, bool)
 
 

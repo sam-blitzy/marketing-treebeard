@@ -15,8 +15,9 @@
  * semantic tokens in `tokens.css`, except for the few structural, reset, accessibility, motion
  * and breakpoint literals that `GAPS.md` lists. Binding Blitzy OS later changes only the wrapper
  * internals under `components/`, the token values in `tokens.css`, `web/package.json` and
- * `web/package-lock.json` (AAP 0.4.6); the names exported here stay as they are. Every
- * component and token is listed as a gap in `GAPS.md`.
+ * `web/package-lock.json` (AAP 0.4.6), except that a breakpoint other than `48rem` also changes
+ * its pin in `web/.stylelintrc.json` and `web/src/stylelint-config.test.ts`; the names exported
+ * here stay as they are. Every component and token is listed as a gap in `GAPS.md`.
  *
  * The surface is explicit by design. There is no `export *`, so a helper a component module
  * keeps for itself never becomes public by accident, and no default export. This module holds

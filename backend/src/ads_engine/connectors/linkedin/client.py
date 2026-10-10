@@ -384,12 +384,10 @@ def _owner(account_urn: str) -> str:
 
 
 def _chunks[T](items: Sequence[T], size: int) -> list[Sequence[T]]:
-    """Split ``items`` into consecutive chunks of at most ``size``."""
     return [items[index : index + size] for index in range(0, len(items), size)]
 
 
 def _distinct(items: Iterable[str]) -> list[str]:
-    """Return ``items`` without repeats, in first-seen order."""
     return list(dict.fromkeys(items))
 
 
@@ -737,7 +735,6 @@ def _distinct_rows[R](rows: Iterable[R], key: Callable[[R], Hashable]) -> tuple[
 
 
 def _urn_key(row: CampaignGroupRow | CampaignRow | CreativeRow) -> str:
-    """Natural key of an entity row: its URN."""
     return row.urn
 
 
@@ -747,7 +744,6 @@ def _daily_key(row: CreativeDailyRow) -> tuple[str, date]:
 
 
 def _form_key(row: LeadFormRow) -> str:
-    """Natural key of a lead form: its canonical URN."""
     return row.canonical_urn
 
 

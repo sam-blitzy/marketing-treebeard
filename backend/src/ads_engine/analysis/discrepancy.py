@@ -441,6 +441,15 @@ def _reason(item: DiscrepancyInfo) -> str:
 def _candidate(ctx: AnalysisContext, item: DiscrepancyInfo, crm_link: Flag | None) -> Candidate:
     """Build the pinned C0 item of one unresolved discrepancy.
 
+    Threshold keys: none. C0 has no tolerance: Google amounts are compared in micros exactly
+    and LinkedIn amounts at the currency's minor unit, and decisions are validated to that
+    unit, so rounding can neither cause nor hide a mismatch.
+
+    Rationale (AAP 0.5.4.4, P1): discrepancies come first, because no other recommendation on
+    a subject can be trusted while its platform state differs from the decided state. The item
+    is therefore pinned first, ranked by ``(detected_at, id)``, and exempt from holds, feedback
+    and ordinary ranking; :func:`evaluate` documents the rule.
+
     ``crm_link`` is the run's ``no_crm_link`` flag, or ``None`` while the Google-to-CRM link is
     verified. A Google subject's item carries it (AAP 0.3.3: Google items carry
     ``no_crm_link``); a LinkedIn subject's never does.

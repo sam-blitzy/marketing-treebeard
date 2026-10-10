@@ -152,8 +152,9 @@ class FactCampaignDaily(IdPkMixin, DatasetScopedMixin, Base):
             never assumed to be an integer count. ``None`` when unavailable.
         conversions_value: Google ``metrics.conversions_value``; ``None`` when unavailable.
         budget_lost_is: Google ``search_budget_lost_impression_share`` as a fraction from 0
-            to 1; a value of at least 0.10 marks a capped day (AAP 0.5.4.1). ``None`` when
-            Google does not report it, for example for a non-search campaign.
+            to 1; a value at or above ``budget.capped_lost_is_share`` (default 0.10) marks a
+            capped day (AAP 0.5.4.1). ``None`` when Google does not report it, for example
+            for a non-search campaign.
         impression_share: Google ``search_impression_share`` as a fraction from 0 to 1;
             ``None`` when unavailable.
         fetched_at: When this row's values were last written by an upsert.

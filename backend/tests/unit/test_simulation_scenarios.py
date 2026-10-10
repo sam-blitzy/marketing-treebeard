@@ -128,6 +128,7 @@ from ads_engine.simulation.scenarios import (
     Scenario,
     SubjectRef,
     context_from_world,
+    fixed_clock,
     for_module,
     input_differences,
     pairs,
@@ -164,7 +165,8 @@ def _with_context(scenario: Scenario, **changes: Any) -> Scenario:
 
 
 def test_fixed_clock_reads_noon_utc_on_the_anchor() -> None:
-    assert FIXED_CLOCK() == FIXED_NOW == datetime(2026, 10, 2, 12, tzinfo=UTC)
+    assert fixed_clock() == FIXED_NOW == datetime(2026, 10, 2, 12, tzinfo=UTC)
+    assert FIXED_CLOCK is fixed_clock
     assert FIXED_NOW.date() == FIXED_ANCHOR
     assert len(set(MODULES)) == len(MODULES) == 12
     assert all(re.fullmatch(r"(acceptance|integration)/test_[a-z0-9_]+\.py", m) for m in MODULES)
@@ -1243,7 +1245,7 @@ class _HiddenPortal(SimulatedWorld):
     def __init__(
         self, spec: WorldSpec, answers: Mapping[str, PropertyRecord | None], **kwargs: Any
     ) -> None:
-        super().__init__(DEFAULT_SEED, spec, clock=FIXED_CLOCK, content_assets=(), **kwargs)
+        super().__init__(DEFAULT_SEED, spec, clock=fixed_clock, content_assets=(), **kwargs)
         self._answers = dict(answers)
 
     def hubspot_property(self, object_type: str, name: str) -> PropertyRecord | None:
@@ -1254,7 +1256,7 @@ class _HiddenPortal(SimulatedWorld):
 
 def _portal(name: str = "c1b.eligible.fires", **kwargs: Any) -> SimulatedWorld:
     return SimulatedWorld(
-        DEFAULT_SEED, SCENARIOS[name].spec, clock=FIXED_CLOCK, content_assets=(), **kwargs
+        DEFAULT_SEED, SCENARIOS[name].spec, clock=fixed_clock, content_assets=(), **kwargs
     )
 
 
@@ -1319,7 +1321,7 @@ def test_resolve_bindings_reports_unresolved_stage_labels() -> None:
     spec = _scenario("c1b.eligible.fires").spec
     assert spec.hubspot is not None
     removed = spec.with_(hubspot=spec.hubspot.with_(removed_stage_labels=("First meeting booked",)))
-    world = SimulatedWorld(DEFAULT_SEED, removed, clock=FIXED_CLOCK, content_assets=())
+    world = SimulatedWorld(DEFAULT_SEED, removed, clock=fixed_clock, content_assets=())
     mql = resolve_bindings(world, Thresholds.load(), FIXED_NOW).mql
     assert not mql.available
     assert mql.reason == "stage 'First meeting booked' not found in lifecyclestage options"
@@ -1413,7 +1415,7 @@ def test_google_touch_discovery_covers_the_first_native_day_of_a_zone_east_of_ut
     base = _scenario("hubspot.google_discovery.case")
     spec = base.spec.with_google(time_zone=tokyo)
     world = SimulatedWorld(
-        DEFAULT_SEED, spec, clock=FIXED_CLOCK, content_assets=base.context.content_assets
+        DEFAULT_SEED, spec, clock=fixed_clock, content_assets=base.context.content_assets
     )
     context = dataclasses.replace(base.context, window=(-25, -1), kind="custom")
     ctx = context_from_world(world, context, base.thresholds(), now=FIXED_NOW)
@@ -1695,7 +1697,7 @@ def test_a_datetime_property_binding_reads_the_exact_stage_instants() -> None:
     world = SimulatedWorld(
         DEFAULT_SEED,
         base.spec,
-        clock=FIXED_CLOCK,
+        clock=fixed_clock,
         content_assets=base.context.content_assets,
         mapping=mapping,
     )
@@ -2030,9 +2032,9 @@ class _RecordingTransport(httpx.AsyncBaseTransport):
 
 
 def _stated_range(scenario: Scenario) -> tuple[date, date]:
-    """The scenario's stated ``days``, ending the day before :func:`FIXED_CLOCK`'s date."""
+    """The scenario's stated ``days``, ending the day before :func:`fixed_clock`'s date."""
     days = cast(int, scenario.expect.values["days"])
-    end = FIXED_CLOCK().date() - timedelta(days=1)
+    end = fixed_clock().date() - timedelta(days=1)
     return end - timedelta(days=days - 1), end
 
 

@@ -277,7 +277,6 @@ def _minor_unit(currency: str) -> int:
 
 
 def _exact(value: Decimal | int) -> Fraction:
-    """Return a stored amount, count or configured value as an exact fraction."""
     return Fraction(value)
 
 
@@ -889,7 +888,6 @@ def _cost_per_conversion_value(
 def _campaign_extra(
     ctx: AnalysisContext, campaign: CampaignInfo, ad_group_id: int
 ) -> dict[str, Any]:
-    """Return the campaign and ad group names an item's ``evidence.extra`` carries."""
     return {
         "campaign": campaign.name,
         "campaign_external_id": campaign.external_id,
@@ -898,7 +896,6 @@ def _campaign_extra(
 
 
 def _flags(flag: Flag | None) -> tuple[Flag, ...]:
-    """Return ``(flag,)``, or ``()`` without one."""
     return () if flag is None else (flag,)
 
 
@@ -1219,6 +1216,19 @@ def _k1_candidate(
     crm_link: Flag | None,
 ) -> Candidate:
     """Build one K1 item: a zero-conversion term that cleared the click and spend gates.
+
+    Rule K1 (AAP 0.5.4.3), gated by :func:`_evaluate_k1`. Threshold keys:
+    :data:`K1_THRESHOLD_KEYS`, copied into ``evidence.thresholds``. The click gate ``n_star`` is
+    max(``k1.min_clicks_floor``, ceil(``k1.rule_of_three`` ÷ r)), r being the account rate over
+    the trailing ``k1.baseline_days``, which holds at least ``k1.min_baseline_conversions``
+    conversions; the spend floor is ``k1.min_spend_cpa_multiple`` x the account
+    cost/conversion, shown as the ``min_spend`` baseline; ``keywords.min_search_term_coverage``
+    sets the coverage flag.
+
+    Rationale: ``n_star`` is a heuristic labelled "minimum clicks for the account's conversion
+    rate" and claims no probability, and the spend floor requires at least one typical
+    conversion's cost to have been spent, so a zero-conversion term becomes a block candidate
+    only once it has had a fair chance to convert.
 
     ``baseline_coverage`` is the run's assessment of the baseline span: when it is not fully
     assessed the item carries the ``incomplete`` flag and the baseline label says so.
@@ -1643,6 +1653,16 @@ def _k2_candidate(
     crm_link: Flag | None,
 ) -> Candidate:
     """Build one K2 item: a converting ``NONE`` term at or better than campaign efficiency.
+
+    Rule K2 (AAP 0.5.4.3), gated by :func:`_evaluate_k2`. Threshold keys:
+    :data:`K2_THRESHOLD_KEYS`, copied into ``evidence.thresholds``. The term reached
+    ``k2.min_conversions``, the sample's required count, with a cost/conversion at most
+    ``k2.max_cpa_ratio`` x the campaign's, shown as the ``max_cost_per_conversion`` baseline.
+    ``adjacent`` was selected with ``k2.adjacent_jaccard``, ``k2.adjacent_max_terms`` and
+    ``k2.adjacent_min_clicks``; ``keywords.min_search_term_coverage`` sets the coverage flag.
+
+    Rationale: ``k2.min_conversions`` (3) avoids one-off conversions, and ``k2.max_cpa_ratio``
+    (1.0) keeps only terms at or better than campaign efficiency.
 
     ``crm_link`` is the run's ``no_crm_link`` flag, appended after the coverage flag; ``None``
     while the Google-to-CRM link is verified.
@@ -2096,12 +2116,10 @@ def _qs_labels(basis: _QsBasis | None, span: int) -> tuple[str, str]:
 
 
 def _optional_money(value: Fraction | None, currency: str) -> Decimal | None:
-    """Return a money value at the minor unit, or ``None``."""
     return None if value is None else _money(value, currency)
 
 
 def _optional_ratio(value: Fraction | None) -> Decimal | None:
-    """Return a displayed ratio, or ``None``."""
     return None if value is None else _ratio(value)
 
 
@@ -2111,12 +2129,26 @@ def _optional_count(value: Decimal | None) -> Decimal | None:
 
 
 def _span_json(start: date, end: date) -> dict[str, date]:
-    """Return an inclusive native-date span for ``evidence.extra``."""
     return {"start": start, "end": end}
 
 
 def _k3_reason(evidence: Evidence) -> str:
-    """Render K3's reason from its evidence only."""
+    """Render K3's reason from its evidence only.
+
+    Rule K3 (AAP 0.5.4.3), gated by :func:`_evaluate_k3`. Threshold keys:
+    :data:`K3_THRESHOLD_KEYS`. Every item rendered passed the window gate
+    (``k3.min_window_days``, ``window.sustained_min_days``) and the click gate
+    (``k3.min_clicks_per_half`` in each half). The reason cites each trigger that fired: the
+    quality-score fall of at least ``k3.qs_drop``, between the first and last
+    ``k3.qs_span_days`` (each scored on at least ``k3.min_qs_days_per_span`` days) or between
+    the window's keyword snapshots; the CPC rise of at least ``k3.rise_ratio`` between halves.
+
+    Rationale: 30 clicks per half give a stable CPC, a one-point drop on the integer 1-10
+    quality-score scale is material, and 15% is above normal auction noise. A CPC rise is always
+    cited with its cost/conversion rise of at least ``k3.rise_ratio``, or with conversions
+    falling to 0 from at least ``k3.min_first_half_conversions``, because K3 flags CPC that rose
+    without a matching rise in conversion.
+    """
     extra = evidence.extra
     triggers = extra["triggers"]
     sentences: list[str] = []
@@ -2173,6 +2205,21 @@ def _k3_candidate(
     crm_link: Flag | None,
 ) -> Candidate:
     """Build one K3 item from the branches that fired, with its account's coverage flag.
+
+    Rule K3 (AAP 0.5.4.3), gated by :func:`_evaluate_k3`. Threshold keys:
+    :data:`K3_THRESHOLD_KEYS`, copied into ``evidence.thresholds``. The window reached
+    ``k3.min_window_days`` and ``window.sustained_min_days``, and each half reached
+    ``k3.min_clicks_per_half``, the sample's required clicks. ``quality`` compared daily scores
+    over the first and last ``k3.qs_span_days`` (each scored on at least
+    ``k3.min_qs_days_per_span`` days), or the Q-G7 snapshots, against ``k3.qs_drop``;
+    ``k3.qs_span_days`` also labels the quality-score metrics and spans. ``cpc`` applied
+    ``k3.rise_ratio`` and ``k3.min_first_half_conversions``;
+    ``keywords.min_search_term_coverage`` sets the coverage flag.
+
+    Rationale: ``k3.min_clicks_per_half`` (30) gives a stable CPC, a ``k3.qs_drop`` of 1 on the
+    integer 1-10 scale is material, and ``k3.rise_ratio`` (1.15) is above normal auction noise.
+    Requiring cost/conversion to rise as well, or conversions to fall to 0, means CPC rose
+    without a matching rise in conversion.
 
     ``crm_link`` is the run's ``no_crm_link`` flag, appended after the coverage flag; ``None``
     while the Google-to-CRM link is verified.
