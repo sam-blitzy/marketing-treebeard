@@ -896,6 +896,18 @@ These targets run tools on the host, so they need uv, Python and Node in additio
   unset E2E_ADMIN_PASSWORD
   ```
 
+  The API cannot withdraw feedback, so `actions.spec.ts` undoes its own snooze through the
+  stack's database. Before it snoozes, it checks that it reaches this stack's database. Each
+  attempt adds its own note, `e2e-actions-snooze:` and a random UUID, to the UI's snooze request
+  on its way to the API. After the test, pass or fail and on every retry, it deletes only the row
+  carrying that note, never another snooze of the same item, and queues one analysis request,
+  then waits until the next default run shows the item again. It runs `psql`
+  in the Compose `db` service through `E2E_COMPOSE` (default `docker compose`, run from the
+  repository root). `make e2e` passes its `COMPOSE` there, so `-p` and `-f` flags carry over.
+  Set `E2E_PSQL` instead to any command that runs `psql` on the stack's database and reads SQL
+  on stdin, for example
+  `E2E_PSQL='docker exec -i <container> psql -X -q -v ON_ERROR_STOP=1 -U ads -d ads_engine'`.
+
 - **`make secret-scan`**: gitleaks over every commit ([Secrets](#secrets)).
 
 ## Make targets
@@ -914,7 +926,7 @@ at the first failing command.
 | `seed-simulated` | Requires `.env`; `docker compose run --rm migrate sh -c 'ads-engine migrate && ads-engine seed-simulated'` |
 | `test` | Backend pytest on a disposable `postgres:18.6` of its own (`ads-engine-testdb-<random token>` on `127.0.0.1:TEST_DB_PORT`, default 55432, `0` for a free port; a container it did not create is never reused or removed), then the web unit tests. On exit, Ctrl-C included, it removes that container and its anonymous volume and checks for up to about 10 s that they are gone; a removal it cannot confirm fails the target, even when the tests passed, and prints the `docker` command that finds or removes what remains. `PYTEST_ARGS` passes extra pytest arguments |
 | `lint` | `uv sync --frozen`, then `ruff format --check`, `ruff check`, `mypy --strict src`; `npm ci`, then `npm run lint`, `npm run typecheck` |
-| `e2e` | `check-tools`; requires `.env` and `ADMIN_PASSWORD`; starts the stack with `DATA_MODE=simulated` as `up` does; `npm ci`; `PLAYWRIGHT_INSTALL`; `npm run e2e`; leaves the stack running |
+| `e2e` | `check-tools`; requires `.env` and `ADMIN_PASSWORD`; starts the stack with `DATA_MODE=simulated` as `up` does; `npm ci`; `PLAYWRIGHT_INSTALL`; `npm run e2e` with `E2E_COMPOSE` set to `COMPOSE`; leaves the stack running |
 | `secret-scan` | `zricethezav/gitleaks:v8.30.1` with `.gitleaks.toml` over every commit (`gitleaks git --redact --exit-code 1`); a finding fails it |
 
 Overridable variables, on the command line or in the environment: `COMPOSE` (default

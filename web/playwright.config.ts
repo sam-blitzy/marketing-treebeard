@@ -14,6 +14,11 @@
  *   read one value; worker processes inherit the runner's environment.
  * - `E2E_ADMIN_PASSWORD`: the `ADMIN_PASSWORD` given to `make init`. Required, no default:
  *   loading this config fails at once without it, instead of every test failing with a 401.
+ * - `E2E_PSQL`: a command that runs `psql` on the stack's database and reads SQL on stdin.
+ *   `actions.spec.ts` undoes its snooze through it, because the API cannot withdraw feedback.
+ *   Unset, the spec runs `psql` in the Compose `db` service through `E2E_COMPOSE`.
+ * - `E2E_COMPOSE`: the Compose command of the stack, with its `-p`/`-f` flags. It runs from the
+ *   repository root. Defaults to `docker compose`; `make e2e` passes its `COMPOSE`.
  * - `CI`: when set, `test.only` is forbidden, failed tests are retried once, no trace is
  *   recorded (a trace would carry the session cookie into the uploaded artifact), and the HTML
  *   report is written to `playwright-report/` for upload.

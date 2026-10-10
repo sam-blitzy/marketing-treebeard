@@ -19,7 +19,7 @@
 #
 # Overridable variables (command line or environment):
 #   COMPOSE             the Compose command (default: docker compose); add -p/-f flags here;
-#                       empty means the default
+#                       empty means the default. e2e passes it to Playwright as E2E_COMPOSE
 #   APP_URL             origin of the web service that up/e2e poll and Playwright targets
 #   HEALTH_TIMEOUT      seconds up/e2e wait for /api/v1/healthz to answer 200
 #   TEST_DB_PORT        127.0.0.1 port of the disposable test database (default 55432); 0 lets
@@ -569,6 +569,13 @@ lint: ## ruff format --check, ruff check, mypy --strict; eslint, stylelint and t
 	echo "Web: npm run lint (eslint, stylelint), npm run typecheck (tsc --noEmit)"
 	(cd web && npm ci && npm run lint && npm run typecheck)
 
+# actions.spec.ts undoes its snooze through this stack's db service, so the specs reach the stack
+# with the same Compose command, -p/-f flags included. COMPOSE reaches Playwright as the
+# environment variable E2E_COMPOSE, never spliced into the recipe as quoted make text, so quotes
+# inside it (a -f path with spaces) arrive intact. The spec runs it through sh -c from the
+# repository root, which parses it as the recipes' own $(COMPOSE) commands are parsed. override
+# keeps an E2E_COMPOSE given to make from pointing the specs at another stack.
+e2e: override export E2E_COMPOSE = $(COMPOSE)
 e2e: check-tools ## Playwright against the stack in DATA_MODE=simulated (make e2e ADMIN_PASSWORD=<value>)
 	@$(REQUIRE_ENV_FILE)
 	if [ -z "$${ADMIN_PASSWORD:-}" ]; then

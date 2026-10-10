@@ -173,3 +173,23 @@ regexTarget = "match"
 regexes = [
   '''(?i)^["']?(?:next[-_]?)?page[-_]?token["']?[ \t]*[:=]''',
 ]
+
+# Synthetic metric keys in the web end-to-end tests (`{ key: 'e2e_unavailable_count' }`). The
+# routed edge-case pages inject evidence metrics whose keys are lowercase snake-case identifiers
+# carrying an `e2e` segment, such as e2e_floored_count and baseline_e2e_floored_cost; some sit just
+# above the 3.5 entropy floor. A key made only of lowercase words and underscores is a field name,
+# not a credential: generated secrets carry digits or mixed case, and the value test admits no
+# digit outside the fixed `e2e` segment and no upper case, so hex and base64 never pass.
+# Scoped to the built-in generic-api-key rule, whose `key:` heuristic is what such a line trips,
+# and to web/tests/e2e/, so the same value anywhere else, and any provider key shape, is still
+# reported.
+[[allowlists]]
+description = "Synthetic e2e metric keys in the web end-to-end tests (generic-api-key only)."
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = [
+  '''(?:^|/)web/tests/e2e/[^/]+\.ts$''',
+]
+regexes = [
+  '''^(?:[a-z]+_)*e2e(?:_[a-z]+)+$''',
+]
