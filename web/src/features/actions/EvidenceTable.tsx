@@ -30,6 +30,7 @@
  *
  * @packageDocumentation
  */
+import { memo } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 
 import type {
@@ -480,7 +481,10 @@ export interface EvidenceTableProps {
  * empty gap. Nothing here renders `null` or `undefined` as text: absent values read
  * "unavailable" and absent baselines "—".
  *
- * The component holds no state and has no effects; its output depends only on its props.
+ * The component holds no state and has no effects; its output depends only on its props. It is
+ * therefore memoized on them: an item's frozen evidence keeps its object identity across a
+ * refetch that leaves it unchanged, so a card that renders again for another reason, such as a
+ * live hold or flag, does not rebuild its evidence block.
  *
  * @param props - see {@link EvidenceTableProps}
  * @returns the evidence block
@@ -493,7 +497,10 @@ export interface EvidenceTableProps {
  * // "Thresholds applied" and "Data used".
  * ```
  */
-export function EvidenceTable({ evidence, caption }: EvidenceTableProps): ReactElement {
+export const EvidenceTable = memo(function EvidenceTable({
+  evidence,
+  caption,
+}: EvidenceTableProps): ReactElement {
   const tableCaption =
     caption !== undefined && caption.trim() !== '' ? caption : DEFAULT_EVIDENCE_CAPTION;
 
@@ -553,4 +560,4 @@ export function EvidenceTable({ evidence, caption }: EvidenceTableProps): ReactE
       ) : null}
     </Stack>
   );
-}
+});

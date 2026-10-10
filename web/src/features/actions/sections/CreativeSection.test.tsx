@@ -24,8 +24,10 @@
  */
 import { mockApi } from '../../../test/mockApi';
 
-import { fireEvent, render, screen, within } from '@testing-library/react';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
+import { useState } from 'react';
+import type { ReactElement } from 'react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Group, Item, Section } from '../../../api/types';
 import {
@@ -43,8 +45,10 @@ import {
   makeRun,
   makeSection,
 } from '../../../test/fixtures';
+import * as formatModule from '../../../lib/format';
 import { formatCount, formatPercent } from '../../../lib/format';
 import { renderWithProviders } from '../../../test/render';
+import * as evidenceExtraModule from '../evidenceExtra';
 import {
   CreativeSection,
   NOT_ESTIMABLE,
@@ -667,5 +671,103 @@ describe('CreativeSection', () => {
 
       expect(container.childElementCount).toBe(0);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// A section rendered again
+// ---------------------------------------------------------------------------------------------
+
+describe('CreativeSection rendered again', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * Renders the section from state, then returns `show`, which hands it a new section object as a
+   * refetched page does.
+   */
+  async function renderReplaceable(initial: Section): Promise<(next: Section) => void> {
+    const control: { show?: (next: Section) => void } = {};
+    function Host(): ReactElement {
+      const [section, setSection] = useState(initial);
+      control.show = setSection;
+      return <CreativeSection section={section} run={RUN} overlay={OVERLAY} />;
+    }
+    await renderWithProviders(<Host />);
+    return (next) => {
+      act(() => {
+        control.show?.(next);
+      });
+    };
+  }
+
+  /** `section` with the item `id` replaced by `replace(item)`, every other item kept as is. */
+  function withItem(section: Section, id: number, replace: (item: Item) => Item): Section {
+    return {
+      ...section,
+      groups: section.groups.map((group) => ({
+        ...group,
+        items: group.items.map((item) => (item.id === id ? replace(item) : item)),
+      })),
+    };
+  }
+
+  /** `item` with the leads of its variant `name` set to `leads`. */
+  function withVariantLeads(item: Item, name: string, leads: number): Item {
+    const extra = item.evidence.extra ?? {};
+    const rows: unknown[] = Array.isArray(extra.variants) ? extra.variants : [];
+    return {
+      ...item,
+      evidence: {
+        ...item.evidence,
+        extra: {
+          ...extra,
+          variants: rows.map((row) =>
+            evidenceExtraModule.isRecord(row) && row.name === name ? { ...row, leads } : row,
+          ),
+        },
+      },
+    };
+  }
+
+  it("reads a block's variants once per first item, and again only when that item changes", async () => {
+    const section = defaultCreative();
+    const reads = vi.spyOn(evidenceExtraModule, 'variants');
+    const show = await renderReplaceable(section);
+    const caption = `Variants in ${PIPELINE_EMEA}`;
+    expect(reads).toHaveBeenCalledTimes(1);
+    expect(bodyRows(screen.getByRole('table', { name: caption }))[0]?.[5]).toBe('64');
+
+    // A new section object holding the same items: the rows are reused.
+    show({ ...section, groups: section.groups.map((group) => ({ ...group })) });
+    expect(reads).toHaveBeenCalledTimes(1);
+
+    // The CR3 item's variants change: the table reads and shows them.
+    show(
+      withItem(section, FIXTURE_ITEM_IDS.cr3, (item) => withVariantLeads(item, 'Variant A', 70)),
+    );
+    expect(reads).toHaveBeenCalledTimes(2);
+    expect(bodyRows(screen.getByRole('table', { name: caption }))).toEqual([
+      ['Variant A', '13,250', '0.44%', '1.22%', '39.51%', '70'],
+      ['Variant B', '12,400', '0.4%', '1.19%', '33.11%', '49'],
+    ]);
+  });
+
+  it('keeps its table for the same rows and renders new rows', () => {
+    const rows = evidenceExtraModule.variants(pageItem(FIXTURE_ITEM_IDS.cr3));
+    const changed = rows.map((row) => (row.name === 'Variant B' ? { ...row, leads: 51 } : row));
+    const counts = vi.spyOn(formatModule, 'formatCount');
+    const { rerender } = render(<VariantsTable campaignName={PIPELINE_EMEA} rows={rows} />);
+    const formatted = counts.mock.calls.length;
+    expect(formatted).toBeGreaterThan(0);
+
+    rerender(<VariantsTable campaignName={PIPELINE_EMEA} rows={rows} />);
+    expect(counts.mock.calls).toHaveLength(formatted);
+
+    rerender(<VariantsTable campaignName={PIPELINE_EMEA} rows={changed} />);
+    expect(counts.mock.calls.length).toBeGreaterThan(formatted);
+    const table = screen.getByRole('table', { name: `Variants in ${PIPELINE_EMEA}` });
+    expect(bodyRows(table).map((row) => row[5])).toEqual(['64', '51']);
   });
 });

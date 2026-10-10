@@ -11,7 +11,8 @@
  * - **Any other preset** posts `POST /runs` with the preset's window ending on the default
  *   window end ({@link presetWindow}), then opens the created run at `/actions?run=<id>`.
  * - **A custom range** posts its own start and end, then opens the created run the same way.
- * - **A recent custom run** can be reopened from a select, which navigates to it by id.
+ * - **A recent custom run** can be reopened from a select behind the "Recent custom windows"
+ *   disclosure, which navigates to it by id.
  *
  * A custom run is computed synchronously and can take up to about half a minute (AAP 0.1.1), so
  * the picker is disabled and a spinner shows while it computes. A failure is stated in a
@@ -20,11 +21,12 @@
  * message.
  *
  * The two reads the picker depends on never fail silently. A failed `GET /runs/latest`
- * and a failed `GET /runs?kind=custom` are each stated in a warning banner that names the read,
- * gives the API's message and offers a Retry button; meanwhile the presets end on the last
- * default run read, or else on the run on screen, and the reopen select keeps the runs it last
- * listed. A 404 `not_found` or 409 `run_not_ready` from `GET /runs/latest` is not a failure: no
- * default run has succeeded yet, and the read polls by itself until one has.
+ * and, while the recent custom windows are open, a failed `GET /runs?kind=custom` are each
+ * stated in a warning banner that names the read, gives the API's message and offers a Retry
+ * button; meanwhile the presets end on the last default run read, or else on the run on screen,
+ * and the reopen select keeps the runs it last listed. A 404 `not_found` or 409 `run_not_ready`
+ * from `GET /runs/latest` is not a failure: no default run has succeeded yet, and the read polls
+ * by itself until one has.
  *
  * Rules this file keeps:
  * - **No window length in the client** (AAP 0.5.4.1, 0.5.5). The presets, the default and the
@@ -33,6 +35,12 @@
  * - **Calendar dates stay calendar dates.** A window is one calendar-date range applied to each
  *   source's native days, so dates are computed in UTC only and shown exactly as stored; no
  *   time zone ever moves a day.
+ * - **Custom-run history on request.** `GET /runs?kind=custom` is read only while "Recent custom
+ *   windows" is open. The disclosure opens on a press, and a picker starts with it open only
+ *   while the session still holds the list: the user has opened it and not closed it since.
+ *   Closing it forgets the list, so it stays closed and unread until the user opens it again.
+ *   Reading it on every load of `/actions` would add a request the five sections do not need to
+ *   render within two seconds, so reopening a custom run stays one press away instead.
  * - **Messages are announced politely.** Every warning banner of a failed computation or read
  *   sits in one `role="status"` region that every state of the picker renders in the same
  *   place, so a message is announced when it appears (WCAG 2.2 SC 4.1.3) without
@@ -47,7 +55,7 @@
  * @packageDocumentation
  */
 import { useNavigate } from '@tanstack/react-router';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 
 import {
@@ -57,6 +65,8 @@ import {
   useCreateRun,
   useCustomRuns,
   useDefaultRun,
+  useForgetCustomRuns,
+  useHasCachedCustomRuns,
 } from '../../api/queries';
 import type { ApiError } from '../../api/queries';
 import type { CreateRunRequest, IsoDate, Run } from '../../api/types';
@@ -193,6 +203,15 @@ const RETRY_LABEL = 'Retry';
 /** The empty choice of the reopen select, which keeps the select on no run. */
 const NO_CUSTOM_RUN: SelectOption = { value: '', label: 'Choose a custom window' };
 
+/** The label of the button that discloses the recent custom runs. */
+const RECENT_CUSTOM_RUNS_LABEL = 'Recent custom windows';
+
+/** The label of the spinner shown while the recent custom runs are first read. */
+const CUSTOM_RUNS_LOADING_LABEL = 'Loading recent custom windows';
+
+/** Shown in place of the reopen select when no succeeded custom run can be reopened. */
+const NO_CUSTOM_RUNS_TEXT = 'No custom windows yet';
+
 /**
  * The text that states a failed `POST /runs`:
  *
@@ -309,11 +328,12 @@ export interface WindowPickerProps {
 }
 
 /**
- * The status bar's window picker: the configured presets plus a custom range, and a select
- * that reopens a recent custom run.
+ * The status bar's window picker: the configured presets plus a custom range, and, behind a
+ * "Recent custom windows" disclosure, a select that reopens a recent custom run.
  *
  * - **Loading**: a "Loading windows" spinner until `GET /config` and `GET /runs/latest` have
- *   answered.
+ *   answered. Once the default `/actions` page has loaded, the latest default run is already
+ *   cached from that page's own read, so only the configuration can hold the picker back.
  * - **No configuration**: a "Window presets unavailable" warning with the API's message, and no
  *   picker, because the client has no presets of its own.
  * - **Selection shown**: the preset of `run.days` is pressed when it is a configured preset and
@@ -329,18 +349,28 @@ export interface WindowPickerProps {
  *   default run yet" ({@link isAwaitingFirstRun}), a "Could not read the latest default run"
  *   warning gives the API's message and the date the presets end on meanwhile: the last
  *   default run read, or else `run.window_end`.
- * - **Failure to list custom runs**: when `GET /runs?kind=custom` fails, a "Could not load
- *   recent custom windows" warning gives the API's message; runs an earlier read listed stay in
- *   the select.
+ * - **Failure to list custom runs**: when `GET /runs?kind=custom` fails while the recent custom
+ *   windows are open, a "Could not load recent custom windows" warning gives the API's message;
+ *   runs an earlier read listed stay in the select. Closing the list removes the warning.
  * - **Retrying**: each read's warning has a Retry button that reads it again. The button is
  *   disabled while a run computes, and shows a spinner while its read runs, with the warning
  *   kept in place ({@link useSettledError}); when the read fails again, focus returns to it, and
  *   when the read succeeds the warning goes.
  * - **Announcing**: every warning is a polite status message, never an alert, and the warnings
  *   appear in the order above.
- * - **Reopening**: when succeeded custom runs exist, "Reopen a custom window" lists them newest
- *   first; choosing one navigates to it by id. The select is hidden while the list first loads,
- *   when its first read fails, and when it holds no succeeded run.
+ * - **Reopening**: a quiet "Recent custom windows" button discloses the recent custom runs. It
+ *   carries `aria-expanded` and `aria-controls`, naming a region whose content exists only while
+ *   the list is open. The list starts closed, and only opening it reads `GET /runs?kind=custom`.
+ *   It starts open while the session still holds the list, so moving between runs keeps it in
+ *   view with the run on screen selected. Closing it forgets the list
+ *   ({@link useForgetCustomRuns}), so it starts closed and unread on every later mount until it
+ *   is opened again, which reads the list once. While open, the region shows a "Loading recent
+ *   custom windows" spinner until the first read answers; then "Reopen a custom window" lists
+ *   the succeeded custom runs newest first, and choosing one navigates to it by id, or "No
+ *   custom windows yet" says there is none to reopen. After a failed first read the region
+ *   stays empty and hidden, and the warning below the controls states the failure. The button
+ *   is disabled while a run computes, like every other control, and pressing it leaves focus
+ *   on it.
  *
  * The component must render inside a TanStack `RouterProvider` and a `QueryClientProvider`, as
  * every `/actions` screen does.
@@ -354,7 +384,14 @@ export function WindowPicker({ run }: WindowPickerProps) {
   const config = useConfig();
   const defaultRun = useDefaultRun();
   const createRun = useCreateRun();
-  const customRuns = useCustomRuns();
+  // The recent custom runs are read only while their disclosure is open. It starts open only
+  // while the list is cached, that is while the user has opened it and not closed it since:
+  // closing it forgets the list.
+  const customRunsCached = useHasCachedCustomRuns();
+  const forgetCustomRuns = useForgetCustomRuns();
+  const [customRunsOpen, setCustomRunsOpen] = useState(customRunsCached);
+  const customRunsRegionId = useId();
+  const customRuns = useCustomRuns(undefined, { enabled: customRunsOpen });
   const navigate = useNavigate();
   // A window the client itself cannot turn into a request (presetWindow's RangeError). The
   // picker validates its configuration before it renders a preset, so this stays null unless
@@ -377,7 +414,8 @@ export function WindowPicker({ run }: WindowPickerProps) {
     customRuns.data !== undefined,
   );
   const defaultRunFailed = defaultRunError !== null && !isAwaitingFirstRun(defaultRunError);
-  const customRunsFailed = customRunsError !== null;
+  // Stated only while the list is open: a closed list is not read, so its last failure is moot.
+  const customRunsFailed = customRunsOpen && customRunsError !== null;
   // Busy while a run computes, or while a failed read runs again: that read's Retry button is
   // then loading, hence disabled.
   const busy =
@@ -599,12 +637,34 @@ export function WindowPicker({ run }: WindowPickerProps) {
     );
   }
 
+  // The disclosed recent custom runs: nothing while closed or after a failed first read (its
+  // warning states it), a spinner until the first read answers, then the reopen select or the
+  // statement that no custom run can be reopened.
+  let recentCustomRuns: ReactNode = null;
+  if (customRunsOpen) {
+    if (reopenable.length > 0) {
+      recentCustomRuns = (
+        <Select
+          label="Reopen a custom window"
+          options={reopenOptions}
+          value={reopenValue}
+          onChange={reopen}
+          disabled={pending}
+        />
+      );
+    } else if (customRuns.data !== undefined) {
+      recentCustomRuns = <span>{NO_CUSTOM_RUNS_TEXT}</span>;
+    } else if (!customRunsFailed) {
+      recentCustomRuns = <Spinner label={CUSTOM_RUNS_LOADING_LABEL} />;
+    }
+  }
+
   return (
     <PickerFrame notices={notices}>
-      {/* Top-aligned, so the picker's and the select's labels share a line and opening the
-          custom range never moves the controls beside it. The spinner follows the controls, so
-          showing it never moves them; where the row has no room left for it, it wraps onto a
-          line below them for as long as the run computes. */}
+      {/* Top-aligned, so the picker's label and the disclosure button share a line and opening
+          the custom range or the recent custom windows never moves the controls beside it. The
+          spinner follows the controls, so showing it never moves them; where the row has no
+          room left for it, it wraps onto a line below them for as long as the run computes. */}
       <Inline gap={4} align="start">
         <DateRangePicker
           label="Analysis window"
@@ -617,15 +677,33 @@ export function WindowPicker({ run }: WindowPickerProps) {
           maxDays={windowConfig.max_days}
           disabled={pending}
         />
-        {reopenable.length > 0 && (
-          <Select
-            label="Reopen a custom window"
-            options={reopenOptions}
-            value={reopenValue}
-            onChange={reopen}
-            disabled={pending}
-          />
-        )}
+        {/* The disclosure: its button in an Inline row keeps its own width, and the region it
+            controls is always in place, hidden while it has nothing to show, so the button's
+            aria-controls always names an element. */}
+        <Stack gap={2}>
+          <Inline>
+            <Button
+              variant="quiet"
+              size="sm"
+              aria-expanded={customRunsOpen}
+              aria-controls={customRunsRegionId}
+              disabled={pending}
+              onClick={() => {
+                // A closed list is no longer needed: forgetting it keeps every later mount
+                // closed and unread until the user opens it again, which reads it afresh.
+                if (customRunsOpen) {
+                  forgetCustomRuns();
+                }
+                setCustomRunsOpen(!customRunsOpen);
+              }}
+            >
+              {RECENT_CUSTOM_RUNS_LABEL}
+            </Button>
+          </Inline>
+          <div id={customRunsRegionId} hidden={recentCustomRuns === null}>
+            {recentCustomRuns}
+          </div>
+        </Stack>
         {pending && <Spinner label="Computing custom window" />}
       </Inline>
     </PickerFrame>

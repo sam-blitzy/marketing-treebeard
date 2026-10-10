@@ -15,12 +15,16 @@
  * - **`/`** redirects to `/actions`.
  * - **Layout**: each of the four screens renders inside one `PageShell` with the signed-in email,
  *   "Sign out" and the primary navigation, whose current link carries `aria-current="page"`.
+ * - **Code splitting**: the Decisions, Sources and Settings routes have lazy components, Actions
+ *   and Login eager ones, and each lazy screen renders inside the layout once its chunk loads.
  * - **`/actions?run=`** keeps only positive safe integers, and a rejected value is removed from the
  *   URL by a replacing redirect; **`/login?redirect=`** keeps only same-origin paths the same way.
  * - **Not found**: an unknown path renders "Page not found" inside the shell when signed in, and
  *   sends a signed-out visitor to sign in.
  * - **Sign out**: success and a 401 clear the cache and open `/login`, so the guard asks the API
- *   again; any other failure keeps the session and explains itself beside the button.
+ *   again; any other failure keeps the session and explains itself beside the button, in the
+ *   polite status region mounted with the layout, and returns focus to the button only when focus
+ *   had fallen to `<body>`.
  * - **Focus after navigation**: focus moves to `<main>` only when the focused control was removed.
  */
 // mockApi registers an afterEach hook that fails a test with an unmatched request. Vitest skips
@@ -208,7 +212,10 @@ describe('auth guard', () => {
     expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
     // The guard runs before the page, so nothing of the signed-in screen is requested.
     expect(callsTo(api, 'GET', '/recommendations')).toHaveLength(0);
-    expect(screen.queryByRole('navigation', { name: 'Primary' })).toBeNull();
+    // The sign-in screen's own navigation lists itself only, never a signed-in screen.
+    expect(within(primaryNav()).getAllByRole('link').map((link) => link.textContent)).toEqual([
+      'Sign in',
+    ]);
   });
 
   it('sends a signed-out visitor at /actions to the sign-in form, keeping /actions', async () => {
@@ -435,6 +442,63 @@ describe('authenticated layout', () => {
     // A client-side navigation adds one history entry.
     expect(router.history.length).toBe(2);
   });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Code splitting
+// ---------------------------------------------------------------------------------------------
+
+describe('code splitting', () => {
+  it('loads Decisions, Sources and Settings lazily and keeps Actions and Login eager', async () => {
+    mockApi({ ...pageReads(), ...SIGNED_IN });
+    const { router } = renderApp('/actions');
+    await findTitle('Actions');
+    const { routesByPath } = router;
+
+    // lazyRouteComponent gives its component a `preload` that loads the chunk, and sets it to
+    // undefined once the chunk has loaded. The route tree is module state shared by every test
+    // in this file, so the key, present either way, marks a lazy component, not its value.
+    const lazy = [routesByPath['/decisions'], routesByPath['/sources'], routesByPath['/settings']];
+    for (const route of lazy) {
+      expect(route.options.component).toHaveProperty('preload');
+    }
+    const eager = [routesByPath['/actions'], routesByPath['/login']];
+    for (const route of eager) {
+      expect(route.options.component).toBeDefined();
+      expect(route.options.component).not.toHaveProperty('preload');
+    }
+  });
+
+  /** The code-split screens: link text, path and page title. */
+  const LAZY_SCREENS = [
+    ['Decisions', '/decisions', 'Decisions'],
+    ['Sources', '/sources', 'Sources'],
+    ['Settings', '/settings', 'Settings'],
+  ] as const;
+
+  it.each(LAZY_SCREENS)(
+    'renders %s inside the layout once its chunk loads after a navigation from /actions',
+    async (label, path, title) => {
+      mockApi({ ...pageReads(), ...SIGNED_IN });
+      const { router } = renderApp('/actions');
+      await findTitle('Actions');
+
+      fireEvent.click(within(primaryNav()).getByRole('link', { name: label }));
+
+      // The screen arrives asynchronously, after its chunk.
+      await findTitle(title);
+      await waitForPath(router, path);
+      const main = screen.getByRole('main');
+      expect(within(main).getByRole('heading', { level: 1, name: title })).toBeTruthy();
+      expect(main.contains(primaryNav())).toBe(false);
+      expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
+      expect(
+        within(screen.getByRole('banner')).getByRole('button', { name: 'Sign out' }),
+      ).toBeTruthy();
+      // The chunk has loaded, so the lazy component no longer offers a preload.
+      expect(router.routesByPath[path].options.component?.preload).toBeUndefined();
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -678,6 +742,43 @@ describe('not found', () => {
 // Sign out
 // ---------------------------------------------------------------------------------------------
 
+/** A `POST /auth/logout` the test answers by hand, so the request stays pending until then. */
+interface HeldLogout {
+  /** The handler to register for `POST /auth/logout`. */
+  handler: () => Promise<MockResponse>;
+  /** Answers the pending request with `response`. */
+  release: (response: MockResponse) => void;
+}
+
+/**
+ * A sign-out request held pending until the test releases it, so the test can move focus while
+ * the "Sign out" button is loading.
+ *
+ * @returns The handler and its release.
+ */
+function heldLogout(): HeldLogout {
+  let release: (response: MockResponse) => void = () => undefined;
+  const promise = new Promise<MockResponse>((resolve) => {
+    release = resolve;
+  });
+  return { handler: () => promise, release };
+}
+
+/** The 500 of a failed sign-out that keeps the session. */
+const LOGOUT_FAILED = apiError(500, 'internal_error', 'Internal error');
+
+/** What the top bar says beside "Sign out" after a failed sign-out. */
+const SIGN_OUT_FAILED = 'Sign-out failed. Try again.';
+
+/**
+ * The top bar's polite status region, which holds "Sign out" and, after a failure, the message.
+ *
+ * @returns The `role="status"` element inside the `banner` landmark.
+ */
+function signOutStatus(): HTMLElement {
+  return within(screen.getByRole('banner')).getByRole('status');
+}
+
 describe('sign out', () => {
   it('posts /auth/logout with the CSRF header, clears the cache and opens /login', async () => {
     const api = mockApi({
@@ -699,7 +800,10 @@ describe('sign out', () => {
     expect(posts).toHaveLength(1);
     expect(posts[0]?.headers.get('X-Requested-With')).toBe('ads-engine');
     expect(queryClient.getQueryData(queryKeys.me)).toBeUndefined();
-    expect(screen.queryByRole('navigation', { name: 'Primary' })).toBeNull();
+    // The sign-in screen's own navigation lists itself only, never a signed-in screen.
+    expect(within(primaryNav()).getAllByRole('link').map((link) => link.textContent)).toEqual([
+      'Sign in',
+    ]);
 
     // The cleared cache cannot let the guard pass: it asks the API, which says signed out.
     api.use(SIGNED_OUT);
@@ -727,23 +831,29 @@ describe('sign out', () => {
   });
 
   it('keeps the session and explains a failed sign-out beside the button', async () => {
-    const api = mockApi({
-      ...pageReads(),
-      ...SIGNED_IN,
-      'POST /auth/logout': apiError(500, 'internal_error', 'Internal error'),
-    });
+    const api = mockApi({ ...pageReads(), ...SIGNED_IN, 'POST /auth/logout': LOGOUT_FAILED });
     const { router, queryClient } = renderApp('/settings');
     await findTitle('Settings');
     const button = screen.getByRole('button', { name: 'Sign out' });
     expect(button.hasAttribute('aria-describedby')).toBe(false);
+    // The polite region is mounted before any failure, holding the button and no message.
+    const status = signOutStatus();
+    expect(status.getAttribute('aria-live')).toBe('polite');
+    expect(status.getAttribute('aria-atomic')).toBe('false');
+    expect(status.contains(button)).toBe(true);
+    expect(status.textContent).toBe('Sign out');
 
     fireEvent.click(button);
 
-    const message = await screen.findByText('Sign-out failed. Try again.');
+    const message = await screen.findByText(SIGN_OUT_FAILED);
     expect(router.state.location.pathname).toBe('/settings');
     expect(screen.getByRole('heading', { level: 1, name: 'Settings' })).toBeTruthy();
     expect(queryClient.getQueryData(queryKeys.me)).toEqual(makeMe());
     const signOut = screen.getByRole('button', { name: 'Sign out' });
+    // The message lands in the region that already existed, beside the same button.
+    expect(signOutStatus()).toBe(status);
+    expect(status.contains(message)).toBe(true);
+    expect(signOut).toBe(button);
     expect(message.id).not.toBe('');
     expect(signOut.getAttribute('aria-describedby')).toBe(message.id);
     await waitFor(() => {
@@ -757,6 +867,90 @@ describe('sign out', () => {
     await findTitle('Sign in');
     await waitForPath(router, '/login');
     expect(callsTo(api, 'POST', '/auth/logout')).toHaveLength(2);
+  });
+
+  it('clears the message while a retry is pending, so a repeated failure is new content', async () => {
+    const api = mockApi({ ...pageReads(), ...SIGNED_IN, 'POST /auth/logout': LOGOUT_FAILED });
+    renderApp('/settings');
+    await findTitle('Settings');
+    const status = signOutStatus();
+    const button = screen.getByRole('button', { name: 'Sign out' });
+    fireEvent.click(button);
+    await screen.findByText(SIGN_OUT_FAILED);
+    await waitFor(() => {
+      expect(button.hasAttribute('disabled')).toBe(false);
+    });
+
+    const retry = heldLogout();
+    api.use({ 'POST /auth/logout': retry.handler });
+    fireEvent.click(button);
+
+    await waitFor(() => {
+      expect(button.hasAttribute('disabled')).toBe(true);
+    });
+    expect(screen.queryByText(SIGN_OUT_FAILED)).toBeNull();
+    expect(button.hasAttribute('aria-describedby')).toBe(false);
+
+    retry.release(LOGOUT_FAILED);
+
+    const message = await screen.findByText(SIGN_OUT_FAILED);
+    expect(signOutStatus()).toBe(status);
+    expect(status.contains(message)).toBe(true);
+    expect(button.getAttribute('aria-describedby')).toBe(message.id);
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(callsTo(api, 'POST', '/auth/logout')).toHaveLength(2);
+  });
+
+  it('returns focus to "Sign out" when it fell to <body> while the request was pending', async () => {
+    const held = heldLogout();
+    mockApi({ ...pageReads(), ...SIGNED_IN, 'POST /auth/logout': held.handler });
+    const { router } = renderApp('/settings');
+    await findTitle('Settings');
+    const button = screen.getByRole('button', { name: 'Sign out' });
+    button.focus();
+    fireEvent.click(button);
+    await waitFor(() => {
+      expect(button.hasAttribute('disabled')).toBe(true);
+    });
+    // A browser moves focus off a control that becomes disabled; jsdom keeps it there and
+    // ignores blur() on it, so focus passes through <main> (tabindex="-1") to reach <body>.
+    const main = screen.getByRole('main');
+    main.focus();
+    main.blur();
+    expect(document.activeElement).toBe(document.body);
+
+    held.release(LOGOUT_FAILED);
+
+    await screen.findByText(SIGN_OUT_FAILED);
+    await waitFor(() => {
+      expect(document.activeElement).toBe(button);
+    });
+    expect(button.hasAttribute('disabled')).toBe(false);
+    expect(router.state.location.pathname).toBe('/settings');
+  });
+
+  it('leaves focus on the control the user moved to while the request was pending', async () => {
+    const held = heldLogout();
+    mockApi({ ...pageReads(), ...SIGNED_IN, 'POST /auth/logout': held.handler });
+    const { router } = renderApp('/settings');
+    await findTitle('Settings');
+    const button = screen.getByRole('button', { name: 'Sign out' });
+    button.focus();
+    fireEvent.click(button);
+    await waitFor(() => {
+      expect(button.hasAttribute('disabled')).toBe(true);
+    });
+    const link = within(primaryNav()).getByRole('link', { name: 'Decisions' });
+    link.focus();
+
+    held.release(LOGOUT_FAILED);
+
+    await screen.findByText(SIGN_OUT_FAILED);
+    await waitFor(() => {
+      expect(button.hasAttribute('disabled')).toBe(false);
+    });
+    expect(document.activeElement).toBe(link);
+    expect(router.state.location.pathname).toBe('/settings');
   });
 });
 

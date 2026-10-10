@@ -32,7 +32,8 @@
  *   first-start screen fills in by itself. A transient failure keeps polling; an expired
  *   session (401) or any other error stops it. {@link useSources} polls every
  *   {@link SOURCES_POLL_MS}. Polling runs only while the page is visible and stops when the
- *   last component using the query unmounts.
+ *   last component using the query unmounts. A prefetch ({@link usePrefetchActionsReads})
+ *   registers no component, so it reads once and never polls.
  *
  * Path ids are always sent as `encodeURIComponent(String(id))`, because `apiFetch` does not
  * encode path segments.
@@ -72,6 +73,7 @@ import {
   useQueryClient,
 } from '@tanstack/react-query';
 import type { QueryClient } from '@tanstack/react-query';
+import { useCallback, useEffect } from 'react';
 
 import { ApiError, apiFetch, apiFetchPage, isApiError } from './client';
 import type {
@@ -395,9 +397,46 @@ export function useMe() {
 }
 
 /**
+ * Query options for the latest **succeeded default** run, `GET /runs/latest` → {@link Run}:
+ * the options {@link useDefaultRun} observes and {@link usePrefetchActionsReads} prefetches.
+ *
+ * **Seeded from the default page.** When the cache already holds the default recommendations
+ * page (`queryKeys.recommendations('default')`, `GET /recommendations` without `run_id`), a
+ * new `queryKeys.runs.latest` entry starts from that page's `run`, dated when the page was
+ * read, so it is fetched only once that copy is stale. Both reads answer with the same run:
+ * run selection gives `/runs/latest` and `GET /recommendations` without `run_id` only the
+ * latest succeeded default run (AAP 0.5.3), and the API's `get_latest_run`
+ * (`api/routes/runs.py`) and `get_recommendations` (`api/routes/recommendations.py`) both
+ * render it as `schemas.Run.from_row(latest_default_run(...))`. Only the default page seeds
+ * it: a page addressed by run id may show a custom run, which never stands in for the
+ * default. The seed applies only while the entry does not exist yet; an existing entry keeps
+ * its own data and polling.
+ *
+ * Polling is inline, `(query) => currentStatePollInterval(query.state.error, true)`, for the
+ * reason {@link currentStatePollInterval} gives.
+ *
+ * @param queryClient - The client whose cache holds the default page to seed from.
+ * @returns Options for `useQuery` or `prefetchQuery`, keyed by `queryKeys.runs.latest`.
+ */
+export function defaultRunQueryOptions(queryClient: QueryClient) {
+  return queryOptions({
+    queryKey: queryKeys.runs.latest,
+    queryFn: ({ signal }) => apiFetch<Run>('/runs/latest', { signal }),
+    initialData: () =>
+      queryClient.getQueryData<RecommendationsPage>(queryKeys.recommendations('default'))?.run,
+    initialDataUpdatedAt: () =>
+      queryClient.getQueryState(queryKeys.recommendations('default'))?.dataUpdatedAt,
+    refetchInterval: (query) => currentStatePollInterval(query.state.error, true),
+  });
+}
+
+/**
  * The latest **succeeded default** run: `GET /runs/latest` → {@link Run} (AAP 0.5.3 run
  * selection). A custom run, even one whose window equals the default, never stands in for
  * it, and a running or failed default run never replaces the last good one.
+ *
+ * A first read after the default `/actions` page has loaded sends no request while that page
+ * is fresh, because the entry starts from the page's own run ({@link defaultRunQueryOptions}).
  *
  * Status codes: 200; 404 `not_found` ("No analysis run yet") before the first default run
  * succeeds. While that 404 persists the query refetches every {@link FIRST_RUN_POLL_MS}, so
@@ -413,11 +452,8 @@ export function useMe() {
  * @returns The query result, keyed by `queryKeys.runs.latest`.
  */
 export function useDefaultRun() {
-  return useQuery({
-    queryKey: queryKeys.runs.latest,
-    queryFn: ({ signal }) => apiFetch<Run>('/runs/latest', { signal }),
-    refetchInterval: (query) => currentStatePollInterval(query.state.error, true),
-  });
+  const queryClient = useQueryClient();
+  return useQuery(defaultRunQueryOptions(queryClient));
 }
 
 /**
@@ -447,18 +483,64 @@ export function useRun(runId: RunId | undefined) {
  * The newest custom-window runs, newest first, in every status:
  * `GET /runs?kind=custom&limit=` → {@link Run}[].
  *
+ * With `enabled: false` the query sends nothing and keeps whatever list it already holds, so a
+ * caller can defer the read until the user asks for the list; `WindowPicker` does, behind its
+ * "Recent custom windows" disclosure, and drops the list with {@link useForgetCustomRuns} once
+ * the user no longer asks for it.
+ *
  * Status codes: 200, an empty list when there are none; 422 `validation_error` for a `limit`
  * outside 1–100.
  *
  * @param limit - How many runs to list, 1 to 100; 20 when omitted, the API's own default.
+ * @param options - `enabled`: whether the list may be read; `true` when omitted.
  * @returns The query result, keyed by `queryKeys.runs.custom(limit)`.
  */
-export function useCustomRuns(limit: number = DEFAULT_CUSTOM_RUNS_LIMIT) {
+export function useCustomRuns(
+  limit: number = DEFAULT_CUSTOM_RUNS_LIMIT,
+  options: { enabled?: boolean } = {},
+) {
   return useQuery({
     queryKey: queryKeys.runs.custom(limit),
     queryFn: ({ signal }) =>
       apiFetch<Run[]>('/runs', { query: { kind: 'custom', limit }, signal }),
+    enabled: options.enabled ?? true,
   });
+}
+
+/**
+ * Whether the cache already holds a custom-run list for `limit` ({@link useCustomRuns}), that
+ * is whether it was read earlier in this session and not forgotten since
+ * ({@link useForgetCustomRuns}). It reads the cache at render time and sends nothing, so a
+ * caller can open a deferred list at once while the session still holds it.
+ *
+ * @param limit - The list's limit, as given to {@link useCustomRuns}; 20 when omitted.
+ * @returns `true` when `queryKeys.runs.custom(limit)` holds data, even data being refetched.
+ */
+export function useHasCachedCustomRuns(limit: number = DEFAULT_CUSTOM_RUNS_LIMIT): boolean {
+  const queryClient = useQueryClient();
+  return queryClient.getQueryData<Run[]>(queryKeys.runs.custom(limit)) !== undefined;
+}
+
+/**
+ * A callback that forgets the custom-run list for `limit` ({@link useCustomRuns}): it removes
+ * exactly `queryKeys.runs.custom(limit)` from the cache, and with it the list, its error and
+ * any read still in flight, which is aborted. Every other key stays, the lists of other limits
+ * included. It sends nothing.
+ *
+ * `WindowPicker` calls it when the user closes "Recent custom windows", so
+ * {@link useHasCachedCustomRuns} is `false` afterwards and a later mount starts with the list
+ * closed and unread. A `useCustomRuns` observer that is still mounted, disabled, keeps working:
+ * on its next render TanStack Query builds a new, empty entry under the same key, and enabling
+ * the observer again reads the list once.
+ *
+ * @param limit - The list's limit, as given to {@link useCustomRuns}; 20 when omitted.
+ * @returns A callback, stable while the client and `limit` stay the same.
+ */
+export function useForgetCustomRuns(limit: number = DEFAULT_CUSTOM_RUNS_LIMIT): () => void {
+  const queryClient = useQueryClient();
+  return useCallback(() => {
+    queryClient.removeQueries({ queryKey: queryKeys.runs.custom(limit), exact: true });
+  }, [queryClient, limit]);
 }
 
 /**
@@ -625,10 +707,36 @@ export function useDiscrepancies(
  * @returns The query result, keyed by `queryKeys.sources`.
  */
 export function useSources() {
-  return useQuery({
+  return useQuery(sourcesQueryOptions());
+}
+
+/**
+ * Query options for every source's health, `GET /sources` → {@link Source}[]: the options
+ * {@link useSources} observes and {@link usePrefetchActionsReads} prefetches. They poll every
+ * {@link SOURCES_POLL_MS} while a component observes them; a prefetch reads once.
+ *
+ * @returns Options for `useQuery` or `prefetchQuery`, keyed by `queryKeys.sources`.
+ */
+export function sourcesQueryOptions() {
+  return queryOptions({
     queryKey: queryKeys.sources,
     queryFn: ({ signal }) => apiFetch<Source[]>('/sources', { signal }),
     refetchInterval: SOURCES_POLL_MS,
+  });
+}
+
+/**
+ * Query options for the read-only configuration, `GET /config` → {@link ConfigView}: the
+ * options {@link useConfig} observes and {@link usePrefetchActionsReads} prefetches. The
+ * result stays fresh for 5 minutes, because thresholds change only when the API restarts.
+ *
+ * @returns Options for `useQuery` or `prefetchQuery`, keyed by `queryKeys.config`.
+ */
+export function configQueryOptions() {
+  return queryOptions({
+    queryKey: queryKeys.config,
+    queryFn: ({ signal }) => apiFetch<ConfigView>('/config', { signal }),
+    staleTime: LONG_STALE_MS,
   });
 }
 
@@ -646,11 +754,44 @@ export function useSources() {
  * @returns The query result, keyed by `queryKeys.config`.
  */
 export function useConfig() {
-  return useQuery({
-    queryKey: queryKeys.config,
-    queryFn: ({ signal }) => apiFetch<ConfigView>('/config', { signal }),
-    staleTime: LONG_STALE_MS,
-  });
+  return useQuery(configQueryOptions());
+}
+
+/**
+ * Starts the `/actions` status bar's reads alongside the page's own `GET /recommendations`,
+ * instead of after it (AAP 0.1.1: the five sections render in under 2 s).
+ *
+ * The status bar mounts only once the page has data, so its reads would otherwise wait for
+ * the page. From an effect keyed on `runId`, this hook prefetches:
+ *
+ * - `GET /config` ({@link configQueryOptions}), for the window picker and the White papers
+ *   section;
+ * - `GET /sources` ({@link sourcesQueryOptions}), for the source chips;
+ * - `GET /runs/latest` ({@link defaultRunQueryOptions}), only when `runId` addresses a run.
+ *   Without one the page itself reads the latest default run, and the picker's default-run
+ *   entry starts from that page's `run`; prefetching it then would create the entry before
+ *   the page lands, read the same run twice and defeat the seed.
+ *
+ * It never reads the custom-run list, which waits until the user asks for it. A prefetch
+ * registers no component, so nothing polls while the page shows its loading, first-start or
+ * failure state; the status bar's hooks take the entries over once it mounts. An entry that
+ * is still fresh is not read again. A failed prefetch is read again when those hooks mount,
+ * and the prefetch itself never rejects.
+ *
+ * Call it from the page component, which renders only after the router's auth guard has
+ * passed, so no protected read starts before the session is known.
+ *
+ * @param runId - The run `/actions?run=<id>` addresses; omitted for the latest default run.
+ */
+export function usePrefetchActionsReads(runId?: RunId): void {
+  const queryClient = useQueryClient();
+  useEffect(() => {
+    void queryClient.prefetchQuery(configQueryOptions());
+    void queryClient.prefetchQuery(sourcesQueryOptions());
+    if (runId !== undefined) {
+      void queryClient.prefetchQuery(defaultRunQueryOptions(queryClient));
+    }
+  }, [queryClient, runId]);
 }
 
 // ---------------------------------------------------------------------------------------------

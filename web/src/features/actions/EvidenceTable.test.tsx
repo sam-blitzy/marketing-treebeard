@@ -27,6 +27,7 @@ import { render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { Baseline, Item, Metric, Sample, StatTest } from '../../api/types';
+import * as formatModule from '../../lib/format';
 import { formatMetric, formatSample, formatTestLine } from '../../lib/format';
 import {
   FIXTURE_ITEM_IDS,
@@ -666,6 +667,38 @@ describe('EvidenceTable inside the app providers', () => {
     const table = screen.getByRole('table', { name: 'Evidence' });
     expect(within(table).getByText('No metrics recorded')).toBeDefined();
     expect(within(table).queryAllByRole('rowheader')).toEqual([]);
+  });
+});
+
+
+// ---------------------------------------------------------------------------------------------
+// EvidenceTable rendered again
+// ---------------------------------------------------------------------------------------------
+
+describe('EvidenceTable rendered again', () => {
+  it('keeps its output for the same evidence and caption, and renders changed evidence', () => {
+    const spend = metric('spend', 'Spend', '120.00', 'currency', { currency: 'USD' });
+    const evidence = makeEvidence({ metrics: [spend], baselines: [] });
+    const raised = { ...spend, value: '180.00' };
+    const changed = { ...evidence, metrics: [raised] };
+    const expected = formatMetric(raised);
+    const formats = vi.spyOn(formatModule, 'formatMetric');
+    const { rerender } = render(<EvidenceTable evidence={evidence} />);
+    const formatted = formats.mock.calls.length;
+    expect(formatted).toBeGreaterThan(0);
+
+    // The same evidence object, as a refetch that left the item unchanged hands back.
+    rerender(<EvidenceTable evidence={evidence} />);
+    expect(formats.mock.calls).toHaveLength(formatted);
+
+    // Changed evidence arrives as a new object: the table shows the new value.
+    rerender(<EvidenceTable evidence={changed} />);
+    expect(formats.mock.calls.length).toBeGreaterThan(formatted);
+    expect(tableTexts()[1]).toEqual(['Spend', expected, '—']);
+
+    // A new caption renders too.
+    rerender(<EvidenceTable evidence={changed} caption="Budget evidence" />);
+    expect(tableTexts('Budget evidence')[1]).toEqual(['Spend', expected, '—']);
   });
 });
 

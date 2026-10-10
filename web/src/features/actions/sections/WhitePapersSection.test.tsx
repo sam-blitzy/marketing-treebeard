@@ -32,8 +32,10 @@
 import { apiError, json, mockApi } from '../../../test/mockApi';
 import type { MockHandler, MockResponse } from '../../../test/mockApi';
 
-import { fireEvent, screen, waitFor, within } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
+import { useState } from 'react';
+import type { ReactElement } from 'react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type {
   ConfigView,
@@ -60,6 +62,7 @@ import {
 } from '../../../test/fixtures';
 import { renderWithProviders } from '../../../test/render';
 import { formatMetric } from '../../../lib/format';
+import * as evidenceExtraModule from '../evidenceExtra';
 import { WHITE_PAPER_METRIC_KEYS, type WhitePaperMetricKey } from '../evidenceExtra';
 import { WhitePapersSection, mqlHeader } from './WhitePapersSection';
 
@@ -1151,5 +1154,123 @@ describe('WhitePapersSection', () => {
       expect(within(section).queryByRole('table')).toBeNull();
       expect(within(section).getByText('No actions in this section')).toBeTruthy();
     });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// A section rendered again
+// ---------------------------------------------------------------------------------------------
+
+describe('WhitePapersSection rendered again', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * Renders the section from state, then returns `show`, which hands it a new section object as a
+   * refetched page does, and waits for the bound MQL header.
+   */
+  async function renderReplaceable(initial: Section): Promise<(next: Section) => void> {
+    const control: { show?: (next: Section) => void } = {};
+    function Host(): ReactElement {
+      const [section, setSection] = useState(initial);
+      control.show = setSection;
+      return <WhitePapersSection section={section} run={RUN} overlay={OVERLAY} />;
+    }
+    mockApi({ 'GET /config': json(200, makeConfig()) });
+    await renderWithProviders(<Host />);
+    await screen.findAllByRole('columnheader', { name: MQL_BOUND });
+    return (next) => {
+      act(() => {
+        control.show?.(next);
+      });
+    };
+  }
+
+  /** A new section object holding the very same item objects, as structural sharing keeps them. */
+  function sameItems(section: Section): Section {
+    return { ...section, groups: section.groups.map((group) => ({ ...group })) };
+  }
+
+  /** `section` with the item `id` replaced by `replace(item)`, every other item kept as is. */
+  function withItem(section: Section, id: number, replace: (item: Item) => Item): Section {
+    return {
+      ...section,
+      groups: section.groups.map((group) => ({
+        ...group,
+        items: group.items.map((item) => (item.id === id ? replace(item) : item)),
+      })),
+    };
+  }
+
+  it('formats each asset row once per item object, and again only for an item that changed', async () => {
+    const section = defaultWhitePapers();
+    const newSpend = { ...citedMetric(pageItem(FIXTURE_ITEM_IDS.wEur), 'spend'), value: '3000.00' };
+    const costNotes = vi.spyOn(evidenceExtraModule, 'whitePaperCostNotes');
+    const show = await renderReplaceable(section);
+    // Three rows, each formatted once, although the section rendered again for the configuration.
+    expect(costNotes).toHaveBeenCalledTimes(3);
+
+    show(sameItems(section));
+    expect(costNotes).toHaveBeenCalledTimes(3);
+    expect(bodyRows(table('White papers (EUR)'))[0]?.[cellIndex('spend')]).toBe('€2,840.00');
+
+    show(
+      withItem(section, FIXTURE_ITEM_IDS.wEur, (item) => ({
+        ...item,
+        evidence: {
+          ...item.evidence,
+          metrics: item.evidence.metrics.map((each) => (each.key === 'spend' ? newSpend : each)),
+        },
+      })),
+    );
+    expect(costNotes).toHaveBeenCalledTimes(4);
+    const [first, second] = bodyRows(table('White papers (EUR)'));
+    expect(first?.[cellIndex('spend')]).toBe(formatMetric(newSpend));
+    expect(second?.[cellIndex('spend')]).toBe('€1,500.00');
+  });
+
+  it("keeps an expanded row open and shows its item's new per-creative rows", async () => {
+    const section = defaultWhitePapers();
+    const creatives = vi.spyOn(evidenceExtraModule, 'creativeRows');
+    const show = await renderReplaceable(section);
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Details for The 2026 B2B Pipeline Report' }),
+    );
+    const caption = 'Per creative: The 2026 B2B Pipeline Report';
+    expect(within(table(caption)).getByText('Variant A')).toBeTruthy();
+    const read = creatives.mock.calls.length;
+    expect(read).toBeGreaterThanOrEqual(1);
+
+    // The same item: its per-creative rows are not read again.
+    show(sameItems(section));
+    expect(creatives.mock.calls).toHaveLength(read);
+
+    // The item's credit rows change: the open details read and show the new rows.
+    show(
+      withItem(section, FIXTURE_ITEM_IDS.wEur, (item) => {
+        const extra = item.evidence.extra ?? {};
+        const rows: unknown[] = Array.isArray(extra.rows) ? extra.rows : [];
+        return {
+          ...item,
+          evidence: {
+            ...item.evidence,
+            extra: {
+              ...extra,
+              rows: rows.map((row) =>
+                evidenceExtraModule.isRecord(row) && row.label === 'Variant A'
+                  ? { ...row, label: 'Variant A (refreshed)' }
+                  : row,
+              ),
+            },
+          },
+        };
+      }),
+    );
+    expect(creatives.mock.calls.length).toBeGreaterThan(read);
+    const details = table(caption);
+    expect(within(details).getByText('Variant A (refreshed)')).toBeTruthy();
+    expect(within(details).queryByText('Variant A')).toBeNull();
+    expect(within(details).getByText('unknown creative')).toBeTruthy();
   });
 });

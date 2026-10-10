@@ -9,7 +9,10 @@
  * `run_in_progress` reads "Another analysis is running. Try again shortly."; a 422 and every
  * other API error show the API's own message. Failed reads of `GET /runs/latest` and
  * `GET /runs?kind=custom` are stated with a Retry button, and recent custom runs can be reopened
- * by id. No window length is written into the client: every preset, the default and the longest
+ * by id from behind the "Recent custom windows" disclosure, which alone reads
+ * `GET /runs?kind=custom`, starts open only while that list is cached, and forgets the list when
+ * it is closed, so a later picker starts closed and reads it only once opened again. No window
+ * length is written into the client: every preset, the default and the longest
  * span come from the configuration, and window ends come from runs.
  *
  * Requests are answered by `../../test/mockApi`, so the real client and TanStack Query hooks
@@ -24,10 +27,11 @@
  */
 import { apiError, html, json, mockApi } from '../../test/mockApi';
 import type { ApiMock, MockHandlers, MockResponse, RecordedCall } from '../../test/mockApi';
-import { renderWithProviders } from '../../test/render';
+import { createTestQueryClient, renderWithProviders } from '../../test/render';
 import { fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
+import { queryKeys } from '../../api/queries';
 import type { ConfigView, Run } from '../../api/types';
 import { CUSTOM_RUN_ID, DEFAULT_RUN_ID, makeConfig, makeRun } from '../../test/fixtures';
 import { WindowPicker, presetWindow } from './WindowPicker';
@@ -148,6 +152,33 @@ function renderPicker(run: Run = makeRun(), path = '/actions') {
 /** A preset or picker button by its accessible name. */
 function button(name: string): HTMLElement {
   return screen.getByRole('button', { name });
+}
+
+/**
+ * Presses "Recent custom windows", which opens the recent custom runs and so reads
+ * `GET /runs?kind=custom`.
+ *
+ * @returns The disclosure button.
+ */
+function openRecentCustomRuns(): HTMLElement {
+  const toggle = button('Recent custom windows');
+  fireEvent.click(toggle);
+  return toggle;
+}
+
+/** The `GET /runs?kind=custom` requests made so far. */
+function customRunReads(api: ApiMock): RecordedCall[] {
+  return api.calls.filter((call) => call.method === 'GET' && call.path === '/runs');
+}
+
+/** The region the "Recent custom windows" button names in `aria-controls`. */
+function recentCustomRunsRegion(): HTMLElement {
+  const id = button('Recent custom windows').getAttribute('aria-controls') ?? '';
+  const region = id === '' ? null : document.getElementById(id);
+  if (region === null) {
+    throw new Error('The "Recent custom windows" button controls no element.');
+  }
+  return region;
 }
 
 /** Waits until the picker's controls are on screen. */
@@ -357,14 +388,14 @@ describe('WindowPicker', () => {
       const api = stubApi({ 'GET /runs/latest': latest.handler });
       const { queryClient } = await renderPicker();
 
-      // GET /config and GET /runs?kind=custom have answered; only the held GET /runs/latest
-      // is still fetching, so only the default run holds the picker back.
+      // GET /config has answered and GET /runs?kind=custom waits until the recent custom
+      // windows are opened; only the held GET /runs/latest is still fetching, so only the
+      // default run holds the picker back.
       await waitFor(() => {
         expect(queryClient.isFetching()).toBe(1);
       });
       expect(api.calls.map((call) => `${call.method} ${call.path}`).sort()).toEqual([
         'GET /config',
-        'GET /runs',
         'GET /runs/latest',
       ]);
       expect(statusWithText('Loading windows')).toBeDefined();
@@ -531,6 +562,7 @@ describe('WindowPicker', () => {
       });
       const { router } = await renderPicker();
       await presetsShown();
+      const toggle = openRecentCustomRuns();
       await waitFor(() => {
         expect(screen.getByRole('combobox', { name: 'Reopen a custom window' })).toBeTruthy();
       });
@@ -553,6 +585,7 @@ describe('WindowPicker', () => {
       expect(
         screen.getByRole('combobox', { name: 'Reopen a custom window' }).hasAttribute('disabled'),
       ).toBe(true);
+      expect(toggle.hasAttribute('disabled')).toBe(true);
       expect(router.state.location.search).toEqual({});
 
       created.resolve(json(201, customRun));
@@ -567,6 +600,7 @@ describe('WindowPicker', () => {
       for (const name of [...presetLabels(), 'Custom range']) {
         expect(button(name).hasAttribute('disabled')).toBe(false);
       }
+      expect(toggle.hasAttribute('disabled')).toBe(false);
     });
 
     it('ends every preset on the latest default run, not on an older run on screen', async () => {
@@ -869,13 +903,18 @@ describe('WindowPicker', () => {
       });
       await renderPicker();
       await presetsShown();
+      openRecentCustomRuns();
 
       await waitFor(() => {
         expect(noticeTitles()).toEqual(['Could not load recent custom windows']);
       });
       expect(within(noticeRegion()).getByText('Could not list runs.')).toBeTruthy();
       expect(screen.queryByRole('combobox', { name: 'Reopen a custom window' })).toBeNull();
-      const customCall = api.calls.find((call) => call.method === 'GET' && call.path === '/runs');
+      // Neither a spinner nor "No custom windows yet": the warning states the failed read.
+      expect(statusWithText('Loading recent custom windows')).toBeUndefined();
+      expect(screen.queryByText('No custom windows yet')).toBeNull();
+      expect(recentCustomRunsRegion().hidden).toBe(true);
+      const customCall = customRunReads(api)[0];
       expect(customCall?.search.get('kind')).toBe('custom');
 
       api.use({ 'GET /runs': json(200, [customRun]) });
@@ -887,6 +926,25 @@ describe('WindowPicker', () => {
       expect(screen.queryByText('Could not load recent custom windows')).toBeNull();
     });
 
+    it('states a failed GET /runs?kind=custom only while the recent custom windows are open', async () => {
+      const api = stubApi({
+        'GET /runs': apiError(500, 'internal_error', 'Could not list runs.'),
+      });
+      await renderPicker();
+      await presetsShown();
+      const toggle = openRecentCustomRuns();
+      await waitFor(() => {
+        expect(noticeTitles()).toEqual(['Could not load recent custom windows']);
+      });
+
+      fireEvent.click(toggle);
+
+      expect(toggle.getAttribute('aria-expanded')).toBe('false');
+      expect(screen.queryByText('Could not load recent custom windows')).toBeNull();
+      expect(screen.queryByRole('button', { name: 'Retry loading recent custom windows' })).toBeNull();
+      expect(customRunReads(api)).toHaveLength(1);
+    });
+
     it('states the computation first, then the default-run read, then the custom-runs read', async () => {
       stubApi({
         'GET /runs/latest': apiError(500, 'internal_error', 'The database is unavailable.'),
@@ -894,6 +952,8 @@ describe('WindowPicker', () => {
         'POST /runs': apiError(409, 'run_in_progress', 'An analysis is already running.'),
       });
       await renderPicker();
+      await presetsShown();
+      openRecentCustomRuns();
       await waitFor(() => {
         expect(noticeTitles()).toEqual([
           'Could not read the latest default run',
@@ -941,6 +1001,7 @@ describe('WindowPicker', () => {
       const api = stubApi({ 'GET /runs': json(200, runs) });
       const { router } = await renderPicker();
       await presetsShown();
+      openRecentCustomRuns();
 
       const select = await screen.findByRole<HTMLSelectElement>('combobox', {
         name: 'Reopen a custom window',
@@ -974,6 +1035,7 @@ describe('WindowPicker', () => {
       stubApi({ 'GET /runs': json(200, [september, failed, customRun]) });
       await renderPicker();
       await presetsShown();
+      openRecentCustomRuns();
 
       const select = await screen.findByRole<HTMLSelectElement>('combobox', {
         name: 'Reopen a custom window',
@@ -992,6 +1054,7 @@ describe('WindowPicker', () => {
       stubApi({ 'GET /runs': json(200, [september, customRun]) });
       const { router } = await renderPicker(customRun, `/actions?run=${String(CUSTOM_RUN_ID)}`);
       await presetsShown();
+      openRecentCustomRuns();
 
       const select = await screen.findByRole<HTMLSelectElement>('combobox', {
         name: 'Reopen a custom window',
@@ -1003,17 +1066,22 @@ describe('WindowPicker', () => {
       expect(router.state.location.search).toEqual({ run: CUSTOM_RUN_ID });
     });
 
-    it('renders no select when GET /runs lists no custom run', async () => {
+    it('says "No custom windows yet", with no select, when GET /runs lists no custom run', async () => {
       const api = stubApi({ 'GET /runs': json(200, []) });
       const { queryClient } = await renderPicker();
       await presetsShown();
+      openRecentCustomRuns();
 
       // Every read has answered, the empty custom-run list included.
       await waitFor(() => {
+        expect(screen.getByText('No custom windows yet')).toBeTruthy();
+      });
+      await waitFor(() => {
         expect(queryClient.isFetching()).toBe(0);
       });
-      const listed = api.calls.find((call) => call.method === 'GET' && call.path === '/runs');
+      const listed = customRunReads(api)[0];
       expect(listed?.search.get('kind')).toBe('custom');
+      expect(within(recentCustomRunsRegion()).getByText('No custom windows yet')).toBeTruthy();
       expect(screen.queryByRole('combobox', { name: 'Reopen a custom window' })).toBeNull();
       expect(screen.queryByRole('combobox')).toBeNull();
       expect(screen.queryByText('Could not load recent custom windows')).toBeNull();
@@ -1023,18 +1091,275 @@ describe('WindowPicker', () => {
       const api = stubApi({ 'GET /runs': json(200, [failed]) });
       const { queryClient } = await renderPicker();
       await presetsShown();
+      openRecentCustomRuns();
 
       await waitFor(() => {
-        expect(api.calls.some((call) => call.method === 'GET' && call.path === '/runs')).toBe(
-          true,
-        );
+        expect(customRunReads(api)).toHaveLength(1);
       });
       await waitFor(() => {
         expect(queryClient.isFetching()).toBe(0);
       });
       expect(statusWithText('Loading windows')).toBeUndefined();
+      expect(screen.getByText('No custom windows yet')).toBeTruthy();
       expect(screen.queryByRole('combobox', { name: 'Reopen a custom window' })).toBeNull();
       expect(screen.queryByText('Could not load recent custom windows')).toBeNull();
+    });
+  });
+
+  describe('the recent custom windows disclosure', () => {
+    it('starts closed and reads no GET /runs?kind=custom on mount', async () => {
+      const api = stubApi({ 'GET /runs': json(200, [customRun]) });
+      const { queryClient } = await renderPicker();
+      await presetsShown();
+      await waitFor(() => {
+        expect(queryClient.isFetching()).toBe(0);
+      });
+
+      const toggle = button('Recent custom windows');
+      expect(toggle.getAttribute('aria-expanded')).toBe('false');
+      // The controlled region is in place, hidden and empty, so aria-controls names an element.
+      const region = recentCustomRunsRegion();
+      expect(region.hidden).toBe(true);
+      expect(region.childNodes).toHaveLength(0);
+      expect(screen.queryByRole('combobox')).toBeNull();
+      expect(customRunReads(api)).toHaveLength(0);
+      expect(api.calls.map((call) => `${call.method} ${call.path}`).sort()).toEqual([
+        'GET /config',
+        'GET /runs/latest',
+      ]);
+    });
+
+    it('opens on a press: one GET /runs?kind=custom, a spinner until it answers, then the select', async () => {
+      const list = deferred();
+      const api = stubApi({ 'GET /runs': list.handler });
+      await renderPicker();
+      await presetsShown();
+
+      const toggle = button('Recent custom windows');
+      toggle.focus();
+      fireEvent.click(toggle);
+
+      expect(toggle.getAttribute('aria-expanded')).toBe('true');
+      // Pressing it leaves focus on it.
+      expect(document.activeElement).toBe(toggle);
+      await waitFor(() => {
+        expect(customRunReads(api)).toHaveLength(1);
+      });
+      expect(customRunReads(api)[0]?.search.get('kind')).toBe('custom');
+      expect(customRunReads(api)[0]?.search.get('limit')).toBe('20');
+      const region = recentCustomRunsRegion();
+      expect(region.hidden).toBe(false);
+      expect(within(region).getByText('Loading recent custom windows')).toBeTruthy();
+      expect(screen.queryByRole('combobox')).toBeNull();
+
+      list.resolve(json(200, [customRun]));
+
+      const select = await within(region).findByRole<HTMLSelectElement>('combobox', {
+        name: 'Reopen a custom window',
+      });
+      expect(Array.from(select.options, (option) => option.textContent)).toEqual([
+        'Choose a custom window',
+        reopenLabel(customRun),
+      ]);
+      expect(within(region).queryByText('Loading recent custom windows')).toBeNull();
+      expect(customRunReads(api)).toHaveLength(1);
+    });
+
+    it('closes on a second press, removing the select and reading nothing more', async () => {
+      const api = stubApi({ 'GET /runs': json(200, [customRun]) });
+      await renderPicker();
+      await presetsShown();
+      const toggle = openRecentCustomRuns();
+      await screen.findByRole('combobox', { name: 'Reopen a custom window' });
+
+      fireEvent.click(toggle);
+
+      expect(toggle.getAttribute('aria-expanded')).toBe('false');
+      expect(screen.queryByRole('combobox')).toBeNull();
+      expect(recentCustomRunsRegion().hidden).toBe(true);
+      expect(customRunReads(api)).toHaveLength(1);
+    });
+
+    it('starts open, without a press, when the list was read earlier in the session', async () => {
+      stubApi({ 'GET /runs': json(200, [customRun]) });
+      const queryClient = createTestQueryClient();
+      queryClient.setQueryData(queryKeys.runs.custom(20), [customRun]);
+      await renderWithProviders(<WindowPicker run={makeRun()} />, { queryClient });
+      await presetsShown();
+
+      expect(button('Recent custom windows').getAttribute('aria-expanded')).toBe('true');
+      // The cached list shows at once, with no spinner.
+      expect(screen.getByRole('combobox', { name: 'Reopen a custom window' })).toBeTruthy();
+      expect(statusWithText('Loading recent custom windows')).toBeUndefined();
+    });
+
+    it('forgets the list when closed, so a later picker starts closed and reads nothing until opened', async () => {
+      const api = stubApi({ 'GET /runs': json(200, [customRun]) });
+      const first = await renderPicker();
+      await presetsShown();
+      const toggle = openRecentCustomRuns();
+      await screen.findByRole('combobox', { name: 'Reopen a custom window' });
+      fireEvent.click(toggle);
+      expect(first.queryClient.getQueryData(queryKeys.runs.custom(20))).toBeUndefined();
+      first.unmount();
+
+      // Back on /actions later in the session, with the same cache.
+      const { queryClient } = await renderWithProviders(<WindowPicker run={makeRun()} />, {
+        queryClient: first.queryClient,
+      });
+      await presetsShown();
+      await waitFor(() => {
+        expect(queryClient.isFetching()).toBe(0);
+      });
+
+      const again = button('Recent custom windows');
+      expect(again.getAttribute('aria-expanded')).toBe('false');
+      expect(recentCustomRunsRegion().hidden).toBe(true);
+      expect(recentCustomRunsRegion().childNodes).toHaveLength(0);
+      expect(screen.queryByRole('combobox')).toBeNull();
+      expect(customRunReads(api)).toHaveLength(1);
+
+      again.focus();
+      fireEvent.click(again);
+
+      expect(again.getAttribute('aria-expanded')).toBe('true');
+      expect(document.activeElement).toBe(again);
+      // Forgotten, so the list is read afresh: a spinner until it answers, then the select.
+      expect(within(recentCustomRunsRegion()).getByText('Loading recent custom windows')).toBeTruthy();
+      await screen.findByRole('combobox', { name: 'Reopen a custom window' });
+      await waitFor(() => {
+        expect(queryClient.isFetching()).toBe(0);
+      });
+      expect(customRunReads(api)).toHaveLength(2);
+      expect(customRunReads(api)[1]?.search.get('kind')).toBe('custom');
+    });
+
+    it('reads the list once more when reopened after a close on the same picker', async () => {
+      const api = stubApi({ 'GET /runs': json(200, [customRun]) });
+      const { queryClient } = await renderPicker();
+      await presetsShown();
+      const toggle = openRecentCustomRuns();
+      await screen.findByRole('combobox', { name: 'Reopen a custom window' });
+      fireEvent.click(toggle);
+      expect(screen.queryByRole('combobox')).toBeNull();
+      expect(customRunReads(api)).toHaveLength(1);
+
+      fireEvent.click(toggle);
+
+      expect(toggle.getAttribute('aria-expanded')).toBe('true');
+      // The closed list was forgotten: nothing to show until the new read answers.
+      expect(within(recentCustomRunsRegion()).getByText('Loading recent custom windows')).toBeTruthy();
+      expect(screen.queryByRole('combobox')).toBeNull();
+      const select = await screen.findByRole<HTMLSelectElement>('combobox', {
+        name: 'Reopen a custom window',
+      });
+      expect(Array.from(select.options, (option) => option.textContent)).toEqual([
+        'Choose a custom window',
+        reopenLabel(customRun),
+      ]);
+      await waitFor(() => {
+        expect(queryClient.isFetching()).toBe(0);
+      });
+      expect(customRunReads(api)).toHaveLength(2);
+    });
+
+    it('stays open on a later picker after a run is chosen, with that run selected', async () => {
+      stubApi({ 'GET /runs': json(200, [customRun]) });
+      const first = await renderPicker();
+      await presetsShown();
+      openRecentCustomRuns();
+      const select = await screen.findByRole<HTMLSelectElement>('combobox', {
+        name: 'Reopen a custom window',
+      });
+
+      fireEvent.change(select, { target: { value: String(CUSTOM_RUN_ID) } });
+
+      await waitFor(() => {
+        expect(first.router.state.location.search).toEqual({ run: CUSTOM_RUN_ID });
+      });
+      first.unmount();
+
+      // The chosen run's page mounts a new picker with the same cache.
+      await renderWithProviders(<WindowPicker run={customRun} />, {
+        queryClient: first.queryClient,
+        path: `/actions?run=${String(CUSTOM_RUN_ID)}`,
+      });
+      await presetsShown();
+
+      expect(button('Recent custom windows').getAttribute('aria-expanded')).toBe('true');
+      const reopened = screen.getByRole<HTMLSelectElement>('combobox', {
+        name: 'Reopen a custom window',
+      });
+      expect(reopened.value).toBe(String(CUSTOM_RUN_ID));
+      expect(statusWithText('Loading recent custom windows')).toBeUndefined();
+    });
+
+    it('lists a computed run while open, and reads no list for one computed while closed', async () => {
+      const api = stubApi({ 'GET /runs': json(200, []) });
+      const { queryClient } = await renderPicker();
+      await presetsShown();
+      const toggle = openRecentCustomRuns();
+      await screen.findByText('No custom windows yet');
+
+      api.use({ 'GET /runs': json(200, [customRun]) });
+      fireEvent.click(button('90 days'));
+
+      // The created run invalidates the open list, which is read again and now lists it.
+      const select = await screen.findByRole<HTMLSelectElement>('combobox', {
+        name: 'Reopen a custom window',
+      });
+      expect(Array.from(select.options, (option) => option.textContent)).toEqual([
+        'Choose a custom window',
+        reopenLabel(customRun),
+      ]);
+      await waitFor(() => {
+        expect(queryClient.isFetching()).toBe(0);
+      });
+      expect(posts(api)).toHaveLength(1);
+      expect(customRunReads(api)).toHaveLength(2);
+
+      fireEvent.click(toggle);
+      fireEvent.click(button('56 days'));
+
+      await waitFor(() => {
+        expect(posts(api)).toHaveLength(2);
+      });
+      await waitFor(() => {
+        expect(toggle.hasAttribute('disabled')).toBe(false);
+      });
+      await waitFor(() => {
+        expect(queryClient.isFetching()).toBe(0);
+      });
+      // A closed list was forgotten: the invalidation reads nothing and opens nothing.
+      expect(toggle.getAttribute('aria-expanded')).toBe('false');
+      expect(customRunReads(api)).toHaveLength(2);
+      expect(queryClient.getQueryData(queryKeys.runs.custom(20))).toBeUndefined();
+    });
+
+    it('is disabled while a run computes, like every other control', async () => {
+      const created = deferred();
+      const api = stubApi({ 'POST /runs': created.handler });
+      await renderPicker();
+      await presetsShown();
+      const toggle = button('Recent custom windows');
+      expect(toggle.hasAttribute('disabled')).toBe(false);
+
+      fireEvent.click(button('56 days'));
+      await waitFor(() => {
+        expect(posts(api)).toHaveLength(1);
+      });
+      await waitFor(() => {
+        expect(toggle.hasAttribute('disabled')).toBe(true);
+      });
+      // A disabled button fires no click: the list stays closed and unread.
+      fireEvent.click(toggle);
+      expect(toggle.getAttribute('aria-expanded')).toBe('false');
+      expect(customRunReads(api)).toHaveLength(0);
+
+      created.resolve(apiError(409, 'run_in_progress', 'An analysis is already running.'));
+      await waitFor(() => {
+        expect(toggle.hasAttribute('disabled')).toBe(false);
+      });
     });
   });
 });

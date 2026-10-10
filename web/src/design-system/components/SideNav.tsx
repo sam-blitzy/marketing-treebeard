@@ -2,8 +2,9 @@
  * `SideNav`: the product's vertical navigation list with optional item counts (AAP 0.4.2,
  * "Section navigation: `SideNav` with anchor items and counts", status GAP).
  *
- * Two places render it (AAP 0.5.5): the app's primary navigation in the router layout, and the
- * `/actions` section navigation, whose anchor links carry each section's item count. It renders
+ * Three places render it (AAP 0.5.5): the app's primary navigation in the router layout, the
+ * sign-in screen's own primary navigation in `LoginPage`, and the `/actions` section navigation,
+ * whose anchor links carry each section's item count. It renders
  * one `<nav>` landmark named by `label`, holding a list of links, so assistive technology can
  * jump to the navigation and hear how many destinations it holds (WCAG 2.2 SC 1.3.1, 2.4.1 and
  * 4.1.2). The styling lives in `SideNav.css`, whose class names are the contract rendered here:

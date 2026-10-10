@@ -8,6 +8,10 @@
  * - **Run selection.** Without `?run=` the page reads `GET /recommendations` without `run_id`,
  *   the latest default run; with `?run=<id>` it reads that run, shows "Custom window {start} –
  *   {end}" with "Back to default", and the link returns to the default run.
+ * - **Status bar reads.** `GET /config` and `GET /sources` start before `GET /recommendations`
+ *   answers; a loaded default page then reads neither `GET /runs/latest` (its own run is the
+ *   latest default run) nor `GET /runs?kind=custom`, and `/actions?run=<id>` also starts
+ *   `GET /runs/latest` before its page answers.
  * - **The loaded page**, top to bottom: the single `<h1>` "Actions", the status bar, the custom
  *   banner (custom runs only), the global banners in their fixed order (only the discrepancy
  *   banner is an alert, and the short-window banner reads "Window of N days is below the
@@ -22,18 +26,26 @@
  *   could not be loaded" with the API's message and a Retry that keeps the failure screen
  *   while it reads again and returns focus to its button. A failed background refetch keeps the
  *   page; a failure never carries over to another run.
+ * - **Polls.** A poll in flight, a poll that returns the same page and one whose overlay differs
+ *   only in `computed_at` render no section again, even when the overlay's dataset lists arrive
+ *   as new arrays equal in value; a changed overlay field, dataset list or item still reaches
+ *   the screen, every section renders again for a changed list, and only the section holding a
+ *   changed item renders again.
  */
 import { apiError, json, mockApi } from '../../test/mockApi';
 import type { ApiMock, MockHandlers, MockResponse, RecordedCall } from '../../test/mockApi';
 
-import { fireEvent, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
+import { replaceEqualDeep } from '@tanstack/react-query';
+import type { QueryClient } from '@tanstack/react-query';
 import { useSearch } from '@tanstack/react-router';
+import { Profiler } from 'react';
 import type { ReactElement } from 'react';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { queryKeys } from '../../api/queries';
 import { SECTION_ORDER } from '../../api/types';
-import type { RecommendationsPage, Run } from '../../api/types';
+import type { RecommendationsPage, Run, SectionKey } from '../../api/types';
 import {
   CUSTOM_RUN_ID,
   FIXTURE_BANNERS,
@@ -43,13 +55,16 @@ import {
   makeConfig,
   makeDiscrepancy,
   makeFeedback,
+  makeOverlay,
   makeRecommendationsPage,
   makeRun,
   makeSection,
   makeSources,
 } from '../../test/fixtures';
-import { renderWithProviders } from '../../test/render';
+import { createTestQueryClient, renderWithProviders } from '../../test/render';
+import * as statusBarModule from '../status/StatusBar';
 import { ActionsPage, SECTION_COMPONENTS } from './ActionsPage';
+import * as sectionFrameModule from './sections/SectionFrame';
 
 // ---------------------------------------------------------------------------------------------
 // Fixtures and helpers
@@ -81,18 +96,45 @@ function customPage(): RecommendationsPage {
 }
 
 /**
+ * The reads the page starts beside `GET /recommendations` in every state, before any data
+ * arrives: the status bar's configuration and sources (`usePrefetchActionsReads`).
+ */
+function prefetchedReads(): MockHandlers {
+  return {
+    'GET /config': json(200, makeConfig()),
+    'GET /sources': json(200, makeSources()),
+  };
+}
+
+/**
  * The reads a loaded page makes besides `GET /recommendations`: the window picker's
- * configuration, default run and custom runs, the source chips' sources, and the Campaigns
- * section's discrepancies (White papers shares the configuration read).
+ * configuration and default run, the source chips' sources, and the Campaigns section's
+ * discrepancies (White papers shares the configuration read). The recent custom runs are read
+ * only once the user opens them, so `GET /runs` has no handler and a read of it fails the test.
  */
 function pageReads(): MockHandlers {
   return {
-    'GET /config': json(200, makeConfig()),
+    ...prefetchedReads(),
     'GET /runs/latest': json(200, makeRun()),
-    'GET /runs': json(200, [customRun()]),
-    'GET /sources': json(200, makeSources()),
     'GET /discrepancies': json(200, [makeDiscrepancy('status')]),
   };
+}
+
+/**
+ * A test client whose reads stay fresh for 30 s, the app's own default (`QUERY_STALE_MS` in
+ * `src/main.tsx`), so a seeded or prefetched entry is reused as in the app rather than read
+ * again on mount, as the default test client's `staleTime: 0` would.
+ */
+function appFreshClient(): QueryClient {
+  const client = createTestQueryClient();
+  const defaults = client.getDefaultOptions();
+  client.setDefaultOptions({ ...defaults, queries: { ...defaults.queries, staleTime: 30_000 } });
+  return client;
+}
+
+/** The paths of the `GET` requests sent so far, in request order. */
+function readPaths(api: ApiMock): string[] {
+  return api.calls.filter((call) => call.method === 'GET').map((call) => call.path);
 }
 
 /** Handlers for a loaded default page, plus `extra`. */
@@ -395,6 +437,77 @@ describe('ActionsPage', () => {
     });
   });
 
+  describe('status bar reads', () => {
+    it('starts GET /config and GET /sources before the default page answers, and reads no run metadata', async () => {
+      const { handler, gate } = gated();
+      const api = mockApi(defaultHandlers({ 'GET /recommendations': handler }));
+      const queryClient = appFreshClient();
+      await renderWithProviders(<ActionsRoute />, { queryClient });
+
+      await waitFor(() => {
+        expect(gate.release).toBeDefined();
+      });
+      await waitFor(() => {
+        expect([...new Set(readPaths(api))].sort()).toEqual([
+          '/config',
+          '/recommendations',
+          '/sources',
+        ]);
+      });
+      // GET /recommendations has not answered yet.
+      expect(screen.getByText('Loading actions')).toBeTruthy();
+
+      gate.release?.(json(200, makeRecommendationsPage()));
+      await loadedPage();
+      await waitFor(() => {
+        expect(queryClient.isFetching()).toBe(0);
+      });
+
+      // The picker's latest default run is the page's own run, and the recent custom runs wait
+      // until they are opened: no GET /runs/latest and no GET /runs?kind=custom.
+      expect(readPaths(api).filter((path) => path.startsWith('/runs'))).toEqual([]);
+      expect(screen.getByRole('button', { name: 'Recent custom windows' })).toBeTruthy();
+      // The status bar took the prefetched entries over without reading them again.
+      expect(readPaths(api).filter((path) => path === '/config')).toHaveLength(1);
+      expect(readPaths(api).filter((path) => path === '/sources')).toHaveLength(1);
+    });
+
+    it('also starts GET /runs/latest before an addressed run answers, on /actions?run=<id>', async () => {
+      const { handler, gate } = gated();
+      const api = mockApi(
+        defaultHandlers({ [`GET /recommendations?run_id=${String(CUSTOM_RUN_ID)}`]: handler }),
+      );
+      const queryClient = appFreshClient();
+      await renderWithProviders(<ActionsRoute />, {
+        queryClient,
+        path: `/actions?run=${String(CUSTOM_RUN_ID)}`,
+      });
+
+      await waitFor(() => {
+        expect(gate.release).toBeDefined();
+      });
+      await waitFor(() => {
+        expect([...new Set(readPaths(api))].sort()).toEqual([
+          '/config',
+          '/recommendations',
+          '/runs/latest',
+          '/sources',
+        ]);
+      });
+      expect(screen.getByText('Loading actions')).toBeTruthy();
+
+      gate.release?.(json(200, customPage()));
+      await loadedPage();
+      await waitFor(() => {
+        expect(queryClient.isFetching()).toBe(0);
+      });
+
+      // The picker reuses the prefetched default run, and still reads no custom-run list.
+      expect(readPaths(api).filter((path) => path === '/runs/latest')).toHaveLength(1);
+      expect(readPaths(api).filter((path) => path === '/runs')).toEqual([]);
+    });
+  });
+
   describe('states before data', () => {
     it('shows the title and "Loading actions" until the first response arrives', async () => {
       const { handler, gate } = gated();
@@ -421,8 +534,12 @@ describe('ActionsPage', () => {
     ])(
       'says "No analysis run yet" on %s for the default run and fills in by itself',
       async (_label, response) => {
-        // Only GET /recommendations: nothing else is read before the first run exists.
-        const { api, queryClient } = await renderPage({ 'GET /recommendations': response });
+        // Only GET /recommendations and the status bar's prefetched reads: no run metadata or
+        // section read is sent before the first run exists.
+        const { api, queryClient } = await renderPage({
+          'GET /recommendations': response,
+          ...prefetchedReads(),
+        });
 
         await screen.findByText('No analysis run yet');
         const notice = noticeRegion();
@@ -524,6 +641,7 @@ describe('ActionsPage', () => {
     it('shows the API message and a Retry that keeps the screen while it reads again', async () => {
       const { api } = await renderPage({
         'GET /recommendations': apiError(500, 'internal_error', 'Database unavailable'),
+        ...prefetchedReads(),
       });
 
       await screen.findByText('Actions could not be loaded');
@@ -573,6 +691,7 @@ describe('ActionsPage', () => {
     it('leaves focus where the user moved it while a Retry ran', async () => {
       const { api } = await renderPage({
         'GET /recommendations': apiError(500, 'internal_error', 'Database unavailable'),
+        ...prefetchedReads(),
       });
       await screen.findByText('Actions could not be loaded');
       const retry = screen.getByRole('button', { name: 'Retry' });
@@ -598,12 +717,388 @@ describe('ActionsPage', () => {
     });
 
     it('falls back to a generic reason when the API message is blank', async () => {
-      await renderPage({ 'GET /recommendations': apiError(500, 'internal_error', '   ') });
+      await renderPage({
+        'GET /recommendations': apiError(500, 'internal_error', '   '),
+        ...prefetchedReads(),
+      });
 
       await screen.findByText('Actions could not be loaded');
       expect(
         within(noticeRegion()).getByText('The recommendations could not be read. Try again.'),
       ).toBeTruthy();
     });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Polls: what renders again
+// ---------------------------------------------------------------------------------------------
+
+describe('ActionsPage polls', () => {
+  /** A later read instant than the fixture overlay's `computed_at`, one poll after it. */
+  const NEXT_READ_AT = '2026-10-06T06:00:30Z';
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * Renders the default `/actions` page with `handlers` inside a `Profiler` that counts the
+   * page's commits, so a test can wait for a render it then asserts on. `queryClient` is the
+   * client to render with, a new test client by default.
+   */
+  async function renderProfiledPage(
+    handlers: MockHandlers,
+    queryClient: QueryClient = createTestQueryClient(),
+  ) {
+    const commits = { count: 0 };
+    const api = mockApi(handlers);
+    const result = await renderWithProviders(
+      <Profiler
+        id="actions-page"
+        onRender={() => {
+          commits.count += 1;
+        }}
+      >
+        <ActionsRoute />
+      </Profiler>,
+      { queryClient },
+    );
+    return { ...result, api, commits };
+  }
+
+  /**
+   * Waits until no read is in flight and every pending query notification has reached React,
+   * so render counts taken afterwards change only through the refetch under test.
+   */
+  async function settle(queryClient: QueryClient): Promise<void> {
+    await waitFor(() => {
+      expect(queryClient.isFetching()).toBe(0);
+    });
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 20);
+      });
+    });
+  }
+
+  /**
+   * Starts a refetch of the page whose `GET /recommendations` answers only on `release`, and
+   * resolves once that request is in flight.
+   */
+  async function startPoll(api: ApiMock, queryClient: QueryClient) {
+    const { handler, gate } = gated();
+    api.use({ 'GET /recommendations': handler });
+    const done = queryClient.refetchQueries({ queryKey: queryKeys.recommendationsAll });
+    await waitFor(() => {
+      expect(gate.release).toBeDefined();
+    });
+    return {
+      done,
+      release: (response: MockResponse) => {
+        gate.release?.(response);
+      },
+    };
+  }
+
+  /** The region of one section, found by its anchor id. */
+  function sectionRegion(key: SectionKey): HTMLElement {
+    const region = document.getElementById(sectionFrameModule.sectionAnchorId(key));
+    if (region === null) {
+      throw new Error(`the page has no ${key} section`);
+    }
+    return region;
+  }
+
+  /** The default page with an empty discrepancy group, and `openNow` open discrepancies now. */
+  function pageWithoutDiscrepancyCards(openNow: number): RecommendationsPage {
+    const page = makeRecommendationsPage({ overlay: makeOverlay({ open_discrepancies: openNow }) });
+    page.sections = page.sections.map((section) =>
+      section.key !== 'campaigns'
+        ? section
+        : {
+            ...section,
+            groups: section.groups.map((group) =>
+              group.key === 'discrepancies' ? { ...group, items: [] } : group,
+            ),
+          },
+    );
+    return page;
+  }
+
+  /** The source chip of one source in the status bar, found by the name it starts with. */
+  function sourceChip(name: string): HTMLElement {
+    const chips = within(screen.getByRole('list', { name: 'Data sources' })).getAllByRole(
+      'listitem',
+    );
+    const chip = chips.find((item) => item.textContent?.startsWith(name) === true);
+    if (chip === undefined) {
+      throw new Error(`the status bar has no ${name} source chip`);
+    }
+    return chip;
+  }
+
+  /**
+   * The default page's banners in the API's order with a dataset banner of a later read: a
+   * stale-data `banner` goes just before the incomplete-data banner, and an incomplete-data
+   * `banner` replaces it.
+   */
+  function bannersWith(
+    banner: RecommendationsPage['banners'][number] & {
+      code: 'stale_datasets' | 'incomplete_datasets';
+    },
+  ) {
+    const banners = FIXTURE_BANNERS.slice(0, 4).map((entry) => ({ ...entry }));
+    const incomplete = banners.findIndex((entry) => entry.code === 'incomplete_datasets');
+    if (incomplete === -1) {
+      throw new Error('the default page has no incomplete-data banner');
+    }
+    banners.splice(incomplete, banner.code === 'incomplete_datasets' ? 1 : 0, banner);
+    return banners;
+  }
+
+  /** Whether a cached query value is a `GET /recommendations` page. */
+  function isRecommendationsPage(value: unknown): value is RecommendationsPage {
+    return typeof value === 'object' && value !== null && 'overlay' in value && 'sections' in value;
+  }
+
+  /**
+   * A test client that shares each refetched page with the one it replaces, as TanStack Query
+   * does by default, except that the overlay's dataset lists always arrive as new arrays. An
+   * unchanged list is then equal in value to the one on screen but not the same array, as from
+   * any client that does not share structure, so a section's overlay comparison reaches its
+   * lists and has to compare them entry by entry. Every other part of the page keeps its
+   * identity when unchanged, so the sections' `section` and `run` still compare as the same.
+   */
+  function freshOverlayListsClient(): QueryClient {
+    const client = createTestQueryClient();
+    client.setQueryDefaults(queryKeys.recommendationsAll, {
+      structuralSharing: (previous: unknown, next: unknown): unknown => {
+        const shared = replaceEqualDeep(previous, next);
+        if (!isRecommendationsPage(shared)) {
+          return shared;
+        }
+        const { overlay } = shared;
+        return {
+          ...shared,
+          overlay: {
+            ...overlay,
+            stale_datasets: [...overlay.stale_datasets],
+            incomplete_datasets: [...overlay.incomplete_datasets],
+          },
+        };
+      },
+    });
+    return client;
+  }
+
+  /** The latest default page the client holds, the one on screen. */
+  function shownPage(queryClient: QueryClient): RecommendationsPage {
+    const page = queryClient.getQueryData<RecommendationsPage>(
+      queryKeys.recommendations('default'),
+    );
+    if (page === undefined) {
+      throw new Error('the client holds no default page');
+    }
+    return page;
+  }
+
+  it('renders no section again for a poll that returns the same page, or one that differs only in overlay.computed_at', async () => {
+    const frames = vi.spyOn(sectionFrameModule, 'SectionFrame');
+    const statusBars = vi.spyOn(statusBarModule, 'StatusBar');
+    const { api, queryClient, commits } = await renderProfiledPage(defaultHandlers());
+    await loadedPage();
+    await settle(queryClient);
+    const sectionRenders = frames.mock.calls.length;
+    const statusRenders = statusBars.mock.calls.length;
+    expect(sectionRenders).toBeGreaterThanOrEqual(SECTION_ORDER.length);
+    expect(statusRenders).toBeGreaterThanOrEqual(1);
+
+    // A poll in flight re-renders the page for its fetch status alone; the content does not.
+    const beforeFetching = commits.count;
+    const same = await startPoll(api, queryClient);
+    await waitFor(() => {
+      expect(commits.count).toBeGreaterThan(beforeFetching);
+    });
+    expect(statusBars.mock.calls).toHaveLength(statusRenders);
+    expect(frames.mock.calls).toHaveLength(sectionRenders);
+
+    // It returns a page equal to the one shown: the page renders as it goes idle, nothing else.
+    const beforeIdle = commits.count;
+    same.release(json(200, makeRecommendationsPage()));
+    await same.done;
+    await waitFor(() => {
+      expect(commits.count).toBeGreaterThan(beforeIdle);
+    });
+    expect(recommendationReads(api)).toHaveLength(2);
+    expect(statusBars.mock.calls).toHaveLength(statusRenders);
+    expect(frames.mock.calls).toHaveLength(sectionRenders);
+
+    // The next poll returns a new read instant only: the status bar takes the new overlay, while
+    // no section renders again.
+    const later = await startPoll(api, queryClient);
+    later.release(
+      json(200, makeRecommendationsPage({ overlay: makeOverlay({ computed_at: NEXT_READ_AT }) })),
+    );
+    await later.done;
+    await waitFor(() => {
+      expect(statusBars.mock.calls.length).toBeGreaterThan(statusRenders);
+    });
+    await settle(queryClient);
+    expect(recommendationReads(api)).toHaveLength(3);
+    expect(frames.mock.calls).toHaveLength(sectionRenders);
+    expect(sectionHeadings()).toEqual(SECTION_TITLES);
+  });
+
+  it('shows a change in overlay.open_discrepancies in the Campaigns discrepancy group and the banner', async () => {
+    const { api, queryClient } = await renderProfiledPage(
+      defaultHandlers({ 'GET /recommendations': json(200, pageWithoutDiscrepancyCards(0)) }),
+    );
+    await loadedPage();
+    await settle(queryClient);
+    const campaigns = sectionRegion('campaigns');
+    expect(within(campaigns).queryByText(/detected since this run was computed$/u)).toBeNull();
+
+    const poll = await startPoll(api, queryClient);
+    poll.release(json(200, pageWithoutDiscrepancyCards(2)));
+    await poll.done;
+
+    expect(
+      await within(campaigns).findByText('2 open discrepancies detected since this run was computed'),
+    ).toBeTruthy();
+    expect(screen.getByText('2 open discrepancies to resolve first')).toBeTruthy();
+  });
+
+  it("re-renders only the section whose item changed, and shows the item's new current state", async () => {
+    const frames = vi.spyOn(sectionFrameModule, 'SectionFrame');
+    const { api, queryClient } = await renderProfiledPage(defaultHandlers());
+    await loadedPage();
+    await settle(queryClient);
+    const itemId = `item-${String(FIXTURE_ITEM_IDS.b1)}`;
+    expect(document.getElementById(itemId)).not.toBeNull();
+    const budget = sectionRegion('budget');
+    expect(within(budget).queryByText('1 hidden since this run')).toBeNull();
+    const sectionRenders = frames.mock.calls.length;
+
+    // Feedback given elsewhere since the last poll now hides the B1 card.
+    const next = makeRecommendationsPage();
+    findPageItem(next, FIXTURE_ITEM_IDS.b1).current.hidden_by = 'dismiss';
+    const poll = await startPoll(api, queryClient);
+    poll.release(json(200, next));
+    await poll.done;
+
+    expect(await within(budget).findByText('1 hidden since this run')).toBeTruthy();
+    expect(document.getElementById(itemId)).toBeNull();
+    await settle(queryClient);
+    // Only the Budget section renders again; the other four keep their output.
+    expect(frames.mock.calls).toHaveLength(sectionRenders + 1);
+  });
+
+  it('renders every section again for a poll whose overlay.stale_datasets gains a dataset, and shows it as stale', async () => {
+    const staleDataset = 'google.metrics_daily';
+    const staleMessage = `Stale data: ${staleDataset} (last success 2026-10-04 05:30 UTC)`;
+    const frames = vi.spyOn(sectionFrameModule, 'SectionFrame');
+    const { api, queryClient } = await renderProfiledPage(defaultHandlers());
+    await loadedPage();
+    await settle(queryClient);
+    expect(within(sourceChip('Google')).queryByText('Stale')).toBeNull();
+    expect(screen.queryByText(staleMessage)).toBeNull();
+    const sectionRenders = frames.mock.calls.length;
+
+    // The poll reads a Google dataset as stale now: the overlay's list gains it, and the API
+    // adds the stale-data banner. Every section and run is unchanged, so structural sharing
+    // keeps them as the objects on screen, and the overlay list alone differs.
+    const poll = await startPoll(api, queryClient);
+    poll.release(
+      json(
+        200,
+        makeRecommendationsPage({
+          overlay: makeOverlay({ stale_datasets: [staleDataset], computed_at: NEXT_READ_AT }),
+          banners: bannersWith({
+            code: 'stale_datasets',
+            tone: 'warning',
+            message: staleMessage,
+            count: 1,
+          }),
+        }),
+      ),
+    );
+    await poll.done;
+
+    expect(await within(sourceChip('Google')).findByText('Stale')).toBeTruthy();
+    expect(within(sourceChip('LinkedIn')).queryByText('Stale')).toBeNull();
+    expect(within(sourceChip('HubSpot')).queryByText('Stale')).toBeNull();
+    expect(screen.getByText(staleMessage)).toBeTruthy();
+    await settle(queryClient);
+    // Every section takes the changed overlay: each renders exactly once more.
+    expect(frames.mock.calls).toHaveLength(sectionRenders + SECTION_ORDER.length);
+  });
+
+  it('renders no section again for overlay lists that arrive as new arrays equal in value, and every section once an entry changes', async () => {
+    const laterReadAt = '2026-10-06T06:01:00Z';
+    const movedDataset = 'linkedin.analytics_daily';
+    const movedMessage =
+      `Incomplete data: ${movedDataset} (covers through 2026-10-04, ` +
+      'before the window end 2026-10-05)';
+    const frames = vi.spyOn(sectionFrameModule, 'SectionFrame');
+    const statusBars = vi.spyOn(statusBarModule, 'StatusBar');
+    const { api, queryClient } = await renderProfiledPage(
+      defaultHandlers(),
+      freshOverlayListsClient(),
+    );
+    await loadedPage();
+    await settle(queryClient);
+    const shown = shownPage(queryClient);
+    const sectionRenders = frames.mock.calls.length;
+    const statusRenders = statusBars.mock.calls.length;
+
+    // A new read instant and the same lists, delivered as new arrays: the status bar takes the
+    // new overlay, while no section renders again.
+    const same = await startPoll(api, queryClient);
+    same.release(
+      json(200, makeRecommendationsPage({ overlay: makeOverlay({ computed_at: NEXT_READ_AT }) })),
+    );
+    await same.done;
+    await waitFor(() => {
+      expect(statusBars.mock.calls.length).toBeGreaterThan(statusRenders);
+    });
+    await settle(queryClient);
+    const polled = shownPage(queryClient);
+    // The sections keep their objects; each list is another array with the same entries.
+    expect(polled.sections).toBe(shown.sections);
+    expect(polled.run).toBe(shown.run);
+    expect(polled.overlay.computed_at).toBe(NEXT_READ_AT);
+    for (const list of ['stale_datasets', 'incomplete_datasets'] as const) {
+      expect(polled.overlay[list]).not.toBe(shown.overlay[list]);
+      expect(polled.overlay[list]).toEqual(shown.overlay[list]);
+    }
+    expect(frames.mock.calls).toHaveLength(sectionRenders);
+
+    // The next poll moves the one incomplete dataset from Google to LinkedIn: a list of the same
+    // length with another entry, which every section takes.
+    const moved = await startPoll(api, queryClient);
+    moved.release(
+      json(
+        200,
+        makeRecommendationsPage({
+          overlay: makeOverlay({ incomplete_datasets: [movedDataset], computed_at: laterReadAt }),
+          banners: bannersWith({
+            code: 'incomplete_datasets',
+            tone: 'warning',
+            message: movedMessage,
+            count: 1,
+          }),
+        }),
+      ),
+    );
+    await moved.done;
+
+    expect(await within(sourceChip('LinkedIn')).findByText('Incomplete')).toBeTruthy();
+    expect(within(sourceChip('Google')).queryByText('Incomplete')).toBeNull();
+    expect(screen.getByText(movedMessage)).toBeTruthy();
+    expect(screen.queryByText(FIXTURE_BANNERS[3]?.message ?? '')).toBeNull();
+    await settle(queryClient);
+    expect(shownPage(queryClient).sections).toBe(shown.sections);
+    expect(frames.mock.calls).toHaveLength(sectionRenders + SECTION_ORDER.length);
   });
 });

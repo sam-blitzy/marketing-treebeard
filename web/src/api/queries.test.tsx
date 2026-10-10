@@ -15,6 +15,12 @@
  *   user and configuration reads, cancellation on unmount, the poll interval each read chooses
  *   after a success, a missing first run, a transient failure and a final error, and the polls
  *   themselves under fake timers;
+ * - the query-option factories, the latest default run seeded from a fresh cached default page
+ *   (never from a page addressed by run id), the custom-run list held back while disabled and
+ *   forgotten on request (only its own limit, aborting a read in flight, and read once more by
+ *   an observer enabled again), and
+ *   the `/actions` prefetch, which reads the configuration and sources (and the latest default
+ *   run only for an addressed run) without polling and never reads the custom-run list;
  * - `useDiscrepancies` paging: a first page at `limit=500`, every `Link: rel="next"` page
  *   followed exactly as named however short the page, a repeated page rejected, and one
  *   restart from the first page after a 422 `invalid_cursor`;
@@ -41,10 +47,13 @@ import {
   DEFAULT_DISCREPANCY_STATES,
   FIRST_RUN_POLL_MS,
   SOURCES_POLL_MS,
+  configQueryOptions,
+  defaultRunQueryOptions,
   isApiError,
   isAwaitingFirstRun,
   meQueryOptions,
   queryKeys,
+  sourcesQueryOptions,
   useConfig,
   useCreateRun,
   useCustomRuns,
@@ -52,9 +61,12 @@ import {
   useDefaultRun,
   useDiscrepancies,
   useFeedback,
+  useForgetCustomRuns,
+  useHasCachedCustomRuns,
   useLogin,
   useLogout,
   useMe,
+  usePrefetchActionsReads,
   useRecommendations,
   useRecordDecision,
   useRequestSync,
@@ -139,14 +151,22 @@ const LONG_STALE_MS = 5 * 60_000;
 /** Every `QueryClient` a test created, cleared after it so no timer outlives the test. */
 const clients: QueryClient[] = [];
 
+/** The app's default freshness (`QUERY_STALE_MS` in `src/main.tsx`), for {@link createWrapper}. */
+const APP_STALE_MS = 30_000;
+
 /**
  * A query client that never retries and never garbage-collects, and the provider for it.
  *
+ * @param staleTime - The default freshness of every query; `0`, TanStack's default, when
+ *   omitted. Pass {@link APP_STALE_MS} to reuse cached entries as the app does.
  * @returns The client and a `wrapper` for `renderHook`.
  */
-function createWrapper(): WrapperSetup {
+function createWrapper(staleTime?: number): WrapperSetup {
   const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false, gcTime: Infinity }, mutations: { retry: false } },
+    defaultOptions: {
+      queries: { retry: false, gcTime: Infinity, staleTime },
+      mutations: { retry: false },
+    },
   });
   clients.push(queryClient);
   function wrapper({ children }: { children: ReactNode }): ReactNode {
@@ -758,6 +778,62 @@ describe('useDefaultRun', () => {
     unmount();
     expect(signal?.aborted).toBe(true);
   });
+
+  it('defaultRunQueryOptions keys GET /runs/latest and polls from the query state', () => {
+    const { queryClient } = createWrapper();
+    const options = defaultRunQueryOptions(queryClient);
+    expect(options.queryKey).toEqual(queryKeys.runs.latest);
+    expect(typeof options.refetchInterval).toBe('function');
+    expect(typeof options.initialData).toBe('function');
+    expect(typeof options.initialDataUpdatedAt).toBe('function');
+  });
+
+  it('starts from a fresh cached default page and sends no GET /runs/latest', async () => {
+    const mock = stubFetch(routes({ 'GET /api/v1/runs/latest': () => json(200, runPayload()) }));
+    const setup = createWrapper(APP_STALE_MS);
+    const page = pagePayload();
+    setup.queryClient.setQueryData(queryKeys.recommendations('default'), page);
+    const pageUpdatedAt = setup.queryClient.getQueryState(
+      queryKeys.recommendations('default'),
+    )?.dataUpdatedAt;
+
+    const { result, queryClient } = renderWithWrapper(() => useDefaultRun(), setup);
+    await act(() => Promise.resolve());
+
+    expect(result.current.data).toEqual(page.run);
+    expect(result.current.isStale).toBe(false);
+    expect(queryClient.getQueryState(queryKeys.runs.latest)?.dataUpdatedAt).toBe(pageUpdatedAt);
+    expect(mock).not.toHaveBeenCalled();
+    // It still polls like any default-run read.
+    expect(pollInterval(queryClient, queryKeys.runs.latest)).toBe(CURRENT_STATE_POLL_MS);
+  });
+
+  it('reads GET /runs/latest when the cached default page is stale', async () => {
+    const latest = runPayload(DEFAULT_RUN_ID + 1);
+    const mock = stubFetch(routes({ 'GET /api/v1/runs/latest': () => json(200, latest) }));
+    const setup = createWrapper(APP_STALE_MS);
+    setup.queryClient.setQueryData(queryKeys.recommendations('default'), pagePayload(), {
+      updatedAt: Date.now() - 2 * APP_STALE_MS,
+    });
+
+    const { result } = renderWithWrapper(() => useDefaultRun(), setup);
+    await waitFor(() => expect(result.current.data).toEqual(latest));
+    expect(onlyRequest(mock).parsed.pathname).toBe('/api/v1/runs/latest');
+  });
+
+  it('never starts from a page addressed by run id, which may show a custom run', async () => {
+    const mock = stubFetch(routes({ 'GET /api/v1/runs/latest': () => json(200, runPayload()) }));
+    const setup = createWrapper(APP_STALE_MS);
+    setup.queryClient.setQueryData(
+      queryKeys.recommendations(CUSTOM_RUN_ID),
+      pagePayload(CUSTOM_RUN_ID, 'custom'),
+    );
+
+    const { result } = renderWithWrapper(() => useDefaultRun(), setup);
+    expect(result.current.data).toBeUndefined();
+    await waitFor(() => expect(result.current.data).toEqual(runPayload()));
+    expect(onlyRequest(mock).parsed.pathname).toBe('/api/v1/runs/latest');
+  });
 });
 
 
@@ -835,6 +911,160 @@ describe('useCustomRuns', () => {
     const { parsed } = onlyRequest(mock);
     expect(parsed.searchParams.get('kind')).toBe('custom');
     expect(parsed.searchParams.get('limit')).toBe('5');
+  });
+
+  it('sends nothing while disabled, and reads the list once enabled', async () => {
+    const runs = [runPayload(CUSTOM_RUN_ID, 'custom')];
+    const mock = stubFetch(routes({ 'GET /api/v1/runs': () => json(200, runs) }));
+    const state = { enabled: false };
+    const { result, rerender } = renderWithWrapper(() =>
+      useCustomRuns(undefined, { enabled: state.enabled }),
+    );
+    await act(() => Promise.resolve());
+    expect(mock).not.toHaveBeenCalled();
+    expect(result.current.status).toBe('pending');
+    expect(result.current.fetchStatus).toBe('idle');
+
+    state.enabled = true;
+    rerender();
+    await waitFor(() => expect(result.current.data).toEqual(runs));
+    expect(params(onlyRequest(mock))).toEqual([
+      ['kind', 'custom'],
+      ['limit', '20'],
+    ]);
+  });
+});
+
+describe('useHasCachedCustomRuns', () => {
+  it('is true only once the cache holds the list for that limit', () => {
+    const setup = createWrapper();
+    const before = renderWithWrapper(() => useHasCachedCustomRuns(), setup);
+    expect(before.result.current).toBe(false);
+
+    setup.queryClient.setQueryData(queryKeys.runs.custom(20), [runPayload(CUSTOM_RUN_ID, 'custom')]);
+    expect(renderWithWrapper(() => useHasCachedCustomRuns(), setup).result.current).toBe(true);
+    expect(renderWithWrapper(() => useHasCachedCustomRuns(5), setup).result.current).toBe(false);
+  });
+
+  it('sends no request', () => {
+    const mock = stubFetch(() => json(200, []));
+    renderWithWrapper(() => useHasCachedCustomRuns());
+    expect(mock).not.toHaveBeenCalled();
+  });
+});
+
+describe('useForgetCustomRuns', () => {
+  it('removes only the custom-run list for 20 by default, and sends nothing', () => {
+    const mock = stubFetch(() => json(200, []));
+    const setup = createWrapper();
+    const kept = [
+      queryKeys.runs.custom(5),
+      queryKeys.runs.latest,
+      queryKeys.runs.byId(CUSTOM_RUN_ID),
+      queryKeys.recommendations('default'),
+    ];
+    seed(setup.queryClient, [queryKeys.runs.custom(20), ...kept]);
+    const { result } = renderWithWrapper(
+      () => ({ forget: useForgetCustomRuns(), cached: useHasCachedCustomRuns() }),
+      setup,
+    );
+    expect(result.current.cached).toBe(true);
+
+    act(() => {
+      result.current.forget();
+    });
+
+    const cache = setup.queryClient.getQueryCache();
+    expect(cache.find({ queryKey: queryKeys.runs.custom(20), exact: true })).toBeUndefined();
+    for (const key of kept) {
+      expect(setup.queryClient.getQueryData(key)).toEqual({ seeded: key });
+    }
+    expect(renderWithWrapper(() => useHasCachedCustomRuns(), setup).result.current).toBe(false);
+    expect(mock).not.toHaveBeenCalled();
+  });
+
+  it('removes only the list for the limit it is given', () => {
+    const setup = createWrapper();
+    seed(setup.queryClient, [queryKeys.runs.custom(20), queryKeys.runs.custom(5)]);
+    const { result } = renderWithWrapper(() => useForgetCustomRuns(5), setup);
+
+    act(() => {
+      result.current();
+    });
+
+    expect(setup.queryClient.getQueryData(queryKeys.runs.custom(5))).toBeUndefined();
+    expect(setup.queryClient.getQueryData(queryKeys.runs.custom(20))).toEqual({
+      seeded: queryKeys.runs.custom(20),
+    });
+  });
+
+  it('returns the same callback across renders', () => {
+    const { result, rerender } = renderWithWrapper(() => useForgetCustomRuns());
+    const first = result.current;
+    rerender();
+    expect(result.current).toBe(first);
+  });
+
+  it('leaves a mounted, disabled observer working: enabled again, it reads the list once', async () => {
+    const runs = [runPayload(CUSTOM_RUN_ID, 'custom')];
+    const mock = stubFetch(routes({ 'GET /api/v1/runs': () => json(200, runs) }));
+    const state = { enabled: true };
+    const { result, rerender, queryClient } = renderWithWrapper(() => ({
+      list: useCustomRuns(undefined, { enabled: state.enabled }),
+      forget: useForgetCustomRuns(),
+    }));
+    await waitFor(() => expect(result.current.list.data).toEqual(runs));
+    expect(sent(mock)).toHaveLength(1);
+
+    // As WindowPicker closes its disclosure: the observer is disabled and the list forgotten.
+    act(() => {
+      state.enabled = false;
+      result.current.forget();
+    });
+    rerender();
+    await act(() => Promise.resolve());
+
+    expect(result.current.list.data).toBeUndefined();
+    expect(result.current.list.fetchStatus).toBe('idle');
+    expect(queryClient.getQueryData(queryKeys.runs.custom(20))).toBeUndefined();
+    expect(sent(mock)).toHaveLength(1);
+
+    state.enabled = true;
+    rerender();
+
+    await waitFor(() => expect(result.current.list.data).toEqual(runs));
+    await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+    const requests = sent(mock);
+    expect(requests).toHaveLength(2);
+    expect(requests[1] === undefined ? [] : params(requests[1])).toEqual([
+      ['kind', 'custom'],
+      ['limit', '20'],
+    ]);
+    expect(queryClient.getQueryData(queryKeys.runs.custom(20))).toEqual(runs);
+  });
+
+  it('aborts a read of the list still in flight', async () => {
+    const mock = stubFetch(
+      (_url, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init.signal?.addEventListener('abort', () => {
+            reject(new DOMException('The operation was aborted.', 'AbortError'));
+          });
+        }),
+    );
+    const { result } = renderWithWrapper(() => ({
+      list: useCustomRuns(),
+      forget: useForgetCustomRuns(),
+    }));
+    await waitFor(() => expect(mock).toHaveBeenCalledTimes(1));
+    const { signal } = onlyRequest(mock);
+    expect(signal?.aborted).toBe(false);
+
+    act(() => {
+      result.current.forget();
+    });
+
+    expect(signal?.aborted).toBe(true);
   });
 });
 
@@ -1146,6 +1376,13 @@ describe('useDiscrepancies', () => {
 // ---------------------------------------------------------------------------------------------
 
 describe('useSources', () => {
+  it('sourcesQueryOptions keys GET /sources under queryKeys.sources, polling every SOURCES_POLL_MS', () => {
+    const options = sourcesQueryOptions();
+    expect(options.queryKey).toEqual(queryKeys.sources);
+    expect(options.refetchInterval).toBe(SOURCES_POLL_MS);
+    expect(options.staleTime).toBeUndefined();
+  });
+
   it('reads GET /api/v1/sources and polls every SOURCES_POLL_MS', async () => {
     const sources = sourcesPayload();
     const mock = stubFetch(routes({ 'GET /api/v1/sources': () => json(200, sources) }));
@@ -1189,6 +1426,13 @@ describe('useSources', () => {
 });
 
 describe('useConfig', () => {
+  it('configQueryOptions keys GET /config under queryKeys.config, fresh for 5 minutes', () => {
+    const options = configQueryOptions();
+    expect(options.queryKey).toEqual(queryKeys.config);
+    expect(options.staleTime).toBe(LONG_STALE_MS);
+    expect(options.refetchInterval).toBeUndefined();
+  });
+
   it('reads GET /api/v1/config and stays fresh for a second mount', async () => {
     const config = configPayload();
     const mock = stubFetch(routes({ 'GET /api/v1/config': () => json(200, config) }));
@@ -1213,6 +1457,81 @@ describe('useConfig', () => {
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect(result.current.error?.code).toBe('config_error');
     expect(result.current.error?.message).toBe('thresholds.yaml is invalid');
+  });
+});
+
+describe('usePrefetchActionsReads', () => {
+  /** Answers the three reads the hook may prefetch, and the custom-run list it must not. */
+  function prefetchRoutes(): Responder {
+    return routes({
+      'GET /api/v1/config': () => json(200, configPayload()),
+      'GET /api/v1/sources': () => json(200, sourcesPayload()),
+      'GET /api/v1/runs/latest': () => json(200, runPayload()),
+      'GET /api/v1/runs': () => json(200, []),
+    });
+  }
+
+  /** The number of components observing the entry under `queryKey`. */
+  function observers(client: QueryClient, queryKey: QueryKey): number | undefined {
+    return client.getQueryCache().find({ queryKey, exact: true })?.getObserversCount();
+  }
+
+  it('reads GET /config and GET /sources for the default page, without polling', async () => {
+    const mock = stubFetch(prefetchRoutes());
+    const { queryClient } = renderWithWrapper(() => {
+      usePrefetchActionsReads();
+    });
+    await waitFor(() => expect(mock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+
+    expect(sent(mock).map((request) => request.parsed.pathname).sort()).toEqual([
+      '/api/v1/config',
+      '/api/v1/sources',
+    ]);
+    expect(queryClient.getQueryData(queryKeys.config)).toEqual(configPayload());
+    expect(queryClient.getQueryData(queryKeys.sources)).toEqual(sourcesPayload());
+    // No default-run entry, so the default page's own run can seed it later.
+    expect(queryClient.getQueryState(queryKeys.runs.latest)).toBeUndefined();
+    expect(queryClient.getQueryState(queryKeys.runs.custom(20))).toBeUndefined();
+    // A prefetch registers no observer, so nothing polls.
+    expect(observers(queryClient, queryKeys.config)).toBe(0);
+    expect(observers(queryClient, queryKeys.sources)).toBe(0);
+  });
+
+  it('also reads GET /runs/latest for an addressed run, and never the custom-run list', async () => {
+    const mock = stubFetch(prefetchRoutes());
+    const { queryClient } = renderWithWrapper(() => {
+      usePrefetchActionsReads(CUSTOM_RUN_ID);
+    });
+    await waitFor(() => expect(mock).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+
+    expect(sent(mock).map((request) => request.parsed.pathname).sort()).toEqual([
+      '/api/v1/config',
+      '/api/v1/runs/latest',
+      '/api/v1/sources',
+    ]);
+    expect(queryClient.getQueryData(queryKeys.runs.latest)).toEqual(runPayload());
+    expect(observers(queryClient, queryKeys.runs.latest)).toBe(0);
+    expect(sent(mock).some((request) => request.parsed.pathname === '/api/v1/runs')).toBe(false);
+  });
+
+  it('reads nothing again on a re-render for the same run, and leaves fresh entries alone', async () => {
+    const mock = stubFetch(prefetchRoutes());
+    const setup = createWrapper(APP_STALE_MS);
+    const { queryClient, rerender } = renderWithWrapper(() => {
+      usePrefetchActionsReads();
+    }, setup);
+    await waitFor(() => expect(mock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+
+    rerender();
+    // A second page using the same client finds both entries fresh.
+    renderWithWrapper(() => {
+      usePrefetchActionsReads();
+    }, setup);
+    await act(() => Promise.resolve());
+    expect(mock).toHaveBeenCalledTimes(2);
   });
 });
 

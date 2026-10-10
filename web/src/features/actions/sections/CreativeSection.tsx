@@ -30,9 +30,10 @@
  *
  * @packageDocumentation
  */
+import { memo, useMemo } from 'react';
 import type { ReactElement } from 'react';
 
-import type { Group } from '../../../api/types';
+import type { Group, Item } from '../../../api/types';
 import { DataTable, Stack } from '../../../design-system';
 import type { DataTableColumn } from '../../../design-system';
 import { NOT_APPLICABLE, UNAVAILABLE, formatCount, formatPercent } from '../../../lib/format';
@@ -108,6 +109,34 @@ export function formatVariantRate(
 // ---------------------------------------------------------------------------------------------
 // Variants table
 // ---------------------------------------------------------------------------------------------
+
+/** The variants of a block without a first item: none, so it shows no table. */
+const NO_VARIANTS: readonly VariantRow[] = Object.freeze([]);
+
+/**
+ * Each block's variants, read from its first item, kept while the item object lives. Items from
+ * `GET /recommendations` are never changed in place: a refetch that leaves an item unchanged
+ * hands back the same object, and a changed item arrives as a new one, so kept rows always
+ * match their item.
+ */
+const VARIANT_ROWS = new WeakMap<Item, readonly VariantRow[]>();
+
+/**
+ * The variants table rows of a block (`variants()` of its first item), read once per item
+ * object, so a block that renders again keeps the same rows unless its first item changed.
+ */
+function variantRowsOf(item: Item | undefined): readonly VariantRow[] {
+  if (item === undefined) {
+    return NO_VARIANTS;
+  }
+  const kept = VARIANT_ROWS.get(item);
+  if (kept !== undefined) {
+    return kept;
+  }
+  const rows = variants(item);
+  VARIANT_ROWS.set(item, rows);
+  return rows;
+}
 
 /** One variants-table row: the variant and its React key, unique within the table. */
 interface KeyedVariant {
@@ -207,6 +236,9 @@ export interface VariantsTableProps {
  * absent count renders "unavailable". The table states numbers only: which variant leads, and
  * whether that lead is distinguishable, is said by the API's CR1 cards (AAP 0.5.4.2 P7).
  *
+ * Memoized on its props, with the keyed rows derived once per `rows` array: given the same
+ * campaign name and the same rows, a block that renders again keeps the table as it is.
+ *
  * @param props - see {@link VariantsTableProps}
  * @returns the table, or `null` when there are no variants
  *
@@ -215,19 +247,23 @@ export interface VariantsTableProps {
  * <VariantsTable campaignName="Lead Gen — Pipeline Report EMEA" rows={variants(group.items[0])} />
  * ```
  */
-export function VariantsTable({ campaignName, rows }: VariantsTableProps): ReactElement | null {
-  if (rows.length === 0) {
+export const VariantsTable = memo(function VariantsTable({
+  campaignName,
+  rows,
+}: VariantsTableProps): ReactElement | null {
+  const keyed = useMemo(() => keyedVariants(rows), [rows]);
+  if (keyed.length === 0) {
     return null;
   }
   return (
     <DataTable
       caption={`Variants in ${campaignName}`}
       columns={VARIANT_COLUMNS}
-      rows={keyedVariants(rows)}
+      rows={keyed}
       getRowKey={(row) => row.key}
     />
   );
-}
+});
 
 // ---------------------------------------------------------------------------------------------
 // The section
@@ -254,7 +290,7 @@ function campaignNameOf(group: Group): string {
 function renderCampaignBlock(group: Group, parts: GroupParts): ReactElement {
   return (
     <Stack>
-      <VariantsTable campaignName={campaignNameOf(group)} rows={variants(group.items[0])} />
+      <VariantsTable campaignName={campaignNameOf(group)} rows={variantRowsOf(group.items[0])} />
       {parts.body}
     </Stack>
   );

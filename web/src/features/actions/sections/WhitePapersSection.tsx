@@ -44,6 +44,7 @@
  *
  * @packageDocumentation
  */
+import { useMemo } from 'react';
 import type { ReactElement } from 'react';
 
 import { useConfig } from '../../../api/queries';
@@ -354,6 +355,28 @@ function toAssetRow(item: Item): AssetRowView {
   return { item, name: assetName(item), cells, frozenMql: frozenMqlHeader(item) };
 }
 
+/**
+ * Each item's formatted asset row, kept while the item object lives. Items from
+ * `GET /recommendations` are never changed in place: a refetch that leaves an item unchanged
+ * hands back the same object, and a changed item arrives as a new one, so a kept row always
+ * matches its item.
+ */
+const ASSET_ROWS = new WeakMap<Item, AssetRowView>();
+
+/**
+ * An item's asset row ({@link toAssetRow}), formatted once per item object, so a cohort that
+ * renders again reformats only the rows whose item changed.
+ */
+function assetRowOf(item: Item): AssetRowView {
+  const kept = ASSET_ROWS.get(item);
+  if (kept !== undefined) {
+    return kept;
+  }
+  const row = toAssetRow(item);
+  ASSET_ROWS.set(item, row);
+  return row;
+}
+
 /** One per-creative row with its position, so equal creative keys never collide. */
 interface CreativeRowView {
   /** The row's position in the stored partition. */
@@ -507,7 +530,11 @@ interface AssetDetailsProps {
  */
 function AssetDetails({ row, mql }: AssetDetailsProps): ReactElement {
   const { item, name } = row;
-  const creatives = creativeRows(item).map((creative, index) => ({ index, row: creative }));
+  const creatives = useMemo(
+    () => creativeRows(item).map((creative, index) => ({ index, row: creative })),
+    [item],
+  );
+  const columns = useMemo(() => creativeColumns(mql), [mql]);
   const reason = textOrNull(item.reason);
   const historical = item.current.historical;
   // As on a card: a historical row is held by its replaced data, which its badge states, so the
@@ -523,7 +550,7 @@ function AssetDetails({ row, mql }: AssetDetailsProps): ReactElement {
     <Stack gap={3}>
       <DataTable
         caption={`Per creative: ${name}`}
-        columns={creativeColumns(mql)}
+        columns={columns}
         rows={creatives}
         getRowKey={(creative) => `${creative.index}-${creative.row.key}`}
         emptyMessage={NO_CREATIVE_ROWS}
@@ -573,10 +600,11 @@ interface AssetTableProps {
  */
 function AssetTable({ caption, rows, mql }: AssetTableProps): ReactElement {
   const header = tableMqlHeader(rows, mql);
+  const columns = useMemo(() => assetColumns(header), [header]);
   return (
     <DataTable
       caption={caption}
-      columns={assetColumns(header)}
+      columns={columns}
       rows={rows}
       getRowKey={(row) => String(row.item.id)}
       renderExpanded={(row) => <AssetDetails row={row} mql={row.frozenMql ?? header} />}
@@ -594,7 +622,7 @@ function AssetTable({ caption, rows, mql }: AssetTableProps): ReactElement {
  * the one the row's frozen evidence records, else `mql`, the current configuration's.
  */
 function WhitePaperItemFallback({ item, mql }: { item: Item; mql: string }): ReactElement {
-  const row = toAssetRow(item);
+  const row = assetRowOf(item);
   const header = row.frozenMql ?? mql;
   const fields: FieldItem[] = [
     ...WHITE_PAPER_METRIC_KEYS.map((key) => ({
@@ -668,8 +696,8 @@ interface CohortTablesProps {
 function CohortTables({ parts, mql }: CohortTablesProps): ReactElement {
   const summary = findCohortSummary(parts.group.items);
   const currency = cohortCurrency(parts, summary);
-  const visibleRows = parts.visible.map(toAssetRow);
-  const heldRows = parts.held.map(toAssetRow);
+  const visibleRows = parts.visible.map(assetRowOf);
+  const heldRows = parts.held.map(assetRowOf);
   const overlapNote = textOrNull(summary?.overlapNote) ?? OVERLAP_NOTE_FALLBACK;
 
   return (

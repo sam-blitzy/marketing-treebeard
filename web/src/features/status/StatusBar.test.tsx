@@ -3,10 +3,11 @@
  * named "Analysis status" holding, in order, the window picker, each source's day boundary from
  * `Run.source_days` with the display time zone, and the source chips.
  *
- * The bar's children read `GET /config`, `GET /runs/latest`, `GET /runs?kind=custom` and
- * `GET /sources` through the real hooks, answered by `../../test/mockApi` with payloads from
- * `../../test/fixtures`. `mockApi` is imported before `../../test/render` and Testing Library, so
- * its unmatched-request check runs after Testing Library's cleanup.
+ * The bar's children read `GET /config`, `GET /runs/latest` and `GET /sources` through the real
+ * hooks, answered by `../../test/mockApi` with payloads from `../../test/fixtures`; the picker
+ * reads `GET /runs?kind=custom` only once its recent custom windows are opened, so that read has
+ * no handler and would fail the test. `mockApi` is imported before `../../test/render` and
+ * Testing Library, so its unmatched-request check runs after Testing Library's cleanup.
  */
 import { json, mockApi } from '../../test/mockApi';
 import { renderWithProviders } from '../../test/render';
@@ -29,7 +30,6 @@ function stubReads(): void {
   mockApi({
     'GET /config': json(200, makeConfig()),
     'GET /runs/latest': json(200, makeRun()),
-    'GET /runs': json(200, []),
     'GET /sources': json(200, makeSources()),
   });
 }

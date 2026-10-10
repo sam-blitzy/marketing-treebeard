@@ -14,6 +14,9 @@
  * | `/settings`  | `SettingsPage`   | signed in (read-only)                                   |
  * | any other    | "Page not found" | signed in, so it renders inside the app shell           |
  *
+ * `LoginPage` and `ActionsPage` are imported statically; the `/decisions`, `/sources` and
+ * `/settings` screens are code-split (see "Code splitting" below).
+ *
  * The four signed-in screens sit under one pathless layout route, `authenticated`. Its
  * `beforeLoad` reads `GET /auth/me` through the TanStack Query cache
  * (`ensureQueryData(meQueryOptions())`), so navigation between screens re-asks nothing while the
@@ -32,6 +35,24 @@
  * login screen failed) they bring a `PageShell` of their own, so they also keep exactly one
  * `<main>` and one `<h1>`.
  *
+ * Code splitting (AAP 0.1.1: the five sections render from precomputed runs in under 2 s): the
+ * entry bundle carries only the screens a first load can show, `/actions` (the landing page)
+ * and `/login`. `DecisionsPage`, `SourcesPage` and `SettingsPage` are `lazyRouteComponent`s over
+ * a dynamic `import()`, so each screen's module graph is a chunk of its own that a first
+ * `/actions` or `/login` load neither downloads nor parses. The chunk loads:
+ * - **On intent**: `defaultPreload: 'intent'` preloads a route, chunk included, when its link is
+ *   hovered, focused or touched, so a click usually finds the screen loaded.
+ * - **On navigation** otherwise: the route stays pending until its chunk has loaded, and a load
+ *   slower than the router's pending threshold (`defaultPendingMs`, 1 s) shows
+ *   {@link RoutePending} in the layout's `<main>`, beside the navigation.
+ * - **On failure**: the import rejects with a {@link ScreenChunkError} and the screen throws it
+ *   when it renders. For a missing module, as after a deploy that replaced the hashed chunks
+ *   (nginx answers a missing `/assets/` file with 404), TanStack Router reloads the page once
+ *   per error message in the tab's session (sessionStorage key
+ *   `tanstack_router_reload:<message>`), which fetches the new `index.html`. Any other failure,
+ *   or the same one again, shows {@link RootError} in the layout. Its Retry reloads the page,
+ *   because the browser keeps a failed module fetch for the life of the document.
+ *
  * Focus after navigation (WCAG 2.2 SC 2.4.3) is handled once, by the always-mounted root route:
  * see {@link useFocusRecoveryAfterNavigation}.
  *
@@ -44,6 +65,9 @@
  * - **No alert role** (AAP 0.5.5 reserves `role="alert"` for open discrepancies).
  * - **No cycle**: features never import this file. They type `Link` and `useNavigate` through the
  *   `Register` augmentation at the end of this module.
+ * - **Lean entry bundle** (AAP 0.1.1): `DecisionsPage`, `SourcesPage` and `SettingsPage` are
+ *   never imported statically, here or by anything the entry imports, or their graphs fold back
+ *   into the entry chunk.
  *
  * @example
  * ```tsx
@@ -72,13 +96,14 @@ import {
   createRootRouteWithContext,
   createRoute,
   createRouter,
+  lazyRouteComponent,
   redirect,
   useNavigate,
   useRouter,
   useRouterState,
 } from '@tanstack/react-router';
 import type { ErrorComponentProps, RouterHistory } from '@tanstack/react-router';
-import { createContext, useContext, useEffect, useId } from 'react';
+import { createContext, useContext, useEffect, useId, useRef, useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 
 import { isApiError, meQueryOptions, useLogout } from './api/queries';
@@ -88,6 +113,7 @@ import {
   Banner,
   Button,
   EmptyState,
+  Inline,
   PageShell,
   SideNav,
   Spinner,
@@ -97,9 +123,6 @@ import {
 import type { SideNavItem, SideNavLinkProps } from './design-system';
 import { ActionsPage } from './features/actions/ActionsPage';
 import { LoginPage } from './features/auth/LoginPage';
-import { DecisionsPage } from './features/decisions/DecisionsPage';
-import { SettingsPage } from './features/settings/SettingsPage';
-import { SourcesPage } from './features/sources/SourcesPage';
 
 // ---------------------------------------------------------------------------------------------
 // Texts and constants
@@ -309,6 +332,46 @@ function carriesRejectedValue(rawSearch: object, key: string, validated: unknown
 }
 
 // ---------------------------------------------------------------------------------------------
+// Code-split screens
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The chunk of a code-split screen failed to load: a deploy replaced the hashed chunk, or the
+ * network failed. It keeps the failure's message, so `lazyRouteComponent` still recognises a
+ * missing module and reloads the page once, and carries the failure itself as `cause`.
+ *
+ * {@link RootError} tells it apart from every other failure. The browser keeps a failed module
+ * fetch for the life of the document, so re-running the import fails again at once; Retry
+ * therefore reloads the page for this error instead of invalidating the router.
+ */
+class ScreenChunkError extends Error {
+  /** Always `'ScreenChunkError'`, so the class survives minification. */
+  override readonly name = 'ScreenChunkError';
+
+  /**
+   * @param cause - What the screen's `import()` rejected with.
+   */
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+  }
+}
+
+/**
+ * Wraps the `import()` of a code-split screen so that a failure rejects with a
+ * {@link ScreenChunkError}. A successful import resolves to the module unchanged, so
+ * `lazyRouteComponent` keeps the module's type and checks the export name against it.
+ *
+ * @param importer - The screen's `import()`, with a literal specifier so Vite splits it out.
+ * @returns The importer to hand to `lazyRouteComponent`.
+ */
+function screenImporter<TModule>(importer: () => Promise<TModule>): () => Promise<TModule> {
+  return () =>
+    importer().catch((cause: unknown) => {
+      throw new ScreenChunkError(cause);
+    });
+}
+
+// ---------------------------------------------------------------------------------------------
 // Shared frame of the error, not-found and pending screens
 // ---------------------------------------------------------------------------------------------
 
@@ -405,7 +468,9 @@ function RootComponent(): ReactElement {
  *
  * "Retry" invalidates the router, which re-runs every matched route's `beforeLoad` (the auth
  * guard reads `GET /auth/me` again, because a failed query holds no data), and resets the error
- * boundary so the route renders again.
+ * boundary so the route renders again. For a {@link ScreenChunkError} it reloads the page
+ * instead: the browser keeps the failed module fetch for the life of the document, so only a
+ * new document can load the screen's chunk.
  *
  * The title carries "Something went wrong" and the banner the specific message, so each text
  * appears once on the screen and the page keeps one `<h1>` (UI1: one `<h1>` per page).
@@ -415,6 +480,10 @@ function RootError({ error, reset }: ErrorComponentProps): ReactElement {
   const message = isApiError(error) && error.message !== '' ? error.message : GENERIC_ERROR_MESSAGE;
 
   const retry = () => {
+    if (error instanceof ScreenChunkError) {
+      window.location.reload();
+      return;
+    }
     void router.invalidate();
     reset();
   };
@@ -462,8 +531,8 @@ function NotFound(): ReactElement {
 
 /**
  * The router's `defaultPendingComponent`: a design-system `Spinner` labelled "Loading", shown
- * while a route's `beforeLoad` (the auth guard's first `GET /auth/me`) takes longer than the
- * router's pending threshold.
+ * while a route's `beforeLoad` (the auth guard's first `GET /auth/me`) or a code-split screen's
+ * chunk takes longer than the router's pending threshold.
  */
 function RoutePending(): ReactElement {
   return (
@@ -558,9 +627,23 @@ function isSessionGone(error: ApiError): boolean {
  *   clears the query cache before the screen leaves, and an observer would then re-fetch
  *   `GET /auth/me` only to receive the 401 of the session just ended.
  * - **Sign out** posts `/auth/logout`. Once it succeeds, or fails with 401 because the session
- *   had already ended, the query cache is cleared and the screen moves to `/login`. Any other
- *   failure keeps the user signed in and shows "Sign-out failed. Try again." beside the button,
- *   linked to it through `aria-describedby`.
+ *   had already ended, the query cache is cleared and the screen moves to `/login`, where
+ *   {@link useFocusRecoveryAfterNavigation} places focus. Any other failure keeps the user signed
+ *   in and shows "Sign-out failed. Try again." beside the button, linked to it through
+ *   `aria-describedby` while it shows.
+ *   - **Announcement** (WCAG 2.2 SC 4.1.3): the button and the message sit in one polite
+ *     `role="status"` region that mounts with the layout, so each failure adds the message to a
+ *     region assistive technology already watches; the next attempt removes it while pending, so
+ *     a repeated failure is announced again. `aria-atomic="false"` limits the announcement to
+ *     the message instead of re-reading the button's label with it. The region is never
+ *     `role="alert"`, which open discrepancies alone use. Inside it an `Inline`, spaced like the
+ *     top bar's actions row, lays out the message and the button, so without a failure the
+ *     region holds the button alone and the bar looks as it would without the region.
+ *   - **Focus** (WCAG 2.2 SC 2.4.3): the loading button is natively disabled, so a browser may
+ *     drop focus to `<body>` while the request is pending. After each failure, once the render
+ *     that re-enables the button has committed, focus returns to "Sign out" when it is on
+ *     `<body>` or nowhere. Focus the user moved to another control during the request stays
+ *     where it is.
  * - **Primary navigation**: Actions, Decisions, Sources and Settings, in that order. The current
  *   screen's link carries `aria-current="page"`, set by `SideNav` from the router's pathname.
  * - **Main**: the routed page, or "Page not found" for a path no screen matches.
@@ -572,6 +655,20 @@ function AppLayout(): ReactElement {
   const navigate = useNavigate();
   const pathname = useRouterState({ select: (state) => state.location.pathname });
   const signOutErrorId = useId();
+  const signOutButtonRef = useRef<HTMLButtonElement>(null);
+  // The number of sign-outs that failed and kept the session. Every failure changes it, so the
+  // effect below runs once per failure, after the render that shows the message has committed.
+  const [signOutFailures, setSignOutFailures] = useState(0);
+
+  useEffect(() => {
+    if (signOutFailures === 0) {
+      return;
+    }
+    const focused = document.activeElement;
+    if (focused === null || focused === document.body) {
+      signOutButtonRef.current?.focus();
+    }
+  }, [signOutFailures]);
 
   const signOut = () => {
     logout.mutate(undefined, {
@@ -579,7 +676,12 @@ function AppLayout(): ReactElement {
         if (error === null || isSessionGone(error)) {
           queryClient.clear();
           void navigate({ to: '/login' });
+          return;
         }
+        // Focusing here would reach the button while it is still disabled. The render this
+        // update schedules reads the settled mutation, so it re-enables the button before the
+        // effect above runs.
+        setSignOutFailures((count) => count + 1);
       },
     });
   };
@@ -599,15 +701,20 @@ function AppLayout(): ReactElement {
         topBar={
           <TopBar productName={PRODUCT_NAME}>
             {email !== '' && <span>{email}</span>}
-            {signOutFailed && <span id={signOutErrorId}>{SIGN_OUT_FAILED_MESSAGE}</span>}
-            <Button
-              variant="quiet"
-              loading={logout.isPending}
-              aria-describedby={signOutFailed ? signOutErrorId : undefined}
-              onClick={signOut}
-            >
-              {SIGN_OUT_LABEL}
-            </Button>
+            <div role="status" aria-live="polite" aria-atomic="false">
+              <Inline gap={3} justify="end">
+                {signOutFailed && <span id={signOutErrorId}>{SIGN_OUT_FAILED_MESSAGE}</span>}
+                <Button
+                  ref={signOutButtonRef}
+                  variant="quiet"
+                  loading={logout.isPending}
+                  aria-describedby={signOutFailed ? signOutErrorId : undefined}
+                  onClick={signOut}
+                >
+                  {SIGN_OUT_LABEL}
+                </Button>
+              </Inline>
+            </div>
           </TopBar>
         }
         sideNav={<SideNav label={PRIMARY_NAV_LABEL} items={items} renderLink={renderPrimaryLink} />}
@@ -724,25 +831,43 @@ function ActionsRouteComponent(): ReactElement {
   return <ActionsPage runId={run} />;
 }
 
-/** `/decisions`: discrepancy resolution and the decision log. */
+/**
+ * `/decisions`: discrepancy resolution and the decision log. Code-split: `DecisionsPage` is a
+ * separate chunk, loaded on link intent or first visit (see the module header).
+ */
 const decisionsRoute = createRoute({
   getParentRoute: () => authenticatedRoute,
   path: '/decisions',
-  component: DecisionsPage,
+  component: lazyRouteComponent(
+    screenImporter(() => import('./features/decisions/DecisionsPage')),
+    'DecisionsPage',
+  ),
 });
 
-/** `/sources`: per-source mode, health and freshness, and "Sync now". */
+/**
+ * `/sources`: per-source mode, health and freshness, and "Sync now". Code-split: `SourcesPage`
+ * is a separate chunk, loaded on link intent or first visit (see the module header).
+ */
 const sourcesRoute = createRoute({
   getParentRoute: () => authenticatedRoute,
   path: '/sources',
-  component: SourcesPage,
+  component: lazyRouteComponent(
+    screenImporter(() => import('./features/sources/SourcesPage')),
+    'SourcesPage',
+  ),
 });
 
-/** `/settings`: the read-only configuration view. */
+/**
+ * `/settings`: the read-only configuration view. Code-split: `SettingsPage` is a separate
+ * chunk, loaded on link intent or first visit (see the module header).
+ */
 const settingsRoute = createRoute({
   getParentRoute: () => authenticatedRoute,
   path: '/settings',
-  component: SettingsPage,
+  component: lazyRouteComponent(
+    screenImporter(() => import('./features/settings/SettingsPage')),
+    'SettingsPage',
+  ),
 });
 
 /**
@@ -788,8 +913,8 @@ const routeTree = rootRoute.addChildren([
  *
  * Every route without its own screens uses {@link RootError}, {@link NotFound} and
  * {@link RoutePending}, so no TanStack default (with its raw button and stack details) ever
- * renders. Links preload on intent; the only preloaded work is the auth guard, which reads the
- * cached user.
+ * renders. Links preload on intent: the auth guard, which reads the cached user, and the chunk of
+ * a code-split screen not loaded yet.
  *
  * @param queryClient - The app's query client, passed to every route as context.
  * @param history - The history to run on; the browser history when omitted.

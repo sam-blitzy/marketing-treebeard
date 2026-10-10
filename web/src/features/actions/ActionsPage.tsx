@@ -24,7 +24,10 @@
  *
  * Performance (AAP 0.1.1): the whole page comes from one precomputed `GET /recommendations`
  * response. This module sends no per-item request; the children read only page-level state
- * (configuration, sources, the discrepancy list, recent custom runs), each once.
+ * (configuration, sources, the discrepancy list), each once. The status bar's reads start
+ * alongside the page's own read rather than after it, the default page's run doubles as the
+ * latest default run the window picker needs, and recent custom runs are read only when the
+ * user opens that list.
  *
  * States, in precedence order:
  *
@@ -57,10 +60,15 @@
  * @packageDocumentation
  */
 import { Link } from '@tanstack/react-router';
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import type { ComponentType, ReactElement, ReactNode } from 'react';
 
-import { isApiError, isAwaitingFirstRun, useRecommendations } from '../../api/queries';
+import {
+  isApiError,
+  isAwaitingFirstRun,
+  usePrefetchActionsReads,
+  useRecommendations,
+} from '../../api/queries';
 import type { ApiError } from '../../api/queries';
 import { SECTION_ORDER } from '../../api/types';
 import type { RecommendationsPage, Run, RunId, Section, SectionKey } from '../../api/types';
@@ -150,6 +158,104 @@ export const SECTION_COMPONENTS: Record<SectionKey, ComponentType<SectionCompone
     budget: BudgetSection,
     creative: CreativeSection,
     white_papers: WhitePapersSection,
+  });
+
+// ---------------------------------------------------------------------------------------------
+// Section render boundary
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The overlay field that only stamps when the API read the current state. Every
+ * `GET /recommendations` response carries the instant of its own read, so each poll changes it
+ * even when nothing on the page changed, and no section renders it.
+ */
+const OVERLAY_READ_TIME_KEY = 'computed_at' satisfies keyof SectionComponentProps['overlay'];
+
+/** Whether a decoded JSON value is an object (neither `null` nor an array), read key by key. */
+function isJsonObject(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Whether a decoded JSON value is an array. */
+function isJsonArray(value: unknown): value is readonly unknown[] {
+  return Array.isArray(value);
+}
+
+/**
+ * Whether two values decoded from API JSON are equal in value: the same primitive, arrays with
+ * equal entries in the same order, or objects with the same keys, in any order, and equal values.
+ *
+ * @param a - the earlier value
+ * @param b - the later value
+ * @param skipKey - a key left out when comparing the two top-level objects; nested objects are
+ *   compared in full
+ * @returns `true` when nothing but `skipKey` differs
+ */
+function sameJsonValue(a: unknown, b: unknown, skipKey?: string): boolean {
+  if (a === b) {
+    return true;
+  }
+  if (isJsonArray(a) || isJsonArray(b)) {
+    return (
+      isJsonArray(a) &&
+      isJsonArray(b) &&
+      a.length === b.length &&
+      a.every((entry, index) => sameJsonValue(entry, b[index]))
+    );
+  }
+  if (!isJsonObject(a) || !isJsonObject(b)) {
+    return false;
+  }
+  for (const key of new Set([...Object.keys(a), ...Object.keys(b)])) {
+    if (key !== skipKey && !sameJsonValue(a[key], b[key])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Whether a section renders the same for `next` as it did for `prev`, so React keeps its last
+ * output: the same `section` and `run` objects, and an overlay equal in value on every field but
+ * its read time ({@link OVERLAY_READ_TIME_KEY}).
+ *
+ * TanStack Query's structural sharing hands a refetched page's unchanged parts back as the very
+ * objects the page already held, so `section` and `run` compare by identity: a changed item,
+ * group, finding, withheld line or suppression count gives its section a new object. The overlay
+ * is a new object on every response, because its read time changes on every poll; its other
+ * fields (open discrepancies, source modes, stale and incomplete datasets, and any field the API
+ * adds) are compared by value. The read time is left out because no section renders it:
+ * comparing it would rebuild every section on every poll.
+ *
+ * @param prev - the props of the section's last render
+ * @param next - the props of this render
+ * @returns `true` when the section can skip this render
+ */
+function sameSectionInputs(
+  prev: Readonly<SectionComponentProps>,
+  next: Readonly<SectionComponentProps>,
+): boolean {
+  return (
+    prev.section === next.section &&
+    prev.run === next.run &&
+    sameJsonValue(prev.overlay, next.overlay, OVERLAY_READ_TIME_KEY)
+  );
+}
+
+/**
+ * The renderer the page uses for each section: its {@link SECTION_COMPONENTS} entry inside
+ * `memo` with {@link sameSectionInputs}. The page re-renders whenever its read's fetch status
+ * changes, at the start and the end of every poll, and each poll delivers a new overlay; this
+ * boundary keeps a section whose inputs did not change from rebuilding its partitions, cards,
+ * evidence and tables, while a section whose data or overlay state changed renders again.
+ */
+const SECTION_RENDERERS: Readonly<Record<SectionKey, ComponentType<SectionComponentProps>>> =
+  Object.freeze({
+    keywords: memo(SECTION_COMPONENTS.keywords, sameSectionInputs),
+    campaigns: memo(SECTION_COMPONENTS.campaigns, sameSectionInputs),
+    budget: memo(SECTION_COMPONENTS.budget, sameSectionInputs),
+    creative: memo(SECTION_COMPONENTS.creative, sameSectionInputs),
+    white_papers: memo(SECTION_COMPONENTS.white_papers, sameSectionInputs),
   });
 
 // ---------------------------------------------------------------------------------------------
@@ -306,8 +412,12 @@ interface ActionsContentProps {
  * same response, so every part describes one moment. The sections sit inside one
  * {@link ActionOutcomeProvider}, whose polite region, between the navigation and the first
  * section, announces each card's outcome even after the card has left the page.
+ *
+ * Memoized on `page`: the page re-renders whenever its read's fetch status changes, at the start
+ * and the end of every poll, and this content renders again only for a newly delivered page.
+ * Each section then renders again only when its own inputs changed ({@link SECTION_RENDERERS}).
  */
-function ActionsContent({ page }: ActionsContentProps): ReactElement {
+const ActionsContent = memo(function ActionsContent({ page }: ActionsContentProps): ReactElement {
   const { run, overlay, banners, sections } = page;
   const sectionsByKey = firstSectionByKey(sections);
 
@@ -324,19 +434,22 @@ function ActionsContent({ page }: ActionsContentProps): ReactElement {
           if (section === undefined) {
             return null;
           }
-          const SectionComponent = SECTION_COMPONENTS[key];
+          const SectionComponent = SECTION_RENDERERS[key];
           return <SectionComponent key={key} section={section} run={run} overlay={overlay} />;
         })}
       </ActionOutcomeProvider>
     </ActionsFrame>
   );
-}
+});
 
 /**
  * The `/actions` screen: the five ranked action sections of one analysis run, with the status
  * bar, the global banners and the section navigation above them (AAP 0.5.5).
  *
- * It reads the page with one `useRecommendations(runId)` call and renders, in precedence order:
+ * It reads the page with one `useRecommendations(runId)` call and, beside it,
+ * `usePrefetchActionsReads(runId)` starts the status bar's reads (`GET /config`, `GET /sources`
+ * and, for an addressed run only, `GET /runs/latest`), so they do not wait for the page to
+ * arrive. It renders, in precedence order:
  *
  * - the loaded page whenever data exists, including after a failed background refetch;
  * - `PageShell.Title` "Actions" with a `Spinner` labelled "Loading actions" until the first
@@ -371,6 +484,8 @@ function ActionsContent({ page }: ActionsContentProps): ReactElement {
  */
 export function ActionsPage({ runId }: ActionsPageProps): ReactElement {
   const query = useRecommendations(runId);
+  // The status bar's reads start here, beside the page's own, rather than once the page has data.
+  usePrefetchActionsReads(runId);
   const failure = useSettledFailure(
     runId,
     query.error,

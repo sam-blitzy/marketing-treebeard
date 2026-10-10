@@ -14,7 +14,11 @@
  * - success: the signed-in user seeded into `queryKeys.me` and `/login` replaced by the
  *   `redirect` path, honoured only when it is a same-origin path, otherwise `/actions`;
  * - Enter submitting natively, because the fields and the submit button share one form;
- * - validation of empty fields, with nothing sent and focus on the first empty field;
+ * - the "Primary" side navigation, holding only the current "Sign in" link (AAP 0.5.5);
+ * - validation mirroring the API: empty fields, the admin email's shape, and the 320 and 1024
+ *   code-point limits measured as the API measures them, each message under its own field, with
+ *   nothing sent and focus on the first field in error;
+ * - a 422 `validation_error` naming `body.email` or `body.password`, shown under that field;
  * - 401 `invalid_credentials`, 429 `rate_limited` with and without a usable `Retry-After`, any
  *   other API failure, and the pending state that blocks a second submission.
  *
@@ -23,7 +27,7 @@
 import { apiError, html, json, mockApi } from '../../test/mockApi';
 import type { MockResponse } from '../../test/mockApi';
 import { renderWithProviders } from '../../test/render';
-import { fireEvent, screen, waitFor } from '@testing-library/react';
+import { fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
 import { queryKeys } from '../../api/queries';
@@ -40,6 +44,12 @@ const ADMIN_EMAIL = makeMe().email;
 
 /** A password with surrounding and inner spaces, which must reach the API exactly as typed. */
 const TYPED_PASSWORD = ' correct horse battery ';
+
+/** The field error for an email without the admin email's `local@domain` shape. */
+const EMAIL_FORMAT_MESSAGE = 'Enter an email address in the form name@example.com';
+
+/** A 12-code-point domain part, for emails built to an exact length. */
+const EMAIL_DOMAIN = '@example.com';
 
 /** The page's three controls, found as a user finds them: by their visible names. */
 function controls(): {
@@ -116,6 +126,38 @@ describe('LoginPage', () => {
     // The browser's own validation bubbles are off, so the page's messages are the only ones.
     expect(loginForm().noValidate).toBe(true);
     expect(screen.queryByRole('alert')).toBeNull();
+    expect(api.calls).toHaveLength(0);
+  });
+
+  it('shows a Primary navigation holding only the current Sign in link', async () => {
+    const api = mockApi({});
+    const { router } = await renderWithProviders(<LoginPage redirectTo="/decisions" />, {
+      path: '/login?redirect=/decisions',
+    });
+
+    // Every screen has the side navigation (AAP 0.5.5); signed out, it lists no signed-in screen.
+    const nav = screen.getByRole('navigation', { name: 'Primary' });
+    const links = within(nav).getAllByRole('link');
+    expect(links.map((link) => link.textContent)).toEqual(['Sign in']);
+    for (const name of ['Actions', 'Decisions', 'Sources', 'Settings']) {
+      expect(screen.queryByRole('link', { name })).toBeNull();
+    }
+    const [link] = links;
+    if (link === undefined) {
+      throw new Error('The Primary navigation holds no link.');
+    }
+    expect(link.getAttribute('aria-current')).toBe('page');
+    // The design-system class contract only: the router adds no "active" class of its own.
+    expect(link.className).toBe('ds-sidenav__link ds-sidenav__link--current');
+    // The link keeps the current search, so following it never drops the redirect.
+    expect(link.getAttribute('href')).toBe('/login?redirect=%2Fdecisions');
+
+    fireEvent.click(link);
+
+    await waitFor(() => {
+      expect(router.state.location.search).toEqual({ redirect: '/decisions' });
+    });
+    expect(router.state.location.pathname).toBe('/login');
     expect(api.calls).toHaveLength(0);
   });
 
@@ -319,6 +361,248 @@ describe('LoginPage', () => {
     expect(screen.queryByText('Enter your password')).toBeNull();
   });
 
+  it.each([
+    ['no @', 'not-an-email'],
+    ['nothing before the @', '@example.com'],
+    ['nothing after the last @', 'admin@example.com@'],
+    ['a space inside', 'ad min@example.com'],
+    ['an em space inside', 'admin@exa\u2003mple.com'],
+    ['a line separator inside', 'admin\u2028@example.com'],
+  ])(
+    'reports an email with %s under the email field and sends nothing',
+    async (_label, typed) => {
+      const api = mockApi({});
+      await renderWithProviders(<LoginPage redirectTo="/actions" />, { path: '/login' });
+
+      signIn(typed, TYPED_PASSWORD);
+
+      const { email, password } = controls();
+      expect(descriptionOf(email)).toEqual([EMAIL_FORMAT_MESSAGE]);
+      expect(email.getAttribute('aria-invalid')).toBe('true');
+      expect(password.getAttribute('aria-invalid')).toBeNull();
+      expect(password.value).toBe(TYPED_PASSWORD);
+      await waitFor(() => {
+        expect(document.activeElement).toBe(email);
+      });
+      expect(screen.queryByRole('alert')).toBeNull();
+      expect(api.calls).toHaveLength(0);
+    },
+  );
+
+  it.each([
+    ['a second @ in the local part, split at the last @', 'first@last@example.com'],
+    ['a domain without a dot', 'admin@localhost'],
+    ['U+FEFF inside, which the API does not count as whitespace', 'ad\ufeffmin@example.com'],
+  ])('sends an email with %s, which the API accepts as an admin email', async (_label, typed) => {
+    const api = mockApi({
+      'POST /auth/login': apiError(401, 'invalid_credentials', 'Invalid email or password'),
+    });
+    await renderWithProviders(<LoginPage redirectTo="/actions" />, { path: '/login' });
+
+    signIn(typed, TYPED_PASSWORD);
+
+    await waitFor(() => {
+      expect(api.calls).toHaveLength(1);
+    });
+    expect(api.calls[0]?.body).toEqual({ email: typed, password: TYPED_PASSWORD });
+    expect(controls().email.getAttribute('aria-invalid')).toBeNull();
+  });
+
+  it('trims the email as the API trims it, including U+0085 and U+001F', async () => {
+    const api = mockApi({ 'POST /auth/login': json(200, makeMe()) });
+    await renderWithProviders(<LoginPage redirectTo="/actions" />, { path: '/login' });
+
+    signIn(`\u0085\u001f ${ADMIN_EMAIL}\u3000\t`, TYPED_PASSWORD);
+
+    await waitFor(() => {
+      expect(api.calls).toHaveLength(1);
+    });
+    expect(api.calls[0]?.body).toEqual({ email: ADMIN_EMAIL, password: TYPED_PASSWORD });
+  });
+
+  it('rejects an email of 321 code points after trimming and sends one of exactly 320', async () => {
+    const api = mockApi({
+      'POST /auth/login': apiError(401, 'invalid_credentials', 'Invalid email or password'),
+    });
+    await renderWithProviders(<LoginPage redirectTo="/actions" />, { path: '/login' });
+
+    // 309 + 12 = 321 code points once the surrounding ideographic spaces are trimmed. They are
+    // not ASCII whitespace, so the page trims them, not the email input's value sanitisation.
+    signIn(`\u3000${'a'.repeat(309)}${EMAIL_DOMAIN}\u3000`, TYPED_PASSWORD);
+
+    const { email, password } = controls();
+    expect(descriptionOf(email)).toEqual(['Email must be at most 320 characters']);
+    expect(email.getAttribute('aria-invalid')).toBe('true');
+    expect(password.getAttribute('aria-invalid')).toBeNull();
+    await waitFor(() => {
+      expect(document.activeElement).toBe(email);
+    });
+    expect(api.calls).toHaveLength(0);
+
+    // 308 astral characters are 616 UTF-16 units but 308 code points: 320 in all, the limit.
+    const longest = `${'\u{1F600}'.repeat(308)}${EMAIL_DOMAIN}`;
+    signIn(`\u3000${longest}\u3000`, TYPED_PASSWORD);
+
+    await waitFor(() => {
+      expect(api.calls).toHaveLength(1);
+    });
+    expect(api.calls[0]?.body).toEqual({ email: longest, password: TYPED_PASSWORD });
+  });
+
+  it('measures the email after lowercasing, as the API does', async () => {
+    const api = mockApi({
+      'POST /auth/login': apiError(401, 'invalid_credentials', 'Invalid email or password'),
+    });
+    await renderWithProviders(<LoginPage redirectTo="/actions" />, { path: '/login' });
+
+    // U+0130 lowercases to two code points: 154 typed become 308, plus 12 for the domain is 320.
+    signIn(`${'\u0130'.repeat(154)}${EMAIL_DOMAIN}`, TYPED_PASSWORD);
+    await waitFor(() => {
+      expect(api.calls).toHaveLength(1);
+    });
+
+    // One more is 322 once lowercased, although only 167 code points are typed.
+    signIn(`${'\u0130'.repeat(155)}${EMAIL_DOMAIN}`, TYPED_PASSWORD);
+
+    expect(descriptionOf(controls().email)).toEqual(['Email must be at most 320 characters']);
+    expect(api.calls).toHaveLength(1);
+  });
+
+  it('rejects a password of 1025 code points and sends 1024 astral characters unchanged', async () => {
+    const api = mockApi({ 'POST /auth/login': json(200, makeMe()) });
+    const { router } = await renderWithProviders(<LoginPage redirectTo="/actions" />, {
+      path: '/login',
+    });
+
+    signIn(ADMIN_EMAIL, 'p'.repeat(1025));
+
+    const { email, password } = controls();
+    expect(descriptionOf(password)).toEqual(['Password must be at most 1024 characters']);
+    expect(password.getAttribute('aria-invalid')).toBe('true');
+    expect(email.getAttribute('aria-invalid')).toBeNull();
+    await waitFor(() => {
+      expect(document.activeElement).toBe(password);
+    });
+    expect(api.calls).toHaveLength(0);
+
+    // 1024 code points, each two UTF-16 units: within the limit, sent exactly as typed.
+    const longest = '\u{1F511}'.repeat(1024);
+    expect(longest).toHaveLength(2048);
+    signIn(ADMIN_EMAIL, longest);
+
+    await waitFor(() => {
+      expect(router.state.location.pathname).toBe('/actions');
+    });
+    expect(api.calls).toHaveLength(1);
+    expect(api.calls[0]?.body).toEqual({ email: ADMIN_EMAIL, password: longest });
+  });
+
+  it('reports an invalid email and an empty password together and focuses the email', async () => {
+    const api = mockApi({});
+    await renderWithProviders(<LoginPage redirectTo="/actions" />, { path: '/login' });
+
+    signIn('not-an-email', '');
+
+    const { email, password } = controls();
+    expect(descriptionOf(email)).toEqual([EMAIL_FORMAT_MESSAGE]);
+    expect(email.getAttribute('aria-invalid')).toBe('true');
+    expect(descriptionOf(password)).toEqual(['Enter your password']);
+    expect(password.getAttribute('aria-invalid')).toBe('true');
+    await waitFor(() => {
+      expect(document.activeElement).toBe(email);
+    });
+    expect(api.calls).toHaveLength(0);
+  });
+
+  it('shows a 422 naming body.email under the email field only', async () => {
+    const detail = 'Value error, must not contain a NUL (U+0000) character';
+    mockApi({
+      'POST /auth/login': apiError(422, 'validation_error', `body.email: ${detail}`),
+    });
+    await renderWithProviders(<LoginPage redirectTo="/actions" />, { path: '/login' });
+
+    signIn(ADMIN_EMAIL, TYPED_PASSWORD);
+
+    await waitFor(() => {
+      expect(descriptionOf(controls().email)).toEqual([detail]);
+    });
+    const { email, password } = controls();
+    expect(email.getAttribute('aria-invalid')).toBe('true');
+    expect(password.getAttribute('aria-invalid')).toBeNull();
+    expect(descriptionOf(password)).toEqual([]);
+    // A field message only: no banner, and nothing typed is cleared.
+    expect(screen.getAllByText(detail)).toHaveLength(1);
+    expect(password.value).toBe(TYPED_PASSWORD);
+    expect(email.value).toBe(ADMIN_EMAIL);
+    await waitFor(() => {
+      expect(document.activeElement).toBe(email);
+    });
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('shows a 422 naming both fields under each and focuses the email', async () => {
+    mockApi({
+      'POST /auth/login': apiError(
+        422,
+        'validation_error',
+        'body.password: String should have at most 1024 characters; ' +
+          'body.email: Value error, a; b; body.extra: Extra inputs are not permitted (and 2 more)',
+      ),
+    });
+    await renderWithProviders(<LoginPage redirectTo="/actions" />, { path: '/login' });
+
+    signIn(ADMIN_EMAIL, TYPED_PASSWORD);
+
+    await waitFor(() => {
+      expect(descriptionOf(controls().email)).toEqual(['Value error, a; b']);
+    });
+    expect(descriptionOf(controls().password)).toEqual([
+      'String should have at most 1024 characters',
+    ]);
+    await waitFor(() => {
+      expect(document.activeElement).toBe(controls().email);
+    });
+  });
+
+  it('shows a 422 naming only body.password under the password field and focuses it', async () => {
+    mockApi({
+      'POST /auth/login': apiError(
+        422,
+        'validation_error',
+        'body.password: Input should be a valid string',
+      ),
+    });
+    await renderWithProviders(<LoginPage redirectTo="/actions" />, { path: '/login' });
+
+    signIn(ADMIN_EMAIL, TYPED_PASSWORD);
+
+    await waitFor(() => {
+      expect(descriptionOf(controls().password)).toEqual(['Input should be a valid string']);
+    });
+    expect(controls().email.getAttribute('aria-invalid')).toBeNull();
+    await waitFor(() => {
+      expect(document.activeElement).toBe(controls().password);
+    });
+  });
+
+  it('handles a 422 naming neither field like any other failure', async () => {
+    mockApi({
+      'POST /auth/login': apiError(422, 'validation_error', 'body: Field required'),
+    });
+    await renderWithProviders(<LoginPage redirectTo="/actions" />, { path: '/login' });
+
+    signIn(ADMIN_EMAIL, TYPED_PASSWORD);
+
+    expect(await screen.findAllByText('body: Field required')).toHaveLength(2);
+    const { email, password } = controls();
+    expect(descriptionOf(password)).toEqual(['body: Field required']);
+    expect(email.getAttribute('aria-invalid')).toBeNull();
+    expect(password.value).toBe('');
+    await waitFor(() => {
+      expect(document.activeElement).toBe(password);
+    });
+  });
+
   it('shows one message for 401 invalid_credentials, clears the password and focuses it', async () => {
     mockApi({
       'POST /auth/login': apiError(401, 'invalid_credentials', 'Invalid email or password'),
@@ -341,6 +625,9 @@ describe('LoginPage', () => {
       expect(document.activeElement).toBe(password);
     });
     expect(email.value).toBe(ADMIN_EMAIL);
+    // The message concerns the attempt, not the email: the email field stays valid.
+    expect(email.getAttribute('aria-invalid')).toBeNull();
+    expect(descriptionOf(email)).toEqual([]);
     // The page never says which part failed and never echoes the password.
     expect(screen.queryByText('Invalid email or password')).toBeNull();
     expect(document.body.textContent).not.toContain(TYPED_PASSWORD.trim());
