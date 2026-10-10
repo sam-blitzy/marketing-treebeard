@@ -31,9 +31,11 @@
  * has exactly one `<main>` landmark.
  *
  * Error, not-found and pending screens render through {@link RouteFrame}: inside the layout
- * they fill `<main>` beside the navigation, and outside it (the layout's own guard failed, or the
- * login screen failed) they bring a `PageShell` of their own, so they also keep exactly one
- * `<main>` and one `<h1>`.
+ * they fill `<main>` beside the navigation, and outside it (the layout's own guard failed or is
+ * still pending, the login screen failed, or a `notFound()` was raised outside the layout) they
+ * bring a `PageShell` of their own, so each keeps exactly one `<main>`. The error and not-found
+ * screens render a `PageShell.Title`, the page's one `<h1>`; the pending screen renders only its
+ * labelled `Spinner`, with no heading.
  *
  * Code splitting (AAP 0.1.1: the five sections render from precomputed runs in under 2 s): the
  * entry bundle carries only the screens a first load can show, `/actions` (the landing page)
@@ -383,7 +385,10 @@ const InsideAppLayoutContext = createContext(false);
 
 /** Props of {@link RouteFrame}. */
 interface RouteFrameProps {
-  /** The screen's content: its title slot and body. */
+  /**
+   * The screen's content: the title slot and body of an error or not-found screen, or the
+   * labelled `Spinner` of a pending screen.
+   */
   children: ReactNode;
 }
 

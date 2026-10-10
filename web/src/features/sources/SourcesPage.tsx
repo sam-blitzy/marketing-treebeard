@@ -160,7 +160,7 @@ const NO_RUNS_TEXT = 'No sync runs yet';
 /** Text of the status line before the worker's first attempt on a source. */
 const NO_ATTEMPT_TEXT = 'No attempt yet';
 
-/** Text of the "Stale" badges: a dataset last succeeded too long ago or stops short. */
+/** Text of the "Stale" badges: a dataset never succeeded or last succeeded too long ago. */
 const STALE_LABEL = 'Stale';
 
 /** Explains the Google call count: the product's own cap, not Google's token-wide quota. */
@@ -313,9 +313,11 @@ function useFocusReturn(
 }
 
 /**
- * Whether any dataset shown in a source's section is stale: it last succeeded more than
- * `sources.stale_after_hours` ago or covers less than the window end (AAP 0.3.2). `Source` has no
- * flag of its own for this, so it is derived from the freshness rows, primary and companion.
+ * Whether any dataset shown in a source's section is stale: it never succeeded, or it last
+ * succeeded more than `sources.stale_after_hours` ago, as `GET /sources` decides from the
+ * configuration. The coverage-versus-window-end check of AAP 0.3.2 applies to recommendation
+ * items through the run overlay, not to this screen, which has no analysis window. `Source` has
+ * no flag of its own for this, so it is derived from the freshness rows, primary and companion.
  *
  * @param source - one source of `GET /sources`
  * @returns `true` when at least one freshness row is stale
