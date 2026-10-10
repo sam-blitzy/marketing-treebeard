@@ -15,6 +15,9 @@
  *   and an empty or no-change patch is refused before any request.
  * - **Requests.** The exact `POST /decisions` and `record_intended` bodies, the
  *   `X-Requested-With: ads-engine` header, `onDone` and the query invalidation after success.
+ *   Total budgets are posted for a `CUSTOM_PERIOD` shared budget with no status or daily
+ *   budget, and for lifetime, `CUSTOM_PERIOD` and dual-budget campaigns with only the changed
+ *   fields in a patch and the complete state in an intended state.
  * - **Errors.** A 422 shows the API's message and takes focus; a 409 `subject_retired` locks
  *   the form as "Computed from replaced data"; a 409 `discrepancy_resolved` reads "Already
  *   resolved". No error takes `role="alert"`.
@@ -30,7 +33,13 @@ import { act, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import { useState } from 'react';
 
 import { CURRENT_STATE_POLL_MS, queryKeys } from '../../api/queries';
-import type { Decision, Discrepancy, SubjectIn, SubjectView } from '../../api/types';
+import type {
+  Decision,
+  Discrepancy,
+  DiscrepancyValue,
+  SubjectIn,
+  SubjectView,
+} from '../../api/types';
 import { Button } from '../../design-system';
 import {
   FIXTURE_BUDGET_IDS,
@@ -94,6 +103,27 @@ function linkedinDecision(overrides: Partial<Decision> = {}): Decision {
   });
 }
 
+/**
+ * An `untracked` discrepancy on the LinkedIn campaign, an `own_budget` subject in EUR: its
+ * platform side is the campaign's complete current state, `active` with these budgets, and
+ * carries no micros, which only Google reports.
+ *
+ * @param budgets - The campaign's daily and total budgets on the platform; `null` where it has
+ *   none.
+ * @param overrides - Discrepancy fields to replace.
+ * @returns The discrepancy.
+ */
+function linkedinUntracked(
+  budgets: Required<Pick<DiscrepancyValue, 'daily_budget' | 'total_budget'>>,
+  overrides: Partial<Discrepancy> = {},
+): Discrepancy {
+  return makeDiscrepancy('untracked', {
+    subject: linkedinSubject('EUR'),
+    platform_value: { status: 'active', ...budgets, currency: 'EUR', amount_micros: null },
+    ...overrides,
+  });
+}
+
 // ---------------------------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------------------------
@@ -132,6 +162,16 @@ function onlyCall(api: ApiMock, method: string, path: string): RecordedCall {
     throw new Error(`expected one ${method} ${path}, got ${String(calls.length)}`);
   }
   return call;
+}
+
+/**
+ * Every write recorded, whatever its path.
+ *
+ * @param api - The mock.
+ * @returns The `POST` calls, in request order.
+ */
+function postsOf(api: ApiMock): RecordedCall[] {
+  return api.calls.filter((call) => call.method === 'POST');
 }
 
 /**
@@ -878,6 +918,244 @@ describe('DecisionForm', () => {
     });
   });
 
+  describe('submitting a total budget (AAP 0.5.2 lifetime and CUSTOM_PERIOD budgets)', () => {
+    it('posts a CUSTOM_PERIOD shared budget only its total, never status or daily', async () => {
+      const onDone = vi.fn<() => void>();
+      const api = mockApi({
+        [logKey(SHARED_BUDGET)]: json(200, [
+          makeDecision('budget', { daily_budget: null, total_budget: '9000.00' }),
+        ]),
+        'POST /decisions': json(
+          201,
+          makeDecision('budget', {
+            id: 907,
+            origin: 'user',
+            decided_by: 'admin@example.com',
+            daily_budget: null,
+            total_budget: '9500.00',
+            patch: { total_budget: '9500.00' },
+          }),
+        ),
+      });
+      await renderForm({
+        subject: SHARED_BUDGET,
+        // Neither field is in a CUSTOM_PERIOD budget's shape, so neither may reach the patch.
+        prefill: { status: 'paused', daily_budget: '700.00' },
+        members: [
+          {
+            id: String(FIXTURE_CAMPAIGN_IDS.displayProspecting),
+            name: 'Display Prospecting — US',
+          },
+        ],
+        onDone,
+      });
+
+      expect(screen.getByText('Last decided: total budget $9,000.00')).toBeDefined();
+      expect(
+        screen.getByText('Applies to the shared budget used by: Display Prospecting — US'),
+      ).toBeDefined();
+      expect(screen.queryByRole('combobox')).toBeNull();
+      expect(screen.queryByRole('spinbutton', { name: 'Daily budget' })).toBeNull();
+      typeInto(amountInput('Total budget'), '9500.00');
+      fireEvent.click(saveButton());
+
+      await waitFor(() => {
+        expect(onDone).toHaveBeenCalledTimes(1);
+      });
+      const post = onlyCall(api, 'POST', '/decisions');
+      expect(post.headers.get('X-Requested-With')).toBe('ads-engine');
+      expect(post.body).toEqual({
+        subject: { type: 'budget', id: FIXTURE_BUDGET_IDS.search },
+        patch: { total_budget: '9500.00' },
+      });
+      expect(post.body).not.toHaveProperty('patch.status');
+      expect(post.body).not.toHaveProperty('patch.daily_budget');
+      expect(postsOf(api)).toEqual([post]);
+    });
+
+    it('posts a lifetime LinkedIn campaign its total alone, keeping status out', async () => {
+      const onDone = vi.fn<() => void>();
+      const api = mockApi({
+        [logKey(LINKEDIN_CAMPAIGN)]: json(200, [linkedinDecision({ daily_budget: null })]),
+        'POST /decisions': json(
+          201,
+          linkedinDecision({
+            id: 908,
+            origin: 'user',
+            decided_by: 'admin@example.com',
+            daily_budget: null,
+            total_budget: '3600.00',
+            patch: { total_budget: '3600.00' },
+          }),
+        ),
+      });
+      // A lifetime campaign has no daily budget, so a proposed one is dropped, never posted.
+      await renderForm({ subject: LINKEDIN_CAMPAIGN, prefill: { daily_budget: '240.00' }, onDone });
+
+      expect(screen.getByText('Last decided: Active · total budget €3,000.00')).toBeDefined();
+      expect(screen.queryByRole('spinbutton', { name: 'Daily budget' })).toBeNull();
+      expect(amountInput('Total budget').getAttribute('step')).toBe('0.01');
+      typeInto(amountInput('Total budget'), '3600.00');
+      expect(statusSelect()).toHaveProperty('value', 'active');
+      fireEvent.click(saveButton());
+
+      await waitFor(() => {
+        expect(onDone).toHaveBeenCalledTimes(1);
+      });
+      const post = onlyCall(api, 'POST', '/decisions');
+      expect(post.headers.get('X-Requested-With')).toBe('ads-engine');
+      expect(post.body).toEqual({
+        subject: { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.pipelineEmea },
+        patch: { total_budget: '3600.00' },
+      });
+      expect(post.body).not.toHaveProperty('patch.status');
+      expect(post.body).not.toHaveProperty('patch.daily_budget');
+      expect(postsOf(api)).toEqual([post]);
+    });
+
+    it('posts a Google CUSTOM_PERIOD campaign its total alone, in whole micros', async () => {
+      const onDone = vi.fn<() => void>();
+      const api = mockApi({
+        [logKey(OWN_BUDGET)]: json(200, [
+          makeDecision('own_budget', { daily_budget: null, total_budget: '6000.00' }),
+        ]),
+        'POST /decisions': json(
+          201,
+          makeDecision('own_budget', {
+            id: 909,
+            origin: 'user',
+            decided_by: 'admin@example.com',
+            daily_budget: null,
+            total_budget: '6000.000001',
+            patch: { total_budget: '6000.000001' },
+          }),
+        ),
+      });
+      await renderForm({ subject: OWN_BUDGET, onDone });
+
+      expect(screen.getByText('Last decided: Active · total budget $6,000.00')).toBeDefined();
+      expect(screen.queryByRole('spinbutton', { name: 'Daily budget' })).toBeNull();
+      const total = amountInput('Total budget');
+      expect(total).toHaveProperty('value', '6000.00');
+      // Google amounts may carry whole micros, whatever the currency, and nothing finer.
+      expect(total.getAttribute('step')).toBe('0.000001');
+      typeInto(total, '6000.0000001');
+      expect(screen.getByText('Use at most 6 decimal places')).toBeDefined();
+      expect(saveButton()).toHaveProperty('disabled', true);
+      typeInto(total, '6000.000001');
+      expect(total.getAttribute('aria-invalid')).toBeNull();
+      fireEvent.click(saveButton());
+
+      await waitFor(() => {
+        expect(onDone).toHaveBeenCalledTimes(1);
+      });
+      const post = onlyCall(api, 'POST', '/decisions');
+      expect(post.headers.get('X-Requested-With')).toBe('ads-engine');
+      expect(post.body).toEqual({
+        subject: { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.brandSearch },
+        patch: { total_budget: '6000.000001' },
+      });
+      expect(post.body).not.toHaveProperty('patch.status');
+      expect(post.body).not.toHaveProperty('patch.daily_budget');
+      expect(postsOf(api)).toEqual([post]);
+    });
+
+    it('posts only the total of a dual-budget campaign when only the total changed', async () => {
+      const onDone = vi.fn<() => void>();
+      const api = mockApi({
+        [logKey(LINKEDIN_CAMPAIGN)]: json(200, [linkedinDecision()]),
+        'POST /decisions': json(
+          201,
+          linkedinDecision({
+            id: 910,
+            origin: 'user',
+            decided_by: 'admin@example.com',
+            total_budget: '3500.00',
+            patch: { total_budget: '3500.00' },
+          }),
+        ),
+      });
+      await renderForm({ subject: LINKEDIN_CAMPAIGN, onDone });
+
+      typeInto(amountInput('Total budget'), '3500.00');
+      expect(amountInput('Daily budget')).toHaveProperty('value', '100.00');
+      expect(statusSelect()).toHaveProperty('value', 'active');
+      fireEvent.click(saveButton());
+
+      await waitFor(() => {
+        expect(onDone).toHaveBeenCalledTimes(1);
+      });
+      const post = onlyCall(api, 'POST', '/decisions');
+      expect(post.headers.get('X-Requested-With')).toBe('ads-engine');
+      expect(post.body).toEqual({
+        subject: { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.pipelineEmea },
+        patch: { total_budget: '3500.00' },
+      });
+      // The server keeps the decided status and daily budget; unchanged fields are never resent.
+      expect(post.body).not.toHaveProperty('patch.status');
+      expect(post.body).not.toHaveProperty('patch.daily_budget');
+      expect(postsOf(api)).toEqual([post]);
+    });
+
+    it('posts the status and both budgets of a dual-budget campaign when all changed', async () => {
+      const onDone = vi.fn<() => void>();
+      const patch = { status: 'paused', daily_budget: '120.00', total_budget: '3600.00' } as const;
+      const api = mockApi({
+        [logKey(LINKEDIN_CAMPAIGN)]: json(200, [linkedinDecision()]),
+        'POST /decisions': json(
+          201,
+          linkedinDecision({
+            id: 911,
+            origin: 'user',
+            decided_by: 'admin@example.com',
+            ...patch,
+            patch,
+            note: 'New quarter plan',
+          }),
+        ),
+      });
+      await renderForm({ subject: LINKEDIN_CAMPAIGN, onDone });
+
+      typeInto(statusSelect(), 'paused');
+      typeInto(amountInput('Daily budget'), '120.00');
+      typeInto(amountInput('Total budget'), '3600.00');
+      typeInto(noteField(), 'New quarter plan');
+      fireEvent.click(saveButton());
+
+      await waitFor(() => {
+        expect(onDone).toHaveBeenCalledTimes(1);
+      });
+      const post = onlyCall(api, 'POST', '/decisions');
+      expect(post.headers.get('X-Requested-With')).toBe('ads-engine');
+      expect(post.body).toEqual({
+        subject: { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.pipelineEmea },
+        patch: { status: 'paused', daily_budget: '120.00', total_budget: '3600.00' },
+        note: 'New quarter plan',
+      });
+      expect(postsOf(api)).toEqual([post]);
+    });
+
+    it('refuses a total budget finer than the minor unit, posting nothing', async () => {
+      const onDone = vi.fn<() => void>();
+      const api = mockApi({ [logKey(LINKEDIN_CAMPAIGN)]: json(200, [linkedinDecision()]) });
+      await renderForm({ subject: LINKEDIN_CAMPAIGN, onDone });
+
+      // A valid status change does not carry an invalid total through: nothing is saved.
+      typeInto(statusSelect(), 'paused');
+      typeInto(amountInput('Total budget'), '3000.005');
+
+      expect(screen.getByText('Use at most 2 decimal places')).toBeDefined();
+      expect(amountInput('Total budget').getAttribute('aria-invalid')).toBe('true');
+      expect(amountInput('Daily budget').getAttribute('aria-invalid')).toBeNull();
+      expect(saveButton()).toHaveProperty('disabled', true);
+      expect(screen.queryByText('No change from the last decided state')).toBeNull();
+
+      fireEvent.submit(formOf(saveButton()));
+      expect(postsOf(api)).toHaveLength(0);
+      expect(onDone).not.toHaveBeenCalled();
+    });
+  });
+
   describe('recording an intended state (AAP 0.5.4.4 record_intended)', () => {
     it('refuses to render without the discrepancy to resolve', async () => {
       mockApi({ [logKey(OWN_BUDGET)]: json(200, []) });
@@ -1085,6 +1363,151 @@ describe('DecisionForm', () => {
         expect(saveButton('Save intended state')).toHaveProperty('disabled', true);
       });
       expect(onDone).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('recording an intended total budget (AAP 0.5.4.4 record_intended)', () => {
+    it('sends a lifetime campaign its status and total, with no daily budget', async () => {
+      const onDone = vi.fn<() => void>();
+      const lifetime = { daily_budget: null, total_budget: '3000.00' };
+      const api = mockApi({
+        [logKey(LINKEDIN_CAMPAIGN)]: json(200, []),
+        'POST /discrepancies/:id/resolve': json(
+          200,
+          linkedinUntracked(lifetime, {
+            state: 'awaiting_platform',
+            resolution: 'record_intended',
+          }),
+        ),
+      });
+      await renderForm({
+        subject: LINKEDIN_CAMPAIGN,
+        mode: 'intended_state',
+        discrepancy: linkedinUntracked(lifetime),
+        // A lifetime campaign has no daily budget, so a proposed one is dropped, never sent.
+        prefill: { daily_budget: '240.00' },
+        onDone,
+      });
+
+      expect(
+        screen.getByText('No decision recorded yet · platform shows Active · total budget €3,000.00'),
+      ).toBeDefined();
+      expect(screen.queryByRole('spinbutton', { name: 'Daily budget' })).toBeNull();
+      expect(amountInput('Total budget')).toHaveProperty('value', '3000.00');
+      typeInto(statusSelect(), 'paused');
+      // A total finer than the EUR minor unit cannot be recorded.
+      typeInto(amountInput('Total budget'), '2500.005');
+      expect(screen.getByText('Use at most 2 decimal places')).toBeDefined();
+      expect(saveButton('Save intended state')).toHaveProperty('disabled', true);
+      typeInto(amountInput('Total budget'), '2500.00');
+      fireEvent.click(saveButton('Save intended state'));
+
+      await waitFor(() => {
+        expect(onDone).toHaveBeenCalledTimes(1);
+      });
+      const post = onlyCall(api, 'POST', RESOLVE_PATH);
+      expect(post.params).toEqual({ id: String(FIXTURE_DISCREPANCY_ID) });
+      expect(post.headers.get('X-Requested-With')).toBe('ads-engine');
+      expect(post.body).toEqual({
+        resolution: 'record_intended',
+        intended_state: { status: 'paused', total_budget: '2500.00' },
+      });
+      expect(post.body).not.toHaveProperty('intended_state.daily_budget');
+      expect(postsOf(api)).toEqual([post]);
+      expect(callsTo(api, 'POST', '/decisions')).toHaveLength(0);
+    });
+
+    it('sends a dual-budget campaign its complete state, unchanged amounts included', async () => {
+      const onDone = vi.fn<() => void>();
+      const api = mockApi({
+        [logKey(LINKEDIN_CAMPAIGN)]: json(200, []),
+        'POST /discrepancies/:id/resolve': json(
+          200,
+          linkedinUntracked(
+            { daily_budget: '100.00', total_budget: '3000.00' },
+            { state: 'awaiting_platform', resolution: 'record_intended' },
+          ),
+        ),
+      });
+      await renderForm({
+        subject: LINKEDIN_CAMPAIGN,
+        mode: 'intended_state',
+        discrepancy: linkedinUntracked({ daily_budget: '100.00', total_budget: '3000.00' }),
+        onDone,
+      });
+
+      expect(amountInput('Daily budget')).toHaveProperty('value', '100.00');
+      typeInto(amountInput('Total budget'), '3200.00');
+      fireEvent.click(saveButton('Save intended state'));
+
+      await waitFor(() => {
+        expect(onDone).toHaveBeenCalledTimes(1);
+      });
+      const post = onlyCall(api, 'POST', RESOLVE_PATH);
+      expect(post.headers.get('X-Requested-With')).toBe('ads-engine');
+      // record_intended needs the complete state, so the unchanged status and daily budget go too.
+      expect(post.body).toEqual({
+        resolution: 'record_intended',
+        intended_state: { status: 'active', daily_budget: '100.00', total_budget: '3200.00' },
+      });
+      expect(postsOf(api)).toEqual([post]);
+      expect(callsTo(api, 'POST', '/decisions')).toHaveLength(0);
+    });
+
+    it('sends a CUSTOM_PERIOD shared budget its total alone, never status or daily', async () => {
+      const onDone = vi.fn<() => void>();
+      const customPeriod: DiscrepancyValue = {
+        daily_budget: null,
+        total_budget: '9000.00',
+        currency: 'USD',
+        amount_micros: 9_000_000_000,
+      };
+      const api = mockApi({
+        [logKey(SHARED_BUDGET)]: json(200, []),
+        'POST /discrepancies/:id/resolve': json(
+          200,
+          makeDiscrepancy('untracked', {
+            shape: 'budget',
+            platform_value: customPeriod,
+            state: 'awaiting_platform',
+            resolution: 'record_intended',
+          }),
+        ),
+      });
+      await renderForm({
+        subject: SHARED_BUDGET,
+        mode: 'intended_state',
+        discrepancy: makeDiscrepancy('untracked', {
+          shape: 'budget',
+          platform_value: customPeriod,
+        }),
+        // Neither field is in a CUSTOM_PERIOD budget's shape, so neither may be sent.
+        prefill: { status: 'paused', daily_budget: '700.00' },
+        onDone,
+      });
+
+      expect(
+        screen.getByText('No decision recorded yet · platform shows total budget $9,000.00'),
+      ).toBeDefined();
+      expect(screen.queryByRole('combobox')).toBeNull();
+      expect(screen.queryByRole('spinbutton', { name: 'Daily budget' })).toBeNull();
+      expect(amountInput('Total budget')).toHaveProperty('value', '9000.00');
+      typeInto(amountInput('Total budget'), '9500.00');
+      fireEvent.click(saveButton('Save intended state'));
+
+      await waitFor(() => {
+        expect(onDone).toHaveBeenCalledTimes(1);
+      });
+      const post = onlyCall(api, 'POST', RESOLVE_PATH);
+      expect(post.headers.get('X-Requested-With')).toBe('ads-engine');
+      expect(post.body).toEqual({
+        resolution: 'record_intended',
+        intended_state: { total_budget: '9500.00' },
+      });
+      expect(post.body).not.toHaveProperty('intended_state.status');
+      expect(post.body).not.toHaveProperty('intended_state.daily_budget');
+      expect(postsOf(api)).toEqual([post]);
+      expect(callsTo(api, 'POST', '/decisions')).toHaveLength(0);
     });
   });
 
