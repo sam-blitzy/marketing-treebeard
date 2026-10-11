@@ -7,7 +7,8 @@ text primitives those rules share:
 
 * K2 expansion candidates list adjacent terms: other window search terms whose token
   Jaccard similarity with the converting term is at least ``k2.adjacent_jaccard``
-  (:func:`adjacent_terms`).
+  (:meth:`TermIndex.similar` over an index built once per search-term report, or
+  :func:`adjacent_terms` for a single query).
 * C3b launch ideas group converting search terms by single linkage at ``c3b.jaccard``
   (:func:`cluster_terms`) and name each cluster by its head tokens, the tokens present in at
   least ``c3b.head_token_share`` of its members (:func:`head_tokens`), listed in the order
@@ -44,6 +45,7 @@ Example:
     True
 """
 
+import heapq
 import re
 import unicodedata
 from collections import Counter, defaultdict
@@ -56,6 +58,7 @@ from typing import Final
 __all__ = [
     "STOPWORDS",
     "TermCluster",
+    "TermIndex",
     "adjacent_terms",
     "cluster_terms",
     "contains_tokens",
@@ -657,6 +660,137 @@ def _term_key(term: str) -> str:
     return " ".join(_normalise(term).split())
 
 
+class TermIndex:
+    """An inverted token index over search terms, built once and queried per term (K2).
+
+    K2 asks one question of an account's search-term report for every expansion candidate:
+    which other terms reach token Jaccard ``k2.adjacent_jaccard`` with it. The index answers
+    each query without reading the whole report again. On construction every distinct term is
+    tokenised once (:func:`tokenize`), its caseless, whitespace-normalised spelling is
+    recorded once, and every token maps to the ascending positions of the terms containing
+    it; a query then compares only terms that share a token with the queried term
+    (:meth:`similar`).
+
+    Terms keep the order they are given in, and a repeated string is indexed once, at its
+    first occurrence. An index never changes after construction, and no answer depends on set
+    or dict iteration order, so the same terms always give the same answers.
+
+    Args:
+        terms: The terms to index, in the order queries return them. K2 passes its eligible
+            terms ranked by conversions, then clicks, then term.
+
+    Raises:
+        TypeError: ``terms`` is a single string, or one of its items is not a string.
+
+    Example:
+        >>> from decimal import Decimal
+        >>> index = TermIndex(["crm tool", "CRM Tool Pricing", "tool pricing guide", "crm tool"])
+        >>> index.terms
+        ('crm tool', 'CRM Tool Pricing', 'tool pricing guide')
+        >>> index.similar("crm tool pricing", threshold=Decimal("0.5"))
+        ['crm tool', 'tool pricing guide']
+        >>> index.similar("crm tool pricing", threshold=Decimal("0.5"), limit=1)
+        ['crm tool']
+    """
+
+    __slots__ = ("_keys", "_positions", "_postings", "_terms", "_tokens")
+
+    def __init__(self, terms: Sequence[str]) -> None:
+        """Index ``terms`` (see the class docstring for the arguments and errors)."""
+        _reject_single_string("terms", terms)
+        distinct: dict[str, None] = {}
+        for term in terms:
+            if not isinstance(term, str):
+                raise TypeError(f"terms must hold only strings, found {type(term).__name__}")
+            distinct.setdefault(term, None)
+        self._terms: tuple[str, ...] = tuple(distinct)
+        self._tokens: tuple[frozenset[str], ...] = tuple(tokenize(term) for term in self._terms)
+        self._keys: tuple[str, ...] = tuple(_term_key(term) for term in self._terms)
+        self._positions: dict[str, int] = {term: index for index, term in enumerate(self._terms)}
+        postings: dict[str, list[int]] = {}
+        for position, tokens in enumerate(self._tokens):
+            for token in tokens:
+                postings.setdefault(token, []).append(position)
+        self._postings: dict[str, tuple[int, ...]] = {
+            token: tuple(positions) for token, positions in postings.items()
+        }
+
+    @property
+    def terms(self) -> tuple[str, ...]:
+        """The distinct indexed terms, in first-occurrence order (the order of every answer)."""
+        return self._terms
+
+    def similar(self, term: str, *, threshold: Decimal, limit: int | None = None) -> list[str]:
+        """Return the indexed terms whose token Jaccard with ``term`` meets ``threshold``.
+
+        An indexed term matches when ``jaccard(tokenize(term), tokenize(other)) >= threshold``,
+        inclusive and compared exactly as cross-multiplied integers. ``term`` itself never
+        matches, also when an indexed term spells it with different case or spacing
+        ("CRM  Tool" is "crm tool"), and a term without tokens matches nothing. ``term`` need
+        not be indexed; when it is, its stored tokens are reused.
+
+        Matches come in index order, and the search stops at the ``limit``-th match, so with a
+        ranked index the first ``limit`` matches are the best ranked. Only terms sharing one of
+        the queried term's ``len(x) - ceil(threshold * len(x)) + 1`` rarest tokens (fewest
+        indexed terms first, then code-point order) are compared. This pruning is exact: a term
+        ``y`` with Jaccard at least ``threshold`` shares at least ``ceil(threshold * len(x))``
+        tokens with the queried token set ``x``, because ``len(x | y) >= len(x)``, so it
+        cannot miss every one of those rarest tokens; every remaining term is decided by the
+        exact comparison.
+
+        Args:
+            term: The queried search term, typically a converting term.
+            threshold: The configured similarity (``k2.adjacent_jaccard``), a ``Decimal`` in
+                (0, 1].
+            limit: The most matches to return; ``None`` returns every match and ``0`` none.
+
+        Returns:
+            The matching indexed terms in index order; empty when ``term`` has no tokens.
+
+        Raises:
+            TypeError: ``threshold`` is not a ``Decimal``, ``limit`` is neither ``None`` nor an
+                ``int`` (a ``bool`` is refused), or ``term`` is not a string.
+            ValueError: ``threshold`` is outside (0, 1], or ``limit`` is negative.
+        """
+        link = _ratio("threshold", threshold)
+        if limit is not None:
+            if isinstance(limit, bool) or not isinstance(limit, int):
+                raise TypeError(f"limit must be an int or None, got {type(limit).__name__}")
+            if limit < 0:
+                raise ValueError(f"limit must be at least 0, got {limit}")
+        if not isinstance(term, str):
+            raise TypeError(f"term must be a string, got {type(term).__name__}")
+        position = self._positions.get(term)
+        if position is None:
+            own_tokens, own_key = tokenize(term), _term_key(term)
+        else:
+            own_tokens, own_key = self._tokens[position], self._keys[position]
+        if not own_tokens or limit == 0:
+            return []
+        postings = self._postings
+
+        def rarest_first(token: str) -> tuple[int, str]:
+            return len(postings.get(token, ())), token
+
+        prefix = _probe_prefix_length(len(own_tokens), link)
+        probes = sorted(own_tokens, key=rarest_first)[:prefix]
+        matches: list[str] = []
+        previous = -1
+        # Each posting list ascends, so the merge visits candidates in index order; a term
+        # sharing several probed tokens comes out once per token, consecutively.
+        for candidate in heapq.merge(*(postings[token] for token in probes if token in postings)):
+            if candidate == previous:
+                continue
+            previous = candidate
+            if self._keys[candidate] != own_key and _meets(
+                own_tokens, self._tokens[candidate], link
+            ):
+                matches.append(self._terms[candidate])
+                if limit is not None and len(matches) >= limit:
+                    break
+        return matches
+
+
 def adjacent_terms(term: str, candidates: Sequence[str], *, threshold: Decimal) -> list[str]:
     """Return the candidates whose token Jaccard similarity with ``term`` meets ``threshold``.
 
@@ -671,6 +805,9 @@ def adjacent_terms(term: str, candidates: Sequence[str], *, threshold: Decimal) 
     click minimum, orders by conversions then clicks, and keeps at most
     ``k2.adjacent_max_terms``.
 
+    This is one query of a :class:`TermIndex` built over ``candidates``; a caller with many
+    terms to query against the same candidates builds the index once and queries it instead.
+
     Args:
         term: The converting search term.
         candidates: The window's search terms.
@@ -681,7 +818,8 @@ def adjacent_terms(term: str, candidates: Sequence[str], *, threshold: Decimal) 
         Matching candidates in first-occurrence order; empty when ``term`` has no tokens.
 
     Raises:
-        TypeError: ``candidates`` is a single string, or ``threshold`` is not a ``Decimal``.
+        TypeError: ``candidates`` is a single string or holds an item that is not a string
+            (checked only when ``term`` has tokens), or ``threshold`` is not a ``Decimal``.
         ValueError: ``threshold`` is outside (0, 1].
 
     Example:
@@ -694,17 +832,7 @@ def adjacent_terms(term: str, candidates: Sequence[str], *, threshold: Decimal) 
         ['crm tool', 'tool pricing guide']
     """
     _reject_single_string("candidates", candidates)
-    link = _ratio("threshold", threshold)
-    own_tokens = tokenize(term)
-    if not own_tokens:
+    _ratio("threshold", threshold)
+    if not tokenize(term):
         return []
-    own_key = _term_key(term)
-    seen: set[str] = set()
-    matches: list[str] = []
-    for candidate in candidates:
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        if _term_key(candidate) != own_key and _meets(own_tokens, tokenize(candidate), link):
-            matches.append(candidate)
-    return matches
+    return TermIndex(candidates).similar(term, threshold=threshold)

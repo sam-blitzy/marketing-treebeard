@@ -18,6 +18,7 @@ from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -1281,6 +1282,74 @@ def test_config_error_message_and_pickling() -> None:
         error.key,
         error.detail,
     )
+
+
+def _round_trip(config: Thresholds) -> Thresholds:
+    """``config`` pickled and unpickled, as the runner hands it to its analysis process."""
+    restored = pickle.loads(pickle.dumps(config))  # noqa: S301 - round-trip of our own object
+    assert isinstance(restored, Thresholds)
+    return restored
+
+
+def _assert_same_configuration(restored: Thresholds, original: Thresholds) -> None:
+    """``restored`` holds exactly ``original``'s values, frozen and indexed again."""
+    assert restored == original
+    assert restored.config_hash == original.config_hash
+    assert restored.as_view() == original.as_view()
+    assert restored.raw == original.raw
+    assert restored.mapping == original.mapping
+    assert restored.content_assets == original.content_assets
+    assert restored.source_dir == original.source_dir
+    assert isinstance(restored.raw, MappingProxyType)
+    with pytest.raises(TypeError):
+        restored.raw["window"] = {}  # type: ignore[index]
+
+
+def test_the_shipped_configuration_pickles(shipped: Thresholds) -> None:
+    restored = _round_trip(shipped)
+    _assert_same_configuration(restored, shipped)
+    assert restored.value("window.presets") == shipped.value("window.presets") == (14, 28, 56, 90)
+    assert isinstance(restored.value("window.presets"), tuple)
+    assert restored.ratio("budget.capped_day_ratio") == shipped.ratio("budget.capped_day_ratio")
+    assert restored.strings("crm.booking_sources") == shipped.strings("crm.booking_sources")
+    # The registry indexes are rebuilt from the registry, not copied.
+    benchmarks = restored.asset_for_form(BENCHMARKS_FORM)
+    assert benchmarks is not None
+    assert benchmarks == shipped.asset_for_form(BENCHMARKS_FORM)
+    playbook = restored.asset_for_creative(OVERRIDE_CREATIVE)
+    assert playbook is not None
+    assert playbook == shipped.asset_for_creative(OVERRIDE_CREATIVE)
+    assert restored.asset_for_form("urn:li:leadGenForm:1") is None
+
+
+def test_an_overridden_configuration_pickles_with_its_values_and_hash(
+    shipped: Thresholds,
+) -> None:
+    only = ContentAsset("only-paper", "Only Paper", (BENCHMARKS_FORM,), ())
+    overridden = Thresholds.load(
+        CONFIG_DIR,
+        overrides={
+            "window.default_days": 21,
+            "window.presets": [14, 21, 28, 56, 90],
+            "budget.capped_day_ratio": Decimal("0.90"),
+            "crm.booking_sources": ("MEETINGS_PUBLIC", "CRM_UI"),
+        },
+        content_assets=[only],
+    )
+    assert overridden.config_hash != shipped.config_hash
+    restored = _round_trip(overridden)
+    _assert_same_configuration(restored, overridden)
+    assert restored.default_days == 21
+    assert restored.presets == (14, 21, 28, 56, 90)
+    assert restored.ratio("budget.capped_day_ratio") == Decimal("0.9")
+    assert restored.strings("crm.booking_sources") == ("MEETINGS_PUBLIC", "CRM_UI")
+    assert restored.mapping.booking_sources == ("MEETINGS_PUBLIC", "CRM_UI")
+    assert restored.content_assets == (only,)
+    assert restored.asset_for_form(BENCHMARKS_FORM) == only
+    assert restored.asset_for_form(PLAYBOOK_FORM) is None
+    assert restored.asset_for_creative(OVERRIDE_CREATIVE) is None
+    # A copy that is pickled again stays the same configuration.
+    _assert_same_configuration(_round_trip(restored), overridden)
 
 
 def test_direct_construction_is_validated(shipped: Thresholds) -> None:

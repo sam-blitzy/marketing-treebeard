@@ -87,6 +87,7 @@ import {
   makeItemOverlay,
   makeRecommendationsPage,
 } from '../../test/fixtures';
+import { byTextContent } from '../../test/text';
 import {
   ActionOutcomeProvider,
   BLOCKING_DISCREPANCY_LINK_LABEL,
@@ -376,7 +377,9 @@ describe('RecommendationCard: header and body', () => {
     const reason = within(card).getByText(item.reason);
     const fields = within(card).getByText('Section fields');
     const table = within(card).getByRole('table', { name: 'Evidence' });
-    const chip = within(card).getByText(formatWindowChip(item.evidence.window));
+    const chip = within(card).getByText(
+      byTextContent('.ds-badge', formatWindowChip(item.evidence.window)),
+    );
     const flags = within(card).getByRole('list', { name: 'Flags' });
 
     const order = [reason, fields, table, chip, flags];
@@ -395,7 +398,7 @@ describe('RecommendationCard: header and body', () => {
     expect(chip).toBe(
       '2026-09-08 – 2026-10-05 · 28 days · Google days: America/New_York · LinkedIn days: UTC',
     );
-    expect(within(cardOf(item)).getByText(chip)).toBeDefined();
+    expect(within(cardOf(item)).getByText(byTextContent('.ds-badge', chip))).toBeDefined();
   });
 
   it('shows the recorded flags plus the current ones', async () => {
@@ -702,7 +705,7 @@ describe('RecommendationCard: reason placement', () => {
     const order = [
       within(card).getByText(fieldText),
       within(card).getByRole('table', { name: 'Evidence' }),
-      within(card).getByText(formatWindowChip(item.evidence.window)),
+      within(card).getByText(byTextContent('.ds-badge', formatWindowChip(item.evidence.window))),
       within(card).getByRole('list', { name: 'Flags' }),
     ];
     order.slice(1).forEach((node, index) => {
@@ -1933,6 +1936,117 @@ describe('RecommendationActions: a newer run of the same recommendation', () => 
       expect(document.activeElement).toBe(markDone);
     });
     expect(buttonNames(next)).toEqual(['Mark done', 'Dismiss', 'Snooze for 7 days']);
+  });
+});
+
+describe('RecommendationCard: a card React mounts anew in another place', () => {
+  /** Where {@link renderMovableCard} renders the card: one of two sibling lists. */
+  type Place = 'visible' | 'replaced';
+
+  /**
+   * Renders `initial` in the "Visible" list and returns `move`, which renders `next` in the
+   * list `place` names instead, as a refetch moves a card from a group's visible cards into its
+   * "Computed from replaced data" block: React unmounts the card in one list and mounts a new
+   * one in the other within one commit.
+   */
+  async function renderMovableCard(initial: Item): Promise<(next: Item, place: Place) => void> {
+    const control: { move?: (next: { item: Item; place: Place }) => void } = {};
+    function Host() {
+      const [shown, setShown] = useState<{ item: Item; place: Place }>({
+        item: initial,
+        place: 'visible',
+      });
+      control.move = setShown;
+      const card = <RecommendationCard item={shown.item} />;
+      return (
+        <Stack>
+          <Button>Elsewhere</Button>
+          <Stack aria-label="Visible">{shown.place === 'visible' ? card : null}</Stack>
+          <Stack aria-label="Replaced">{shown.place === 'replaced' ? card : null}</Stack>
+        </Stack>
+      );
+    }
+    await renderCard(<Host />);
+    return (next, place) => {
+      act(() => {
+        control.move?.({ item: next, place });
+      });
+    };
+  }
+
+  it('moves focus from an open decision dialog to the moved card\'s replaced-data line', async () => {
+    api.use({ 'GET /decisions': json(200, [genericCrmDecision()]) });
+    const item = c1Item();
+    const move = await renderMovableCard(item);
+    const left = cardOf(item);
+    act(() => {
+      within(left).getByRole('button', { name: RECORD_DECISION_LABEL }).focus();
+    });
+    await openDecisionDialog(item);
+
+    const moved = { ...item, current: historicalOverlay() };
+    move(moved, 'replaced');
+
+    expect(screen.queryByRole('dialog')).toBeNull();
+    const card = within(screen.getByRole('group', { name: 'Replaced' })).getByRole('article', {
+      name: item.action,
+    });
+    expect(card).not.toBe(left);
+    const badge = within(card).getByText(HISTORICAL_LABEL);
+    await waitFor(() => {
+      expect(document.activeElement?.contains(badge)).toBe(true);
+    });
+    const line = document.activeElement;
+    expect(line).not.toBe(card);
+    expect(line?.getAttribute('tabindex')).toBe('-1');
+    expect(line?.textContent).toBe(
+      `${HISTORICAL_LABEL}${historicalProvenanceText(moved.evidence.provenance, 'live')}`,
+    );
+    // Every action of the moved card is disabled.
+    for (const button of cardButtons(moved)) {
+      expect(button.hasAttribute('disabled')).toBe(true);
+    }
+  });
+
+  it('moves focus on a footer action to the moved card itself when it is current', async () => {
+    const item = makeItem({ id: 61 });
+    const move = await renderMovableCard(item);
+    const dismiss = within(cardOf(item)).getByRole('button', { name: FEEDBACK_LABELS.dismiss });
+    act(() => {
+      dismiss.focus();
+    });
+    expect(document.activeElement).toBe(dismiss);
+
+    // A newer run's item for the same subject, still current, mounts in the other list.
+    const next = newerRun(item);
+    move(next, 'replaced');
+
+    const card = within(screen.getByRole('group', { name: 'Replaced' })).getByRole('article', {
+      name: next.action,
+    });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(card);
+    });
+    expect(card.getAttribute('tabindex')).toBe('-1');
+    expect(within(card).queryByText(HISTORICAL_LABEL)).toBeNull();
+  });
+
+  it('leaves focus the user has put outside the card where it is', async () => {
+    const item = makeItem({ id: 61 });
+    const move = await renderMovableCard(item);
+    const elsewhere = screen.getByRole('button', { name: 'Elsewhere' });
+    act(() => {
+      elsewhere.focus();
+    });
+
+    move({ ...item, current: historicalOverlay() }, 'replaced');
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+
+    expect(document.activeElement).toBe(elsewhere);
   });
 });
 

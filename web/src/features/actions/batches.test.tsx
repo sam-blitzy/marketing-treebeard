@@ -446,6 +446,52 @@ describe('BatchedList', () => {
     expect(renderedRanks()).toEqual([1]);
     expect(showMore()?.textContent).toBe('Show 1 more action');
   });
+
+  it('reveals through the last entry mustShow holds for after a commit, moving no focus', () => {
+    const control: { show?: (id: number | null) => void } = {};
+    function MustShow() {
+      const [id, setId] = useState<number | null>(null);
+      control.show = setId;
+      return (
+        <BatchedList
+          entries={entries(70)}
+          batchSize={CARD_BATCH_SIZE}
+          noun={ACTION_NOUN}
+          getKey={(entry) => entry.id}
+          renderEntry={(entry) => (
+            <article id={anchorOf(entry)} data-rank={entry.rank}>
+              {`Rank ${String(entry.rank)}`}
+            </article>
+          )}
+          focusIdOf={anchorOf}
+          mustShow={(entry) => entry.id === id}
+        />
+      );
+    }
+    render(<MustShow />);
+    expect(renderedRanks()).toEqual(ranksThrough(20));
+
+    // An entry already shown changes nothing.
+    act(() => {
+      control.show?.(12);
+    });
+    expect(renderedRanks()).toEqual(ranksThrough(20));
+
+    // An entry beyond the shown batches: the batches through it, in the same act, no focus moved.
+    act(() => {
+      control.show?.(45);
+    });
+    expect(renderedRanks()).toEqual(ranksThrough(60));
+    expect(screen.getByRole('status').textContent).toBe('Showing 60 of 70 actions');
+    expect(document.activeElement).toBe(document.body);
+    expect(scrollIntoView).not.toHaveBeenCalled();
+
+    // Once it no longer holds, the limit stays where it grew to.
+    act(() => {
+      control.show?.(null);
+    });
+    expect(renderedRanks()).toEqual(ranksThrough(60));
+  });
 });
 
 // ---------------------------------------------------------------------------------------------

@@ -45,6 +45,7 @@ from ads_engine.db.models.decisions import (
     SUBJECT_TYPES,
     Decision,
 )
+from ads_engine.decisions import _AMOUNT_LABELS as AMOUNT_LABELS
 from ads_engine.decisions import _KIND_LABELS as KIND_LABELS
 from ads_engine.decisions import _PERIOD_LABELS as PERIOD_LABELS
 from ads_engine.decisions import _RESOLUTION_LABELS as RESOLUTION_LABELS
@@ -1757,7 +1758,7 @@ def _assert_a_sentence(message: str) -> None:
             {"total_budget": 12.5},
             "invalid_value",
             {"field": "total_budget"},
-            "The total_budget must be an exact decimal amount.",
+            "The total budget must be an exact decimal amount.",
             id="float-amount",
         ),
     ],
@@ -1784,7 +1785,7 @@ def test_a_submitted_patch_is_refused_in_a_capitalised_sentence(
         pytest.param(
             "daily_budget",
             "twelve",
-            "The daily_budget must be an exact decimal amount.",
+            "The daily budget must be an exact decimal amount.",
             id="amount",
         ),
     ],
@@ -1813,21 +1814,35 @@ def test_a_patch_built_directly_is_refused_in_a_capitalised_sentence(
             _google_campaign("DAILY"),
             Decimal(0),
             "invalid_amount",
-            "The daily_budget must be a positive amount below 10^12.",
+            "The daily budget must be a positive amount below 1,000,000,000,000.",
             id="not-positive",
+        ),
+        pytest.param(
+            _google_campaign("DAILY"),
+            Decimal(10) ** 12,
+            "invalid_amount",
+            "The daily budget must be a positive amount below 1,000,000,000,000.",
+            id="the-bound-itself",
+        ),
+        pytest.param(
+            _linkedin_campaign(currency="USD"),
+            Decimal("1234567890123"),
+            "invalid_amount",
+            "The daily budget must be a positive amount below 1,000,000,000,000.",
+            id="thirteen-digits",
         ),
         pytest.param(
             _google_campaign("DAILY"),
             Decimal("12.3456789"),
             "sub_minor_unit",
-            "The daily_budget must be a whole number of micros (at most 6 decimal places).",
+            "The daily budget must be a whole number of micros (at most 6 decimal places).",
             id="google-finer-than-a-micro",
         ),
         pytest.param(
             _linkedin_campaign(currency="USD"),
             Decimal("12.345"),
             "sub_minor_unit",
-            "The daily_budget must not be finer than the USD minor unit (2 places).",
+            "The daily budget must not be finer than the USD minor unit (2 places).",
             id="linkedin-finer-than-a-cent",
         ),
     ],
@@ -1835,7 +1850,11 @@ def test_a_patch_built_directly_is_refused_in_a_capitalised_sentence(
 def test_an_amount_refusal_reads_as_a_capitalised_sentence(
     state: SubjectState, amount: Decimal, code: str, message: str
 ) -> None:
-    """AAP 0.5.2 amount rules: each 422 names the request's field in a capitalised sentence."""
+    """AAP 0.5.2 amount rules: each 422 names the request's field in words, in a sentence.
+
+    The UI shows the message as it is, so the field reads "daily budget" and the bound
+    "1,000,000,000,000"; the request's field name stays in ``details``.
+    """
     error = _rejected(
         state, _own("active", daily=Decimal(1000)), DecisionPatch(daily_budget=amount)
     )
@@ -1843,6 +1862,30 @@ def test_an_amount_refusal_reads_as_a_capitalised_sentence(
     assert (error.status_code, error.code, error.details) == (422, code, {"field": "daily_budget"})
     assert error.message == message
     _assert_a_sentence(error.message)
+    assert "daily_budget" not in error.message
+    assert "10^12" not in error.message
+
+
+def test_a_total_budget_refusal_names_the_total_budget_in_words() -> None:
+    """A lifetime campaign's amount refusal reads "total budget", never ``total_budget``."""
+    error = _rejected(
+        _linkedin_campaign(daily=False, total=True),
+        _own("active", total=Decimal(3000)),
+        DecisionPatch(total_budget=Decimal("1000000000000.5")),
+    )
+
+    assert (error.status_code, error.code, error.details) == (
+        422,
+        "invalid_amount",
+        {"field": "total_budget"},
+    )
+    assert error.message == "The total budget must be a positive amount below 1,000,000,000,000."
+    _assert_a_sentence(error.message)
+
+
+def test_every_amount_field_a_refusal_names_has_a_label() -> None:
+    """Each amount field has the words its refusals use, and only those fields have one."""
+    assert dict(AMOUNT_LABELS) == {"daily_budget": "daily budget", "total_budget": "total budget"}
 
 
 @pytest.mark.parametrize(
@@ -1869,14 +1912,20 @@ def test_an_amount_refusal_reads_as_a_capitalised_sentence(
         pytest.param(
             {"status": "active", "daily_budget": 12.5},
             {"field": "daily_budget"},
-            "The daily_budget must be an exact decimal amount.",
+            "The daily budget must be an exact decimal amount.",
             id="float-amount",
         ),
         pytest.param(
             {"status": "active", "daily_budget": "0"},
             {"field": "daily_budget", "rule": "invalid_amount"},
-            "The daily_budget must be a positive amount below 10^12.",
+            "The daily budget must be a positive amount below 1,000,000,000,000.",
             id="not-positive",
+        ),
+        pytest.param(
+            {"status": "active", "daily_budget": "1000000000000"},
+            {"field": "daily_budget", "rule": "invalid_amount"},
+            "The daily budget must be a positive amount below 1,000,000,000,000.",
+            id="the-bound-itself",
         ),
     ],
 )

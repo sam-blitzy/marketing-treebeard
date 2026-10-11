@@ -13,6 +13,10 @@ What this module does, and what it leaves to the domain:
   about replaced data never reappear in the log. The
   newest-first page is drawn from one bounded index probe per active dataset
   (:func:`_newest_decision_ids`), so its cost does not grow with the log's history.
+  One subject's history is refused with 409 ``subject_retired`` when the subject exists
+  outside those datasets, so a stale screen never takes it for a subject with nothing
+  decided yet (:func:`_retired_subject`, worded as ``POST`` refuses a decision recorded
+  from an item on such a subject).
   ``POST`` answers with the same statement over the committed row, re-read from the
   database, so both routes render an amount at its stored scale (``"120.000000"``).
 * **Writing** delegates every rule to :func:`ads_engine.decisions.record_decision`: the
@@ -422,6 +426,26 @@ async def _subject_dataset_id(session: AsyncSession, subject: schemas.SubjectIn)
     return await session.scalar(statement)
 
 
+def _retired_subject(subject: schemas.SubjectIn) -> ApiError:
+    """Build the 409 ``subject_retired`` for a subject outside every active dataset.
+
+    Both routes answer it with this one wording: ``POST /decisions`` for a decision recorded
+    from an item, and ``GET /decisions`` for one subject's history (AAP 0.3.2, 0.5.3). The
+    subject is named by type and id only.
+
+    Args:
+        subject: The campaign or shared budget, whose dataset is not active.
+
+    Returns:
+        ``ApiError(409, "subject_retired", …)``.
+    """
+    return conflict(
+        "subject_retired",
+        f"{subject.type.capitalize()} {subject.id} does not belong to an active dataset; "
+        "decisions apply only to the active dataset's subjects",
+    )
+
+
 async def _hold_item_current(
     session: AsyncSession, recommendation: Recommendation, subject: schemas.SubjectIn
 ) -> None:
@@ -467,11 +491,7 @@ async def _hold_item_current(
     subject_dataset_id = await _subject_dataset_id(session, subject)
     if subject_dataset_id is not None:
         if subject_dataset_id not in current_ids:
-            raise conflict(
-                "subject_retired",
-                f"{subject.type.capitalize()} {subject.id} does not belong to an active "
-                "dataset; decisions apply only to the active dataset's subjects",
-            )
+            raise _retired_subject(subject)
         dataset_ids.add(subject_dataset_id)
     for dataset_id in sorted(dataset_ids):
         await lock_dataset(session, dataset_id)
@@ -512,6 +532,15 @@ async def list_decisions(
     one subject type's, through the newest ``limit`` rows of each active dataset
     (:func:`_newest_decision_ids`), merged into the same order and limit.
 
+    A subject that exists outside those datasets, in a retired dataset or one still
+    building, is refused with 409 ``subject_retired`` rather than listed as an empty
+    history: ``POST /decisions`` refuses every decision on it, and an empty list would read
+    as a subject with nothing decided yet on a screen opened before its dataset was
+    replaced (AAP 0.3.2, 0.5.5). "Active" is the set the log lists, each source's active
+    primary dataset. Campaigns and shared budgets belong only to Google and LinkedIn primary
+    datasets, where this set and the overlay's :func:`current_dataset_ids` agree, so the
+    answer matches the one ``POST`` gives the same subject.
+
     Args:
         user: The signed-in user.
         session: The request's session; only read.
@@ -525,7 +554,9 @@ async def list_decisions(
         The decision views, newest first.
 
     Raises:
-        ApiError: 422 ``invalid_query`` when ``subject_id`` comes without ``subject_type``.
+        ApiError: 422 ``invalid_query`` when ``subject_id`` comes without ``subject_type``;
+            409 ``subject_retired`` when ``subject_id`` names a campaign or shared budget
+            whose dataset is not an active primary dataset.
     """
     if subject_id is not None and subject_type is None:
         # Subject ids are internal ids of two different tables, so an id alone could name a
@@ -536,6 +567,13 @@ async def list_decisions(
             "subject_id requires subject_type: ids are unique only within a subject type",
         )
     active_ids = [dataset.id for dataset in (await active_datasets(session)).values()]
+    if subject_type is not None and subject_id is not None:
+        # The log no longer lists a replaced subject's history, so an empty answer for it
+        # would read like an active subject with no decision yet.
+        subject = schemas.SubjectIn(type=subject_type, id=subject_id)
+        subject_dataset_id = await _subject_dataset_id(session, subject)
+        if subject_dataset_id is not None and subject_dataset_id not in active_ids:
+            raise _retired_subject(subject)
     if not active_ids:
         return []
     if subject_id is not None:

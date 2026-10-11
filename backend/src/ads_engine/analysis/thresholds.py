@@ -1661,6 +1661,30 @@ class Thresholds:
             raise ConfigError("config", None, "config_hash must be a SHA-256 hex digest")
         object.__setattr__(self, "source_dir", Path(self.source_dir))
 
+    def __reduce__(self) -> tuple[Any, ...]:
+        """Pickle the configuration as its constructor arguments, ``raw`` thawed.
+
+        ``raw`` and the registry indexes are read-only ``MappingProxyType`` trees, which
+        cannot be pickled, so a copy is rebuilt from a plain-``dict`` and ``list`` form of
+        ``raw`` and the other fields: :meth:`__post_init__` freezes, validates and indexes it
+        again. An overridden configuration (:meth:`load` with ``overrides``) round-trips with
+        its values and its ``config_hash`` unchanged. The analysis runner hands a custom run's
+        configuration to its analysis process this way.
+
+        Returns:
+            ``(Thresholds, (raw, mapping, content_assets, config_hash, source_dir))``.
+        """
+        return (
+            type(self),
+            (
+                _canonical(self.raw),
+                self.mapping,
+                self.content_assets,
+                self.config_hash,
+                self.source_dir,
+            ),
+        )
+
     # -- construction ------------------------------------------------------------------
 
     @classmethod

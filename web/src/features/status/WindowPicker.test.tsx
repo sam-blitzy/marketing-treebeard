@@ -45,6 +45,7 @@ import {
   makeRecommendationsPage,
   makeRun,
 } from '../../test/fixtures';
+import { byTextContent } from '../../test/text';
 import { WindowPicker, presetWindow } from './WindowPicker';
 
 // ---------------------------------------------------------------------------------------------
@@ -87,11 +88,33 @@ function presetLabels(window: ConfigView['window'] = fixtureWindow): string[] {
 }
 
 /**
- * The reopen-select label of a custom run: "{start} – {end} · {days} days · computed
- * {finished_at in the run's display time zone} · run {id}".
+ * The reopen-select label of a custom run: "{start} – {end}" when `copyNumber` is 1, that is
+ * for the only or the oldest listed run of its window, and "{start} – {end} ({copyNumber})"
+ * for each later listed run of that window, counted from the oldest.
  */
-function reopenLabel(run: Run): string {
-  return `${run.window_start} – ${run.window_end} · ${daysLabel(run.days)} · computed ${formatInstant(run.finished_at, run.display_timezone)} · run ${String(run.id)}`;
+function reopenLabel(run: Run, copyNumber: number): string {
+  const range = `${run.window_start} – ${run.window_end}`;
+  return copyNumber === 1 ? range : `${range} (${String(copyNumber)})`;
+}
+
+/**
+ * The hint under the reopen select for the custom run it shows: "Run {id} · {days} days ·
+ * computed {finished_at in the run's display time zone}".
+ */
+function reopenHint(run: Run): string {
+  return `Run ${String(run.id)} · ${daysLabel(run.days)} · computed ${formatInstant(run.finished_at, run.display_timezone)}`;
+}
+
+/**
+ * The accessible description of `element`: the text of each element its `aria-describedby`
+ * names, in order, joined by a space; `null` when it names none.
+ */
+function accessibleDescription(element: HTMLElement): string | null {
+  const ids = (element.getAttribute('aria-describedby') ?? '').split(/\s+/).filter(Boolean);
+  if (ids.length === 0) {
+    return null;
+  }
+  return ids.map((id) => document.getElementById(id)?.textContent ?? '').join(' ');
 }
 
 /**
@@ -854,7 +877,12 @@ describe('WindowPicker', () => {
         expect(router.state.location.search).toEqual({});
       });
       expect(
-        screen.queryByText('A window of 14 days ending 0001-01-01 would start before the year 1.'),
+        screen.queryByText(
+          byTextContent(
+            '.ds-banner__title',
+            'A window of 14 days ending 0001-01-01 would start before the year 1.',
+          ),
+        ),
       ).toBeNull();
     });
   });
@@ -1168,7 +1196,7 @@ describe('WindowPicker', () => {
       status: 'failed',
     });
 
-    it('lists the custom runs as "{start} – {end} · {days} days · computed {instant} · run {id}" and opens the chosen one by id on Reopen', async () => {
+    it('lists the custom runs as "{start} – {end}" and opens the chosen one by id on Reopen', async () => {
       const runs = [september, customRun] as const;
       const api = stubApi({ 'GET /runs': json(200, runs) });
       const { router } = await renderPicker();
@@ -1178,9 +1206,10 @@ describe('WindowPicker', () => {
       const select = await screen.findByRole<HTMLSelectElement>('combobox', {
         name: 'Reopen a custom window',
       });
+      // The two runs have different windows, so each is labelled by its range alone.
       expect(Array.from(select.options, (option) => option.textContent)).toEqual([
         'Choose a custom window',
-        ...runs.map(reopenLabel),
+        ...runs.map((run) => reopenLabel(run, 1)),
       ]);
       expect(Array.from(select.options, (option) => option.value)).toEqual([
         '',
@@ -1191,12 +1220,15 @@ describe('WindowPicker', () => {
         String(DEFAULT_RUN_ID),
       );
       expect(select.value).toBe('');
+      // The empty choice names no run, so the select has no hint and no description.
+      expect(accessibleDescription(select)).toBeNull();
 
       const [, second] = runs;
       fireEvent.change(select, { target: { value: String(second.id) } });
 
-      // Choosing only records the choice; "Reopen" opens it.
+      // Choosing only records the choice, which the hint then describes; "Reopen" opens it.
       expect(select.value).toBe(String(second.id));
+      expect(accessibleDescription(select)).toBe(reopenHint(second));
       expect(router.state.location.search).toEqual({});
       fireEvent.click(reopenButton());
 
@@ -1329,19 +1361,18 @@ describe('WindowPicker', () => {
       const select = await screen.findByRole<HTMLSelectElement>('combobox', {
         name: 'Reopen a custom window',
       });
-      // The finished instant is derived from the fixture, so only the window, the length and
-      // the id are pinned here.
+      // Each label is pinned whole: each window is listed once, so its range as stored alone.
       expect(Array.from(select.options, (option) => option.textContent)).toEqual([
         'Choose a custom window',
-        `2026-09-01 – 2026-09-30 · 30 days · computed ${formatInstant(september.finished_at, september.display_timezone)} · run 203`,
-        `2026-07-08 – 2026-10-05 · 90 days · computed ${formatInstant(customRun.finished_at, customRun.display_timezone)} · run ${String(CUSTOM_RUN_ID)}`,
+        '2026-09-01 – 2026-09-30',
+        '2026-07-08 – 2026-10-05',
       ]);
       expect(Array.from(select.options, (option) => option.value)).not.toContain(
         String(failed.id),
       );
     });
 
-    it('tells runs of the same window apart by the instant they finished and their id', async () => {
+    it('tells runs of the same window apart by a copy number from the oldest, and gives the chosen one’s id and finished instant in its hint', async () => {
       /** A succeeded ten-day custom run of one shared window, finished at `finishedAt`. */
       const sameWindow = (id: number, finishedAt: string): Run =>
         makeRun({
@@ -1355,7 +1386,7 @@ describe('WindowPicker', () => {
           finished_at: finishedAt,
         });
       const later = sameWindow(303, '2026-10-10T13:00:00Z');
-      // Two runs finished within the same minute: only their ids tell them apart.
+      // Two runs finished within the same minute: their instants cannot tell them apart.
       const second = sameWindow(302, '2026-10-09T14:05:40Z');
       const first = sameWindow(301, '2026-10-09T14:05:10Z');
       const runs = [later, second, first] as const;
@@ -1368,18 +1399,150 @@ describe('WindowPicker', () => {
         name: 'Reopen a custom window',
       });
       const labels = Array.from(select.options, (option) => option.textContent ?? '').slice(1);
-      expect(labels).toEqual(runs.map(reopenLabel));
+      // Newest first as listed: the oldest is the range alone, each later one adds its number.
+      expect(labels).toEqual([
+        '2026-09-30 – 2026-10-09 (3)',
+        '2026-09-30 – 2026-10-09 (2)',
+        '2026-09-30 – 2026-10-09',
+      ]);
+      expect(labels).toEqual([
+        reopenLabel(later, 3),
+        reopenLabel(second, 2),
+        reopenLabel(first, 1),
+      ]);
       expect(new Set(labels).size).toBe(runs.length);
       runs.forEach((run, index) => {
+        // The label is bounded: it never carries the run id or the finished instant.
+        expect(labels[index]).not.toContain(String(run.id));
+        expect(labels[index]).not.toContain('computed');
+
+        fireEvent.change(select, { target: { value: String(run.id) } });
         const instant = formatInstant(run.finished_at, run.display_timezone);
-        // The instant is shown in the run's display time zone, which the label names.
+        // The instant is shown in the run's display time zone, which the hint names.
         expect(instant.endsWith('America/New_York')).toBe(true);
-        expect(labels[index]).toContain(`computed ${instant}`);
-        expect(labels[index]?.endsWith(` · run ${String(run.id)}`)).toBe(true);
+        expect(accessibleDescription(select)).toBe(
+          `Run ${String(run.id)} · 10 days · computed ${instant}`,
+        );
       });
       expect(formatInstant(first.finished_at, first.display_timezone)).toBe(
         formatInstant(second.finished_at, second.display_timezone),
       );
+    });
+
+    it('adds a copy number only to the later listed runs of a shared window, counts no failed run, and names every chosen run in its hint', async () => {
+      /** A later succeeded run of {@link september}'s window, with a four-digit id. */
+      const septemberAgain = makeRun({
+        id: 2031,
+        kind: 'custom',
+        trigger: 'manual',
+        window_start: september.window_start,
+        window_end: september.window_end,
+        days: september.days,
+      });
+      /**
+       * An older, failed run of {@link customRun}'s window: it is not listed, so it takes no
+       * number, and customRun stays the oldest listed run of that window.
+       */
+      const failedSameWindow = makeRun({
+        id: 201,
+        kind: 'custom',
+        trigger: 'manual',
+        window_start: customRun.window_start,
+        window_end: customRun.window_end,
+        days: customRun.days,
+        status: 'failed',
+      });
+      // The two runs of one window are not adjacent: they are numbered over the whole list.
+      const listed = [septemberAgain, customRun, september] as const;
+      stubApi({
+        'GET /runs': json(200, [septemberAgain, customRun, september, failedSameWindow]),
+      });
+      await renderPicker();
+      await presetsShown();
+      openRecentCustomRuns();
+
+      const select = await screen.findByRole<HTMLSelectElement>('combobox', {
+        name: 'Reopen a custom window',
+      });
+      // The older run of the shared window is the range alone and the newer adds "(2)"; the
+      // older failed run of customRun's window is not counted, so customRun is the range alone.
+      expect(Array.from(select.options, (option) => option.textContent)).toEqual([
+        'Choose a custom window',
+        '2026-09-01 – 2026-09-30 (2)',
+        '2026-07-08 – 2026-10-05',
+        '2026-09-01 – 2026-09-30',
+      ]);
+      expect(Array.from(select.options, (option) => option.value)).toEqual([
+        '',
+        ...listed.map((run) => String(run.id)),
+      ]);
+
+      // Whatever its label, the hint names each chosen run in full.
+      for (const run of listed) {
+        fireEvent.change(select, { target: { value: String(run.id) } });
+        const description = accessibleDescription(select) ?? '';
+        expect(description.startsWith(`Run ${String(run.id)} · `)).toBe(true);
+        expect(description).toBe(reopenHint(run));
+      }
+    });
+
+    it('keeps each run’s copy number when runs of another window are listed between them', async () => {
+      /** A succeeded custom run of {@link september}'s window with a five-digit id. */
+      const ofSeptember = (id: number): Run =>
+        makeRun({
+          id,
+          kind: 'custom',
+          trigger: 'manual',
+          window_start: september.window_start,
+          window_end: september.window_end,
+          days: september.days,
+        });
+      const a1 = ofSeptember(20312);
+      const a2 = ofSeptember(20313);
+      const a3 = ofSeptember(20315);
+      /** The one listed run of another window, computed between a2 and a3. */
+      const b1 = makeRun({
+        id: 20314,
+        kind: 'custom',
+        trigger: 'manual',
+        window_start: '2026-09-16',
+        window_end: '2026-09-29',
+        days: 14,
+      });
+      // Newest first, as the API lists them, with b1 between the runs of the shared window.
+      const runs = [a3, b1, a2, a1] as const;
+      stubApi({ 'GET /runs': json(200, runs) });
+      await renderPicker();
+      await presetsShown();
+      openRecentCustomRuns();
+
+      const select = await screen.findByRole<HTMLSelectElement>('combobox', {
+        name: 'Reopen a custom window',
+      });
+      // The options keep the list's order; a1, the oldest of its window, is the range alone.
+      expect(Array.from(select.options, (option) => option.value)).toEqual([
+        '',
+        ...runs.map((run) => String(run.id)),
+      ]);
+      expect(Array.from(select.options, (option) => option.textContent)).toEqual([
+        'Choose a custom window',
+        '2026-09-01 – 2026-09-30 (3)',
+        '2026-09-16 – 2026-09-29',
+        '2026-09-01 – 2026-09-30 (2)',
+        '2026-09-01 – 2026-09-30',
+      ]);
+      expect(Array.from(select.options, (option) => option.textContent).slice(1)).toEqual([
+        reopenLabel(a3, 3),
+        reopenLabel(b1, 1),
+        reopenLabel(a2, 2),
+        reopenLabel(a1, 1),
+      ]);
+
+      // The hint names each chosen run by its id, which no label carries.
+      for (const run of runs) {
+        fireEvent.change(select, { target: { value: String(run.id) } });
+        expect(accessibleDescription(select)).toBe(reopenHint(run));
+      }
     });
 
     it('selects the custom run on screen, and opens nothing for the empty choice', async () => {
@@ -1400,6 +1563,41 @@ describe('WindowPicker', () => {
       expect(reopenButton().hasAttribute('disabled')).toBe(true);
       fireEvent.click(reopenButton());
       expect(router.state.location.search).toEqual({ run: CUSTOM_RUN_ID });
+    });
+
+    it('describes the chosen run by its id, length and finished instant in a hint under the select, and the empty choice not at all', async () => {
+      stubApi({ 'GET /runs': json(200, [september, customRun]) });
+      await renderPicker(customRun, `/actions?run=${String(CUSTOM_RUN_ID)}`);
+      await presetsShown();
+      openRecentCustomRuns();
+
+      const select = await screen.findByRole<HTMLSelectElement>('combobox', {
+        name: 'Reopen a custom window',
+      });
+      // The run on screen is chosen, so its hint is the select's description.
+      const onScreen = `Run ${String(CUSTOM_RUN_ID)} · 90 days · computed ${formatInstant(customRun.finished_at, customRun.display_timezone)}`;
+      expect(reopenHint(customRun)).toBe(onScreen);
+      expect(accessibleDescription(select)).toBe(onScreen);
+      // The hint is visible text after the select, in the disclosed region, and is all the
+      // select's description refers to.
+      const hint = within(recentCustomRunsRegion()).getByText(onScreen);
+      expect(select.compareDocumentPosition(hint) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+        Node.DOCUMENT_POSITION_FOLLOWING,
+      );
+      expect(select.getAttribute('aria-describedby')).toBe(hint.id);
+
+      // The description follows a changed choice.
+      fireEvent.change(select, { target: { value: String(september.id) } });
+      expect(accessibleDescription(select)).toBe(
+        `Run ${String(september.id)} · 30 days · computed ${formatInstant(september.finished_at, september.display_timezone)}`,
+      );
+      expect(within(recentCustomRunsRegion()).queryByText(onScreen)).toBeNull();
+
+      // The empty choice names no run: no hint is rendered and the select has no description.
+      fireEvent.change(select, { target: { value: '' } });
+      expect(select.getAttribute('aria-describedby')).toBeNull();
+      expect(accessibleDescription(select)).toBeNull();
+      expect(within(recentCustomRunsRegion()).queryByText(/· computed /)).toBeNull();
     });
 
     it('says "No custom windows yet", with no select, when GET /runs lists no custom run', async () => {
@@ -1603,7 +1801,7 @@ describe('WindowPicker', () => {
       });
       expect(Array.from(select.options, (option) => option.textContent)).toEqual([
         'Choose a custom window',
-        reopenLabel(customRun),
+        reopenLabel(customRun, 1),
       ]);
       expect(within(region).queryByText('Loading recent custom windows')).toBeNull();
       expect(customRunReads(api)).toHaveLength(1);
@@ -1699,7 +1897,7 @@ describe('WindowPicker', () => {
       });
       expect(Array.from(select.options, (option) => option.textContent)).toEqual([
         'Choose a custom window',
-        reopenLabel(customRun),
+        reopenLabel(customRun, 1),
       ]);
       await waitFor(() => {
         expect(queryClient.isFetching()).toBe(0);
@@ -1755,7 +1953,7 @@ describe('WindowPicker', () => {
       });
       expect(Array.from(select.options, (option) => option.textContent)).toEqual([
         'Choose a custom window',
-        reopenLabel(customRun),
+        reopenLabel(customRun, 1),
       ]);
       await waitFor(() => {
         expect(queryClient.isFetching()).toBe(0);

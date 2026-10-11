@@ -77,7 +77,8 @@ call time, so a test can replace either one; the independent post-checks then tr
 Purity: reads only the :class:`~ads_engine.analysis.context.AnalysisContext` and the rule
 results; no database, network, settings or logging access. Candidates are frozen, so every
 change is a copy made with :func:`dataclasses.replace`,
-:meth:`~ads_engine.analysis.context.Evidence.with_extra` and
+:meth:`~ads_engine.analysis.context.Evidence.with_extra`,
+:meth:`~ads_engine.analysis.context.Evidence.with_thresholds` and
 :meth:`~ads_engine.analysis.context.Evidence.with_headline`. Never imports ``runner`` or
 ``overlay``, which consume this module's output.
 
@@ -149,6 +150,7 @@ from ads_engine.analysis.context import (
     Candidate,
     DecisionSubject,
     EntityRef,
+    Evidence,
     FeedbackInfo,
     Finding,
     Flag,
@@ -1222,22 +1224,22 @@ def _expanded_depends_on(
     return tuple(ordered)
 
 
-def _merge_flag(candidate: Candidate, flag: Flag) -> Candidate:
+def _merged_flags(flags: tuple[Flag, ...], flag: Flag) -> tuple[Flag, ...]:
     """Add ``flag``; a code already present keeps one badge whose message gains the new text.
 
     A candidate keeps one flag per code (the first message wins on construction), so a
     precedence flag whose code a rule already set, such as K1's own baseline ``incomplete``,
-    is merged into that badge rather than lost.
+    is merged into that badge rather than lost. ``flags`` itself is returned when its badge
+    already carries the message, and a new code is appended last.
     """
-    for position, existing in enumerate(candidate.flags):
+    for position, existing in enumerate(flags):
         if existing.code != flag.code:
             continue
         if flag.message in existing.message:
-            return candidate
+            return flags
         merged = Flag(flag.code, f"{existing.message}; {flag.message}")
-        flags = (*candidate.flags[:position], merged, *candidate.flags[position + 1 :])
-        return replace(candidate, flags=flags)
-    return candidate.with_flags(flag)
+        return (*flags[:position], merged, *flags[position + 1 :])
+    return (*flags, flag)
 
 
 def _apply_p1(
@@ -1276,6 +1278,10 @@ def _apply_p1(
             result.append(replace(candidate, evidence=evidence, depends_on=subjects, pinned=True))
             continue
         blocking = sorted({did for key in depends for did in by_subject.get(key, ())})
+        # One copy per item: the unverified badge is merged into the same replace.
+        flags = candidate.flags
+        if unverified is not None:
+            flags = _merged_flags(flags, unverified)
         if blocking:
             extra["blocking_discrepancies"] = blocking
             reason = candidate.held_reason if candidate.held else HELD_DISCREPANCY_REASON
@@ -1285,13 +1291,15 @@ def _apply_p1(
                 depends_on=subjects,
                 held=True,
                 held_reason=reason,
+                flags=flags,
             )
         else:
             updated = replace(
-                candidate, evidence=candidate.evidence.with_extra(**extra), depends_on=subjects
+                candidate,
+                evidence=candidate.evidence.with_extra(**extra),
+                depends_on=subjects,
+                flags=flags,
             )
-        if unverified is not None:
-            updated = _merge_flag(updated, unverified)
         result.append(updated)
     return result
 
@@ -1672,14 +1680,15 @@ def _incomplete_finding(section: str, found: _IncompleteDataset) -> Finding:
     )
 
 
-def _with_applied_thresholds(candidate: Candidate, applied: Mapping[str, Any]) -> Candidate:
-    """Freeze the thresholds a precedence step applied into the item's evidence (AAP 0.5.4.8).
+def _applied_thresholds(candidate: Candidate, applied: Mapping[str, Any]) -> Evidence:
+    """Return the item's evidence with the thresholds a precedence step applied (AAP 0.5.4.8).
 
     ``evidence.thresholds`` records every threshold the item's verdicts rest on, so the
-    configured value a P4 or P5 judgement used is stored with the run: the copy's evidence is
-    built anew (deep-frozen again) with each key of ``applied`` it lacks appended after the
-    keys already recorded, which keep their values and order. A key already recorded with the
-    same value is left as it is.
+    configured value a P4 or P5 judgement used is stored with the run: the returned evidence
+    (:meth:`~ads_engine.analysis.context.Evidence.with_thresholds`, which freezes only the
+    added values) has each key of ``applied`` it lacks appended after the keys already
+    recorded, which keep their values and order. A key already recorded with the same value
+    is left as it is, and when every key is, the item's own evidence is returned.
 
     Raises:
         PrecedenceInvariantError: When the evidence already records a key of ``applied`` with
@@ -1698,9 +1707,8 @@ def _with_applied_thresholds(candidate: Candidate, applied: Mapping[str, Any]) -
                 f"in evidence.thresholds, but precedence applied {value!r}"
             )
     if not added:
-        return candidate
-    evidence = replace(candidate.evidence, thresholds={**recorded, **added})
-    return replace(candidate, evidence=evidence)
+        return candidate.evidence
+    return candidate.evidence.with_thresholds(added)
 
 
 def _apply_data_state(
@@ -1720,7 +1728,7 @@ def _apply_data_state(
     range (:func:`_required_start`). A ``live`` item with a stale dataset becomes ``stale``.
     Every item with at least one required dataset, stale or not, has the configured
     ``sources.stale_after_hours`` its datasets were judged against frozen into its
-    ``evidence.thresholds`` (:func:`_with_applied_thresholds`). Each section gets one
+    ``evidence.thresholds`` (:func:`_applied_thresholds`). Each section gets one
     ``incomplete_dataset`` finding per incomplete dataset its items read, naming every reason
     and how many items read it; step 10 recounts ``items`` and narrows ``reasons`` over the
     items the run stores, after feedback suppression (:func:`_recount_incomplete_datasets`).
@@ -1750,21 +1758,22 @@ def _apply_data_state(
         stale = [check for check in checks if check.stale]
         incomplete = [check for check in checks if check.incomplete]
         status = DATA_STALE if base == DATA_LIVE and stale else base
-        updated = replace(candidate, data_status=status)
-        if checks:
-            updated = _with_applied_thresholds(updated, applied)
+        evidence = _applied_thresholds(candidate, applied) if checks else candidate.evidence
+        # The flags are merged in order (simulated, stale, incomplete) and stored with the
+        # status and evidence in one copy of the item.
+        flags = candidate.flags
         if base in (DATA_SIMULATED, DATA_MIXED):
-            updated = _merge_flag(updated, _simulated_flag(base, simulated_sources))
+            flags = _merged_flags(flags, _simulated_flag(base, simulated_sources))
         if stale:
-            updated = _merge_flag(
-                updated, _stale_flag(stale, window_end, display_timezone=ctx.display_timezone)
+            flags = _merged_flags(
+                flags, _stale_flag(stale, window_end, display_timezone=ctx.display_timezone)
             )
         if incomplete:
             parts = [
                 f"{check.name} ({'; '.join(_incomplete_reasons(check, window_end))})"
                 for check in incomplete
             ]
-            updated = _merge_flag(updated, Flag(FLAG_INCOMPLETE, f"Incomplete: {'; '.join(parts)}"))
+            flags = _merged_flags(flags, Flag(FLAG_INCOMPLETE, f"Incomplete: {'; '.join(parts)}"))
             bucket = per_section[candidate.section]
             for check in incomplete:
                 key = (check.name, check.dataset_id)
@@ -1775,7 +1784,7 @@ def _apply_data_state(
                 found.items += 1
                 for reason in _incomplete_reasons(check, window_end):
                     found.reasons.setdefault(reason, None)
-        result.append(updated)
+        result.append(replace(candidate, data_status=status, evidence=evidence, flags=flags))
     findings = {
         section: tuple(
             _incomplete_finding(section, bucket[key])
@@ -1797,7 +1806,7 @@ def _apply_short_window(ctx: AnalysisContext, candidates: Sequence[Candidate]) -
     A window is short below ``window.trusted_min_days``; the configured values, never
     literals, fill the flag's message. Every item, short window or not, has the
     ``window.trusted_min_days`` its window was judged against frozen into its
-    ``evidence.thresholds`` (:func:`_with_applied_thresholds`).
+    ``evidence.thresholds`` (:func:`_applied_thresholds`).
 
     Raises:
         PrecedenceInvariantError: When an item's evidence records that key with another
@@ -1805,11 +1814,21 @@ def _apply_short_window(ctx: AnalysisContext, candidates: Sequence[Candidate]) -
     """
     window = ctx.window
     applied = {_TRUSTED_MIN_DAYS_KEY: window.trusted_min_days}
-    frozen = [_with_applied_thresholds(candidate, applied) for candidate in candidates]
-    if not window.short_window:
-        return frozen
-    flag = Flag(FLAG_SHORT_WINDOW, short_window_message(window.days, window.trusted_min_days))
-    return [_merge_flag(candidate, flag) for candidate in frozen]
+    flag = (
+        Flag(FLAG_SHORT_WINDOW, short_window_message(window.days, window.trusted_min_days))
+        if window.short_window
+        else None
+    )
+    result: list[Candidate] = []
+    for candidate in candidates:
+        evidence = _applied_thresholds(candidate, applied)
+        flags = candidate.flags if flag is None else _merged_flags(candidate.flags, flag)
+        if evidence is candidate.evidence and flags is candidate.flags:
+            result.append(candidate)
+        else:
+            # The evidence and the flag are stored in one copy of the item.
+            result.append(replace(candidate, evidence=evidence, flags=flags))
+    return result
 
 
 # ---------------------------------------------------------------------------

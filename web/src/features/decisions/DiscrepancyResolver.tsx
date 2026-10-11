@@ -11,9 +11,10 @@
  *   "`DiscrepancyResolver` lists open and awaiting-platform discrepancies with the resolutions
  *   valid for each kind and subject type"). Its load, empty, refresh and closure outcomes are
  *   announced through one persistent polite status region. When a resolution closes a
- *   discrepancy and its card leaves, focus moves to the next card, else the previous one, else
- *   that region. A link to `/decisions#discrepancy-{id}` loads pages until that card is shown,
- *   then scrolls it into view, or says the discrepancy is no longer unresolved.
+ *   discrepancy and its card leaves, or a refresh drops the card that holds focus, focus moves
+ *   to the next card, else the previous one, else that region. A link to
+ *   `/decisions#discrepancy-{id}` loads pages until that card is shown, then scrolls it into
+ *   view, or says the discrepancy is no longer unresolved.
  *
  * Rules this file keeps:
  *
@@ -536,9 +537,12 @@ function closeDialogSession(current: DialogSession): DialogSession {
  *   every control while this discrepancy is shown, because the server would refuse any
  *   resolution of it again. A failure of the intended-state save, which
  *   the form reports through `onRetired` and `onFailed`, is shown and locks the same way, in this
- *   banner outside the dialog, so it stays once the dialog is closed, even when the save settled
- *   after that; the banner takes focus once the dialog is closed. Any other failure stands until
- *   the next resolution starts or the dialog opens again.
+ *   banner outside the dialog. Either 409 lock stays once the dialog is closed, and so does a
+ *   failure that settled after the dialog was closed, whose form is gone; the banner takes focus
+ *   once the dialog is closed. A failure that is no lock and that the open form already showed
+ *   is dismissed with the dialog: Cancel, Escape, the Close button and the backdrop clear it, and
+ *   the dialog returns focus to "Record intended state". Any other failure stands until the next
+ *   resolution starts or the dialog opens again.
  *
  * The controls' state (the dialog, the outcome and those locks) belongs to the discrepancy's id:
  * a mount reused for another discrepancy starts fresh, so one subject's lock never disables
@@ -583,8 +587,9 @@ function DiscrepancyResolutionBody({
   // even with its dialog closed. While one runs, no other resolution starts.
   const busyResolution: Resolution | null = formPending ? 'record_intended' : pendingResolution;
   // The form's lock or failure, shown here as well, because the form that showed it is gone
-  // once its dialog closes.
-  const formMessage = formRetired ? RETIRED_MESSAGE : formFailure;
+  // once its dialog closes. Each 409 lock keeps its own text, so a failure dismissed with the
+  // dialog (closeIntendedState) never leaves a lock unexplained.
+  const formMessage = formRetired ? RETIRED_MESSAGE : formClosed ? RESOLVED_MESSAGE : formFailure;
 
   // A clicked button is loading while its request runs, and keeps keyboard focus. When the
   // request fails, focus moves on to the error, so keyboard and screen-reader users land on the
@@ -676,7 +681,16 @@ function DiscrepancyResolutionBody({
     setDialog(openDialogSession);
   };
 
+  // Cancel, Escape, the Close button and the backdrop all close the dialog here. A failure held
+  // now arrived while the open form showed it (opening the dialog and starting a save both clear
+  // it, and no opening starts while a save runs), so it goes with the dialog rather than standing
+  // on the card once the user has dismissed it. A save still running has no failure yet: one
+  // that fails after this is reported to a card whose form is gone, and stays. Either 409 lock
+  // stays as well, since its text comes from formRetired or formClosed, not from the failure.
   const closeIntendedState = () => {
+    if (dialog.open) {
+      setFormFailure(null);
+    }
     setDialog(closeDialogSession);
   };
 
@@ -931,17 +945,19 @@ interface Closure {
 }
 
 /**
- * A discrepancy a resolution closed, kept until the next closure replaces it, so focus can be
+ * A discrepancy whose card leaves the list: one a resolution here closed, or one a read dropped
+ * while its card held focus. It is kept until the next closure replaces it, so focus can be
  * placed once its card has left the list (see {@link closedFocusTarget}).
  */
 interface ClosedCard {
   /** The closed discrepancy's id. */
   readonly id: Discrepancy['id'];
-  /** Its card's index in the list shown when the resolution was reported. */
+  /** Its card's index in the list shown when the resolution was reported, or before that read. */
   readonly index: number;
   /**
-   * The ids of the other cards listed when the resolution was reported: those after it in list
-   * order, then those before it, nearest first. Focus goes to the first of them still listed.
+   * The ids of the other cards listed when the resolution was reported, or before that read:
+   * those after it in list order, then those before it, nearest first. Focus goes to the first
+   * of them still listed.
    */
   readonly neighbours: readonly Discrepancy['id'][];
 }
@@ -965,8 +981,9 @@ type ClosedFocus =
     };
 
 /**
- * The {@link ClosedCard} of a resolution that closed discrepancy `id`, from the cards `shown`
- * when it was reported. When `shown` does not hold it, its index is 0 and it has no neighbours.
+ * The {@link ClosedCard} of discrepancy `id`, from the cards `shown` when a resolution that
+ * closed it was reported, or before the read that dropped its focused card. When `shown` does
+ * not hold it, its index is 0 and it has no neighbours.
  */
 function closedCard(id: Discrepancy['id'], shown: readonly Discrepancy[]): ClosedCard {
   const ids = shown.map((discrepancy) => discrepancy.id);
@@ -990,8 +1007,8 @@ function isClosedFocusOn(focus: ClosedFocus | null, id?: Discrepancy['id']): boo
 }
 
 /**
- * Where focus goes after a resolution closed a discrepancy (WCAG 2.2 SC 2.4.3), or `null` when
- * nothing is closed or no list is loaded:
+ * Where focus goes after a resolution closed a discrepancy, or a read dropped the card holding
+ * focus (WCAG 2.2 SC 2.4.3), or `null` when nothing is closed or no list is loaded:
  *
  * - while the closed card is still listed: the card itself, which a failed read keeps on screen
  *   (the resolver places focus there only once no read runs, because the read that drops the
@@ -1001,10 +1018,10 @@ function isClosedFocusOn(focus: ClosedFocus | null, id?: Discrepancy['id']): boo
  *   neighbour is followed by id, so a later read that adds or drops other cards never moves the
  *   target away from a card that holds focus. Should only cards listed since remain, the card
  *   now at the closed card's index, or the last card when the list has shrunk past it;
- * - with no card left: the resolver's status region, which then names the closure and says what
- *   is left open. "Show more discrepancies" is never shown then: a page load keeps following the
- *   API's next link while it has read no discrepancy (`useDiscrepancyPages`), so a list that
- *   shows no card has been read to its end.
+ * - with no card left: the resolver's status region, which then says what is left open, and
+ *   names the closure when a resolution here made it. "Show more discrepancies" is never shown
+ *   then: a page load keeps following the API's next link while it has read no discrepancy
+ *   (`useDiscrepancyPages`), so a list that shows no card has been read to its end.
  *
  * @param closed - The latest closure, or `null` before the first.
  * @param shown - The cards listed now, or `undefined` before the first read.
@@ -1214,20 +1231,26 @@ function useLinkedDiscrepancy(query: DiscrepancyPagesQuery, busy: boolean): Link
  * after the last page removed it, moves to the first discrepancy the page added, unless the user
  * moved focus elsewhere (WCAG 2.2 SC 2.4.3). Every discrepancy stays reachable.
  *
- * **Focus after a closing resolution** (WCAG 2.2 SC 2.4.3). A resolution that closes a
- * discrepancy ("Platform is correct", "Adopt platform state", "Acknowledge removal") removes its
- * card, and with it the clicked button, which kept focus while it loaded, so focus falls to the
- * page. Once the refetched list is shown without the card, focus moves to the card now next to
- * where it was: the following card, else the preceding one, else, with no card left, the status
- * region below, which then names the closure and what is left open ("No open discrepancies" when
- * nothing is).
+ * **Focus after a closing resolution or a refresh** (WCAG 2.2 SC 2.4.3). A resolution that
+ * closes a discrepancy ("Platform is correct", "Adopt platform state", "Acknowledge removal")
+ * removes its card, and with it the clicked button, which kept focus while it loaded, so focus
+ * falls to the page. Once the refetched list is shown without the card, focus moves to the card
+ * now next to where it was: the following card, else the preceding one, else, with no card
+ * left, the status region below, which then names the closure and what is left open ("No open
+ * discrepancies" when nothing is).
  * "Show more" is never shown with no card left, because a page load reads on while it has found
  * none. A card or the region is focusable (`tabindex="-1"`) only as that target, and stays so
  * once focused until the next closure, so a later read never drops the focus it holds; it takes
  * the design system's focus ring. When the refetch fails and the closed card stays listed,
- * the card itself takes focus, and focus moves on as above once a later read drops it. Focus the
- * user has moved elsewhere is never taken back; a resolution that keeps its card listed
- * (`awaiting_platform`) leaves focus on its button ({@link DiscrepancyResolution}).
+ * the card itself takes focus, and focus moves on as above once a later read drops it.
+ * A read, a poll included, that drops the card holding focus without a resolution here hands
+ * focus on the same way, from the cards shown before that read: the worker auto-resolved the
+ * discrepancy, or another tab resolved it, as when this card's 409 "Already resolved" banner
+ * holds focus. The resolver records the card focus enters, its intended-state dialog included,
+ * and forgets it when focus moves to another element or onto the page. No closure is announced
+ * for such a card, because this tab did not close it; the status region's lines say what is
+ * left open. Focus the user has moved elsewhere is never taken back; a resolution that keeps its
+ * card listed (`awaiting_platform`) leaves focus on its button ({@link DiscrepancyResolution}).
  *
  * **Linked discrepancy** (AAP 0.5.5 "with the blocking discrepancy linked"). When the location
  * hash names a card, `#discrepancy-{id}` as a held card's link on `/actions` does, on arrival or
@@ -1289,10 +1312,33 @@ export function DiscrepancyResolver() {
 
   const [closure, setClosure] = useState<Closure | null>(null);
   const [closed, setClosed] = useState<ClosedCard | null>(null);
+  // The discrepancy whose card holds focus, recorded as focus enters the card's list item from
+  // its controls, its banner or its intended-state dialog, whose events React passes up through
+  // the dialog's portal. Focus moving to another element, or onto the page, forgets it
+  // (`forgetFocusedCard`). Removing a focused element fires no focus event, so the record
+  // outlives a card a read drops, and that read can tell the card held focus.
+  const focusedCardRef = useRef<Discrepancy['id'] | null>(null);
   // The cards the latest committed render shows, where a resolution that settles finds its card.
   const shownRef = useRef<readonly Discrepancy[]>([]);
   useEffect(() => {
-    shownRef.current = list?.discrepancies ?? [];
+    const previous = shownRef.current;
+    const shown = list?.discrepancies ?? [];
+    shownRef.current = shown;
+    // A read that drops the card holding focus without a resolution here (the worker
+    // auto-resolved it, or another tab resolved it, whose 409 "Already resolved" banner held
+    // focus) hands focus on as a closing resolution does, from the cards shown before that read.
+    // Only focus lost with the card moves: onto the page, or an element no longer in it.
+    const focusedId = focusedCardRef.current;
+    if (focusedId === null || shown.some((discrepancy) => discrepancy.id === focusedId)) {
+      return;
+    }
+    focusedCardRef.current = null;
+    const active = document.activeElement;
+    if (list === undefined || (active !== null && active !== document.body && active.isConnected)) {
+      return;
+    }
+    // A closure a resolution here recorded for this card stands, with the focus placed for it.
+    setClosed((current) => (current?.id === focusedId ? current : closedCard(focusedId, previous)));
   }, [list]);
   const handleResolved = (updated: Discrepancy) => {
     if (updated.state === 'resolved') {
@@ -1302,7 +1348,21 @@ export function DiscrepancyResolver() {
       const shown = shownRef.current.some((discrepancy) => discrepancy.id === updated.id)
         ? shownRef.current
         : (list?.discrepancies ?? []);
-      setClosed(closedCard(updated.id, shown));
+      // That read may have recorded this card's closure already, as the card that held focus;
+      // replacing it would strip the element focus was placed on of its tabindex.
+      setClosed((current) =>
+        current?.id === updated.id ? current : closedCard(updated.id, shown),
+      );
+    }
+  };
+  // Focus leaving a card forgets it when it moved to another element, which records its own
+  // card if it is in one, or onto the page itself. Focus leaving with the window keeps the
+  // record: the element still holds the document's focus.
+  const forgetFocusedCard = (id: Discrepancy['id'], next: EventTarget | null) => {
+    const active = document.activeElement;
+    const onPage = active === null || active === document.body;
+    if (focusedCardRef.current === id && (next !== null || onPage)) {
+      focusedCardRef.current = null;
     }
   };
 
@@ -1339,12 +1399,13 @@ export function DiscrepancyResolver() {
     }
   }, [settledMore, dataUpdatedAt, errorUpdatedAt]);
 
-  // A closing resolution: focus is placed once while a failed read keeps the closed card listed,
-  // and once after the card has left the list, each time only when focus was lost (onto the
-  // page, or an element no longer in it), so focus the user moved is left where it is. The
-  // element focus was placed on stays focusable until the next closure, so a later read that
-  // changes the target (a discrepancy raised while the status region holds focus) or a poll in
-  // flight never strips the focused element of its tabindex, which would drop focus again.
+  // A closing resolution, or a read that dropped the focused card: focus is placed once while a
+  // failed read keeps a resolution's closed card listed, and once after the card has left the
+  // list, each time only when focus was lost (onto the page, or an element no longer in it), so
+  // focus the user moved is left where it is. The element focus was placed on stays focusable
+  // until the next closure, so a later read that changes the target (a discrepancy raised while
+  // the status region holds focus) or a poll in flight never strips the focused element of its
+  // tabindex, which would drop focus again.
   const closedFocus = closedFocusTarget(closed, list?.discrepancies);
   const reading = query.isFetching;
   const [placed, setPlaced] = useState<{ closed: ClosedCard; focus: ClosedFocus } | null>(null);
@@ -1519,6 +1580,12 @@ export function DiscrepancyResolver() {
                     : undefined
                 }
                 tabIndex={focusable ? -1 : undefined}
+                onFocus={() => {
+                  focusedCardRef.current = discrepancy.id;
+                }}
+                onBlur={(event) => {
+                  forgetFocusedCard(discrepancy.id, event.relatedTarget);
+                }}
               >
                 <DiscrepancyCard
                   discrepancy={discrepancy}

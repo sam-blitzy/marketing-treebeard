@@ -2507,15 +2507,16 @@ describe('DiscrepancyResolution "Record intended state"', () => {
     },
   );
 
-  it('keeps an intended-state failure outside the closed dialog until another resolution', async () => {
+  it('keeps an intended-state failure that ends after its dialog closed until another resolution', async () => {
     const INVALID_MESSAGE = 'The intended state needs the daily budget.';
+    const firstSave = deferred<MockResponse>();
     let attempts = 0;
     const api = mockApi({
       'GET /decisions': json(200, []),
       [RESOLVE_KEY]: () => {
         attempts += 1;
         return attempts === 1
-          ? apiError(422, 'intended_state_invalid', INVALID_MESSAGE)
+          ? firstSave.promise
           : json(200, makeDiscrepancy('untracked', { state: 'resolved' }));
       },
     });
@@ -2523,11 +2524,15 @@ describe('DiscrepancyResolution "Record intended state"', () => {
 
     const dialog = await openIntendedState();
     saveIntendedState(dialog);
-    expect(await within(dialog).findByText(INVALID_MESSAGE)).toBeTruthy();
+    await waitFor(() => {
+      expect(resolveCalls(api)).toHaveLength(1);
+    });
+    // Cancelled while the save runs, so the form that would have shown its failure is gone.
     fireEvent.click(buttonNamed('Cancel', dialog));
     expect(screen.queryByRole('dialog')).toBeNull();
+    firstSave.resolve(apiError(422, 'intended_state_invalid', INVALID_MESSAGE));
 
-    const title = screen.getByText(INVALID_MESSAGE);
+    const title = await screen.findByText(INVALID_MESSAGE);
     await waitFor(() => {
       expect(document.activeElement).toBe(title.closest('[tabindex="-1"]'));
     });
@@ -2685,3 +2690,401 @@ describe('DiscrepancyResolution double submits', () => {
   });
 });
 
+// ---------------------------------------------------------------------------------------------
+// Focus after a refresh drops the focused card (WCAG 2.2 SC 2.4.3)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The resolver's handlers for a list changed elsewhere, by another tab or by the worker: every
+ * read answers `listed()` as it stands then, and every resolution answers 409
+ * `discrepancy_resolved`, as the API answers a stale screen whose discrepancy was resolved
+ * elsewhere. The subject's (empty) decision log serves the intended-state dialog.
+ */
+function changedElsewhereHandlers(listed: () => readonly Discrepancy[]): MockHandlers {
+  return {
+    'GET /runs/latest': json(200, makeRun()),
+    'GET /decisions': json(200, []),
+    [LIST_KEY]: () => json(200, listed()),
+    [RESOLVE_KEY]: (call) =>
+      apiError(409, 'discrepancy_resolved', `Discrepancy ${call.params.id ?? ''} is resolved.`),
+  };
+}
+
+/** Reads the resolver's list again, as its 30 s poll does. */
+async function refreshList(queryClient: QueryClient): Promise<void> {
+  await act(async () => {
+    await queryClient.refetchQueries({ queryKey: queryKeys.discrepanciesAll });
+  });
+}
+
+/** {@link threeCards}, checked to hold three discrepancies. */
+function threeListed(): [Discrepancy, Discrepancy, Discrepancy] {
+  const [first, second, third] = threeCards();
+  if (first === undefined || second === undefined || third === undefined) {
+    throw new Error('threeCards() returned fewer than three discrepancies');
+  }
+  return [first, second, third];
+}
+
+/** The list items made focusable as a place to put focus (`tabindex`), in document order. */
+function focusableItems(): HTMLElement[] {
+  return screen.queryAllByRole('listitem').filter((item) => item.hasAttribute('tabindex'));
+}
+
+describe('DiscrepancyResolver focus after a refresh drops the focused card', () => {
+  it('moves focus to the next card once a refresh drops a card answered "Already resolved"', async () => {
+    const [first, second, third] = threeListed();
+    let listed: readonly Discrepancy[] = [first, second, third];
+    const api = mockApi(changedElsewhereHandlers(() => listed));
+    const { queryClient } = await renderWithProviders(<DiscrepancyResolver />, {
+      path: '/decisions',
+    });
+    const stale = await findCardItem('Brand Search — US');
+    const next = await findCardItem('Search Partners — US');
+
+    fireEvent.click(buttonNamed('Platform is correct', stale));
+    const title = await within(stale).findByText('Already resolved');
+    await waitFor(() => {
+      expect(document.activeElement).toBe(title.closest('[tabindex="-1"]'));
+    });
+    expect(stale.contains(document.activeElement)).toBe(true);
+
+    // Another tab resolved it; the next read leaves it out.
+    listed = [second, third];
+    await refreshList(queryClient);
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(next);
+    });
+    expect(stale.isConnected).toBe(false);
+    expect(focusableItems()).toEqual([next]);
+    expect(listRegion().hasAttribute('tabindex')).toBe(false);
+    // This tab closed nothing, so no closure is announced.
+    expect(within(listRegion()).queryByText(/ resolved$/u)).toBeNull();
+    expect(resolveCalls(api)).toHaveLength(1);
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('moves focus to the status region once a refresh drops the only, "Already resolved" card', async () => {
+    const [first] = threeListed();
+    let listed: readonly Discrepancy[] = [first];
+    mockApi(changedElsewhereHandlers(() => listed));
+    const { queryClient } = await renderWithProviders(<DiscrepancyResolver />, {
+      path: '/decisions',
+    });
+    const stale = await findCardItem('Brand Search — US');
+    const region = listRegion();
+
+    fireEvent.click(buttonNamed('Platform is correct', stale));
+    const title = await within(stale).findByText('Already resolved');
+    await waitFor(() => {
+      expect(document.activeElement).toBe(title.closest('[tabindex="-1"]'));
+    });
+
+    listed = [];
+    await refreshList(queryClient);
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(region);
+    });
+    expect(listRegion()).toBe(region);
+    expect(region.getAttribute('tabindex')).toBe('-1');
+    expect(within(region).getByText('No open discrepancies')).toBeTruthy();
+    expect(within(region).queryByText('Brand Search — US resolved')).toBeNull();
+    expect(screen.queryByRole('list')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('moves focus to the next card when the poll drops the focused card, unresolved here', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const [first, second, third] = threeListed();
+      let listed: readonly Discrepancy[] = [first, second, third];
+      const api = mockApi(changedElsewhereHandlers(() => listed));
+      await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions' });
+      const dropped = await findCardItem('Brand Search — US');
+      const next = await findCardItem('Search Partners — US');
+      const control = buttonNamed('Decision is correct', dropped);
+      control.focus();
+      expect(document.activeElement).toBe(control);
+
+      // The worker auto-resolved it; the 30 s poll leaves it out.
+      listed = [second, third];
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+
+      await waitFor(() => {
+        expect(document.activeElement).toBe(next);
+      });
+      expect(dropped.isConnected).toBe(false);
+      expect(focusableItems()).toEqual([next]);
+      expect(within(listRegion()).queryByText(/ resolved$/u)).toBeNull();
+      expect(resolveCalls(api)).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('moves focus to the previous card when a refresh drops the focused last card', async () => {
+    const [first, second, third] = threeListed();
+    let listed: readonly Discrepancy[] = [first, second, third];
+    mockApi(changedElsewhereHandlers(() => listed));
+    const { queryClient } = await renderWithProviders(<DiscrepancyResolver />, {
+      path: '/decisions',
+    });
+    const firstItem = await findCardItem('Brand Search — US');
+    const previous = await findCardItem('Search Partners — US');
+    const dropped = await findCardItem('Search Shared Budget');
+    buttonNamed('Platform is correct', dropped).focus();
+
+    listed = [first, second];
+    await refreshList(queryClient);
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(previous);
+    });
+    expect(dropped.isConnected).toBe(false);
+    expect(firstItem.hasAttribute('tabindex')).toBe(false);
+    expect(focusableItems()).toEqual([previous]);
+  });
+
+  it('moves focus to the next card when a refresh drops the card whose dialog holds focus', async () => {
+    const [, second, third] = threeListed();
+    let listed: readonly Discrepancy[] = [makeDiscrepancy('untracked'), second, third];
+    mockApi(changedElsewhereHandlers(() => listed));
+    const { queryClient } = await renderWithProviders(<DiscrepancyResolver />, {
+      path: '/decisions',
+    });
+    const dropped = await findCardItem('Brand Search — US');
+    const next = await findCardItem('Search Partners — US');
+    fireEvent.click(buttonNamed('Record intended state', dropped));
+    const dialog = await screen.findByRole('dialog', { name: 'Record intended state' });
+    await within(dialog).findByRole('button', { name: 'Save intended state' });
+    await waitFor(() => {
+      expect(dialog.contains(document.activeElement)).toBe(true);
+    });
+
+    listed = [second, third];
+    await refreshList(queryClient);
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(next);
+    });
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(dropped.isConnected).toBe(false);
+    expect(focusableItems()).toEqual([next]);
+  });
+
+  it('leaves focus the user moved to another card when a refresh drops the card left', async () => {
+    const [first, second, third] = threeListed();
+    let listed: readonly Discrepancy[] = [first, second, third];
+    mockApi(changedElsewhereHandlers(() => listed));
+    const { queryClient } = await renderWithProviders(<DiscrepancyResolver />, {
+      path: '/decisions',
+    });
+    const left = await findCardItem('Brand Search — US');
+    const other = await findCardItem('Search Partners — US');
+    buttonNamed('Decision is correct', left).focus();
+    const moved = buttonNamed('Platform is correct', other);
+    moved.focus();
+
+    listed = [second, third];
+    await refreshList(queryClient);
+
+    await waitFor(() => {
+      expect(left.isConnected).toBe(false);
+    });
+    await settle(queryClient);
+    expect(document.activeElement).toBe(moved);
+    expect(focusableItems()).toEqual([]);
+    expect(listRegion().hasAttribute('tabindex')).toBe(false);
+  });
+
+  it('leaves focus on the page when the user put it there after leaving the dropped card', async () => {
+    const [first, second, third] = threeListed();
+    let listed: readonly Discrepancy[] = [first, second, third];
+    mockApi(changedElsewhereHandlers(() => listed));
+    const { queryClient } = await renderWithProviders(
+      <>
+        <Button onClick={() => undefined}>Elsewhere</Button>
+        <DiscrepancyResolver />
+      </>,
+      { path: '/decisions' },
+    );
+    const left = await findCardItem('Brand Search — US');
+    buttonNamed('Decision is correct', left).focus();
+    // Focus moves to a control outside the list, then onto the page, as a click on it does.
+    const elsewhere = buttonNamed('Elsewhere');
+    elsewhere.focus();
+    elsewhere.blur();
+    expect(document.activeElement).toBe(document.body);
+
+    listed = [second, third];
+    await refreshList(queryClient);
+
+    await waitFor(() => {
+      expect(left.isConnected).toBe(false);
+    });
+    await settle(queryClient);
+    expect(document.activeElement).toBe(document.body);
+    expect(focusableItems()).toEqual([]);
+    expect(listRegion().hasAttribute('tabindex')).toBe(false);
+  });
+
+  it('leaves focus on the page when the user moved it there from the dropped card', async () => {
+    const [first, second, third] = threeListed();
+    let listed: readonly Discrepancy[] = [first, second, third];
+    mockApi(changedElsewhereHandlers(() => listed));
+    const { queryClient } = await renderWithProviders(<DiscrepancyResolver />, {
+      path: '/decisions',
+    });
+    const left = await findCardItem('Brand Search — US');
+    const control = buttonNamed('Decision is correct', left);
+    control.focus();
+    // As a click on an empty part of the page does.
+    control.blur();
+    expect(document.activeElement).toBe(document.body);
+
+    listed = [second, third];
+    await refreshList(queryClient);
+
+    await waitFor(() => {
+      expect(left.isConnected).toBe(false);
+    });
+    await settle(queryClient);
+    expect(document.activeElement).toBe(document.body);
+    expect(focusableItems()).toEqual([]);
+    expect(listRegion().hasAttribute('tabindex')).toBe(false);
+  });
+});
+
+// A failure of the intended-state save that the open form already showed is dismissed with the
+// dialog, however the user closes it; either 409 lock outlives the dialog with its own message.
+describe('DiscrepancyResolution intended-state failure closed with its dialog', () => {
+  const REFUSED_MESSAGE = 'The daily budget must be a positive amount below 1,000,000,000,000.';
+
+  /** The backdrop of the open dialog, whose click asks the dialog to close. */
+  function backdropOf(dialog: HTMLElement): Element {
+    const backdrop = dialog.parentElement?.querySelector('.ds-dialog__backdrop') ?? null;
+    if (backdrop === null) {
+      throw new Error('The dialog renders no backdrop');
+    }
+    return backdrop;
+  }
+
+  /** Each way of closing the dialog without saving. */
+  const CLOSES: readonly (readonly [string, (dialog: HTMLElement) => void])[] = [
+    [
+      'Cancel',
+      (dialog) => {
+        fireEvent.click(buttonNamed('Cancel', dialog));
+      },
+    ],
+    [
+      'the Close button',
+      (dialog) => {
+        fireEvent.click(buttonNamed('Close', dialog));
+      },
+    ],
+    [
+      'Escape',
+      (dialog) => {
+        fireEvent.keyDown(dialog, { key: 'Escape' });
+      },
+    ],
+    [
+      'the backdrop',
+      (dialog) => {
+        fireEvent.click(backdropOf(dialog));
+      },
+    ],
+  ];
+
+  it.each(CLOSES)(
+    'clears a 422 the open form showed once %s closes the dialog',
+    async (_close, close) => {
+      const api = mockApi(
+        intendedHandlers(apiError(422, 'intended_state_invalid', REFUSED_MESSAGE)),
+      );
+      const { onResolved } = await renderResolution(makeDiscrepancy('untracked'));
+
+      const opener = buttonNamed('Record intended state');
+      opener.focus();
+      const dialog = await openIntendedState();
+      saveIntendedState(dialog);
+      expect(await within(dialog).findByText(REFUSED_MESSAGE)).toBeTruthy();
+
+      close(dialog);
+
+      expect(screen.queryByRole('dialog')).toBeNull();
+      expect(screen.queryByText(REFUSED_MESSAGE)).toBeNull();
+      // The dialog hands focus back to its opener, which no banner takes from it.
+      await waitFor(() => {
+        expect(document.activeElement).toBe(opener);
+      });
+      expect(opener.disabled).toBe(false);
+      expect(buttonNamed('Adopt platform state').disabled).toBe(false);
+      expect(resolveCalls(api)).toHaveLength(1);
+      expect(onResolved).not.toHaveBeenCalled();
+      expect(outcomeRegion().textContent).toBe('');
+      expect(screen.queryByRole('alert')).toBeNull();
+    },
+  );
+
+  it('clears a server failure the open form showed once Cancel closes the dialog', async () => {
+    const text = 'The server is temporarily unavailable. Try again shortly.';
+    mockApi(intendedHandlers(html(502, '<html><body>Bad Gateway</body></html>')));
+    await renderResolution(makeDiscrepancy('untracked'));
+
+    const dialog = await openIntendedState();
+    saveIntendedState(dialog);
+    expect(await within(dialog).findByText(text)).toBeTruthy();
+    fireEvent.click(buttonNamed('Cancel', dialog));
+
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.queryByText(text)).toBeNull();
+    expect(buttonNamed('Record intended state').disabled).toBe(false);
+  });
+
+  it.each([
+    [
+      '409 subject_retired',
+      apiError(409, 'subject_retired', 'The subject belongs to a retired dataset.'),
+      'Computed from replaced data',
+      'Escape',
+    ],
+    [
+      '409 discrepancy_resolved',
+      apiError(409, 'discrepancy_resolved', 'Discrepancy 51 is already resolved.'),
+      'Already resolved',
+      'Cancel',
+    ],
+  ] as const)(
+    'keeps the %s lock and its message once the dialog closes',
+    async (_refusal, response, text, closeName) => {
+      const api = mockApi(intendedHandlers(response));
+      await renderResolution(makeDiscrepancy('untracked'));
+
+      buttonNamed('Record intended state').focus();
+      const dialog = await openIntendedState();
+      saveIntendedState(dialog);
+      expect(await within(dialog).findByText(text)).toBeTruthy();
+      const close = CLOSES.find(([name]) => name === closeName)?.[1];
+      if (close === undefined) {
+        throw new Error(`No way to close the dialog named ${closeName}`);
+      }
+      close(dialog);
+
+      expect(screen.queryByRole('dialog')).toBeNull();
+      const title = screen.getByText(text);
+      await waitFor(() => {
+        expect(document.activeElement).toBe(title.closest('[tabindex="-1"]'));
+      });
+      expect(buttonNamed('Adopt platform state').disabled).toBe(true);
+      expect(buttonNamed('Record intended state').disabled).toBe(true);
+      fireEvent.click(buttonNamed('Record intended state'));
+      expect(screen.queryByRole('dialog')).toBeNull();
+      expect(resolveCalls(api)).toHaveLength(1);
+      expect(screen.queryByRole('alert')).toBeNull();
+    },
+  );
+});

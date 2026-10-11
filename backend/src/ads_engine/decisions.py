@@ -319,6 +319,14 @@ _PERIOD_LABELS: Final[Mapping[BudgetPeriod, str]] = MappingProxyType(
 )
 """Each Google budget period as the adjective of a budget, as in "a daily budget"."""
 
+_AMOUNT_LABELS: Final[Mapping[str, str]] = MappingProxyType(
+    {"daily_budget": "daily budget", "total_budget": "total budget"}
+)
+"""Each amount field of ``_AMOUNT_FIELDS`` as an amount refusal names it, in words."""
+
+_MAX_AMOUNT_TEXT: Final[str] = f"{_MAX_AMOUNT:,}"
+"""``_MAX_AMOUNT`` as a refusal message words it, grouped: ``1,000,000,000,000``."""
+
 
 def _is_subject_type(value: object) -> TypeIs[SubjectType]:
     return isinstance(value, str) and value in SUBJECT_TYPES
@@ -572,7 +580,7 @@ class DecisionPatch:
             if amount is None:
                 raise PatchRejected(
                     "invalid_value",
-                    f"The {name} must be an exact decimal amount.",
+                    f"The {_AMOUNT_LABELS[name]} must be an exact decimal amount.",
                     details={"field": name},
                 )
             object.__setattr__(self, name, amount)
@@ -620,7 +628,7 @@ class DecisionPatch:
             if raw is not None and amount is None:
                 raise PatchRejected(
                     "invalid_value",
-                    f"The {name} must be an exact decimal amount.",
+                    f"The {_AMOUNT_LABELS[name]} must be an exact decimal amount.",
                     details={"field": name},
                 )
             amounts[name] = amount
@@ -1572,22 +1580,31 @@ def _check_shape_fields(state: SubjectState, fields: frozenset[str]) -> None:
 
 
 def _check_amount(amount: Decimal, *, field: str, state: SubjectState) -> None:
-    """Refuse an amount that is not positive or is finer than the source allows.
+    """Refuse an amount that is not positive, not below 10^12 or finer than the source allows.
+
+    The UI shows the message as it is, so it names the field in words ("daily budget") and
+    the bound grouped ("1,000,000,000,000"); the request's field name stays in ``details``.
+
+    Args:
+        amount: The submitted amount.
+        field: ``daily_budget`` or ``total_budget``.
+        state: The subject's current state.
 
     Raises:
-        PatchRejected: ``invalid_amount`` or ``sub_minor_unit``.
+        PatchRejected: ``invalid_amount`` or ``sub_minor_unit``, with details ``field``.
     """
     issue = _amount_issue(amount, source=state.source, currency=state.currency)
     if issue is None:
         return
+    label = _AMOUNT_LABELS[field]
     if issue == "invalid_amount":
-        message = f"The {field} must be a positive amount below 10^12."
+        message = f"The {label} must be a positive amount below {_MAX_AMOUNT_TEXT}."
     elif state.source == "google":
-        message = f"The {field} must be a whole number of micros (at most 6 decimal places)."
+        message = f"The {label} must be a whole number of micros (at most 6 decimal places)."
     else:
         places = minor_unit_exponent(state.currency)
         message = (
-            f"The {field} must not be finer than the {state.currency} minor unit ({places} places)."
+            f"The {label} must not be finer than the {state.currency} minor unit ({places} places)."
         )
     raise PatchRejected(issue, message, details={"field": field})
 
@@ -1689,8 +1706,8 @@ def apply_patch(state: SubjectState, current: ExpectedState, patch: DecisionPatc
        (Google: the field its period owns); ``shared_member`` takes no amount
        (``shared_budget_amount``, naming the owning budget); ``budget`` takes exactly the
        one amount its period allows and no status (``field_not_allowed``);
-    5. amounts must be positive and no finer than the minor unit; Google: whole micros
-       (``invalid_amount``, ``sub_minor_unit``);
+    5. amounts must be positive, below 10^12 and no finer than the minor unit; Google:
+       whole micros (``invalid_amount``, ``sub_minor_unit``);
     6. the patch is applied: unsent fields keep their decided values, a member keeps its
        decided ``budget_id``;
     7. an ``own_budget`` result must hold exactly the budget fields the campaign has now
@@ -1774,8 +1791,8 @@ def parse_intended_state(state: SubjectState, intended: Mapping[str, object]) ->
     * ``budget`` takes exactly ``{daily_budget}`` (``DAILY``) or ``{total_budget}``
       (``CUSTOM_PERIOD``), with no status.
 
-    Amounts follow the same rules as patches: positive and no finer than the minor unit
-    (Google: whole micros).
+    Amounts follow the same rules as patches: positive, below 10^12 and no finer than the
+    minor unit (Google: whole micros), refused in the same words.
 
     Args:
         state: The subject's current state.
@@ -1837,7 +1854,9 @@ def parse_intended_state(state: SubjectState, intended: Mapping[str, object]) ->
             continue
         amount = _as_decimal(intended[field])
         if amount is None:
-            raise _intended_invalid(f"The {field} must be an exact decimal amount.", field=field)
+            raise _intended_invalid(
+                f"The {_AMOUNT_LABELS[field]} must be an exact decimal amount.", field=field
+            )
         try:
             _check_amount(amount, field=field, state=state)
         except PatchRejected as exc:

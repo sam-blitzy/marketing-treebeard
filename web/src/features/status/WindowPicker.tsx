@@ -47,9 +47,13 @@
  *   Reading it on every load of `/actions` would add a request the five sections do not need to
  *   render within two seconds, so reopening a custom run stays one press away instead. Moving
  *   through the select's options only chooses; the "Reopen" button opens the choice, so the
- *   page never changes on input (WCAG 2.2 SC 3.2.2). Each option names the run's window, its
- *   length, the instant it finished in the run's display time zone and its id, so runs of the
- *   same window read differently.
+ *   page never changes on input (WCAG 2.2 SC 3.2.2). Each option names the run's window, and
+ *   its label is bounded by design: the range alone, or, for runs that share a window, the
+ *   range and a copy number of at most "(20)", so the closed select shows each label whole at
+ *   every width down to the 320 px reflow width. The copy number counts the listed runs of
+ *   that window from the oldest: the oldest is the range alone, the next adds "(2)", and so
+ *   on. The hint under the select names the chosen run's id, its length and the instant it
+ *   finished in the run's display time zone, in full at every width.
  * - **Messages are announced politely.** The "Computing custom window" spinner and every
  *   warning banner of a failed computation or read sit in one `role="status"` region that
  *   every state of the picker renders in the same place, so each is announced when it appears
@@ -258,15 +262,95 @@ function readErrorMessage(error: unknown): string {
 }
 
 /**
- * The reopen-select label of a custom run: "{window_start} – {window_end} · {days} · computed
- * {finished_at} · run {id}", for example "2026-09-25 – 2026-10-01 · 7 days · computed Oct 6,
- * 2026, 11:22 AM UTC · run 203". The dates are shown exactly as stored and the length is the
- * run's own `days`. The instant the run finished is formatted in the run's
- * `display_timezone` (AAP 0.5.5), and the run id keeps the labels of two runs of the same
- * window distinct even when they finished in the same minute.
+ * The key of a run's window: its `window_start` and `window_end` as stored. Two listed runs
+ * share a window exactly when their keys are equal.
+ *
+ * @param run - A custom run listed by `GET /runs?kind=custom`.
+ * @returns The run's window key.
  */
-function customRunLabel(run: Run): string {
-  return `${formatDateRange(run.window_start, run.window_end)} · ${formatDays(run.days)} · computed ${formatInstant(run.finished_at, run.display_timezone)} · run ${run.id}`;
+function windowKey(run: Run): string {
+  return `${run.window_start}/${run.window_end}`;
+}
+
+/**
+ * The copy number of each custom run the reopen select lists, by run id: 1 for the oldest
+ * listed run of its window, 2 for the next listed run of the same window, and so on.
+ *
+ * Two runs share a window exactly when their `window_start` and `window_end` are equal
+ * ({@link windowKey}). The API lists custom runs newest first, so a run's age is its place in
+ * that list, counted from the end; the list itself is not re-sorted. Only the runs passed in
+ * are counted, so a failed run, which the select never lists, takes no number. The picker
+ * lists at most the 20 runs of one `GET /runs?kind=custom` page, so no copy number exceeds 20.
+ *
+ * @example
+ * ```ts
+ * // Newest first: runs 9 and 4 share a window, and run 7 has its own.
+ * copyNumbers([run9, run7, run4]); // Map { 4 => 1, 7 => 1, 9 => 2 }
+ * ```
+ *
+ * @param reopenable - The custom runs the reopen select lists, newest first as the API orders
+ *   them.
+ * @returns Each listed run's copy number among the listed runs of its window, keyed by run id.
+ */
+function copyNumbers(reopenable: readonly Run[]): ReadonlyMap<Run['id'], number> {
+  // How many runs of each window the walk below has numbered so far.
+  const numberedPerWindow = new Map<string, number>();
+  const numbers = new Map<Run['id'], number>();
+  // The list is newest first, so its reverse visits the runs of each window from the oldest.
+  for (const run of [...reopenable].reverse()) {
+    const key = windowKey(run);
+    const copyNumber = (numberedPerWindow.get(key) ?? 0) + 1;
+    numberedPerWindow.set(key, copyNumber);
+    numbers.set(run.id, copyNumber);
+  }
+  return numbers;
+}
+
+/**
+ * The reopen-select label of a custom run: its window, "{window_start} – {window_end}", with
+ * " ({copyNumber})" added on every listed run of that window but the oldest. The dates are
+ * shown exactly as stored.
+ *
+ * A native select can neither wrap nor truncate the text of its chosen option, so the label
+ * is bounded by design: the range alone, or, for runs that share a window, the range and a
+ * copy number of at most "(20)" ({@link copyNumbers}). The closed select therefore shows each
+ * label whole at every width down to the 320 px reflow width (WCAG 2.2 SC 1.4.10). The copy
+ * number counts the listed runs of the window from the oldest, so runs that share a window
+ * read differently even when they finished in the same minute; the hint under the select
+ * names the chosen run's id ({@link customRunHint}).
+ *
+ * @example
+ * ```ts
+ * // Run 3, the oldest listed run of its window, or the only one:
+ * customRunLabel(run3, 1); // '2026-08-15 – 2026-10-09'
+ * // Run 203, the second listed run of its window, counted from the oldest:
+ * customRunLabel(run203, 2); // '2026-09-01 – 2026-09-30 (2)'
+ * ```
+ *
+ * @param run - A custom run listed by `GET /runs?kind=custom`.
+ * @param copyNumber - The run's copy number among the listed runs of its window
+ *   ({@link copyNumbers}): 1 for the oldest, which is labelled by its range alone.
+ * @returns The run's option label.
+ */
+function customRunLabel(run: Run, copyNumber: number): string {
+  const range = formatDateRange(run.window_start, run.window_end);
+  return copyNumber === 1 ? range : `${range} (${copyNumber})`;
+}
+
+/**
+ * The hint under the reopen select for the custom run it shows: "Run {id} · {days} · computed
+ * {finished_at}", for example "Run 203 · 7 days · computed Oct 6, 2026, 11:22 AM UTC". It names
+ * the run's id, which its label leaves out: the label gives the window and, on a run that
+ * shares its window, a copy number ({@link customRunLabel}). It also gives the run's own `days`
+ * and the instant the run finished, formatted in the run's `display_timezone` (AAP 0.5.5). The
+ * hint is wrapping text, so it shows whole at every width. `Select` references it by
+ * `aria-describedby`, so it is also the select's accessible description.
+ *
+ * @param run - The custom run the reopen select shows.
+ * @returns The hint text for that run.
+ */
+function customRunHint(run: Run): string {
+  return `Run ${run.id} · ${formatDays(run.days)} · computed ${formatInstant(run.finished_at, run.display_timezone)}`;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -416,14 +500,17 @@ export interface WindowPickerProps {
  *   ({@link useForgetCustomRuns}), so it starts closed and unread on every later mount until it
  *   is opened again, which reads the list once. While open, the region shows a "Loading recent
  *   custom windows" spinner until the first read answers; then "Reopen a custom window" lists
- *   the succeeded custom runs newest first ({@link customRunLabel}), with a "Reopen" button
- *   below it, or "No custom windows yet" says there is none to reopen. Choosing an option only
- *   records it; "Reopen" navigates to the chosen run by id. The select shows the run on screen
- *   until a choice is made, and a choice is dropped once another run is on screen. "Reopen" is
- *   disabled on the empty choice and while a run computes. After a failed first read the region
- *   stays empty and hidden, and the warning below the controls states the failure. The
- *   "Recent custom windows" button is disabled while a run computes, like every other control,
- *   and pressing it leaves focus on it.
+ *   the succeeded custom runs newest first, each by its window, with a copy number such as
+ *   "(2)" added on every listed run of a window but its oldest ({@link customRunLabel}). A hint
+ *   under the select gives "Run {id}", the chosen run's length and the instant it finished in
+ *   the run's display time zone ({@link customRunHint}), and none shows on the empty choice. A
+ *   "Reopen" button sits below, or "No custom windows yet" says there is none to reopen.
+ *   Choosing an option only records it; "Reopen" navigates to the chosen run by id. The select
+ *   shows the run on screen until a choice is made, and a choice is dropped once another run is
+ *   on screen. "Reopen" is disabled on the empty choice and while a run computes. After a failed
+ *   first read the region stays empty and hidden, and the warning below the controls states the
+ *   failure. The "Recent custom windows" button is disabled while a run computes, like every
+ *   other control, and pressing it leaves focus on it.
  *
  * The component must render inside a TanStack `RouterProvider` and a `QueryClientProvider`, as
  * every `/actions` screen does.
@@ -552,9 +639,17 @@ export function WindowPicker({ run }: WindowPickerProps) {
   // only succeeded custom runs can be reopened. The API lists them newest first. Runs listed by
   // an earlier read stay listed when a later read fails, which is stated in a warning below.
   const reopenable = (customRuns.data ?? []).filter((custom) => custom.status === 'succeeded');
+  // Each listed run's copy number among the listed runs of its window, from the oldest: the
+  // oldest is labelled by its range alone and each later one adds its number (customRunLabel).
+  // The options keep the API's newest-first order. copyNumbers numbers every run it is given,
+  // so the lookup always finds one; a run it had not seen would have no earlier listed copy.
+  const copies = copyNumbers(reopenable);
   const reopenOptions: readonly SelectOption[] = [
     NO_CUSTOM_RUN,
-    ...reopenable.map((custom) => ({ value: String(custom.id), label: customRunLabel(custom) })),
+    ...reopenable.map((custom) => ({
+      value: String(custom.id),
+      label: customRunLabel(custom, copies.get(custom.id) ?? 1),
+    })),
   ];
   const reopenValue = reopenable.some((custom) => custom.id === run.id)
     ? String(run.id)
@@ -567,6 +662,9 @@ export function WindowPicker({ run }: WindowPickerProps) {
     reopenOptions.some((option) => option.value === reopenDraft.value)
       ? reopenDraft.value
       : reopenValue;
+  // The custom run the select shows, which "Reopen" opens and the hint under the select
+  // describes; `undefined` on the empty choice, which opens nothing and has no hint.
+  const chosen = reopenable.find((custom) => String(custom.id) === reopenSelection);
 
   // A custom run on screen is announced politely by the picker whenever it shows one: after a
   // choice in the picker, a reopen, Back or Forward, or a direct load (WCAG 2.2 SC 4.1.3).
@@ -641,12 +739,11 @@ export function WindowPicker({ run }: WindowPickerProps) {
 
   /** Opens the custom run the reopen select shows, by id; the empty choice opens nothing. */
   const reopen = () => {
-    const found = reopenable.find((custom) => String(custom.id) === reopenSelection);
-    if (found === undefined) {
+    if (chosen === undefined) {
       return;
     }
     clearErrors();
-    openRun(found.id);
+    openRun(chosen.id);
   };
 
   /** Reads the latest default run again, from its warning's Retry button. */
@@ -733,6 +830,7 @@ export function WindowPicker({ run }: WindowPickerProps) {
               options={reopenOptions}
               value={reopenSelection}
               onChange={chooseReopen}
+              hint={chosen === undefined ? undefined : customRunHint(chosen)}
               disabled={pending}
             />
             <Inline>

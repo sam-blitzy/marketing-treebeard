@@ -38,6 +38,7 @@ import { apiError, json, mockApi } from '../../../test/mockApi';
 import type { MockHandlers, MockResponse, RecordedCall } from '../../../test/mockApi';
 import { LiveSection, feedbackConfirmationText, feedbackFlow } from '../../../test/feedbackFlow';
 import { KEEP_SPACES, renderWithProviders } from '../../../test/render';
+import type { QueryClient } from '@tanstack/react-query';
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { memo, useEffect, useMemo, useState } from 'react';
 import type { ReactElement } from 'react';
@@ -76,7 +77,13 @@ import {
 } from '../../../test/fixtures';
 import { LARGE_RENDER_TEST_TIMEOUT_MS } from '../../../test/timeouts';
 import { B1CardsProvider } from '../B1Cards';
-import { DECISION_RECORDED_MESSAGE, RECORD_DECISION_LABEL } from '../RecommendationCard';
+import { Button } from '../../../design-system';
+import {
+  DECISION_RECORDED_MESSAGE,
+  FEEDBACK_LABELS,
+  HISTORICAL_LABEL,
+  RECORD_DECISION_LABEL,
+} from '../RecommendationCard';
 import {
   B1_LINK_LABEL,
   CAMPAIGN_EVIDENCE_LABEL,
@@ -2511,5 +2518,203 @@ describe('CampaignsSection: the confirmation of a card hidden on the page', () =
       '1 hidden since this run',
     );
     expect(within(section).queryAllByRole('alert')).toEqual([]);
+  });
+});
+
+describe('CampaignsSection: a card a refetch moves into the replaced-data block', () => {
+  /**
+   * The overlay of an item whose frozen dataset a dataset activation has replaced since its run
+   * (AAP 0.3.2): historical, held by the replaced data, with every action disabled.
+   */
+  function replacedOverlay(): Item['current'] {
+    return makeItemOverlay({
+      historical: true,
+      held_now: true,
+      held_reason_now: 'Computed from data that has since been replaced',
+      data_status_now: 'live',
+    });
+  }
+
+  /**
+   * `GET /recommendations` answering the page `build` makes, with each item in `replaced`
+   * computed from replaced data, as the overlay reads it live after a dataset activation.
+   */
+  function servePage(
+    replaced: ReadonlySet<Item['id']>,
+    build: () => ReturnType<typeof makeRecommendationsPage> = makeRecommendationsPage,
+  ): MockHandlers {
+    return {
+      'GET /recommendations': () => {
+        const page = build();
+        for (const id of replaced) {
+          findPageItem(page, id).current = replacedOverlay();
+        }
+        return json(200, page);
+      },
+    };
+  }
+
+  /** The "Computed from replaced data ({count})" block of the group region named `group`. */
+  function replacedBlock(group: string, count: number): HTMLElement {
+    return within(screen.getByRole('region', { name: group })).getByRole('group', {
+      name: `Computed from replaced data (${String(count)})`,
+    });
+  }
+
+  /** Refetches every recommendations page, as the 30 s poll of `/actions` does. */
+  async function refetch(queryClient: QueryClient): Promise<void> {
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: queryKeys.recommendationsAll });
+    });
+  }
+
+  /**
+   * Waits for keyboard focus on the replaced-data line of `card`, a historical card: the line
+   * with its "Computed from replaced data" badge and provenance, never the page body.
+   */
+  async function expectFocusOnReplacedLine(card: HTMLElement): Promise<void> {
+    const badge = within(card).getByText(HISTORICAL_LABEL);
+    await waitFor(() => {
+      const active = document.activeElement;
+      expect(active).not.toBe(document.body);
+      expect(active !== null && active !== card && card.contains(active)).toBe(true);
+      expect(active?.contains(badge)).toBe(true);
+    });
+  }
+
+  it('moves focus from the open decision dialog to the same card in its new place', async () => {
+    const replaced = new Set<Item['id']>();
+    mockApi({
+      ...servePage(replaced),
+      'GET /discrepancies': openDiscrepancies(),
+      // The subject's dataset is replaced before the page's own refetch shows it.
+      'GET /decisions': apiError(409, 'subject_retired', 'The dataset was replaced.'),
+    });
+    const { queryClient } = await renderWithProviders(
+      <LiveSection sectionKey="campaigns" component={CampaignsSection} />,
+      { path: '/actions' },
+    );
+    const c1 = pageItem(FIXTURE_ITEM_IDS.c1);
+    const visible = await screen.findByRole('article', { name: c1.action });
+    const opener = within(visible).getByRole('button', { name: RECORD_DECISION_LABEL });
+    act(() => {
+      opener.focus();
+    });
+    fireEvent.click(opener);
+    const dialog = await screen.findByRole('dialog', { name: RECORD_DECISION_LABEL });
+    // The form shows its own lock first: the decision log read was refused as retired.
+    await within(dialog).findByText(HISTORICAL_LABEL);
+    expect(dialog.contains(document.activeElement)).toBe(true);
+
+    replaced.add(c1.id);
+    await refetch(queryClient);
+
+    const moved = await waitFor(() =>
+      within(replacedBlock('Pause', 1)).getByRole('article', { name: c1.action }),
+    );
+    expect(moved).not.toBe(visible);
+    expect(screen.queryByRole('dialog')).toBeNull();
+    await expectFocusOnReplacedLine(moved);
+    // The line states why, and every action of the card is disabled (AAP 0.5.5 "Historical
+    // items").
+    expect(document.activeElement?.textContent).toContain('Simulated Google data, since replaced');
+    const buttons = within(moved).getAllByRole('button');
+    expect(buttons.map((button) => button.textContent)).toEqual([
+      RECORD_DECISION_LABEL,
+      FEEDBACK_LABELS.dismiss,
+      FEEDBACK_LABELS.snooze,
+    ]);
+    for (const button of buttons) {
+      expect(button.hasAttribute('disabled')).toBe(true);
+    }
+  });
+
+  it("moves focus from the card's own footer action to the same card in its new place", async () => {
+    const replaced = new Set<Item['id']>();
+    mockApi({ ...servePage(replaced), 'GET /discrepancies': openDiscrepancies() });
+    const { queryClient } = await renderWithProviders(
+      <LiveSection sectionKey="campaigns" component={CampaignsSection} />,
+      { path: '/actions' },
+    );
+    const c1 = pageItem(FIXTURE_ITEM_IDS.c1);
+    const visible = await screen.findByRole('article', { name: c1.action });
+    act(() => {
+      within(visible).getByRole('button', { name: FEEDBACK_LABELS.dismiss }).focus();
+    });
+
+    replaced.add(c1.id);
+    await refetch(queryClient);
+
+    const moved = await waitFor(() =>
+      within(replacedBlock('Pause', 1)).getByRole('article', { name: c1.action }),
+    );
+    await expectFocusOnReplacedLine(moved);
+  });
+
+  it('moves focus to the same card in the discrepancy group, below its pinned C0 card', async () => {
+    const pause = makeItem({
+      id: 1190,
+      rank: 2,
+      rule_id: 'C1',
+      action: 'Pause Partner Search — US',
+      entity: { source: 'google', type: 'campaign', id: '61000990', name: 'Partner Search — US' },
+    });
+    const build = () => {
+      const page = makeRecommendationsPage();
+      const campaigns = page.sections.find((section) => section.key === 'campaigns');
+      const discrepancies = campaigns?.groups.find((group) => group.key === 'discrepancies');
+      if (discrepancies === undefined) {
+        throw new Error('the fixture page has no discrepancy group');
+      }
+      discrepancies.items = [...discrepancies.items, structuredClone(pause)];
+      return page;
+    };
+    const replaced = new Set<Item['id']>();
+    mockApi({ ...servePage(replaced, build), 'GET /discrepancies': openDiscrepancies() });
+    const { queryClient } = await renderWithProviders(
+      <LiveSection sectionKey="campaigns" component={CampaignsSection} />,
+      { path: '/actions' },
+    );
+    const visible = await screen.findByRole('article', { name: pause.action });
+    act(() => {
+      within(visible).getByRole('button', { name: FEEDBACK_LABELS.snooze }).focus();
+    });
+
+    replaced.add(pause.id);
+    await refetch(queryClient);
+
+    const block = await waitFor(() => replacedBlock('Discrepancies', 1));
+    const moved = within(block).getByRole('article', { name: pause.action });
+    await expectFocusOnReplacedLine(moved);
+    // The C0 card stays pinned above the block, outside it.
+    const c0 = screen.getByRole('article', { name: C0_ACTION });
+    expect(block.contains(c0)).toBe(false);
+  });
+
+  it('leaves focus the user has put elsewhere where it is', async () => {
+    const replaced = new Set<Item['id']>();
+    mockApi({ ...servePage(replaced), 'GET /discrepancies': openDiscrepancies() });
+    const { queryClient } = await renderWithProviders(
+      <>
+        <Button>Elsewhere</Button>
+        <LiveSection sectionKey="campaigns" component={CampaignsSection} />
+      </>,
+      { path: '/actions' },
+    );
+    const c1 = pageItem(FIXTURE_ITEM_IDS.c1);
+    await screen.findByRole('article', { name: c1.action });
+    const elsewhere = screen.getByRole('button', { name: 'Elsewhere' });
+    act(() => {
+      elsewhere.focus();
+    });
+
+    replaced.add(c1.id);
+    await refetch(queryClient);
+
+    await waitFor(() =>
+      within(replacedBlock('Pause', 1)).getByRole('article', { name: c1.action }),
+    );
+    await settle();
+    expect(document.activeElement).toBe(elsewhere);
   });
 });

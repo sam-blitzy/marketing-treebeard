@@ -654,8 +654,11 @@ export function recommendationsQueryOptions(runId?: RunId) {
  * (AAP 0.5.5 `DecisionLog`). It sends `subject_type` and `subject_id` only when the filter
  * sets them. The API returns at most its default 200 rows.
  *
- * Status codes: 200; 422 `invalid_query` when `subject_id` comes without `subject_type`.
- * Recording a decision or resolving a discrepancy invalidates every variant.
+ * Status codes: 200; 422 `invalid_query` when `subject_id` comes without `subject_type`; 409
+ * `subject_retired` when `subject_id` names a campaign or shared budget of a dataset that is
+ * not active, as on a screen opened before its dataset was replaced (AAP 0.3.2). An unknown
+ * `subject_id` answers 200 with no row. Recording a decision or resolving a discrepancy
+ * invalidates every variant.
  *
  * The worker writes decisions too (the baseline of each new dataset, AAP 0.5.2), and other
  * sessions record them, so a shown log refetches every {@link CURRENT_STATE_POLL_MS} (AAP 0.3.2

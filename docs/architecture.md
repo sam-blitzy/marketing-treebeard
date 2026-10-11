@@ -224,8 +224,14 @@ Inside one run (`analysis/runner.py`):
 3. Claim the pending `analysis_request` rows the run serves.
 4. Load the `AnalysisContext` in one read-only `REPEATABLE READ` transaction, so every query
    sees one snapshot while syncs keep writing.
-5. Evaluate the rules, precedence and row rendering on a single analysis thread, off the event
-   loop, so the API keeps serving stored pages while a custom run computes.
+5. Evaluate the rules, precedence and row rendering off the event loop. The worker and the CLI
+   use a single analysis thread. A custom run from `POST /runs` runs steps 4 to 6 in the API's
+   analysis process instead: one child process of the API, spawned at API startup with a lower
+   CPU priority (`nice` 10), that has its own GIL. The API therefore keeps serving stored pages,
+   and answers a contending `POST /runs` with 409 at once, while a large window computes. The
+   API process keeps the lock, the `running` row and the failure record, so it refuses
+   contenders before any heavy work starts, and the analysis process dies with the API
+   process, so no run outlives the lock.
 6. Persist every output together with the run's `succeeded` state, the dataset ids and the
    modes it read, in one transaction. Any failure marks the run `failed` instead, so a run is
    never partial.

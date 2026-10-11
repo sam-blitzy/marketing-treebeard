@@ -37,6 +37,7 @@ import type { ReactNode } from 'react';
 
 import type { Tone } from '../tokens';
 import { withIdentifierBreaks } from './identifierBreaks';
+import { withWholeDates } from './wholeDates';
 
 /**
  * Props of {@link Banner}.
@@ -56,14 +57,15 @@ export interface BannerProps {
   tone?: Tone;
   /**
    * The headline that names the condition, rendered as a paragraph rather than a heading. A
-   * string title gets a line-break opportunity after each underscore of a long identifier
+   * string title keeps each standalone calendar date on one line ({@link withWholeDates}) and
+   * gets a line-break opportunity after each underscore of a long identifier
    * ({@link withIdentifierBreaks}), with its text unchanged.
    */
   title: ReactNode;
   /**
    * Supporting content below the title, such as a reason or a list of affected datasets.
    * Omitted (or `null`, a boolean or an empty string), no content container is rendered. String
-   * content gets the same identifier breaks as a string title.
+   * content gets the same whole dates and identifier breaks as a string title.
    */
   children?: ReactNode;
   /**
@@ -104,8 +106,10 @@ function hasContent(node: ReactNode): boolean {
  * sets `alert` on the open-discrepancies banner and on no other (AAP 0.5.5).
  *
  * A string title or content, usually the API's own message, passes through
- * {@link withIdentifierBreaks}, so a long identifier such as an environment variable name wraps
- * at its underscores on a narrow screen instead of at an arbitrary character.
+ * {@link withWholeDates} and, between its dates, {@link withIdentifierBreaks}. On a narrow
+ * screen a date such as "2026-10-09" therefore stays whole, so a range wraps between its dates
+ * rather than at a hyphen inside one, and a long identifier such as an environment variable
+ * name wraps at its underscores instead of at an arbitrary character.
  *
  * The component holds no state and has no effects; its output depends only on its props.
  *
@@ -136,9 +140,9 @@ export function Banner({
 }: BannerProps) {
   return (
     <div id={id} className={`ds-banner ds-banner--${tone}`} role={alert ? 'alert' : undefined}>
-      <p className="ds-banner__title">{withIdentifierBreaks(title)}</p>
+      <p className="ds-banner__title">{withWholeDates(title, withIdentifierBreaks)}</p>
       {hasContent(children) && (
-        <div className="ds-banner__content">{withIdentifierBreaks(children)}</div>
+        <div className="ds-banner__content">{withWholeDates(children, withIdentifierBreaks)}</div>
       )}
       {hasContent(actions) && <div className="ds-banner__actions">{actions}</div>}
     </div>

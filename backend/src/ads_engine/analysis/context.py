@@ -1869,7 +1869,10 @@ class Evidence:
     depth, becomes a read-only mapping proxy, every list or tuple a tuple and every set a
     ``frozenset``. Neither a later change to the caller's objects nor a write through the
     stored values can therefore alter frozen evidence, and :meth:`to_json` still renders
-    plain JSON objects and arrays.
+    plain JSON objects and arrays. The copies :meth:`with_extra`, :meth:`with_headline` and
+    :meth:`with_thresholds` return freeze and check only the values they add, and share every
+    other field with the evidence they copy, which is deeply immutable already, so each item's
+    evidence is validated once however many precedence steps extend it.
 
     Attributes:
         window: ``AnalysisWindow.to_json()``: ``{start, end, days, source_days,
@@ -1952,14 +1955,43 @@ class Evidence:
         """Return a copy with ``values`` merged into :attr:`extra`; this evidence is unchanged.
 
         ``precedence.py`` uses it for B1/B3 allocation text and the expanded ``depends_on``.
-        The copy is constructed anew, so its ``window``, ``thresholds`` and ``extra`` (the
-        added ``values`` included) are fresh read-only trees that share no mutable object
-        with this evidence or with ``values``.
+        Only ``values`` are frozen and checked, exactly as construction freezes ``extra``: each
+        becomes a read-only tree of its own. The copy's ``extra`` is a new read-only mapping
+        over a fresh ``dict``: this evidence's entries in their order, a key already present
+        taking its new value in place, then the new keys. Every other field, and every existing
+        ``extra`` value, is shared with this evidence, because each is deeply immutable already.
+        The copy therefore shares no mutable object with this evidence or with ``values``, and
+        a later change to ``values`` cannot reach it.
 
         Raises:
             TypeError: When a value in ``values`` cannot be frozen (see :class:`Evidence`).
         """
-        return replace(self, extra={**self.extra, **values})
+        added = _frozen_mapping(values, "Evidence.extra")
+        return self._derived(extra=MappingProxyType({**self.extra, **added}))
+
+    def with_thresholds(self, values: Mapping[str, Any]) -> Evidence:
+        """Return a copy with ``values`` merged into :attr:`thresholds`; this one is unchanged.
+
+        ``precedence.py`` uses it to record the configured values a P4 or P5 judgement applied
+        (AAP 0.5.4.8). Only ``values`` are frozen and checked, exactly as construction freezes
+        ``thresholds``: string keys, every value a read-only tree of its own. The copy's
+        ``thresholds`` is a new read-only mapping over a fresh ``dict``: the recorded keys in
+        their order, a key already recorded taking its new value in place, then the new keys.
+        Every other field is shared with this evidence, because each is deeply immutable
+        already, so the copy shares no mutable object with this evidence or with ``values``.
+
+        Args:
+            values: ``{dotted threshold key: configured value}`` to record.
+
+        Returns:
+            The copy, with ``values`` recorded in ``thresholds``.
+
+        Raises:
+            TypeError: When ``values`` is not a mapping, has a key that is not a string, or
+                holds a value that cannot be frozen (see :class:`Evidence`).
+        """
+        added = _frozen_mapping(values, "Evidence.thresholds")
+        return self._derived(thresholds=MappingProxyType({**self.thresholds, **added}))
 
     def with_headline(self, metric: Metric) -> Evidence:
         """Return a copy that leads with ``metric``; this evidence is unchanged.
@@ -1968,8 +2000,10 @@ class Evidence:
         item's count of the recommendations its discrepancy holds. ``metric`` is appended after
         every existing metric, whose keys and order are kept, and ``extra.headline_metric``
         (:data:`EXTRA_HEADLINE_METRIC`) is set to its key, so the selection names a metric of
-        the copy. As with :meth:`with_extra`, the copy is constructed anew, so its ``window``,
-        ``thresholds`` and ``extra`` are fresh read-only trees that share no mutable object with
+        the copy. Only ``metric`` is checked, as construction checks each metric: its type, and
+        that its key is new. As with :meth:`with_extra`, the copy's ``extra`` is a new read-only
+        mapping over a fresh ``dict``, and every other field is shared with this evidence,
+        because each is deeply immutable already, so the copy shares no mutable object with
         this evidence.
 
         Args:
@@ -1981,7 +2015,7 @@ class Evidence:
         Raises:
             TypeError: When ``metric`` is not a :class:`Metric`.
             ValueError: When this evidence already names a headline metric, or one of its
-                metrics already has ``metric.key`` (raised by the copy's construction).
+                metrics already has ``metric.key``.
         """
         if not isinstance(metric, Metric):
             raise TypeError(f"Evidence.with_headline needs a Metric, found {metric!r}")
@@ -1990,11 +2024,39 @@ class Evidence:
                 f"evidence already names the headline metric "
                 f"{self.extra[EXTRA_HEADLINE_METRIC]!r}; {metric.key!r} cannot replace it"
             )
-        return replace(
-            self,
+        if any(existing.key == metric.key for existing in self.metrics):
+            raise ValueError(f"Evidence.metrics repeats the keys {[metric.key]}")
+        return self._derived(
             metrics=(*self.metrics, metric),
-            extra={**self.extra, EXTRA_HEADLINE_METRIC: metric.key},
+            extra=MappingProxyType({**self.extra, EXTRA_HEADLINE_METRIC: metric.key}),
         )
+
+    def _derived(
+        self,
+        *,
+        metrics: tuple[Metric, ...] | None = None,
+        thresholds: Mapping[str, Any] | None = None,
+        extra: Mapping[str, Any] | None = None,
+    ) -> Evidence:
+        """Return a copy of this evidence with the given fields replaced, skipping validation.
+
+        The copy is assembled field by field, bypassing ``__init__`` and :meth:`__post_init__`:
+        the fields taken from this evidence were frozen and validated when it was built and
+        are deeply immutable, so they are shared, never copied or checked again. Every
+        replacement must already be frozen and validated by the caller (:meth:`with_extra`,
+        :meth:`with_thresholds`, :meth:`with_headline`), so the copy holds exactly what
+        constructing it from the same values would hold.
+        """
+        copy = object.__new__(Evidence)
+        for name in _EVIDENCE_FIELDS:
+            object.__setattr__(copy, name, getattr(self, name))
+        if metrics is not None:
+            object.__setattr__(copy, "metrics", metrics)
+        if thresholds is not None:
+            object.__setattr__(copy, "thresholds", thresholds)
+        if extra is not None:
+            object.__setattr__(copy, "extra", extra)
+        return copy
 
     def to_json(self) -> dict[str, Any]:
         """Return exactly AAP 0.5.3 ``Evidence``.
@@ -2018,6 +2080,10 @@ class Evidence:
         if self.extra:
             rendered["extra"] = json_value(self.extra)
         return rendered
+
+
+_EVIDENCE_FIELDS: Final[tuple[str, ...]] = tuple(part.name for part in fields(Evidence))
+"""Every :class:`Evidence` field name, in declaration order, for ``Evidence._derived``."""
 
 
 def _unique_flags(flags: tuple[Flag, ...]) -> tuple[Flag, ...]:

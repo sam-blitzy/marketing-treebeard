@@ -8,7 +8,9 @@ tests call the route function directly on real PostgreSQL and show that the page
 log's contract: newest first with the ``id`` tie-break across and within datasets, a limit
 that cuts the merged order (also when one dataset holds every newest row), only the active
 datasets' rows, the ``subject_type`` and ``subject_id`` filters, the 422 for a
-``subject_id`` without its type, and the joined subject views and shared-member budget ids.
+``subject_id`` without its type, the 409 ``subject_retired`` for one subject's history when
+that subject belongs to a retired or building dataset (an unknown id still lists nothing),
+and the joined subject views and shared-member budget ids.
 
 The tests run against the PostgreSQL 18 test database named by ``TEST_DATABASE_URL``
 (falling back to ``DATABASE_URL``). The module creates a private schema, builds every table
@@ -435,8 +437,6 @@ async def test_subject_type_restricts_the_log(
         ("google:member", DEFAULT_LIMIT, ("google_member_2", "google_member_1")),
         ("google:budget", DEFAULT_LIMIT, ("google_budget_2", "google_budget_1")),
         ("linkedin:campaign", DEFAULT_LIMIT, ("linkedin_campaign_2", "linkedin_campaign_1")),
-        ("retired:campaign", DEFAULT_LIMIT, ()),
-        ("retired:budget", DEFAULT_LIMIT, ()),
     ],
     ids=[
         "campaign",
@@ -444,15 +444,13 @@ async def test_subject_type_restricts_the_log(
         "shared-member",
         "budget",
         "linkedin-campaign",
-        "retired-campaign",
-        "retired-budget",
     ],
 )
 async def test_subject_id_lists_one_subjects_history(
     session: AsyncSession, subject: str, limit: int, expected: tuple[str, ...]
 ) -> None:
     """``subject_type`` with ``subject_id`` lists that subject's active history, newest
-    first; a subject of the retired dataset lists nothing."""
+    first."""
     world = await _seed(session)
     subject_type: schemas.SubjectType = "budget" if subject.endswith(":budget") else "campaign"
 
@@ -468,6 +466,72 @@ async def test_subject_id_lists_one_subjects_history(
     assert {(view.subject.type, view.subject.id) for view in views} <= {
         (subject_type, world.subjects[subject])
     }
+
+
+def _retired_message(subject_type: str, subject_id: int) -> str:
+    """The 409 ``subject_retired`` message for a subject outside the active datasets."""
+    return (
+        f"{subject_type.capitalize()} {subject_id} does not belong to an active dataset; "
+        "decisions apply only to the active dataset's subjects"
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+@pytest.mark.parametrize(
+    "subject",
+    ["retired:campaign", "retired:member", "retired:budget"],
+    ids=["retired-campaign", "retired-shared-member", "retired-budget"],
+)
+async def test_a_subject_of_a_retired_dataset_is_refused_as_retired(
+    session: AsyncSession, subject: str
+) -> None:
+    """One subject's history is a 409 ``subject_retired`` when the subject belongs to a
+    retired dataset, though that dataset holds decisions about it: an empty list would read
+    as a subject with nothing decided yet."""
+    world = await _seed(session)
+    subject_type: schemas.SubjectType = "budget" if subject.endswith(":budget") else "campaign"
+    subject_id = world.subjects[subject]
+
+    with pytest.raises(ApiError) as caught:
+        await list_decisions(USER, session, subject_type=subject_type, subject_id=subject_id)
+
+    assert caught.value.status_code == 409
+    assert caught.value.code == "subject_retired"
+    assert caught.value.message == _retired_message(subject_type, subject_id)
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_a_subject_of_a_building_dataset_is_refused_as_retired(
+    session: AsyncSession,
+) -> None:
+    """A subject of a dataset still building is not an active dataset's subject either:
+    its history is a 409 ``subject_retired``, as ``POST /decisions`` answers it."""
+    await _seed(session)
+    building = await _dataset(session, "linkedin", "building")
+    account = await _account(session, "linkedin", building, "EUR")
+    campaign = await _campaign(session, "linkedin", building, account, name="Sponsored Content")
+
+    with pytest.raises(ApiError) as caught:
+        await list_decisions(USER, session, subject_type="campaign", subject_id=campaign)
+
+    assert (caught.value.status_code, caught.value.code) == (409, "subject_retired")
+    assert caught.value.message == _retired_message("campaign", campaign)
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_an_unknown_subject_lists_nothing(session: AsyncSession) -> None:
+    """An id no campaign or budget carries lists nothing rather than a 409: there is no
+    subject whose dataset could have been replaced."""
+    world = await _seed(session)
+    unknown = max(world.subjects.values()) + 1
+    subject_types: tuple[schemas.SubjectType, ...] = ("campaign", "budget")
+
+    for subject_type in subject_types:
+        views = await list_decisions(USER, session, subject_type=subject_type, subject_id=unknown)
+        assert views == [], subject_type
 
 
 @pytest.mark.anyio
@@ -486,7 +550,8 @@ async def test_subject_id_without_subject_type_is_rejected(session: AsyncSession
 @pytest.mark.anyio
 @pytest.mark.db
 async def test_no_active_dataset_lists_nothing(session: AsyncSession) -> None:
-    """With no active primary dataset the log is empty, whatever a retired dataset holds."""
+    """With no active primary dataset the log is empty, whatever a retired dataset holds;
+    that dataset's subject is refused as retired, and an unknown subject lists nothing."""
     retired = await _dataset(session, "google", "retired")
     account = await _account(session, "google", retired, "USD")
     campaign = await _campaign(session, "google", retired, account, name="Brand Search")
@@ -507,7 +572,12 @@ async def test_no_active_dataset_lists_nothing(session: AsyncSession) -> None:
 
     assert await list_decisions(USER, session) == []
     assert await list_decisions(USER, session, subject_type="campaign") == []
-    assert await list_decisions(USER, session, subject_type="campaign", subject_id=campaign) == []
+    with pytest.raises(ApiError) as caught:
+        await list_decisions(USER, session, subject_type="campaign", subject_id=campaign)
+    assert (caught.value.status_code, caught.value.code) == (409, "subject_retired")
+    assert caught.value.message == _retired_message("campaign", campaign)
+    unknown = campaign + 1
+    assert await list_decisions(USER, session, subject_type="campaign", subject_id=unknown) == []
 
 
 @pytest.mark.anyio

@@ -1010,9 +1010,11 @@ def test_with_extra_returns_an_independent_frozen_tree() -> None:
         "depends_on": ({"type": "campaign", "id": 7},),
     }
     assert evidence.extra == {"rows": ({"spend": Decimal("1.50")},)}
+    # Only the added values are frozen anew: the copy's ``extra`` is a new read-only mapping,
+    # while the unchanged fields and values, deeply immutable already, are shared.
     assert extended.extra is not evidence.extra
-    assert extended.extra["rows"][0] is not evidence.extra["rows"][0]
-    assert extended.window is not evidence.window
+    assert extended.extra["rows"] is evidence.extra["rows"]
+    assert extended.window is evidence.window
     with pytest.raises(TypeError):
         extended.extra["depends_on"][0]["id"] = 9
     with pytest.raises(TypeError):
@@ -1024,7 +1026,192 @@ def test_with_extra_returns_an_independent_frozen_tree() -> None:
     assert evidence.to_json()["extra"] == {"rows": [{"spend": "1.50"}]}
 
 
-def test_frozen_evidence_renders_the_json_its_input_renders() -> None:
+# -- cheap evidence copies: only the added values are frozen and checked -----------------------
+
+
+def _full_evidence() -> Evidence:
+    """Evidence with every field set, so a copy has every field to carry over."""
+    return Evidence(
+        window={
+            "start": "2026-09-07",
+            "end": "2026-10-04",
+            "days": 28,
+            "source_days": _source_days(),
+        },
+        metrics=(
+            Metric("spend", "Spend", Decimal("12.340000"), "currency", currency="USD"),
+            Metric("clicks", "Clicks", 40, "clicks"),
+        ),
+        baselines=(Baseline("cpa", "Account CPA", Decimal("40.5")),),
+        sample=Sample(10, 7, "days"),
+        test=TestResult("z", Decimal("0.2"), Decimal("0.4"), Decimal("0.05")),
+        thresholds={"c1.min_spend_day_share": 0.7, "window.presets": [14, 28]},
+        datasets=(DatasetStatus("google.metrics_daily", "complete", date(2026, 10, 4)),),
+        provenance=(ProvenanceEntry("google", 11, "live", "primary"),),
+        extra={"rows": [{"spend": Decimal("1.50")}], "tokens": {"crm"}, "note": "kept"},
+    )
+
+
+def _rebuilt(evidence: Evidence, **fields: Any) -> Evidence:
+    """``evidence`` constructed anew with ``fields`` replaced: the full freeze and validation."""
+    return dataclasses.replace(evidence, **fields)
+
+
+def test_cheap_copies_equal_a_full_rebuild_of_the_same_values() -> None:
+    """``with_extra``, ``with_thresholds`` and ``with_headline`` hold what a rebuild would hold.
+
+    Each copy equals the evidence constructed anew from the merged values, field by field and
+    in its JSON, key order included: a key already present keeps its position.
+    """
+    evidence = _full_evidence()
+    values: dict[str, Any] = {
+        "note": "replaced",
+        "depends_on": [{"type": "campaign", "id": 7}],
+        "nested": {"k": [1, [2, {3}]], "at": NOW, "entity": _entity()},
+    }
+    applied: dict[str, Any] = {"sources.stale_after_hours": 24, "window.presets": [14, 28, 56]}
+    held = Metric("held_recommendations", "Recommendations held until resolved", 2, "items")
+
+    copies = {
+        "extra": (
+            evidence.with_extra(**values),
+            _rebuilt(evidence, extra={**evidence.extra, **values}),
+        ),
+        "thresholds": (
+            evidence.with_thresholds(applied),
+            _rebuilt(evidence, thresholds={**evidence.thresholds, **applied}),
+        ),
+        "headline": (
+            evidence.with_headline(held),
+            _rebuilt(
+                evidence,
+                metrics=(*evidence.metrics, held),
+                extra={**evidence.extra, "headline_metric": held.key},
+            ),
+        ),
+    }
+
+    for name, (copy, rebuilt) in copies.items():
+        assert copy == rebuilt, name
+        assert json.dumps(copy.to_json()) == json.dumps(rebuilt.to_json()), name
+    assert list(copies["extra"][0].extra) == ["rows", "tokens", "note", "depends_on", "nested"]
+    assert copies["extra"][0].extra["note"] == "replaced"
+    assert list(copies["thresholds"][0].thresholds) == [
+        "c1.min_spend_day_share",
+        "window.presets",
+        "sources.stale_after_hours",
+    ]
+    assert copies["thresholds"][0].thresholds["window.presets"] == (14, 28, 56)
+    assert evidence == _full_evidence()
+
+
+def test_cheap_copies_share_the_unchanged_fields_and_never_revalidate_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A copy is built without ``__post_init__``: unchanged frozen fields are the same objects.
+
+    The copy's changed mapping is a new read-only mapping, and the evidence it came from is
+    untouched, so each item's evidence is validated once however often precedence extends it.
+    """
+    evidence = _full_evidence()
+    constructions: list[Evidence] = []
+    real = Evidence.__post_init__
+
+    def counting(self: Evidence) -> None:
+        constructions.append(self)
+        real(self)
+
+    monkeypatch.setattr(Evidence, "__post_init__", counting)
+    extended = evidence.with_extra(depends_on=[{"type": "campaign", "id": 7}])
+    recorded = extended.with_thresholds({"sources.stale_after_hours": 24})
+    led = recorded.with_headline(Metric("held_recommendations", "Held", 1, "items"))
+
+    assert constructions == []
+    for copy in (extended, recorded, led):
+        for name in ("window", "baselines", "sample", "test", "datasets", "provenance"):
+            assert getattr(copy, name) is getattr(evidence, name), name
+        assert copy.extra["rows"] is evidence.extra["rows"]
+        assert copy.thresholds["window.presets"] is evidence.thresholds["window.presets"]
+    assert extended.thresholds is evidence.thresholds
+    assert extended.metrics is evidence.metrics
+    assert recorded.extra is extended.extra
+    assert led.thresholds is recorded.thresholds
+    assert led.metrics[:2] == evidence.metrics
+    for mapping in (extended.extra, recorded.thresholds, led.extra):
+        assert type(mapping) is MappingProxyType
+    with pytest.raises(TypeError):
+        recorded.thresholds["sources.stale_after_hours"] = 1  # type: ignore[index]
+    with pytest.raises(TypeError):
+        led.extra["headline_metric"] = "spend"  # type: ignore[index]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        led.extra = {}  # type: ignore[misc]
+    assert "depends_on" not in evidence.extra
+    assert "sources.stale_after_hours" not in evidence.thresholds
+    assert [metric.key for metric in evidence.metrics] == ["spend", "clicks"]
+
+
+def test_cheap_copies_freeze_the_added_values_and_ignore_later_changes_to_them() -> None:
+    """Added dicts become read-only mappings, lists tuples and sets frozensets, at any depth.
+
+    Changing the caller's objects after the call reaches neither the copy nor the original.
+    """
+    evidence = _full_evidence()
+    row: dict[str, Any] = {"spend": Decimal("2.50"), "terms": ["crm", "erp"], "tags": {"a"}}
+    rows: list[dict[str, Any]] = [row]
+    presets: list[int] = [14, 28, 56, 90]
+    applied: dict[str, Any] = {"window.presets_offered": presets}
+
+    extended = evidence.with_extra(added_rows=rows)
+    recorded = evidence.with_thresholds(applied)
+    row["spend"] = Decimal(0)
+    row["terms"].append("cdp")
+    row["tags"].add("b")
+    rows.append({"spend": Decimal(9)})
+    presets.append(180)
+    applied["sources.stale_after_hours"] = 24
+
+    frozen_rows = extended.extra["added_rows"]
+    assert type(frozen_rows) is tuple
+    assert type(frozen_rows[0]) is MappingProxyType
+    assert type(frozen_rows[0]["terms"]) is tuple
+    assert type(frozen_rows[0]["tags"]) is frozenset
+    assert frozen_rows == (
+        {"spend": Decimal("2.50"), "terms": ("crm", "erp"), "tags": frozenset({"a"})},
+    )
+    assert recorded.thresholds["window.presets_offered"] == (14, 28, 56, 90)
+    assert "sources.stale_after_hours" not in recorded.thresholds
+    with pytest.raises(TypeError):
+        frozen_rows[0]["spend"] = Decimal(1)
+    assert evidence == _full_evidence()
+
+
+def test_cheap_copies_still_reject_what_construction_rejects() -> None:
+    """Invalid added values raise as construction would, and leave the evidence unchanged.
+
+    Unfreezable values, frozen records with mutable fields, non-string or non-mapping
+    thresholds and a repeated metric key are all refused.
+    """
+    evidence = _full_evidence()
+    before = evidence.to_json()
+
+    with pytest.raises(TypeError, match=r"^Evidence\.extra\['rows'\]\[0\]\['raw'\] must be"):
+        evidence.with_extra(rows=[{"raw": bytearray(b"x")}])
+    with pytest.raises(TypeError, match=r"Evidence\.extra\['row'\] " + _DICT_FIELD):
+        evidence.with_extra(row=_DictRecord({"values": [1]}))
+    with pytest.raises(TypeError, match=r"Evidence\.extra\['row'\].*_MutableRow"):
+        evidence.with_extra(row=_MutableRow(Decimal(1)))
+    with pytest.raises(TypeError, match=r"^Evidence\.thresholds keys must be strings, found 1$"):
+        evidence.with_thresholds({1: 2})  # type: ignore[dict-item]
+    with pytest.raises(TypeError, match=r"^Evidence\.thresholds must be a mapping, found"):
+        evidence.with_thresholds([("k", 1)])  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match=r"^Evidence\.thresholds\['k'\] must be"):
+        evidence.with_thresholds({"k": object()})
+    with pytest.raises(TypeError, match=r"whose field 'values' holds a list"):
+        evidence.with_thresholds({"k": _ListRecord([1])})
+    with pytest.raises(ValueError, match=r"^Evidence\.metrics repeats the keys \['clicks'\]$"):
+        evidence.with_headline(Metric("clicks", "Clicks again", 1, "clicks"))
+    assert evidence.to_json() == before
+
     window: dict[str, Any] = {
         "start": "2026-09-07",
         "end": "2026-10-04",

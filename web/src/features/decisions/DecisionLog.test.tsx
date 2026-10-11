@@ -1529,4 +1529,47 @@ describe('DecisionLog "Record decision"', () => {
     expect(emeaRecord().disabled).toBe(true);
     expect(posts(api)).toHaveLength(1);
   });
+
+  it('locks a subject whose form read is refused as retired, focusing it once closed', async () => {
+    // The log was read before the dataset was replaced; the form's own read of the subject
+    // answers 409 subject_retired (AAP 0.3.2, 0.5.5).
+    const api = mockApi({
+      ...twoSubjectHandlers(apiError(500, 'unexpected', 'No save is expected.')),
+      [formKey('campaign', FIXTURE_CAMPAIGN_IDS.pipelineEmea)]: apiError(
+        409,
+        'subject_retired',
+        'Campaign 501 does not belong to an active dataset.',
+      ),
+    });
+
+    await renderLog();
+    await findTable('Lead Gen — Pipeline Report EMEA');
+    const record = emeaRecord();
+    record.focus();
+    fireEvent.click(record);
+    const dialog = await screen.findByRole('dialog', { name: 'Record decision' });
+
+    // The form shows the refusal alone, never as a subject with nothing decided.
+    expect(await within(dialog).findByText('Computed from replaced data')).toBeTruthy();
+    expect(
+      within(dialog).queryByText('No decided state is recorded for this subject yet.'),
+    ).toBeNull();
+    expect(within(dialog).queryByRole('button', { name: 'Save decision' })).toBeNull();
+    await waitFor(() => {
+      expect(emeaRecord().disabled).toBe(true);
+    });
+
+    // Once closed, the dialog cannot return focus to the now disabled opener, so the region's
+    // banner takes it.
+    fireEvent.click(buttonNamed('Close', dialog));
+    const failure = await findFailure('Computed from replaced data');
+    await waitFor(() => {
+      expect(document.activeElement).toBe(failure);
+    });
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(posts(api)).toHaveLength(0);
+    // Only that subject is locked.
+    fireEvent.click(budgetRecord());
+    expect(await screen.findByRole('dialog', { name: 'Record decision' })).toBeTruthy();
+  });
 });

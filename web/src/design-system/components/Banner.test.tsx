@@ -186,6 +186,26 @@ describe('Banner', () => {
     }
   });
 
+  it('keeps each date of a string title and content whole, with identifier breaks between', () => {
+    const title = 'Custom window 2026-08-15 – 2026-10-09';
+    const content = 'Stale since 2026-10-01: HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY not read.';
+    const { container } = render(<Banner title={title}>{content}</Banner>);
+
+    const titleNode = container.querySelector('.ds-banner__title');
+    const contentNode = container.querySelector('.ds-banner__content');
+    // The dates keep their stored characters, so the text and accessible text are unchanged.
+    expect(titleNode?.textContent).toBe(title);
+    expect(contentNode?.textContent).toBe(content);
+    expect(titleNode?.innerHTML).toBe(
+      '<span>Custom window <span class="ds-whole-date">2026-08-15</span> – ' +
+        '<span class="ds-whole-date">2026-10-09</span></span>',
+    );
+    expect(
+      [...(contentNode?.querySelectorAll('.ds-whole-date') ?? [])].map((date) => date.textContent),
+    ).toEqual(['2026-10-01']);
+    expect(contentNode?.querySelectorAll('wbr')).toHaveLength(4);
+  });
+
   it('leaves a title without a long identifier, and element content, as given', () => {
     const { container } = render(
       <Banner title="Simulated data: Google (DATA_MODE=simulated)">

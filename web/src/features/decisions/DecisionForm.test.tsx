@@ -2156,3 +2156,426 @@ describe('DecisionForm: the outcome onDone reports', () => {
     expect(onDone.mock.calls).toEqual([[]]);
   });
 });
+
+// The API refuses an amount of 10^12 or more with 422 `invalid_amount` (`_MAX_AMOUNT` in the
+// backend's decisions.py, the integer digits numeric(18,6) holds), so the field refuses it first.
+describe('DecisionForm: the amount bound of 10^12 (AAP 0.5.2 invalid_amount)', () => {
+  const BOUND_MESSAGE = 'Enter an amount below 1,000,000,000,000';
+
+  it.each([
+    ['1234567890123', 'a 13-digit amount'],
+    ['1000000000000', 'exactly 10^12'],
+    ['1000000000000.000000', '10^12 with trailing zeroes'],
+    ['0001000000000000', '10^12 behind leading zeroes'],
+  ])('refuses %j, %s, on its field and posts nothing', async (value) => {
+    const api = mockApi({ [logKey(OWN_BUDGET)]: json(200, [makeDecision('own_budget')]) });
+    await renderForm({ subject: OWN_BUDGET });
+    const region = formStatus();
+
+    typeInto(amountInput('Daily budget'), value);
+
+    expect(screen.getByText(BOUND_MESSAGE)).toBeDefined();
+    expect(amountInput('Daily budget').getAttribute('aria-invalid')).toBe('true');
+    expect(formStatus()).toBe(region);
+    expect(region.textContent).toBe(`1 error: Daily budget: ${BOUND_MESSAGE}.`);
+    expect(saveButton()).toHaveProperty('disabled', true);
+    expect(saveButton().getAttribute('aria-describedby')).toBe(region.id);
+    expect(screen.queryByText('No change from the last decided state')).toBeNull();
+
+    fireEvent.submit(formOf(saveButton()));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(postsOf(api)).toHaveLength(0);
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('names the size before the precision of an amount that breaks both', async () => {
+    mockApi({ [logKey(LINKEDIN_CAMPAIGN)]: json(200, [linkedinDecision()]) });
+    await renderForm({ subject: LINKEDIN_CAMPAIGN });
+
+    typeInto(amountInput('Daily budget'), '1234567890123.456');
+
+    expect(screen.getByText(BOUND_MESSAGE)).toBeDefined();
+    expect(screen.queryByText('Use at most 2 decimal places')).toBeNull();
+    expect(formStatus().textContent).toBe(`1 error: Daily budget: ${BOUND_MESSAGE}.`);
+  });
+
+  it('refuses 10^12 in an intended state too, posting no resolution', async () => {
+    const api = mockApi({ [logKey(OWN_BUDGET)]: json(200, []) });
+    await renderForm({
+      subject: OWN_BUDGET,
+      mode: 'intended_state',
+      discrepancy: makeDiscrepancy('untracked'),
+    });
+
+    typeInto(amountInput('Daily budget'), '1000000000000');
+
+    expect(screen.getByText(BOUND_MESSAGE)).toBeDefined();
+    expect(amountInput('Daily budget').getAttribute('aria-invalid')).toBe('true');
+    expect(formStatus().textContent).toBe(`1 error: Daily budget: ${BOUND_MESSAGE}.`);
+    expect(saveButton('Save intended state')).toHaveProperty('disabled', true);
+    fireEvent.submit(formOf(saveButton('Save intended state')));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(postsOf(api)).toHaveLength(0);
+  });
+
+  it.each([
+    ['999999999999.99', '999999999999.99'],
+    ['999999999999.999999', '999999999999.999999'],
+    ['0999999999999', '0999999999999'],
+  ])('accepts %j on Google, just below the bound, and posts it as typed', async (value, posted) => {
+    const onDone = vi.fn<() => void>();
+    const api = mockApi({
+      [logKey(OWN_BUDGET)]: json(200, [makeDecision('own_budget')]),
+      'POST /decisions': json(201, makeDecision('own_budget', { daily_budget: value })),
+    });
+    await renderForm({ subject: OWN_BUDGET, onDone });
+
+    typeInto(amountInput('Daily budget'), value);
+    expect(amountInput('Daily budget').getAttribute('aria-invalid')).toBeNull();
+    expect(screen.queryByText(BOUND_MESSAGE)).toBeNull();
+    expect(formStatus().childNodes).toHaveLength(0);
+    expect(saveButton()).toHaveProperty('disabled', false);
+    fireEvent.click(saveButton());
+
+    await waitFor(() => {
+      expect(onDone).toHaveBeenCalledTimes(1);
+    });
+    expect(onlyCall(api, 'POST', '/decisions').body).toEqual({
+      subject: { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.brandSearch },
+      patch: { daily_budget: posted },
+    });
+  });
+
+  it('accepts the largest EUR amount below the bound on LinkedIn', async () => {
+    mockApi({ [logKey(LINKEDIN_CAMPAIGN)]: json(200, [linkedinDecision()]) });
+    await renderForm({ subject: LINKEDIN_CAMPAIGN });
+
+    typeInto(amountInput('Daily budget'), '999999999999.99');
+
+    expect(amountInput('Daily budget').getAttribute('aria-invalid')).toBeNull();
+    expect(saveButton()).toHaveProperty('disabled', false);
+  });
+
+  it.each([
+    ['Google', OWN_BUDGET, makeDecision('own_budget'), '0.000001', '999999999999.999999'],
+    ['EUR LinkedIn', LINKEDIN_CAMPAIGN, linkedinDecision(), '0.01', '999999999999.99'],
+    [
+      'JPY LinkedIn',
+      LINKEDIN_CAMPAIGN,
+      linkedinDecision({
+        subject: linkedinSubject('JPY'),
+        daily_budget: '1500',
+        total_budget: null,
+      }),
+      '1',
+      '999999999999',
+    ],
+    [
+      'KWD LinkedIn',
+      LINKEDIN_CAMPAIGN,
+      linkedinDecision({ subject: linkedinSubject('KWD'), daily_budget: '50', total_budget: null }),
+      '0.001',
+      '999999999999.999',
+    ],
+  ] as const)(
+    'caps the %s amount input at the largest amount below 10^12 on its step',
+    async (_subject, subject, decision, step, max) => {
+      mockApi({ [logKey(subject)]: json(200, [decision]) });
+      await renderForm({ subject });
+
+      const input = amountInput('Daily budget');
+      expect(input.getAttribute('min')).toBe('0');
+      expect(input.getAttribute('step')).toBe(step);
+      expect(input.getAttribute('max')).toBe(max);
+      // The form validates itself, so the browser never blocks a submission on its own.
+      expect(formOf(input).noValidate).toBe(true);
+    },
+  );
+});
+
+// AAP 0.5.5: "A 409 subject_retired from a stale screen is shown as the same message" ("Computed
+// from replaced data"), with every action disabled (AAP 0.3.2). The subject's log lists active
+// datasets only, so once the subject is retired its refetch lists no decision, or, from an API
+// that refuses the read, answers 409 subject_retired itself; neither may turn the lock into "No
+// decided state is recorded for this subject yet."
+describe('DecisionForm: the retired lock outlasts every later read (AAP 0.5.5)', () => {
+  const RETIRED = 'Computed from replaced data';
+  const NO_STATE = 'No decided state is recorded for this subject yet.';
+
+  /** The 409 the API answers a save or a log read about a subject of a replaced dataset. */
+  const retiredError = () =>
+    apiError(
+      409,
+      'subject_retired',
+      'Campaign 501 does not belong to an active dataset; decisions apply only to the active ' +
+        "dataset's subjects",
+    );
+
+  /**
+   * The subject's log: the latest decision on the first read, then `later` on every refetch.
+   *
+   * @param later - What every read after the first answers.
+   * @returns The handler and the number of reads it has answered.
+   */
+  function logThen(later: MockResponse) {
+    const reads = { count: 0 };
+    const handler = () => {
+      reads.count += 1;
+      return reads.count === 1 ? json(200, [makeDecision('own_budget')]) : later;
+    };
+    return { handler, reads };
+  }
+
+  /** Whether keyboard focus is on the retired banner or the focus target wrapping it. */
+  function focusIsOnRetiredBanner(): boolean {
+    const active = document.activeElement;
+    return (
+      active !== null && active !== document.body && active.contains(screen.getByText(RETIRED))
+    );
+  }
+
+  it.each([
+    // An API that lists only active datasets' decisions: the form gives way to the banner alone.
+    ['lists no decision', json(200, []), false],
+    // An API that refuses the read: the last read's state stays, locked, under the banner.
+    ['is refused with 409 subject_retired', retiredError(), true],
+  ])('keeps the lock after a refused save when the refetch %s', async (_label, later, kept) => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const log = logThen(later);
+      const onRetired = vi.fn<() => void>();
+      const onCancel = vi.fn<() => void>();
+      mockApi({ [logKey(OWN_BUDGET)]: log.handler, 'POST /decisions': retiredError() });
+      await renderForm({
+        subject: OWN_BUDGET,
+        prefill: { daily_budget: '251.00' },
+        onRetired,
+        onCancel,
+      });
+
+      fireEvent.click(saveButton());
+      expect(await screen.findByText(RETIRED)).toBeDefined();
+      await waitFor(() => {
+        expect(focusIsOnRetiredBanner()).toBe(true);
+      });
+
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      expect(log.reads.count).toBe(2);
+
+      expect(screen.getByText(RETIRED)).toBeDefined();
+      expect(screen.queryByText(NO_STATE)).toBeNull();
+      if (kept) {
+        expect(saveButton()).toHaveProperty('disabled', true);
+        expect(amountInput('Daily budget')).toHaveProperty('disabled', true);
+      } else {
+        expect(screen.queryByRole('button', { name: 'Save decision' })).toBeNull();
+        expect(screen.queryByRole('spinbutton')).toBeNull();
+      }
+      // Focus the refused save put on the message stays on it, also once the form is replaced
+      // (WCAG 2.2 SC 2.4.3).
+      await waitFor(() => {
+        expect(focusIsOnRetiredBanner()).toBe(true);
+      });
+      expect(screen.queryByRole('alert')).toBeNull();
+      // The refused save reported the retirement; a refused read of it reports nothing more.
+      expect(onRetired).toHaveBeenCalledTimes(1);
+      expect(onCancel).not.toHaveBeenCalled();
+
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      expect(screen.getByText(RETIRED)).toBeDefined();
+      expect(screen.queryByText(NO_STATE)).toBeNull();
+      expect(onRetired).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('shows the retired banner alone when the first read is refused, and calls onRetired once', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const onRetired = vi.fn<() => void>();
+      const onFailed = vi.fn<(message: string, error: unknown) => void>();
+      const api = mockApi({ [logKey(OWN_BUDGET)]: retiredError() });
+      await renderForm({
+        subject: OWN_BUDGET,
+        prefill: { status: 'paused' },
+        recommendationId: FIXTURE_ITEM_IDS.c1,
+        onRetired,
+        onFailed,
+      });
+
+      expect(screen.getByText(RETIRED)).toBeDefined();
+      expect(screen.queryByText(NO_STATE)).toBeNull();
+      // The API's own wording, which names internals, is never shown.
+      expect(screen.queryByText(/does not belong to an active dataset/)).toBeNull();
+      expect(screen.queryByRole('button', { name: 'Save decision' })).toBeNull();
+      expect(screen.queryByRole('combobox')).toBeNull();
+      expect(screen.queryByRole('alert')).toBeNull();
+      await waitFor(() => {
+        expect(onRetired).toHaveBeenCalledTimes(1);
+      });
+      expect(onFailed).not.toHaveBeenCalled();
+
+      // The refusal is final: polling stops, and the lock is reported no second time.
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS * 2));
+      expect(callsTo(api, 'GET', '/decisions')).toHaveLength(1);
+      expect(screen.getByText(RETIRED)).toBeDefined();
+      expect(onRetired).toHaveBeenCalledTimes(1);
+      expect(postsOf(api)).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('locks a loaded form when a later read is refused with 409 subject_retired', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const log = logThen(retiredError());
+      const onRetired = vi.fn<() => void>();
+      const api = mockApi({ [logKey(OWN_BUDGET)]: log.handler });
+      await renderForm({
+        subject: OWN_BUDGET,
+        prefill: { daily_budget: '251.00' },
+        onRetired,
+        onCancel: () => undefined,
+      });
+      expect(saveButton()).toHaveProperty('disabled', false);
+      expect(screen.queryByText(RETIRED)).toBeNull();
+
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      expect(log.reads.count).toBe(2);
+
+      // The last decided state is still shown, under the retired banner, with every control off.
+      expect(await screen.findByText(RETIRED)).toBeDefined();
+      expect(screen.getByText('Last decided: Active · daily budget USD 200.00')).toBeDefined();
+      expect(statusSelect()).toHaveProperty('disabled', true);
+      expect(amountInput('Daily budget')).toHaveProperty('disabled', true);
+      expect(noteField()).toHaveProperty('disabled', true);
+      expect(saveButton()).toHaveProperty('disabled', true);
+      expect(screen.getByRole('button', { name: 'Cancel' })).toHaveProperty('disabled', true);
+      expect(screen.queryByText(NO_STATE)).toBeNull();
+      expect(screen.queryByRole('alert')).toBeNull();
+      await waitFor(() => {
+        expect(onRetired).toHaveBeenCalledTimes(1);
+      });
+
+      fireEvent.submit(formOf(saveButton()));
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(postsOf(api)).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('locks an intended state whose subject read is refused, first or on a later poll', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const onRetired = vi.fn<() => void>();
+      let reads = 0;
+      const api = mockApi({
+        // An untracked subject has no decision yet, so its log lists none until it is refused.
+        [logKey(OWN_BUDGET)]: () => {
+          reads += 1;
+          return reads === 1 ? json(200, []) : retiredError();
+        },
+      });
+      await renderForm({
+        subject: OWN_BUDGET,
+        mode: 'intended_state',
+        discrepancy: makeDiscrepancy('untracked'),
+        onRetired,
+      });
+      expect(saveButton('Save intended state')).toHaveProperty('disabled', false);
+
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      expect(reads).toBe(2);
+
+      // The discrepancy still resolves a state, so the locked fields stay readable under it.
+      expect(await screen.findByText(RETIRED)).toBeDefined();
+      expect(saveButton('Save intended state')).toHaveProperty('disabled', true);
+      expect(statusSelect()).toHaveProperty('disabled', true);
+      expect(screen.queryByText(NO_STATE)).toBeNull();
+      await waitFor(() => {
+        expect(onRetired).toHaveBeenCalledTimes(1);
+      });
+      fireEvent.submit(formOf(saveButton('Save intended state')));
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(postsOf(api)).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('shows the retired banner alone for an intended state whose first read is refused', async () => {
+    const onRetired = vi.fn<() => void>();
+    mockApi({ [logKey(OWN_BUDGET)]: retiredError() });
+    await renderForm({
+      subject: OWN_BUDGET,
+      mode: 'intended_state',
+      discrepancy: makeDiscrepancy('untracked'),
+      onRetired,
+    });
+
+    expect(screen.getByText(RETIRED)).toBeDefined();
+    expect(screen.queryByRole('button', { name: 'Save intended state' })).toBeNull();
+    expect(screen.queryByText(NO_STATE)).toBeNull();
+    await waitFor(() => {
+      expect(onRetired).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('starts unlocked for another subject after one subject was retired', async () => {
+    const other: SubjectIn = { type: 'campaign', id: FIXTURE_CAMPAIGN_IDS.genericCrm };
+    const onRetired = vi.fn<() => void>();
+    mockApi({
+      [logKey(OWN_BUDGET)]: retiredError(),
+      [logKey(other)]: json(200, [
+        makeDecision('own_budget', {
+          id: 805,
+          subject: {
+            type: 'campaign',
+            id: other.id,
+            name: 'Generic CRM — US',
+            source: 'google',
+            currency: 'USD',
+          },
+          daily_budget: '150.00',
+        }),
+      ]),
+    });
+
+    /** Renders the form on the retired subject, with a button that moves it to another. */
+    function SubjectSwitch() {
+      const [subject, setSubject] = useState<SubjectIn>(OWN_BUDGET);
+      return (
+        <>
+          <Button
+            onClick={() => {
+              setSubject(other);
+            }}
+          >
+            Switch subject
+          </Button>
+          <DecisionForm subject={subject} onRetired={onRetired} />
+        </>
+      );
+    }
+    await renderWithProviders(<SubjectSwitch />, { path: '/decisions' });
+    expect(await screen.findByText(RETIRED)).toBeDefined();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Switch subject' }));
+
+    expect(await screen.findByText('Last decided: Active · daily budget USD 150.00')).toBeDefined();
+    expect(screen.queryByText(RETIRED)).toBeNull();
+    expect(statusSelect()).toHaveProperty('disabled', false);
+    expect(onRetired).toHaveBeenCalledTimes(1);
+  });
+});

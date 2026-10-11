@@ -6,7 +6,8 @@ error shape, never a database error rendered as 500:
 * an id above the largest PostgreSQL ``bigint`` (``schemas.BIGINT_MAX``) in
   ``subject.id``, ``recommendation_id`` or the ``subject_id`` query is refused before any
   SQL runs, while the largest ``bigint`` itself still reaches the database: an unknown
-  ``subject_id`` lists nothing and an unknown ``recommendation_id`` is a 404;
+  ``subject_id`` lists nothing and an unknown ``recommendation_id`` is a 404, whereas the
+  ``subject_id`` of a subject whose dataset was retired is a 409 ``subject_retired``;
 * text PostgreSQL ``text`` cannot hold, U+0000 or an unpaired surrogate, in the login
   email or a decision note is refused before any SQL runs, and the message never repeats
   it, while an ordinary note, non-ASCII included, is stored exactly as sent.
@@ -470,6 +471,43 @@ async def test_the_largest_bigint_subject_id_query_lists_nothing(
     )
     assert known.status_code == 200, known.text
     assert [row["id"] for row in known.json()] == [world.baseline_id]
+
+
+@pytest.mark.anyio
+async def test_the_history_of_a_retired_subject_is_a_409_subject_retired(
+    sessions: Sessions, world: World, client: httpx.AsyncClient
+) -> None:
+    """One subject's history is 409 ``subject_retired`` in the AAP error shape once the
+    subject's dataset is retired, never an empty list a stale screen would read as "nothing
+    decided yet"; the same query listed its baseline while the dataset was active."""
+    await _sign_in(client, world)
+    params = {"subject_type": "campaign", "subject_id": world.campaign_id}
+    active = await client.get("/api/v1/decisions", params=params)
+    assert active.status_code == 200, active.text
+    assert [row["id"] for row in active.json()] == [world.baseline_id]
+
+    async with sessions() as session, session.begin():
+        await session.execute(
+            update(SourceDataset)
+            .where(SourceDataset.id == world.dataset_id)
+            .values(state="retired", retired_at=NOW)
+        )
+
+    retired = await client.get("/api/v1/decisions", params=params)
+    assert retired.status_code == 409, retired.text
+    assert retired.json() == {
+        "error": {
+            "code": "subject_retired",
+            "message": (
+                f"Campaign {world.campaign_id} does not belong to an active dataset; "
+                "decisions apply only to the active dataset's subjects"
+            ),
+        }
+    }
+    # The whole log still answers, without the retired dataset's rows.
+    log = await client.get("/api/v1/decisions")
+    assert log.status_code == 200, log.text
+    assert world.baseline_id not in [row["id"] for row in log.json()]
 
 
 def test_the_subject_id_query_documents_its_bigint_bounds_in_openapi() -> None:

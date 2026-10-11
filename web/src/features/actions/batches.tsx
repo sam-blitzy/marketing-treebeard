@@ -255,6 +255,14 @@ export interface BatchOptions<T> {
    * to the list's status instead.
    */
   readonly focusIdOf?: (entry: T, index: number) => string;
+  /**
+   * Whether an entry must be shown at once, such as the card or row of a recommendation whose
+   * card or row React has just removed elsewhere on the page while it held keyboard focus
+   * (`./carriedFocus`). After every commit of the list, the batches through the last such entry
+   * not shown yet are revealed, in the re-render React runs before the browser paints, and no
+   * focus moves: the entry takes focus itself. Omitted, no entry is revealed this way.
+   */
+  readonly mustShow?: (entry: T) => boolean;
 }
 
 /** What {@link useBatches} returns: the entries to render and the state of the control. */
@@ -290,7 +298,8 @@ export interface Batches<T> {
  *
  * The hook keeps a reveal limit, a whole number of batches: one batch on mount, or every batch
  * through the entry the hash names. While the list stays mounted the limit never shrinks; it
- * grows by one batch per reveal and through the entry a `hashchange` names. The shown entries are
+ * grows by one batch per reveal, through the entry a `hashchange` names, and through the last
+ * entry `mustShow` holds for after a commit ({@link BatchOptions.mustShow}). The shown entries are
  * the first `min(limit, entries.length)` of the current list, so the last batch can be short, and
  * a list that shrinks, such as after a poll or once feedback hides a card, shows fewer entries.
  * When the list grows again, up to the same limit is shown.
@@ -308,7 +317,7 @@ export interface Batches<T> {
  */
 export function useBatches<T>(entries: readonly T[], options: BatchOptions<T>): Batches<T> {
   const batchSize = normalBatchSize(options.batchSize);
-  const { anchorsOf, focusIdOf } = options;
+  const { anchorsOf, focusIdOf, mustShow } = options;
   const baseId = useId();
   // The first render shows one batch, or, when the hash names a later entry, every batch
   // through it.
@@ -328,6 +337,26 @@ export function useBatches<T>(entries: readonly T[], options: BatchOptions<T>): 
 
   useLayoutEffect(() => {
     latest.current = { entries, anchorsOf, focusIdOf, limit, batchSize, baseId };
+  });
+
+  // After every commit: an entry beyond the shown batches that must be shown at once, such as a
+  // card taking over the focus of one the same commit removed elsewhere, is revealed with the
+  // batches through it. The update re-renders before the browser paints, and the entry mounts
+  // in that render.
+  useLayoutEffect(() => {
+    if (mustShow === undefined) {
+      return;
+    }
+    let last = -1;
+    for (let index = Math.min(limit, entries.length); index < entries.length; index += 1) {
+      const entry = entries[index];
+      if (entry !== undefined && mustShow(entry)) {
+        last = index;
+      }
+    }
+    if (last >= 0) {
+      setLimit((previous) => Math.max(previous, limitThrough(last, batchSize)));
+    }
   });
 
   const entryId = (index: number): string => `${baseId}-entry-${String(index)}`;
@@ -529,6 +558,8 @@ export interface BatchedListProps<T> {
   readonly anchorsOf?: (entry: T) => readonly string[];
   /** The id of the element that takes focus when the entry leads a reveal. */
   readonly focusIdOf: (entry: T, index: number) => string;
+  /** Whether an entry must be shown at once, see {@link BatchOptions.mustShow}. */
+  readonly mustShow?: (entry: T) => boolean;
 }
 
 /**
@@ -566,11 +597,14 @@ export function BatchedList<T>({
   renderEntry,
   anchorsOf,
   focusIdOf,
+  mustShow,
 }: BatchedListProps<T>): ReactElement {
-  const batches = useBatches(
-    entries,
-    anchorsOf === undefined ? { batchSize, focusIdOf } : { batchSize, anchorsOf, focusIdOf },
-  );
+  const batches = useBatches(entries, {
+    batchSize,
+    focusIdOf,
+    ...(anchorsOf === undefined ? {} : { anchorsOf }),
+    ...(mustShow === undefined ? {} : { mustShow }),
+  });
   return (
     <>
       {batches.shown.map((entry) => (

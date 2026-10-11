@@ -81,7 +81,7 @@ import {
 } from '../../../test/fixtures';
 import { LiveSection, feedbackConfirmationText, feedbackFlow } from '../../../test/feedbackFlow';
 import { renderWithProviders } from '../../../test/render';
-import { textWithoutTooltips } from '../../../test/text';
+import { byTextContent, textWithoutTooltips } from '../../../test/text';
 import { LARGE_RENDER_TEST_TIMEOUT_MS } from '../../../test/timeouts';
 import { formatMetric } from '../../../lib/format';
 import { flagText } from '../FlagList';
@@ -790,7 +790,9 @@ describe('WhitePapersSection', () => {
             'by record creation, so it is excluded from cost per meeting',
         ),
       ).toBeTruthy();
-      expect(within(details).getByText(/^2026-09-08 – 2026-10-05 · 28 days/u)).toBeTruthy();
+      expect(
+        within(details).getByText(byTextContent('.ds-badge', /^2026-09-08 – 2026-10-05 · 28 days/u)),
+      ).toBeTruthy();
       // White-paper rows carry no decision subject: Mark done, Dismiss and Snooze only.
       for (const name of ['Mark done', 'Dismiss', 'Snooze for 7 days']) {
         expect(within(details).getByRole('button', { name }).hasAttribute('disabled')).toBe(false);
@@ -2070,7 +2072,9 @@ describe('WhitePapersSection', () => {
       ]);
       const notes = within(details).getByRole('list', { name: `Notes on ${name}` });
       const flags = within(details).getByRole('list', { name: 'Flags' });
-      const chip = within(details).getByText(/^2026-09-08 – 2026-10-05 · 28 days/u);
+      const chip = within(details).getByText(
+        byTextContent('.ds-badge', /^2026-09-08 – 2026-10-05 · 28 days/u),
+      );
       expect(flags.compareDocumentPosition(notes) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
       expect(notes.compareDocumentPosition(chip) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
       // The asset's own counts are unchanged: the excluded events are reported, not added.
@@ -2164,7 +2168,9 @@ describe('WhitePapersSection', () => {
       expect(within(details).queryByText(/^Orphan-deal share:/u)).toBeNull();
       // The rest of the detail is unaffected.
       expect(within(details).getByRole('list', { name: 'Flags' })).toBeTruthy();
-      expect(within(details).getByText(/^2026-09-08 – 2026-10-05 · 28 days/u)).toBeTruthy();
+      expect(
+        within(details).getByText(byTextContent('.ds-badge', /^2026-09-08 – 2026-10-05 · 28 days/u)),
+      ).toBeTruthy();
     });
   });
 
@@ -2435,6 +2441,58 @@ describe('long white-paper tables', () => {
     expect(screen.queryByRole('button', { name: /^Show \d+ more/u })).toBeNull();
     expect(batchStatuses(screen.getByRole('region', { name: 'White papers' }))).toEqual([]);
   });
+
+  it('shows and focuses a moved row beyond the first batch of the replaced-data table', async () => {
+    const usd = cohortOf(pageItem(FIXTURE_ITEM_IDS.wUsd), 60, 9501, 'USD');
+    const section = (items: Item[]) =>
+      makeSection('white_papers', {
+        groups: [makeGroup({ key: 'cohort:USD', title: 'USD', items })],
+      });
+    const control: { show?: (next: Section) => void } = {};
+    function Host(): ReactElement {
+      const [shown, setShown] = useState(section(usd));
+      control.show = setShown;
+      return <WhitePapersSection section={shown} run={RUN} overlay={OVERLAY} />;
+    }
+    mockApi({ 'GET /config': json(200, makeConfig()) });
+    await renderWithProviders(<Host />);
+    await screen.findAllByRole('columnheader', { name: MQL_BOUND });
+    fireEvent.click(screen.getByRole('button', { name: 'Show 10 more white papers' }));
+    act(() => {
+      screen.getByRole('button', { name: 'Show details for USD asset 55 (USD)' }).focus();
+    });
+
+    act(() => {
+      control.show?.(
+        section(
+          usd.map((item) => ({
+            ...item,
+            current: makeItemOverlay({
+              historical: true,
+              held_now: true,
+              held_reason_now: 'Computed from data that has since been replaced',
+              data_status_now: 'live',
+            }),
+          })),
+        ),
+      );
+    });
+
+    const replacedTable = table('White papers (USD) computed from replaced data');
+    const moved = within(replacedTable).getByRole('button', {
+      name: 'Show details for USD asset 55 (USD, computed from replaced data)',
+    });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(moved);
+    });
+    // The table shows the batches through the moved row: here, every row, in API order.
+    const names = assetNames('USD', 60);
+    const headers = rowHeaders(replacedTable);
+    expect(headers).toHaveLength(names.length);
+    names.forEach((name, index) => {
+      expect(headers[index]?.startsWith(name)).toBe(true);
+    });
+  }, LARGE_RENDER_TEST_TIMEOUT_MS);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -2592,6 +2650,94 @@ describe('WhitePapersSection rendered again', () => {
     expect(within(details).getByText('Variant A (refreshed)')).toBeTruthy();
     expect(within(details).queryByText('Variant A')).toBeNull();
     expect(within(details).getByText('unknown creative')).toBeTruthy();
+  });
+
+  /** `item` as the overlay reads it once its frozen dataset has been replaced (AAP 0.3.2). */
+  function replaced(item: Item): Item {
+    return {
+      ...item,
+      current: makeItemOverlay({
+        historical: true,
+        held_now: true,
+        held_reason_now: 'Computed from data that has since been replaced',
+        data_status_now: 'live',
+      }),
+    };
+  }
+
+  /** The collapsed toggle of the row of `name` in its cohort's replaced-data table. */
+  function replacedToggle(name: string, currency: string): HTMLElement {
+    return within(table(`White papers (${currency}) computed from replaced data`)).getByRole(
+      'button',
+      { name: `Show details for ${name} (${currency}, computed from replaced data)` },
+    );
+  }
+
+  it("moves focus on a row's toggle to its toggle in the replaced-data table", async () => {
+    const section = defaultWhitePapers();
+    const show = await renderReplaceable(section);
+    const name = 'The 2026 B2B Pipeline Report';
+    const toggle = screen.getByRole('button', { name: `Show details for ${name} (EUR)` });
+    act(() => {
+      toggle.focus();
+    });
+
+    show(withItem(section, FIXTURE_ITEM_IDS.wEur, replaced));
+
+    const moved = replacedToggle(name, 'EUR');
+    await waitFor(() => {
+      expect(document.activeElement).toBe(moved);
+    });
+    expect(toggle.isConnected).toBe(false);
+    // The cohort's table keeps its other row; the moved row's Action cell says why it moved.
+    expect(within(table('White papers (EUR)')).getAllByRole('row')).toHaveLength(2);
+    expect(actionCell(table('White papers (EUR) computed from replaced data'), name).textContent).toContain(
+      'Computed from replaced data',
+    );
+  });
+
+  it("moves focus in a row's expanded details to its toggle in the replaced-data table", async () => {
+    const section = defaultWhitePapers();
+    const show = await renderReplaceable(section);
+    const item = pageItem(FIXTURE_ITEM_IDS.wUsd);
+    const name = String(item.entity.name);
+    fireEvent.click(screen.getByRole('button', { name: `Show details for ${name} (USD)` }));
+    const markDone = within(detailCell(name)).getByRole('button', { name: 'Mark done' });
+    act(() => {
+      markDone.focus();
+    });
+
+    // The cohort's only visible row: its table leaves the page with it.
+    show(withItem(section, item.id, replaced));
+
+    const moved = replacedToggle(name, 'USD');
+    await waitFor(() => {
+      expect(document.activeElement).toBe(moved);
+    });
+    expect(moved.getAttribute('aria-expanded')).toBe('false');
+    expect(markDone.isConnected).toBe(false);
+    expect(screen.queryByRole('table', { name: 'White papers (USD)' })).toBeNull();
+  });
+
+  it('leaves focus outside the moved row where it is', async () => {
+    const section = defaultWhitePapers();
+    const show = await renderReplaceable(section);
+    const other = screen.getByRole('button', {
+      name: `Show details for ${String(pageItem(FIXTURE_ITEM_IDS.wUsd).entity.name)} (USD)`,
+    });
+    act(() => {
+      other.focus();
+    });
+
+    show(withItem(section, FIXTURE_ITEM_IDS.wEur, replaced));
+
+    replacedToggle('The 2026 B2B Pipeline Report', 'EUR');
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+    expect(document.activeElement).toBe(other);
   });
 });
 

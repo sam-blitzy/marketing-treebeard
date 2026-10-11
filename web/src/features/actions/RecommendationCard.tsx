@@ -57,6 +57,15 @@
  * Keyboard focus, which the disabled or removed button lost, moves to the next card's first
  * enabled action, else the previous card's, else the section heading (WCAG 2.2 SC 2.4.3).
  *
+ * A refetch that finds an item computed from replaced data moves its card into the group's
+ * "Computed from replaced data" block, where React mounts it anew, so the card that left takes
+ * its open decision dialog and footer state with it. Keyboard focus that was inside that card,
+ * or in its open decision dialog, moves to the same item's card in the block: to its
+ * replaced-data line (the badge and the provenance, which say why every action is now disabled),
+ * else to the card itself, unless the user has moved focus elsewhere (`./carriedFocus`, WCAG 2.2
+ * SC 2.4.3). The same holds for any card React mounts anew in place of one of the same
+ * recommendation within one commit.
+ *
  * Every text on the card (action, headline metric label, reason, flag messages, held reason,
  * entity name) comes from the API, so no threshold, window length or rule wording is written
  * into the client (AAP 0.5.4.1). The flags row adds only each code's fixed AAP 0.5.5 label
@@ -84,13 +93,14 @@ import { Badge, Banner, Button, Card, Dialog, Inline, Stack } from '../../design
 import type { CardHeaderProps } from '../../design-system';
 import { formatMetric, formatWindowChip, sourceLabel } from '../../lib/format';
 import { DecisionForm } from '../decisions/DecisionForm';
-import { describeExpectedState } from '../decisions/DecisionLog';
+import { describeExpectedState } from '../decisions/expectedState';
 import { useActionOutcome, useRecordFeedbackConfirmation } from './ActionOutcomes';
 import { BlockingDiscrepancyLinks } from './BlockingDiscrepancies';
+import { useCarriedFocus, useFocusLeaving } from './carriedFocus';
 import { EvidenceTable, evidenceRatioDigits } from './EvidenceTable';
 import { decisionContextFor, headlineMetric, type DecisionContext } from './evidenceExtra';
 import { FlagList } from './FlagList';
-import { isHeld, itemIdentity } from './sections/SectionFrame';
+import { isHeld, itemAnchorId, itemIdentity } from './sections/SectionFrame';
 
 // ---------------------------------------------------------------------------------------------
 // Labels
@@ -461,10 +471,20 @@ function captureFocusOrigin(row: HTMLElement | null): FocusOrigin | null {
  * browser leaves it once the focused button is disabled or removed), on an element no longer in
  * the document, or inside `scope`. Anywhere else the user has moved focus, and it stays there.
  *
+ * Exported for the white-paper rows, which hand focus to their row's toggle by the same rule
+ * when a refetch moves a row into its replaced-data table (`./carriedFocus`).
+ *
  * @param scope - the element focus counts as still being in, such as a card's action row
  * @returns `true` when focus may be moved without taking it from where the user put it
+ *
+ * @example
+ * ```ts
+ * if (focusIsLostOrWithin(card)) {
+ *   card.focus();
+ * }
+ * ```
  */
-function focusIsLostOrWithin(scope: Element): boolean {
+export function focusIsLostOrWithin(scope: Element): boolean {
   const { activeElement, body } = scope.ownerDocument;
   return (
     activeElement === null ||
@@ -707,6 +727,14 @@ function closeDialogSession(current: DialogSession): DialogSession {
  * item already replaced never locks the item shown. A different recommendation rendered in the
  * same place starts with fresh state.
  *
+ * Actions moved to another place start with fresh state too: a refetch that finds the item
+ * computed from replaced data moves its card into the group's "Computed from replaced data"
+ * block (or its white-paper row into the replaced-data table), and React mounts the actions
+ * there anew, with the dialog closed. An open dialog owns keyboard focus, so the row notes that
+ * it leaves holding focus (`./carriedFocus`), and the item's card or row in the new place takes
+ * that focus: the card on its replaced-data line, else on the card itself
+ * ({@link RecommendationCard}), the row on its toggle (WCAG 2.2 SC 2.4.3).
+ *
  * @param props - see {@link RecommendationActionsProps}
  * @returns the actions, or `null` for a C0 item
  *
@@ -775,6 +803,11 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
   // Set when an open dialog's item lost its decision subject; consumed by the first commit
   // after it.
   const [refocusRow, setRefocusRow] = useState(false);
+  // An open dialog owns keyboard focus. When the row leaves the page with it, as when a refetch
+  // moves its card into the group's "Computed from replaced data" block, the item's card or row
+  // mounting in the new place takes focus over (`./carriedFocus`). Focus inside the row itself
+  // is noted by that card or row.
+  useFocusLeaving(itemIdentity(item), () => dialogOpen);
 
   // A newer run's item of the same recommendation has taken the item's place, before the
   // browser paints. The lock belongs to the previous run's item: the new one is judged by its
@@ -1139,6 +1172,16 @@ function hasContent(node: ReactNode): boolean {
  * each card is announced by what it recommends and can be linked to. Badges sit in `Inline`
  * rows, so each chip keeps its own width instead of stretching across the column.
  *
+ * Keyboard focus handoffs of the card itself (`./carriedFocus`, WCAG 2.2 SC 2.4.3): when React
+ * removes a card of the same recommendation elsewhere in the commit that mounts this one, while
+ * focus was inside it or in its open decision dialog, this card takes that focus once mounted,
+ * on its replaced-data line ("Computed from replaced data" and the provenance) when the item is
+ * historical, else on its `<article>` (`tabindex="-1"`, never a Tab stop). That is how focus
+ * follows a card a refetch moves from its group's visible cards into the "Computed from replaced
+ * data" block, and the reverse when a rerun makes the item current again. Focus the user has
+ * moved elsewhere in the meantime stays there. The footer's own handoffs are described at
+ * {@link RecommendationActions}.
+ *
  * @param props - see {@link RecommendationCardProps}
  * @returns the card
  *
@@ -1188,6 +1231,25 @@ export function RecommendationCard({
     ? historicalProvenanceText(item.evidence.provenance, item.current.data_status_now)
     : null;
 
+  // A card React mounts here in place of one of the same recommendation that left the page
+  // holding keyboard focus, such as a card a refetch moved into its group's "Computed from
+  // replaced data" block, takes that focus (WCAG 2.2 SC 2.4.3): on its replaced-data line, which
+  // says why its actions are disabled and its decision dialog closed, else on the card itself.
+  const anchorId = itemAnchorId(item.id);
+  const replacedLineRef = useRef<HTMLDivElement>(null);
+  useCarriedFocus(itemIdentity(item), {
+    holdsFocus: () => {
+      const card = document.getElementById(anchorId);
+      return card !== null && card.contains(document.activeElement);
+    },
+    takeFocus: () => {
+      const card = document.getElementById(anchorId);
+      if (card !== null && focusIsLostOrWithin(card)) {
+        moveFocusTo(replacedLineRef.current ?? card, true);
+      }
+    },
+  });
+
   let footer: ReactNode;
   if (isC0) {
     footer = resolver?.({ disabled: historical });
@@ -1196,7 +1258,7 @@ export function RecommendationCard({
   }
 
   return (
-    <Card id={`item-${item.id}`}>
+    <Card id={anchorId}>
       <Card.Header
         title={item.action}
         rank={String(item.rank)}
@@ -1213,10 +1275,14 @@ export function RecommendationCard({
         */}
         <Stack gap={3}>
           {provenanceText === null ? null : (
-            <Inline gap={2}>
-              <Badge tone="warning">{HISTORICAL_LABEL}</Badge>
-              <span>{provenanceText}</span>
-            </Inline>
+            // Unstyled focus target of a card that took focus over from one a refetch removed
+            // (`useCarriedFocus` above); Inline takes no ref, and the Inline inside lays it out.
+            <div ref={replacedLineRef}>
+              <Inline gap={2}>
+                <Badge tone="warning">{HISTORICAL_LABEL}</Badge>
+                <span>{provenanceText}</span>
+              </Inline>
+            </div>
           )}
           {heldReason === null ? null : (
             <Inline gap={2}>

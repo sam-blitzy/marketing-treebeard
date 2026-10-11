@@ -90,4 +90,19 @@ describe('Badge', () => {
       expect(wbr.previousSibling?.textContent?.endsWith('_')).toBe(true);
     }
   });
+
+  it('keeps each date of a string label whole in one inner span, keeping its text', () => {
+    const label = '2026-08-15 – 2026-10-09 · 56 days · Google days: America/New_York';
+    const { container } = render(<Badge>{label}</Badge>);
+
+    const chip = container.querySelector('.ds-badge');
+    expect(chip?.textContent).toBe(label);
+    // One inner span holds the runs and dates, so the chip's flex layout sees a single item.
+    expect(chip?.children).toHaveLength(1);
+    expect(chip?.firstElementChild?.tagName).toBe('SPAN');
+    expect(chip?.firstElementChild?.attributes).toHaveLength(0);
+    expect(
+      [...(chip?.querySelectorAll('.ds-whole-date') ?? [])].map((date) => date.textContent),
+    ).toEqual(['2026-08-15', '2026-10-09']);
+  });
 });

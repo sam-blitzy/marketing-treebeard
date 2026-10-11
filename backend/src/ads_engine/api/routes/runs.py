@@ -43,6 +43,11 @@ Decisions taken in this module, each stated where its code lives:
   sessions of its own; the request session has only read (the signed-in user and the window
   inputs), so it is rolled back before the computation to return its pooled connection rather
   than hold it idle in a transaction for the length of the run.
+* **The run computes in the API's analysis process.** ``run_analysis(..., isolated=True)``
+  takes the lock and writes the ``running`` row here, then loads, computes and persists the
+  run in the API's analysis process, a child with its own GIL at a lower CPU priority, so
+  this process keeps serving every other request at its usual latency while a large window
+  computes, and a contending ``POST /runs`` is answered 409 at once.
 
 The module imports nothing from ``connectors``, ``sync`` or ``simulation``, and it logs no
 email, secret or token: events carry run ids, dates and the user id only.
@@ -249,7 +254,10 @@ async def create_run(
 
     The runner takes the shared ``analysis`` lock that the worker and the CLI also take,
     so only one run executes at a time whichever process starts it. While any process holds
-    it, this route answers 409 ``run_in_progress`` without waiting.
+    it, this route answers 409 ``run_in_progress`` without waiting. The run's load,
+    computation and persistence execute in the API's analysis process
+    (``isolated=True``), so this process keeps serving other requests, and answering
+    contenders 409, while the run computes.
 
     Args:
         body: The window's first and last calendar dates, both inclusive.
@@ -270,6 +278,10 @@ async def create_run(
         InvalidWindow: When the window breaks a bound (422, rendered by ``api/app.py``).
         RunInProgress: When any process holds the analysis lock (409 ``run_in_progress``,
             rendered by ``api/app.py``).
+        BrokenProcessPool: When the analysis process died during the run; the run is
+            recorded failed and the next ``POST /runs`` spawns a fresh one (500).
+        AnalysisProcessError: When the analysis process could not report the run's outcome
+            (500).
     """
     window = await runner.custom_window(
         body.window_start,
@@ -290,6 +302,7 @@ async def create_run(
         thresholds=thresholds,
         now=now,
         display_timezone=settings.display_timezone,
+        isolated=True,
     )
     _log.info(
         "runs.custom_created",

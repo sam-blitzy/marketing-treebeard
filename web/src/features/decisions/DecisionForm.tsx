@@ -33,10 +33,19 @@
  *   step follows the same rule. Amounts are shown padded to the currency's minor unit, and
  *   finer digits are never rounded away, so an unchanged micro amount is posted exactly as the
  *   API sent it.
+ * - **Size follows the server.** The API refuses an amount of 10^12 or more with 422
+ *   `invalid_amount` (`_MAX_AMOUNT` in the backend's `decisions.py`, the twelve integer digits
+ *   `numeric(18,6)` holds), so the field refuses it first, as a field error that reads "Enter an
+ *   amount below 1,000,000,000,000". It is judged on the integer digits of the canonical text,
+ *   never on a number. The input's `max` is the largest amount below that bound at the accepted
+ *   places, such as `999999999999.99` USD or `999999999999.999999` on Google.
  * - **Errors are the API's.** 422 messages are shown as returned; a failure that is not an
  *   `ApiError`, whose text may carry internal detail, reads "The save failed." instead. A 409
- *   `subject_retired` locks the form for as long as it records about that subject (AAP 0.3.2)
- *   and is reported through `onRetired`, so the consumer locks its own actions too; a 409
+ *   `subject_retired`, whether a save or the subject's decision-log read answers it, locks the
+ *   form as "Computed from replaced data" for as long as it records about that subject (AAP
+ *   0.3.2, 0.5.5) and is reported once through `onRetired`, so the consumer locks its own
+ *   actions too. The lock outranks every state without a form: a later read that lists no
+ *   decision never turns it into "No decided state is recorded for this subject yet."; a 409
  *   `discrepancy_resolved` reads "Already resolved". Every failure but `subject_retired` is
  *   reported through `onFailed` with the text the form shows. Error banners never take
  *   `role="alert"`, which AAP 0.5.5 reserves for the discrepancy banner on `/actions`.
@@ -172,9 +181,12 @@ export interface DecisionFormProps {
    */
   onDone?: (decision?: Decision) => void;
   /**
-   * Called when a save is refused with 409 `subject_retired`, so the consumer can lock what
-   * else it shows for that subject (AAP 0.3.2): the form locks only itself. Like `onDone`, it is
-   * called even when the form unmounted while the request ran.
+   * Called once when the subject turns out to belong to a replaced dataset, so the consumer can
+   * lock what else it shows for that subject (AAP 0.3.2): the form locks only itself. Either a
+   * save is refused with 409 `subject_retired`, and like `onDone` the call then reaches the
+   * consumer even when the form unmounted while the request ran, or the subject's decision-log
+   * read answers it, as it does for a screen opened before the dataset was replaced, and the
+   * call comes from the mounted form. A second refusal for the same form identity calls nothing.
    */
   onRetired?: () => void;
   /**
@@ -219,7 +231,10 @@ const CAMPAIGN_STATUSES: readonly CampaignStatus[] = Object.freeze(['active', 'p
 /** The longest note the API accepts (`schemas.NOTE_MAX_LENGTH`), in characters. */
 const NOTE_MAX_LENGTH = 2000;
 
-/** Shown when a write is refused because the subject's dataset was replaced (AAP 0.3.2). */
+/**
+ * Shown when a write, or the subject's decision-log read, is refused because the subject's
+ * dataset was replaced (AAP 0.3.2, 0.5.5).
+ */
 const RETIRED_MESSAGE = 'Computed from replaced data';
 
 /** Shown when the discrepancy was resolved before this resolution reached the server. */
@@ -251,6 +266,16 @@ const GOOGLE_AMOUNT_PLACES = 6;
 
 /** The `step` of a Google amount input: one micro, {@link GOOGLE_AMOUNT_PLACES} places. */
 const GOOGLE_AMOUNT_STEP = '0.000001';
+
+/**
+ * The most integer digits an amount may carry. The API refuses an amount of 10^12 or more with
+ * 422 `invalid_amount`; this mirrors `_MAX_AMOUNT` in the backend's `decisions.py`, the twelve
+ * integer digits a `numeric(18,6)` money column holds beside its six decimal places.
+ */
+const AMOUNT_MAX_INTEGER_DIGITS = 12;
+
+/** The API's exclusive amount bound, 10^12, as the field's error words it. */
+const AMOUNT_BOUND_TEXT = '1,000,000,000,000';
 
 // ---------------------------------------------------------------------------------------------
 // Types
@@ -321,6 +346,8 @@ interface AmountPolicy {
   padDigits: number;
   /** The amount input's `step`: one unit of the last accepted place. */
   step: string;
+  /** The amount input's `max`: the largest amount below 10^12 at `places` (see `largestAmount`). */
+  max: string;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -354,6 +381,31 @@ function fractionDigits(value: string): number {
 }
 
 /**
+ * The number of digits before the decimal point of a canonical decimal string
+ * ({@link normaliseDecimal}), which has no leading zeros: `"1000000000000"` has 13 and `"0.5"`
+ * has 1.
+ */
+function integerDigits(value: string): number {
+  const dot = value.indexOf('.');
+  return dot === -1 ? value.length : dot;
+}
+
+/**
+ * The largest amount the form accepts at `places` decimal places: the
+ * {@link AMOUNT_MAX_INTEGER_DIGITS} integer digits below 10^12, then `places` more, all nines,
+ * so `"999999999999.99"` at 2, `"999999999999.999999"` at 6 and `"999999999999"` at 0. It is
+ * the amount input's `max`, and lies on the grid its `step`, one unit of the last place,
+ * counts from `min="0"`, so the browser's stepping stops exactly there.
+ *
+ * @param places - The most decimal places accepted: the `places` of an {@link AmountPolicy}.
+ * @returns The amount, as decimal text.
+ */
+function largestAmount(places: number): string {
+  const integer = '9'.repeat(AMOUNT_MAX_INTEGER_DIGITS);
+  return places === 0 ? integer : `${integer}.${'9'.repeat(places)}`;
+}
+
+/**
  * The amount precision of a subject, as the server's `sub_minor_unit` rule sets it
  * (`_amount_issue` in the backend's `decisions.py`; AAP 0.5.2):
  *
@@ -362,18 +414,29 @@ function fractionDigits(value: string): number {
  * - any other source, or a source the API did not name: the currency's minor unit, so
  *   `"10.005"` USD and `"1.5"` JPY are refused.
  *
- * Either way, API amounts are padded to the currency's minor unit for display. The decision
- * shape, and so the fields offered, never depends on the source.
+ * Either way, API amounts are padded to the currency's minor unit for display, and the input's
+ * `max` is the {@link largestAmount} at the accepted places. The decision shape, and so the
+ * fields offered, never depends on the source.
  *
  * @param source - The subject's source, or `null` when unknown.
  * @param currency - The subject's ISO 4217 currency code, or `null` when unknown.
- * @returns The accepted places, the display padding and the input step.
+ * @returns The accepted places, the display padding, the input step and the input maximum.
  */
 function amountPolicy(source: SourceName | null, currency: string | null): AmountPolicy {
   const minorDigits = currencyMinorDigits(currency);
   return source === 'google'
-    ? { places: GOOGLE_AMOUNT_PLACES, padDigits: minorDigits, step: GOOGLE_AMOUNT_STEP }
-    : { places: minorDigits, padDigits: minorDigits, step: currencyStep(currency) };
+    ? {
+        places: GOOGLE_AMOUNT_PLACES,
+        padDigits: minorDigits,
+        step: GOOGLE_AMOUNT_STEP,
+        max: largestAmount(GOOGLE_AMOUNT_PLACES),
+      }
+    : {
+        places: minorDigits,
+        padDigits: minorDigits,
+        step: currencyStep(currency),
+        max: largestAmount(minorDigits),
+      };
 }
 
 /**
@@ -404,12 +467,17 @@ function toInputAmount(value: Money, digits: number): string {
  * Why an amount cannot be submitted, or `null` when it can. The server's own 422 rules
  * (AAP 0.5.2) still apply on top of these.
  *
- * The API requires a positive amount (`invalid_amount`), so zero is refused here as well, with
- * its own message, beyond the non-negative pattern. Precision is judged on the amount's value,
- * its canonical digits ({@link normaliseDecimal}), as the server's `sub_minor_unit` rule judges
- * it: trailing zeroes are accepted however many there are, so `"12.3400"` USD passes, and only a
- * non-zero digit beyond `places` is refused, so `"12.3401"` USD reads "Use at most 2 decimal
- * places" and a Google amount finer than a micro reads "Use at most 6 decimal places".
+ * The API requires a positive amount below 10^12 (`invalid_amount`), so both ends are refused
+ * here as well, each with its own message, beyond the non-negative pattern. Size is judged first,
+ * on the canonical text's integer digits ({@link normaliseDecimal}, {@link integerDigits}),
+ * never on a number: more than {@link AMOUNT_MAX_INTEGER_DIGITS} of them, as in
+ * `"1000000000000"` or `"1234567890123.45"`, reads "Enter an amount below 1,000,000,000,000",
+ * whatever the decimals, and leading zeroes never count, so `"999999999999.99"` and
+ * `"0999999999999"` pass. Precision is judged on the amount's value, its canonical digits, as
+ * the server's `sub_minor_unit` rule judges it: trailing zeroes are accepted however many there
+ * are, so `"12.3400"` USD passes, and only a non-zero digit beyond `places` is refused, so
+ * `"12.3401"` USD reads "Use at most 2 decimal places" and a Google amount finer than a micro
+ * reads "Use at most 6 decimal places".
  *
  * @param value - The amount as typed.
  * @param places - The most decimal places accepted: the `places` of the subject's
@@ -423,6 +491,9 @@ function amountError(value: string, places: number): string | null {
   }
   if (!AMOUNT_PATTERN.test(trimmed)) {
     return 'Enter a non-negative amount';
+  }
+  if (integerDigits(normaliseDecimal(trimmed)) > AMOUNT_MAX_INTEGER_DIGITS) {
+    return `Enter an amount below ${AMOUNT_BOUND_TEXT}`;
   }
   if (fractionDigits(normaliseDecimal(trimmed)) > places) {
     return places === 0
@@ -649,7 +720,10 @@ function saveErrorMessage(error: unknown): string {
   return SAVE_FAILED_MESSAGE;
 }
 
-/** Whether a failed save means the subject's dataset was replaced (409 `subject_retired`). */
+/**
+ * Whether a failed save, or a failed decision-log read, means the subject's dataset was
+ * replaced (409 `subject_retired`).
+ */
 function isRetiredError(error: unknown): boolean {
   return isApiError(error) && error.status === 409 && error.code === 'subject_retired';
 }
@@ -657,6 +731,16 @@ function isRetiredError(error: unknown): boolean {
 /** Whether a failed save means the discrepancy is already closed (409 `discrepancy_resolved`). */
 function isResolvedError(error: unknown): boolean {
   return isApiError(error) && error.status === 409 && error.code === 'discrepancy_resolved';
+}
+
+/**
+ * Whether keyboard focus is lost: on no element, on the body, where a browser leaves it once
+ * the focused element is natively disabled or removed, or on an element no longer in the
+ * document. Anywhere else the user or the enclosing dialog has put it.
+ */
+function focusIsLost(): boolean {
+  const { activeElement, body } = document;
+  return activeElement === null || activeElement === body || !activeElement.isConnected;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -686,11 +770,11 @@ function isResolvedError(error: unknown): boolean {
  * shape. Sending the request calls `onPendingChange(true)`, and its settling calls
  * `onPendingChange(false)` before the outcome's callback. Success calls `onDone`, with the saved
  * `Decision` in decision mode, and puts "Decision saved" or "Intended state saved" in the form's
- * polite status region. A 409 `subject_retired` disables every control while the form records
- * about that subject and calls `onRetired`; the enclosing `Dialog` keeps its own Close button.
- * Every other failure calls `onFailed` with the message the form shows. Each callback is the one
- * the form had when the user saved, and each is called even when the form unmounted while the
- * request ran.
+ * polite status region. A 409 `subject_retired`, to a save or to the subject's decision-log
+ * read, disables every control while the form records about that subject and calls `onRetired`
+ * once; the enclosing `Dialog` keeps its own Close button. Every other failed save calls
+ * `onFailed` with the message the form shows. Each save callback is the one the form had when
+ * the user saved, and each is called even when the form unmounted while the request ran.
  *
  * The form's edits, note, save outcome and locks belong to its identity: the subject's type
  * and id, the mode, the discrepancy's id and `recommendationId`. When any of them changes, even
@@ -701,7 +785,12 @@ function isResolvedError(error: unknown): boolean {
  * States: a `Spinner` while the decision log loads; a critical `Banner` with the API message
  * when it fails, kept while the polled log is read again; a warning `Banner` with no submit
  * when the subject has no decided state and no discrepancy to start from, or when its removal
- * was acknowledged. Once the fields show, the form carries one polite `role="status"` region
+ * was acknowledged. Once the subject is known to be retired, by a refused save or a refused
+ * read, the critical "Computed from replaced data" `Banner` outranks each of those: the form
+ * keeps its fields, locked, under the banner while a state can still be resolved from the last
+ * read, and otherwise shows the banner alone, with no submit. Focus that a disabled field or the
+ * replaced form leaves lost moves to that banner (WCAG 2.2 SC 2.4.3). Once the fields show, the
+ * form carries one polite `role="status"` region
  * from its first render. While a field is invalid and the form is not locked, it holds a
  * summary of the errors such as "1 error: Daily budget: Enter an amount.", and the disabled
  * submit button references it through `aria-describedby`; otherwise it holds the success text
@@ -773,8 +862,8 @@ function DecisionFormBody(props: DecisionFormProps) {
   const [statusDraft, setStatusDraft] = useState<StatusChoice | undefined>(undefined);
   const [amountDrafts, setAmountDrafts] = useState<Partial<Record<AmountField, string>>>({});
   const [note, setNote] = useState('');
-  // A 409 subject_retired is final for this form identity (AAP 0.3.2), and so is a closed
-  // discrepancy.
+  // A 409 subject_retired, to a save or to the log read, is final for this form identity (AAP
+  // 0.3.2), and so is a closed discrepancy.
   const [retired, setRetired] = useState(false);
   const [closed, setClosed] = useState(false);
   const submitHintId = useId();
@@ -793,37 +882,80 @@ function DecisionFormBody(props: DecisionFormProps) {
     }
   }, [saveError]);
 
+  // The subject's log read answers 409 subject_retired once its dataset was replaced, as on a
+  // screen opened before the activation. The refusal locks the form from the render that sees
+  // it; the effect keeps the lock once a refetch has cleared the error, and reports it to the
+  // consumer once per form identity, as a refused save does (handleError).
+  const readRetired = isRetiredError(decisions.error);
+  const retiredReportedRef = useRef(false);
+  useEffect(() => {
+    if (!readRetired || retiredReportedRef.current) {
+      return;
+    }
+    retiredReportedRef.current = true;
+    setRetired(true);
+    onRetired?.();
+  }, [readRetired, onRetired]);
+  const subjectRetired = retired || readRetired;
+
+  // Focus a retirement leaves lost, as the locked form disables the focused field or a refetch
+  // that lists no decision replaces the form with the retired notice, moves to the retired
+  // banner (WCAG 2.2 SC 2.4.3). It runs after every commit, because a later refetch can remove
+  // the focused element long after the lock was set; focus the user placed is never moved.
+  useEffect(() => {
+    if (subjectRetired && focusIsLost()) {
+      errorRef.current?.focus();
+    }
+  });
+
+  // A retired subject takes no decision, whatever its log now holds (AAP 0.3.2): the retired
+  // banner outranks every state without a form, so no later read, which lists active datasets
+  // only, can replace it with "No decided state is recorded" or any other notice (AAP 0.5.5).
+  const retiredNotice = subjectRetired ? (
+    <div ref={errorRef} tabIndex={-1}>
+      <Banner tone="critical" title={RETIRED_MESSAGE} />
+    </div>
+  ) : null;
+
   if (decisions.data === undefined) {
     if (loadFailure !== null) {
-      return <Banner tone="critical" title={saveErrorMessage(loadFailure)} />;
+      return retiredNotice ?? <Banner tone="critical" title={saveErrorMessage(loadFailure)} />;
     }
-    return <Spinner label="Loading decision" />;
+    return retiredNotice ?? <Spinner label="Loading decision" />;
   }
 
   if (mode === 'intended_state' && discrepancy === undefined) {
     return (
-      <Banner tone="critical" title="No discrepancy was given to record an intended state for." />
+      retiredNotice ?? (
+        <Banner tone="critical" title="No discrepancy was given to record an intended state for." />
+      )
     );
   }
 
   const latest = decisions.data[0];
   const state = resolveSubjectState(mode, latest, discrepancy);
   if (state === null) {
-    return <Banner tone="warning" title={NO_STATE_MESSAGE} />;
+    return retiredNotice ?? <Banner tone="warning" title={NO_STATE_MESSAGE} />;
   }
   if (mode === 'decision' && latest?.tombstone === true) {
     // The API refuses every patch on a tombstoned subject (422 subject_removed).
     const name = textOrNull(latest.subject.name) ?? 'This subject';
     return (
-      <Banner tone="warning" title={`${name} was acknowledged as removed`}>
-        It takes no further decisions.
-      </Banner>
+      retiredNotice ?? (
+        <Banner tone="warning" title={`${name} was acknowledged as removed`}>
+          It takes no further decisions.
+        </Banner>
+      )
     );
   }
 
   const fields = shapeFields(state);
   if (!fields.status && fields.amounts.length === 0) {
-    return <Banner tone="warning" title="No budget amount is known for this shared budget yet." />;
+    return (
+      retiredNotice ?? (
+        <Banner tone="warning" title="No budget amount is known for this shared budget yet." />
+      )
+    );
   }
 
   const currency =
@@ -909,7 +1041,7 @@ function DecisionFormBody(props: DecisionFormProps) {
     }
   }
 
-  const locked = disabled || retired;
+  const locked = disabled || subjectRetired;
   const pending = activeMutation.isPending;
   const canSubmit =
     !locked &&
@@ -929,6 +1061,8 @@ function DecisionFormBody(props: DecisionFormProps) {
   const handleError = (error: unknown) => {
     onPendingChange?.(false);
     if (isRetiredError(error)) {
+      // Reported here, so a later refused log read of the same subject reports nothing again.
+      retiredReportedRef.current = true;
       setRetired(true);
       onRetired?.();
       return;
@@ -1002,7 +1136,7 @@ function DecisionFormBody(props: DecisionFormProps) {
       : `Last decided: ${describeState(stateFromDecision(latest), currency)}`;
   const memberNames = (members ?? []).map((member) => member.name).filter((name) => name !== '');
   const saveLabel = mode === 'decision' ? 'Save decision' : 'Save intended state';
-  const errorText = retired
+  const errorText = subjectRetired
     ? RETIRED_MESSAGE
     : saveError === null
       ? null
@@ -1015,7 +1149,8 @@ function DecisionFormBody(props: DecisionFormProps) {
         carries no CSS (AAP 0.4.4). Text lines are therefore <div> elements placed directly in the
         Stack rather than <p>: the base layer keeps the user-agent paragraph margins, which would
         add space no spacing token sets, so the Stack gap tokens alone space every line. The
-        error's wrapper is unstyled and exists only as the focus target after a failed save.
+        error's wrapper is unstyled and exists only as the focus target after a failed save or
+        a retirement.
       */}
       <Stack gap={4} breakLongWords>
         {errorText === null ? null : (
@@ -1053,6 +1188,7 @@ function DecisionFormBody(props: DecisionFormProps) {
             type="number"
             inputMode="decimal"
             min="0"
+            max={precision.max}
             step={precision.step}
             hint={currency === null ? 'In the account currency' : `In ${currency}`}
             error={amountErrors[field]}
@@ -1087,7 +1223,7 @@ function DecisionFormBody(props: DecisionFormProps) {
               {saveLabel}
             </Button>
             {onCancel === undefined ? null : (
-              <Button variant="secondary" onClick={onCancel} disabled={retired}>
+              <Button variant="secondary" onClick={onCancel} disabled={subjectRetired}>
                 Cancel
               </Button>
             )}

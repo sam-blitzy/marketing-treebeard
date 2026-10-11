@@ -59,7 +59,9 @@
  *   (`#item-{id}`, `#group-…`) reveals it.
  * - A card is keyed by its recommendation's identity across runs ({@link itemIdentity}), never by
  *   the per-run item id, so a newer run's items update the cards in place: keyboard focus stays
- *   on the control that had it (WCAG 2.2 SC 2.4.3). Anchors stay `item-{id}`.
+ *   on the control that had it (WCAG 2.2 SC 2.4.3). Anchors stay `item-{id}`. A card that moves
+ *   to another list, such as into the replaced-data block, is mounted anew there and takes over
+ *   the focus the card it replaces held (`../carriedFocus`), shown at once in a batched list.
  * - Built only on the design-system index (AAP 0.4.4): no raw buttons, headings or tables, no
  *   inline styles and no stylesheet. Layout comes from `Stack` and `Inline` alone.
  *
@@ -97,6 +99,7 @@ import {
   type FeedbackConfirmations,
 } from '../ActionOutcomes';
 import { WithheldList, withheldReason } from '../WithheldList';
+import { focusLeftWith } from '../carriedFocus';
 import { discrepancyRef } from '../evidenceExtra';
 import {
   ACTION_NOUN,
@@ -605,6 +608,11 @@ function renderConfirmations(confirmations: readonly ListConfirmation[]): ReactN
  * its blocking C0 card), the list reveals the batches through it and scrolls it into view, on
  * mount and on `hashchange`; a `hashchange` also moves focus to it.
  *
+ * A card that takes over the keyboard focus of a card of the same recommendation removed
+ * elsewhere in the same commit, such as one a refetch moves into the {@link HistoricalItems}
+ * block from the group's visible cards (`../carriedFocus`), is revealed with the batches through
+ * it, so it mounts in time to take that focus (WCAG 2.2 SC 2.4.3).
+ *
  * An item a feedback recorded on this page has hidden ({@link isConfirmed}) shows, in its card's
  * place, its {@link FeedbackConfirmation} from `confirmations`: "Dismissed: {action}
  * ({entity})", directly after the card before it, so the outcome is visible where the user
@@ -655,6 +663,9 @@ export function CardList({
         )}
         anchorsOf={itemAnchors}
         focusIdOf={itemFocusId}
+        // A card that takes over the focus of one the same commit removed elsewhere, such as
+        // a card a refetch moved into this list, is shown at once, however far down it is.
+        mustShow={(item) => focusLeftWith(itemIdentity(item))}
       />
     </>
   );
@@ -720,6 +731,12 @@ export interface HistoricalItemsProps {
  * which the card renders. The held disclosure therefore holds only non-historical items a
  * discrepancy holds, which wait on that discrepancy's resolution, and the rerun it triggers,
  * before they can be trusted.
+ *
+ * A refetch that finds an item computed from replaced data moves its card here from the group's
+ * visible cards. React mounts it anew, so the card that left keeps neither its open decision
+ * dialog nor its keyboard focus; the card mounted here takes that focus over, on its
+ * replaced-data line (`RecommendationCard`, `../carriedFocus`), so focus stays on the item
+ * (WCAG 2.2 SC 2.4.3).
  *
  * Exported so a section that builds a group body of its own (Campaigns' discrepancy group) uses
  * the same block.

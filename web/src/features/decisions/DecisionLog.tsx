@@ -54,7 +54,6 @@ import type { ReactNode } from 'react';
 
 import { useDecisions, useDefaultRun } from '../../api/queries';
 import type {
-  CampaignStatus,
   Decision,
   DecisionOrigin,
   DecisionPatchView,
@@ -74,7 +73,14 @@ import {
   type DataTableColumn,
 } from '../../design-system';
 import { EM_DASH, formatInstant, formatMoney, sourceLabel } from '../../lib/format';
-import { CAMPAIGN_STATUS_LABELS, DecisionForm } from './DecisionForm';
+import { DecisionForm } from './DecisionForm';
+import {
+  FIELD_LABELS,
+  PART_SEPARATOR,
+  describeExpectedState,
+  statusLabel,
+  textOrNull,
+} from './expectedState';
 import { RETRY_LABEL, lastLoadedText, useRetry, useSettledFailure } from './readState';
 
 // ---------------------------------------------------------------------------------------------
@@ -140,9 +146,6 @@ const WIDE_COLUMN_SIZES: Readonly<Record<DecisionColumnKey, DecisionColumnSize>>
  */
 const DECISION_LOG_LIMIT = 200;
 
-/** Separator between the parts of a subject title and of an expected state. */
-const PART_SEPARATOR = ' · ';
-
 /** Separator between the fields of a patch. */
 const PATCH_SEPARATOR = '; ';
 
@@ -168,15 +171,6 @@ const SYSTEM_AUTHOR = 'System';
 
 /** The patch cell of a baseline row, whose patch is empty because no submission wrote it. */
 const BASELINE_PATCH_TEXT = 'Platform state at first sync';
-
-/** The expected state of a row recording an acknowledged removal (`tombstone`). */
-const REMOVAL_TEXT = 'Removal acknowledged';
-
-/** Shown when a row carries no status where its shape owns one. */
-const STATUS_NOT_REPORTED = 'status not reported';
-
-/** Shown when a shared budget's row carries neither amount. */
-const NO_AMOUNT_TEXT = 'no amount recorded';
 
 /** Shown when the decision log could not be loaded and the API sent no message. */
 const LOAD_ERROR_FALLBACK = 'The decision log request failed.';
@@ -206,19 +200,8 @@ const RECORDED_TEXT = 'Decision recorded';
  */
 const RETIRED_MESSAGE = 'Computed from replaced data';
 
-/**
- * A budget name as the API builds it for a shared budget subject ("Shared budget {external
- * id}", `_SHARED_BUDGET_NAME` in `api/routes/decisions.py`). Its prefix is dropped where the
- * text already says "shared budget", so a member reads "shared budget 4455", not
- * "shared budget Shared budget 4455".
- */
-const SHARED_BUDGET_NAME_PREFIX = /^shared budget\s+/i;
-
 /** Characters an HTML id built from a subject keeps; any other becomes `-`. */
 const NON_ID_CHARACTERS = /[^A-Za-z0-9_-]/g;
-
-/** A budget field of a decision, as the patch and the expected state name it. */
-type AmountField = 'daily_budget' | 'total_budget';
 
 /** The patch fields read from stored JSON, in their fixed display order. */
 const PATCH_FIELDS: readonly (keyof DecisionPatchView)[] = Object.freeze([
@@ -226,16 +209,6 @@ const PATCH_FIELDS: readonly (keyof DecisionPatchView)[] = Object.freeze([
   'daily_budget',
   'total_budget',
 ]);
-
-/** The amount fields in display order. */
-const AMOUNT_FIELDS: readonly AmountField[] = Object.freeze(['daily_budget', 'total_budget']);
-
-/** How each field is named in the patch and expected-state cells. */
-const FIELD_LABELS: Readonly<Record<keyof DecisionPatchView, string>> = Object.freeze({
-  status: 'status',
-  daily_budget: 'daily budget',
-  total_budget: 'total budget',
-});
 
 // ---------------------------------------------------------------------------------------------
 // Types
@@ -286,15 +259,6 @@ interface SaveFailure {
 // ---------------------------------------------------------------------------------------------
 // Subjects
 // ---------------------------------------------------------------------------------------------
-
-/** A trimmed, non-empty string, or `null` for anything else. */
-function textOrNull(value: unknown): string | null {
-  if (typeof value !== 'string') {
-    return null;
-  }
-  const trimmed = value.trim();
-  return trimmed === '' ? null : trimmed;
-}
 
 /** The grouping key of a subject: type and id, because ids are unique only within a type. */
 function subjectKey(subject: SubjectView): string {
@@ -358,7 +322,8 @@ function subjectTitle(subject: SubjectView): string {
 
 /**
  * The names of the shared budgets in the log, by internal budget id, so a member's expected
- * state can name the budget it draws from rather than an internal id.
+ * state ({@link describeExpectedState}) can name the budget it draws from rather than an
+ * internal id.
  */
 function sharedBudgetNames(decisions: readonly Decision[]): ReadonlyMap<number, string> {
   const names = new Map<number, string>();
@@ -371,49 +336,9 @@ function sharedBudgetNames(decisions: readonly Decision[]): ReadonlyMap<number, 
   return names;
 }
 
-/**
- * How a member's shared budget is named after "shared budget", the wording `DecisionForm` uses:
- * the budget's name from a decision of the log, without the API's own "Shared budget " prefix
- * ("4455"), or its full name when it has no such prefix; else the Google id the member's row
- * carries (`budget_external_id`); else "id {budget_id}" when the API could not name it either.
- *
- * @param budgetId - The member's `budget_id`.
- * @param externalId - The member row's `budget_external_id`.
- * @param names - Shared budget names by internal id, from {@link sharedBudgetNames}.
- * @returns The label.
- */
-function sharedBudgetLabel(
-  budgetId: number,
-  externalId: string | null,
-  names: ReadonlyMap<number, string>,
-): string {
-  const name = names.get(budgetId);
-  if (name !== undefined) {
-    return textOrNull(name.replace(SHARED_BUDGET_NAME_PREFIX, '')) ?? name;
-  }
-  return textOrNull(externalId) ?? `id ${budgetId}`;
-}
-
 // ---------------------------------------------------------------------------------------------
 // Row cells
 // ---------------------------------------------------------------------------------------------
-
-/** Whether a stored value is one of the normalised campaign statuses. */
-function isCampaignStatus(value: unknown): value is CampaignStatus {
-  return typeof value === 'string' && Object.hasOwn(CAMPAIGN_STATUS_LABELS, value);
-}
-
-/**
- * The label of a decided status ("Paused"), from `CAMPAIGN_STATUS_LABELS`, the labels
- * `DecisionForm` and `DiscrepancyResolver` use. A status outside the normalised set is shown as
- * stored, and a missing one reads "status not reported".
- */
-function statusLabel(status: unknown): string {
-  if (isCampaignStatus(status)) {
-    return CAMPAIGN_STATUS_LABELS[status];
-  }
-  return textOrNull(status) ?? STATUS_NOT_REPORTED;
-}
 
 /**
  * The origin cell. A row recorded from a recommendation reads "Recommendation" whatever its
@@ -475,75 +400,6 @@ function describePatch(decision: Decision): string {
     return parts.join(PATCH_SEPARATOR);
   }
   return decision.origin === 'baseline' ? BASELINE_PATCH_TEXT : EM_DASH;
-}
-
-/** The row's amounts that are set, as "daily budget USD 500.00", in the subject's currency. */
-function amountParts(decision: Decision): string[] {
-  const parts: string[] = [];
-  for (const field of AMOUNT_FIELDS) {
-    const amount = decision[field];
-    if (amount !== null) {
-      parts.push(`${FIELD_LABELS[field]} ${formatMoney(amount, decision.subject.currency)}`);
-    }
-  }
-  return parts;
-}
-
-/** No shared budget names: a member's budget is then named by its id. */
-const NO_BUDGET_NAMES: ReadonlyMap<number, string> = new Map<number, string>();
-
-/**
- * The complete expected state a decision row holds, by its decision shape (AAP 0.5.2), the rule
- * `DiscrepancyResolver` renders decided states with. It is the log's "Resulting expected state"
- * cell, and the recommendation card states a decision it has just recorded with it, from the
- * `POST /decisions` response, so both read the same.
- *
- * - `own_budget`: "{Status} · daily budget {amount} · total budget {amount}", with only the
- *   amounts the row holds;
- * - `shared_member`: "{Status} · shared budget {name, Google id or id}" (see
- *   {@link sharedBudgetLabel}), never an amount, because the amount belongs to the shared budget;
- * - `budget`: "daily budget {amount}" or "total budget {amount}", with no status;
- * - an acknowledged removal (`tombstone`): "Removal acknowledged", followed by the campaign's
- *   decided status (" · Ended") on campaign subjects.
- *
- * Statuses read as `CAMPAIGN_STATUS_LABELS` labels, and amounts are formatted by `formatMoney`
- * in the subject's own currency.
- *
- * @param decision - The decision row.
- * @param budgetNames - Shared budget names by internal id, from {@link sharedBudgetNames}.
- *   Omitted, a member's shared budget is named by its id ("shared budget id 401").
- * @returns The state, as one line.
- *
- * @example
- * ```ts
- * describeExpectedState(savedDecision); // "Active · daily budget USD 160.00"
- * ```
- */
-export function describeExpectedState(
-  decision: Decision,
-  budgetNames: ReadonlyMap<number, string> = NO_BUDGET_NAMES,
-): string {
-  if (decision.tombstone) {
-    return decision.subject.type === 'campaign'
-      ? [REMOVAL_TEXT, statusLabel(decision.status ?? 'ended')].join(PART_SEPARATOR)
-      : REMOVAL_TEXT;
-  }
-  switch (decision.shape) {
-    case 'own_budget':
-      return [statusLabel(decision.status), ...amountParts(decision)].join(PART_SEPARATOR);
-    case 'shared_member': {
-      const parts = [statusLabel(decision.status)];
-      if (decision.budget_id !== null) {
-        const label = sharedBudgetLabel(decision.budget_id, decision.budget_external_id, budgetNames);
-        parts.push(`shared budget ${label}`);
-      }
-      return parts.join(PART_SEPARATOR);
-    }
-    case 'budget': {
-      const parts = amountParts(decision);
-      return parts.length === 0 ? NO_AMOUNT_TEXT : parts.join(PART_SEPARATOR);
-    }
-  }
 }
 
 /**
@@ -820,11 +676,12 @@ function SubjectDecisions({
  *   the subject's dialog opens again or a later save of it starts, so it never outlives a
  *   later success.
  * - **Refused with 409 `subject_retired`**: the subject's dataset was replaced after the log was
- *   read, and the server refuses every later decision on it (AAP 0.3.2). Its banner reads
- *   "Computed from replaced data", the recommendation card's message for the same refusal, and
- *   its "Record decision" stays disabled while the page is shown. The next refresh of the log,
- *   which lists active datasets only, drops the subject; the banner stays, so the refusal is
- *   not lost with it.
+ *   read, and the server refuses every later decision on it (AAP 0.3.2), a save or the form's
+ *   own read of the subject. Its banner reads "Computed from replaced data", the recommendation
+ *   card's message for the same refusal, and its "Record decision" stays disabled while the
+ *   page is shown; once the dialog closes, focus lost to the page moves to that banner. The
+ *   next refresh of the log, which lists active datasets only, drops the subject; the banner
+ *   stays, so the refusal is not lost with it.
  *
  * Focus (WCAG 2.2 SC 2.4.3): a dialog closed mid-save returns focus to its opener, which keeps
  * it while it loads. Once that save settles with no dialog open, and while focus is still on
@@ -935,6 +792,10 @@ export function DecisionLog() {
     setFailures((current) =>
       withFailure(current, target.key, { title: target.title, message: RETIRED_MESSAGE }),
     );
+    // The form also reports a retirement its read of the subject learned, with no save to
+    // settle. The lock disables the opener the closing dialog would return focus to, so focus
+    // is placed for the subject here as well, on its failure once the dialog has closed.
+    setSettledKey(target.key);
   };
 
   const retryButton = (

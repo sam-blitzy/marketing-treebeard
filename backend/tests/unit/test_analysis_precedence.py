@@ -1523,9 +1523,12 @@ def test_creative_groups_never_rank_spend_across_currencies() -> None:
 def test_merge_flag_keeps_one_badge_per_code() -> None:
     _, candidate = sample_candidate()
     existing = candidate.with_flags(Flag(FLAG_STALE, "Data as of rule text"))
-    merged = precedence._merge_flag(existing, Flag(FLAG_STALE, "precedence text"))
+    flags = precedence._merged_flags(existing.flags, Flag(FLAG_STALE, "precedence text"))
+    merged = replace(existing, flags=flags)
     assert flag_message(merged, FLAG_STALE) == "Data as of rule text; precedence text"
-    assert precedence._merge_flag(merged, Flag(FLAG_STALE, "precedence text")) is merged
+    assert precedence._merged_flags(flags, Flag(FLAG_STALE, "precedence text")) is flags
+    added = precedence._merged_flags(flags, Flag(FLAG_SIMULATED, "Simulated data"))
+    assert added == (*flags, Flag(FLAG_SIMULATED, "Simulated data"))
 
 
 # ---------------------------------------------------------------------------

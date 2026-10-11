@@ -9,10 +9,12 @@
  *    "Campaigns to pause or launch", preferring a C1 / C1b pause, whose "Record decision" form
  *    is prefilled with status `paused`, on a campaign with its own budget, so the form offers a
  *    budget amount;
- * 2. enters a budget amount only the server refuses, and checks that the 422's message is shown
- *    in the dialog, which stays open with the entered values and nothing written; then corrects
- *    the amount, records the pause through the same dialog and finds it at the top of the
- *    subject's table in the `/decisions` log;
+ * 2. enters a budget amount of 10^12, which the API refuses with 422 `invalid_amount`, and checks
+ *    that the form refuses it on its field first: the field's error is shown and summarised, the
+ *    field is `aria-invalid`, Save is disabled, no `POST /decisions` is sent and nothing is
+ *    written, while the dialog stays open with the entered values; then corrects the amount,
+ *    records the pause through the same dialog and finds it at the top of the subject's table in
+ *    the `/decisions` log;
  * 3. presses "Sync now" for the item's source on `/sources`. The product is recommend-only
  *    (AAP 0.7.2), so the platform still reports the campaign active, and the entity sync raises
  *    a `status` discrepancy against the `paused` decision. The `/actions` discrepancy banner
@@ -57,7 +59,7 @@
  * @packageDocumentation
  */
 import { test, expect } from '@playwright/test';
-import type { APIResponse, Locator, Page, Response } from '@playwright/test';
+import type { APIResponse, Locator, Page, Request, Response } from '@playwright/test';
 
 import type {
   CampaignStatus,
@@ -175,13 +177,15 @@ const DISCREPANCY_GROUP_KEY = 'discrepancies';
 const PAUSE_RULES: ReadonlySet<string> = new Set(['C1', 'C1b']);
 
 /**
- * A budget amount only the server refuses: 10^12, the smallest amount `decisions.py` rejects with
- * 422 `invalid_amount` ("must be a positive amount below 10^12"). The decision form checks an
- * amount's sign and precision but not its size, and the request schema admits up to 18 digits,
- * so the form posts it and the API refuses it and writes nothing. It is a whole number, so no
- * currency's minor unit and no Google micro rule refuses it first.
+ * A budget amount the decision form refuses on its field: 10^12, the smallest amount
+ * `decisions.py` rejects with 422 `invalid_amount`. The form checks the same bound, so it shows
+ * {@link AMOUNT_BOUND_MESSAGE} on the field and never posts the amount. It is a whole number, so
+ * no currency's minor unit and no Google micro rule refuses it first.
  */
-const SERVER_REFUSED_AMOUNT = '1000000000000';
+const FIELD_REFUSED_AMOUNT = '1000000000000';
+
+/** The field error {@link FIELD_REFUSED_AMOUNT} draws (`amountError` of `DecisionForm.tsx`). */
+const AMOUNT_BOUND_MESSAGE = 'Enter an amount below 1,000,000,000,000';
 
 // ---------------------------------------------------------------------------------------------
 // Timing
@@ -1004,8 +1008,17 @@ test('records a decision and resolves the discrepancy it creates', async ({ page
   const status = dialog.getByRole('combobox', { name: STATUS_FIELD_LABEL, exact: true });
   const save = dialog.getByRole('button', { name: SAVE_DECISION_LABEL, exact: true });
 
-  const refusedMessage =
-    await test.step('an amount the server refuses (422) is shown and writes nothing', async () => {
+  // Every `POST /decisions` the page sends from the refused amount on: the field refusal must
+  // send none, so the corrected save is the only one.
+  const decisionPosts: (string | null)[] = [];
+  const recordDecisionPost = (request: Request) => {
+    if (request.method() === 'POST' && new URL(request.url()).pathname === DECISIONS_PATH) {
+      decisionPosts.push(request.postData());
+    }
+  };
+
+  const amount =
+    await test.step('a 10^12 amount is refused on its field and writes nothing', async () => {
       await expect(card).toBeVisible({ timeout: PAGE_LOAD_TIMEOUT_MS });
       await card.getByRole('button', { name: RECORD_DECISION_LABEL, exact: true }).click();
 
@@ -1020,40 +1033,37 @@ test('records a decision and resolves the discrepancy it creates', async ({ page
       }
       await expect(status.locator('option:checked')).toHaveText(CAMPAIGN_STATUS_LABELS.paused);
 
-      const amount = await firstAmountInput(dialog);
-      await amount.fill(SERVER_REFUSED_AMOUNT);
-      await expect(save, 'the form accepts the amount; only the server refuses it').toBeEnabled();
+      const input = await firstAmountInput(dialog);
+      page.on('request', recordDecisionPost);
+      await input.fill(FIELD_REFUSED_AMOUNT);
 
-      const answered = page.waitForResponse(isDecisionPost);
-      // From this click on the test may have written, so the teardown restores the campaign.
-      owned = { subjectId, before, decidedBefore };
-      await save.click();
-      const response = await answered;
-      expect(response.status(), 'the API refuses the amount with 422').toBe(422);
-      const { error } = (await response.json()) as ErrorResponse;
-      expect(error.code, 'the 422 names the amount rule').toBe('invalid_amount');
-      expect(error.message.trim(), 'the 422 carries a message').not.toBe('');
-      test.info().annotations.push({
-        type: 'refused-decision',
-        description: `POST ${DECISIONS_PATH} answered 422 ${error.code}: ${error.message}`,
-      });
-
-      // The dialog stays open and usable: it shows the API's message as a plain banner (the
-      // alert role is reserved for the discrepancy banner) and keeps every entered value.
-      await expect(dialog, 'the dialog stays open after the refusal').toBeVisible();
+      // The form refuses the amount before any request, as a field error: shown as static text,
+      // summarised in the form's polite status region, never as an alert (the alert role is
+      // reserved for the discrepancy banner), with the field invalid and Save disabled.
       await expect(
-        dialog.getByText(error.message, { exact: true }),
-        'the dialog shows the API message',
+        dialog.getByText(AMOUNT_BOUND_MESSAGE, { exact: true }),
+        'the field shows the amount bound',
       ).toBeVisible();
-      await expect(dialog.getByRole('alert'), 'the error is not an alert').toHaveCount(0);
-      await expect(status, 'the status stays paused').toHaveValue('paused');
-      await expect(amount, 'the refused amount stays entered').toHaveValue(SERVER_REFUSED_AMOUNT);
-      await expect(amount, 'the amount stays editable').toBeEnabled();
-      await expect(save, 'the decision can be saved again').toBeEnabled();
+      await expect(input, 'the refused amount is marked invalid').toHaveAttribute(
+        'aria-invalid',
+        'true',
+      );
       await expect(
-        card.getByText(error.message, { exact: true }),
-        'the card shows the refused save message too',
+        dialog.getByRole('status').filter({ hasText: AMOUNT_BOUND_MESSAGE }),
+        'the status region summarises the field error',
       ).toHaveCount(1);
+      await expect(save, 'an amount at the bound cannot be saved').toBeDisabled();
+      await expect(dialog.getByRole('alert'), 'the error is not an alert').toHaveCount(0);
+
+      // Implicit submission from the field must post nothing either. From this attempt on the
+      // test could have written, were the refusal to fail, so the teardown restores the campaign.
+      owned = { subjectId, before, decidedBefore };
+      await input.press('Enter');
+      await expect(dialog, 'the dialog stays open after the refusal').toBeVisible();
+      await expect(status, 'the status stays paused').toHaveValue('paused');
+      await expect(input, 'the refused amount stays entered').toHaveValue(FIELD_REFUSED_AMOUNT);
+      await expect(input, 'the amount stays editable').toBeEnabled();
+      expect(decisionPosts, 'the refused amount sent no POST /decisions').toEqual([]);
 
       const newest = (await campaignDecisions(page, subjectId))[0];
       expect(newest?.id, 'the refused decision wrote no decision').toBe(decidedBefore.id);
@@ -1061,24 +1071,34 @@ test('records a decision and resolves the discrepancy it creates', async ({ page
         .filter((entry) => entry.subject.type === 'campaign' && entry.subject.id === subjectId)
         .map((entry) => entry.id);
       expect(new Set(unresolved), 'the refused decision wrote no discrepancy').toEqual(before);
-      return error.message;
+      return input;
     });
 
   await test.step('the corrected decision saves and appears in the /decisions log', async () => {
     await resetAmountsToDecided(dialog, decidedBefore);
+    await expect(
+      dialog.getByText(AMOUNT_BOUND_MESSAGE, { exact: true }),
+      'the corrected amount clears the field error',
+    ).toHaveCount(0);
+    await expect(amount, 'the corrected amount is valid').not.toHaveAttribute(
+      'aria-invalid',
+      'true',
+    );
     await expect(status).toHaveValue('paused');
     await expect(save, 'pausing changes the last decided status').toBeEnabled();
     const answered = page.waitForResponse(isDecisionPost);
     await save.click();
     const response = await answered;
+    page.off('request', recordDecisionPost);
     expect(response.status(), 'the corrected decision is saved').toBe(201);
+    // The corrected save is the only decision posted: the refused amount never left the form.
+    expect(decisionPosts, 'only the corrected decision was posted').toHaveLength(1);
+    expect(decisionPosts[0] ?? '', 'the posted patch omits the refused amount').not.toContain(
+      FIELD_REFUSED_AMOUNT,
+    );
     await expect(dialog, 'the dialog closes once the decision is saved').toBeHidden({
       timeout: PAGE_LOAD_TIMEOUT_MS,
     });
-    await expect(
-      card.getByText(refusedMessage, { exact: true }),
-      'the card no longer shows the refused save message',
-    ).toHaveCount(0);
 
     const latest = (await campaignDecisions(page, subjectId))[0];
     expect(latest?.status, 'the newest decision pauses the campaign').toBe('paused');

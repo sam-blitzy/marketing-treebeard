@@ -16,7 +16,10 @@ AAP 0.5.3 (``GET /runs/latest``, ``GET /runs/{id}``, ``GET /runs?kind=custom&lim
   naming the field, and no run is written, while the same dates as ``YYYY-MM-DD`` compute it;
 * a changed ``window.default_days`` shows in ``Run.default_days`` and in the default run;
 * every route needs a session (401) and ``POST /runs`` the CSRF header (403); a session
-  cookie saved before logout cannot create a run afterwards (401).
+  cookie saved before logout cannot create a run afterwards (401);
+* ``POST /runs`` computes in the API's analysis process (the rules refused in this process,
+  it still answers 201), which the application's lifespan starts and stops, and an analysis
+  process that cannot start leaves the API serving.
 
 The application is assembled as ``api/app.py`` assembles it for these routes: the auth and
 runs routers under ``/api/v1`` behind the CSRF guard, Starlette's ``SessionMiddleware`` with
@@ -31,8 +34,10 @@ same engine, exactly as in production. The schema is dropped with ``CASCADE`` at
 An unreachable database fails the tests; it never skips them.
 """
 
+import asyncio
 import os
 import secrets
+import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, date, datetime, timedelta
@@ -55,6 +60,7 @@ from ads_engine.analysis import runner
 from ads_engine.analysis.lock import RunInProgress, analysis_lock
 from ads_engine.analysis.thresholds import Thresholds, resolve_config_dir
 from ads_engine.analysis.window import InvalidWindow
+from ads_engine.api import app as api_app
 from ads_engine.api import deps, security
 from ads_engine.api.deps import ApiError
 from ads_engine.api.routes import auth, runs
@@ -98,6 +104,14 @@ API = "/api/v1"
 def anyio_backend() -> str:
     """Run the async tests on asyncio only."""
     return "asyncio"
+
+
+@pytest.fixture(scope="module", autouse=True)
+async def _analysis_process_stopped(anyio_backend: str) -> AsyncIterator[None]:
+    """Stop the analysis process this module's ``POST /runs`` spawned, once the module ran."""
+    del anyio_backend  # Requested so anyio runs this fixture; the backend is always asyncio.
+    yield
+    await runner.stop_analysis_process()
 
 
 def _database_url() -> URL:
@@ -689,3 +703,112 @@ async def test_a_created_run_is_logged_without_the_email(
     assert fields["days"] == 30
     assert isinstance(fields["user_id"], int)
     assert email not in repr(fields)
+
+
+@pytest.mark.anyio
+async def test_a_custom_run_computes_in_the_analysis_process(
+    app_db: str, thresholds: Thresholds, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refused(_ctx: Any) -> Any:
+        raise AssertionError("a rule module ran in the API process")
+
+    # Every rule refuses to run here, so the 201 proves the run computed elsewhere.
+    monkeypatch.setattr(runner, "_RULES", tuple((name, refused) for name, _ in runner._RULES))
+    email = await _seed()
+    async with await _client(thresholds) as client:
+        await _sign_in(client, email)
+        created = await client.post(f"{API}/runs", json=_window(28), headers=CSRF)
+        assert created.status_code == 201, created.text
+        run = created.json()
+        assert (run["kind"], run["status"]) == ("custom", "succeeded")
+        assert run["config_hash"] == thresholds.config_hash
+        fetched = await client.get(f"{API}/runs/{run['id']}")
+        assert fetched.json() == run
+    assert await _run_count() == 1
+
+
+def _alive(pid: int) -> bool:
+    """Whether process ``pid`` exists (an exited, reaped process does not)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _exited(pid: int) -> bool:
+    """Wait, at most 30 s, until process ``pid`` has exited and been reaped."""
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if not _alive(pid):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+@pytest.mark.anyio
+async def test_the_lifespan_starts_and_stops_the_analysis_process(
+    app_db: str, thresholds: Thresholds, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started: list[int] = []
+    start = runner.start_analysis_process
+
+    async def recording() -> int:
+        pid = await start()
+        started.append(pid)
+        return pid
+
+    monkeypatch.setattr(runner, "start_analysis_process", recording)
+    app = FastAPI(lifespan=api_app._lifespan)
+    app.state.thresholds = thresholds
+    async with app.router.lifespan_context(app):
+        (pid,) = started
+        assert pid != os.getpid()
+        assert _alive(pid)
+        assert runner._process is not None
+    assert runner._process is None
+    assert await asyncio.to_thread(_exited, pid)
+
+
+class _AppLogRecorder:
+    """Stand-in for ``api/app.py``'s logger that records every event with its level."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str, dict[str, Any]]] = []
+
+    def info(self, event: str, **fields: Any) -> None:
+        self.events.append(("info", event, fields))
+
+    def warning(self, event: str, **fields: Any) -> None:
+        self.events.append(("warning", event, fields))
+
+
+@pytest.mark.anyio
+async def test_an_analysis_process_that_cannot_start_leaves_the_api_serving(
+    app_db: str, thresholds: Thresholds, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def failing() -> int:
+        raise OSError("no process can be created")
+
+    recorder = _AppLogRecorder()
+    monkeypatch.setattr(api_app, "_log", recorder)
+    monkeypatch.setattr(runner, "start_analysis_process", failing)
+    app = FastAPI(lifespan=api_app._lifespan)
+    app.state.thresholds = thresholds
+    async with app.router.lifespan_context(app):
+        unavailable = [entry for entry in recorder.events if entry[1].endswith("unavailable")]
+        assert unavailable == [
+            ("warning", "api.analysis_process_unavailable", {"error": "OSError"})
+        ]
+    assert [event for _, event, _ in recorder.events] == [
+        "api.started",
+        "api.analysis_process_unavailable",
+        "api.stopping",
+    ]
+    # The next POST /runs spawns the analysis process itself.
+    email = await _seed()
+    async with await _client(thresholds) as client:
+        await _sign_in(client, email)
+        created = await client.post(f"{API}/runs", json=_window(14), headers=CSRF)
+        assert created.status_code == 201, created.text
+    assert runner._process is not None

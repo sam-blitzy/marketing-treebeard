@@ -54,6 +54,7 @@ const COMMITTED_STYLESHEETS = [
   'src/design-system/components/Tooltip.css',
   'src/design-system/components/TopBar.css',
   'src/design-system/components/shared.css',
+  'src/design-system/components/wholeDates.css',
 ] as const;
 
 /** One stylelint warning, reduced to the fields these tests assert. */

@@ -7,10 +7,15 @@
  * cell or list entry can be compared with its label exactly while the help text is tested on
  * its own, through the trigger's `aria-describedby`.
  *
+ * `Banner` and `Badge` hold each standalone calendar date of a string title, content or label in
+ * its own `ds-whole-date` span, so such text is split across elements and a plain string query
+ * does not find it. {@link byTextContent} finds the element that holds the whole text instead.
+ *
  * Only test files import this module; application code never does.
  *
  * @packageDocumentation
  */
+import type { MatcherFunction } from '@testing-library/react';
 
 /** The bubble every `Tooltip` renders (`ds-tooltip__content`, `role="tooltip"`). */
 const TOOLTIP_SELECTOR = '[role="tooltip"]';
@@ -47,4 +52,38 @@ export function textWithoutTooltips(element: Element): string {
     bubble.remove();
   }
   return copy.textContent;
+}
+
+/**
+ * A Testing Library text matcher for the element matching `selector` whose whole text content is
+ * `text`, or contains a match of `text` when it is a regular expression.
+ *
+ * The default text matcher reads only an element's own text nodes, so it misses text that is
+ * split across child elements, such as a banner title or chip label whose dates sit in
+ * `ds-whole-date` spans. This one reads the element's full `textContent`, exactly as written (no
+ * whitespace normalization), and `selector` names the element that holds the whole text, such
+ * as `.ds-banner__title`, `.ds-banner__content` or `.ds-badge`. The query therefore returns that
+ * element, the one a plain string query would return were the text a single node, and never an
+ * ancestor or inner span that holds the same text. A regular expression is applied with
+ * `String.prototype.search`, which ignores its `lastIndex`, so a global one is safe to reuse.
+ *
+ * @param selector - CSS selector of the element that holds the whole text.
+ * @param text - The exact text content, or a pattern it must contain.
+ * @returns A matcher for `getByText`, `queryByText`, `findByText` and their `All` variants.
+ *
+ * @example
+ * ```ts
+ * const title = 'Custom window 2026-09-26 – 2026-10-05';
+ * within(banner).getByText(byTextContent('.ds-banner__title', title));
+ * screen.getByText(byTextContent('.ds-badge', /^2026-09-08 – 2026-10-05 · 28 days/u));
+ * ```
+ */
+export function byTextContent(selector: string, text: string | RegExp): MatcherFunction {
+  return (_content, element) => {
+    if (element === null || !element.matches(selector)) {
+      return false;
+    }
+    const whole = element.textContent;
+    return typeof text === 'string' ? whole === text : whole.search(text) >= 0;
+  };
 }

@@ -62,7 +62,9 @@ import {
 } from '../../../test/fixtures';
 import { LiveSection, feedbackConfirmationText, feedbackFlow } from '../../../test/feedbackFlow';
 import { renderWithProviders } from '../../../test/render';
+import { FEEDBACK_LABELS, HISTORICAL_LABEL } from '../RecommendationCard';
 import { visibleItemCount } from '../SectionNav';
+import { CARD_BATCH_SIZE } from '../batches';
 import {
   ADJACENT_TERMS_TITLE,
   KEYWORD_DETAILS_LABEL,
@@ -1327,5 +1329,67 @@ describe('KeywordsSection: the confirmation of a card hidden on the page', () =>
     expect(within(region).getByRole('list', { name: 'Not shown' }).textContent).toContain(
       '1 hidden since this run',
     );
+  });
+});
+
+describe('KeywordsSection: a card a refetch moves into the replaced-data block', () => {
+  /** A K1 item on its own search term, `term {id}`, so every item is its own recommendation. */
+  function termItem(id: number, rank: number): Item {
+    const base = makeItem();
+    return makeItem({
+      id,
+      rank,
+      action: `Add "term ${String(id)}" as exact-match negative`,
+      entity: { ...base.entity, id: `61000201|7700119|term ${String(id)}`, name: `term ${String(id)}` },
+    });
+  }
+
+  /** `item` as the overlay reads it once its frozen dataset has been replaced (AAP 0.3.2). */
+  function replaced(item: Item): Item {
+    return {
+      ...item,
+      current: makeItemOverlay({
+        historical: true,
+        held_now: true,
+        held_reason_now: 'Computed from data that has since been replaced',
+        data_status_now: 'live',
+      }),
+    };
+  }
+
+  it('shows and focuses a moved card beyond the first batch of the replaced-data block', async () => {
+    const items = Array.from({ length: 2 * CARD_BATCH_SIZE + 5 }, (_, index) =>
+      termItem(5001 + index, index + 1),
+    );
+    const block = makeGroup({ key: 'block', title: 'Block / negative-keyword candidates', items });
+    const control: SectionControl = {};
+    await renderWithProviders(<Harness initial={keywordsWith(block)} control={control} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Show 20 more actions' }));
+    const target = items[CARD_BATCH_SIZE + 2];
+    if (target === undefined) {
+      throw new Error('no card beyond the first batch');
+    }
+    act(() => {
+      within(screen.getByRole('article', { name: target.action }))
+        .getByRole('button', { name: FEEDBACK_LABELS.dismiss })
+        .focus();
+    });
+
+    act(() => {
+      control.replace?.(keywordsWith({ ...block, items: items.map(replaced) }));
+    });
+
+    const replacedBlock = screen.getByRole('group', {
+      name: `Computed from replaced data (${String(items.length)})`,
+    });
+    const moved = within(replacedBlock).getByRole('article', { name: target.action });
+    const badge = within(moved).getByText(HISTORICAL_LABEL);
+    await waitFor(() => {
+      expect(document.activeElement?.contains(badge)).toBe(true);
+    });
+    expect(moved.contains(document.activeElement)).toBe(true);
+    // The block shows the batches through the moved card, and no more.
+    expect(within(replacedBlock).getAllByRole('article')).toHaveLength(2 * CARD_BATCH_SIZE);
+    expect(within(replacedBlock).getByText('Showing 40 of 45 actions')).toBeDefined();
   });
 });

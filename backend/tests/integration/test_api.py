@@ -386,6 +386,14 @@ def isolated_logging(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     state.redactor, state.handler = saved_redactor, saved_handler
 
 
+@pytest.fixture(scope="module", autouse=True)
+async def _analysis_process_stopped(anyio_backend: str) -> AsyncIterator[None]:
+    """Stop the analysis process this module's ``POST /runs`` spawned, once the module ran."""
+    del anyio_backend  # Requested so anyio runs this fixture; the backend is always asyncio.
+    yield
+    await runner.stop_analysis_process()
+
+
 # ---------------------------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------------------------
@@ -1670,7 +1678,19 @@ async def test_lifespan_drains_request_unwinds_before_disposing_the_pool(
         """Record whether the cleanup had finished, and how many requests were still held."""
         disposed.append((unwound.is_set(), len(app.state.request_unwinds)))
 
+    stops: list[tuple[bool, int, int]] = []
+
+    async def no_analysis_process() -> int:
+        """Spawn nothing: the analysis process's own lifecycle is tested with the runs routes."""
+        return 0
+
+    async def recording_stop_analysis_process() -> None:
+        """Record the drain's state, and how often the pool was disposed, at the stop."""
+        stops.append((unwound.is_set(), len(app.state.request_unwinds), len(disposed)))
+
     monkeypatch.setattr(api_app, "dispose_engine", recording_dispose_engine)
+    monkeypatch.setattr(runner, "start_analysis_process", no_analysis_process)
+    monkeypatch.setattr(runner, "stop_analysis_process", recording_stop_analysis_process)
     captured_logs.configure(settings=get_settings())
     captured_logs.clear()
     async with api_app._lifespan(app):
@@ -1681,6 +1701,8 @@ async def test_lifespan_drains_request_unwinds_before_disposing_the_pool(
         unwound_at_shutdown = unwound.is_set()
 
     assert (held_at_shutdown, unwound_at_shutdown) == (1, False)
+    # The analysis process stops once the drain has finished, and before the pool is disposed.
+    assert stops == [(True, 0, 0)]
     assert disposed == [(True, 0)]
     assert len(events_named(captured_logs, "api.stopping")) == 1
     assert events_named(captured_logs, "api.request_unwinds_pending") == []
@@ -1708,7 +1730,16 @@ async def test_lifespan_disposes_the_pool_once_the_unwind_bound_passes(
         """Record how many requests were still unwinding when the pool was disposed."""
         disposed.append(len(app.state.request_unwinds))
 
+    async def no_analysis_process() -> int:
+        """Spawn nothing, so the shutdown measured here is the drain's alone."""
+        return 0
+
+    async def no_stop() -> None:
+        """Stop nothing: no analysis process was spawned."""
+
     monkeypatch.setattr(api_app, "dispose_engine", recording_dispose_engine)
+    monkeypatch.setattr(runner, "start_analysis_process", no_analysis_process)
+    monkeypatch.setattr(runner, "stop_analysis_process", no_stop)
     captured_logs.configure(settings=get_settings())
     captured_logs.clear()
     loop = asyncio.get_running_loop()

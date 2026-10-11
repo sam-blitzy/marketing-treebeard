@@ -10,6 +10,7 @@ synchronous: no database and no network.
 
 import ast
 import doctest
+import hashlib
 import inspect
 import itertools
 import re
@@ -27,6 +28,7 @@ from ads_engine.analysis import text
 from ads_engine.analysis.text import (
     STOPWORDS,
     TermCluster,
+    TermIndex,
     adjacent_terms,
     cluster_terms,
     contains_tokens,
@@ -789,6 +791,264 @@ def test_adjacent_terms_of_a_term_without_tokens_is_empty() -> None:
     assert adjacent_terms("the best", ["the best", "best of", A], threshold=HALF) == []
 
 
+# --- TermIndex ----------------------------------------------------------------------------
+
+# A seeded corpus with the spellings K2 meets in a real report: terms of one to five topic
+# words with stopwords mixed in, respellings that differ only in case and spacing, exact
+# repeats, and stopword-only or empty terms. Twelve topic words keep overlaps frequent, so
+# every threshold below has many matches to rank, cap and exclude.
+_INDEX_WORDS = (
+    "crm",
+    "tool",
+    "pricing",
+    "guide",
+    "software",
+    "free",
+    "demo",
+    "b2b",
+    "attribution",
+    "revenue",
+    "forecasting",
+    "pipeline",
+)
+_INDEX_STOPWORDS = ("the", "best", "for", "of", "near", "me")
+
+
+def _seeded_corpus(seed: int, size: int) -> tuple[str, ...]:
+    """``size`` terms drawn from a SHA-256 counter stream seeded with ``seed``.
+
+    About a tenth are exact repeats, a tenth case-and-spacing respellings and a twentieth
+    stopword-only or empty; the rest are one to five distinct topic words, some with a
+    stopword inserted.
+    """
+    draws = (
+        int.from_bytes(hashlib.sha256(f"{seed}:{counter}".encode()).digest()[:8], "big")
+        for counter in itertools.count()
+    )
+
+    def pick(count: int) -> int:
+        return next(draws) % count
+
+    def stopword() -> str:
+        return _INDEX_STOPWORDS[pick(len(_INDEX_STOPWORDS))]
+
+    corpus: list[str] = []
+    while len(corpus) < size:
+        roll = pick(20)
+        if corpus and roll < 2:
+            corpus.append(corpus[pick(len(corpus))])
+        elif corpus and roll < 4:
+            words = corpus[pick(len(corpus))].split()
+            corpus.append(("  " if pick(2) else "\t").join(words).upper())
+        elif roll < 5:
+            corpus.append(" ".join(stopword() for _ in range(pick(3))))
+        else:
+            pool = list(_INDEX_WORDS)
+            words = [pool.pop(pick(len(pool))) for _ in range(1 + pick(5))]
+            if pick(10) < 3:
+                words.insert(pick(len(words) + 1), stopword())
+            corpus.append(" ".join(words))
+    return tuple(corpus)
+
+
+_INDEX_CORPORA = {seed: _seeded_corpus(seed, 160) for seed in (7, 2026, 31337)}
+_INDEX_THRESHOLDS = ("1E-30", "0.25", "0.5", "0.6", "1")
+_INDEX_LIMITS = (None, 0, 1, 2, 5)
+
+
+def _reference_similar(term: str, corpus: Sequence[str], threshold: Decimal) -> list[str]:
+    """The pre-index algorithm: tokenise every candidate, compare exactly, drop the term itself.
+
+    Repeats are skipped at their first occurrence, and a candidate with the term's own
+    caseless, whitespace-normalised spelling is never similar.
+    """
+    own = tokenize(term)
+    if not own:
+        return []
+    own_key = text._term_key(term)
+    seen: set[str] = set()
+    matches: list[str] = []
+    for candidate in corpus:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        other = tokenize(candidate)
+        union = own | other
+        if (
+            text._term_key(candidate) != own_key
+            and union
+            and Fraction(len(own & other), len(union)) >= Fraction(threshold)
+        ):
+            matches.append(candidate)
+    return matches
+
+
+@pytest.mark.parametrize("seed", sorted(_INDEX_CORPORA))
+def test_seeded_corpora_hold_repeats_respellings_and_tokenless_terms(seed: int) -> None:
+    """Each corpus has the cases the index must handle, so the comparison below covers them."""
+    corpus = _INDEX_CORPORA[seed]
+    keys = Counter(text._term_key(term) for term in set(corpus) if tokenize(term))
+
+    assert len(set(corpus)) < len(corpus)
+    assert any(count > 1 for count in keys.values())
+    assert any(not tokenize(term) for term in corpus)
+    assert any(word in STOPWORDS for term in corpus for word in term.split() if tokenize(term))
+
+
+@pytest.mark.parametrize("threshold", _INDEX_THRESHOLDS)
+@pytest.mark.parametrize("seed", sorted(_INDEX_CORPORA))
+def test_term_index_matches_a_brute_force_scan_for_every_query_and_limit(
+    seed: int, threshold: str
+) -> None:
+    """K2: every query of the index equals a brute-force scan of the corpus, capped at ``limit``.
+
+    Each distinct corpus term is queried, and so are terms the corpus lacks, at thresholds
+    from 1E-30 to 1 and limits None, 0, 1, 2 and 5. The prefix pruning therefore skips no
+    similar term, results keep first-occurrence order, a capped query returns the reference's
+    first matches, and ``adjacent_terms`` agrees with both.
+    """
+    corpus = _INDEX_CORPORA[seed]
+    index = TermIndex(corpus)
+    unindexed = ("crm pipeline tool", "FREE demo guide", "the best", "attribution", "zzz crm")
+    value = Decimal(threshold)
+
+    for term in (*dict.fromkeys(corpus), *unindexed):
+        expected = _reference_similar(term, corpus, value)
+        assert adjacent_terms(term, corpus, threshold=value) == expected, term
+        for limit in _INDEX_LIMITS:
+            capped = expected if limit is None else expected[:limit]
+            assert index.similar(term, threshold=value, limit=limit) == capped, (term, limit)
+
+
+def test_term_index_keeps_each_distinct_term_once_in_first_occurrence_order() -> None:
+    """The index holds each string once, where it first occurs; respellings stay distinct."""
+    index = TermIndex([C, A, C, "CRM  Tool", A, D])
+
+    assert index.terms == (C, A, "CRM  Tool", D)
+    assert index.similar(B, threshold=HALF) == [C, A, "CRM  Tool"]
+    assert TermIndex([]).terms == ()
+    assert TermIndex([]).similar(B, threshold=HALF) == []
+
+
+def test_term_index_excludes_the_queried_term_in_any_case_or_spacing() -> None:
+    """K2: the queried term never matches itself, however an indexed term cases or spaces it."""
+    index = TermIndex([B, "CRM Tool Pricing", "  crm   TOOL\tpricing ", A, "tool crm pricing"])
+
+    assert index.similar(B, threshold=HALF) == [A, "tool crm pricing"]
+    assert index.similar("CRM TOOL PRICING", threshold=Decimal(1)) == ["tool crm pricing"]
+
+
+def test_term_index_returns_nothing_for_a_tokenless_term_or_a_limit_of_zero() -> None:
+    """A stopword-only or empty term matches nothing, and ``limit=0`` returns no match."""
+    index = TermIndex([A, B, C, "the best", ""])
+
+    assert index.similar("the best", threshold=Decimal("1E-30")) == []
+    assert index.similar("", threshold=Decimal("1E-30")) == []
+    assert index.similar(B, threshold=HALF, limit=0) == []
+    assert index.similar(B, threshold=HALF) == [A, C]
+
+
+def test_term_index_tokenises_each_distinct_term_once_and_reuses_it_for_queries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Building tokenises each distinct term once; querying an indexed term tokenises nothing.
+
+    A term the index lacks is tokenised once per query. This is what keeps K2 linear in the
+    report: no query re-reads the other terms.
+    """
+    calls: list[str] = []
+    real = text.tokenize
+
+    def counting(value: str) -> frozenset[str]:
+        calls.append(value)
+        return real(value)
+
+    monkeypatch.setattr(text, "tokenize", counting)
+    corpus = _INDEX_CORPORA[7]
+    index = TermIndex(corpus)
+
+    assert sorted(calls) == sorted(set(corpus))
+    calls.clear()
+    for term in index.terms:
+        index.similar(term, threshold=HALF, limit=5)
+    assert calls == []
+    assert "zzz crm pipeline" not in corpus
+    index.similar("zzz crm pipeline", threshold=HALF)
+    assert calls == ["zzz crm pipeline"]
+
+
+def test_term_index_stops_comparing_at_the_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With ``limit`` the search stops at the ``limit``-th match: later terms are never compared."""
+    compared: list[int] = []
+    real = text._meets
+
+    def counting(a: frozenset[str], b: frozenset[str], threshold: tuple[int, int]) -> bool:
+        compared.append(len(b))
+        return real(a, b, threshold)
+
+    monkeypatch.setattr(text, "_meets", counting)
+    candidates = [f"crm tool {word}" for word in ("a1", "b2", "c3", "d4", "e5", "f6", "g7")]
+    index = TermIndex(candidates)
+
+    assert index.similar(A, threshold=HALF, limit=2) == candidates[:2]
+    assert len(compared) == 2
+    compared.clear()
+    assert index.similar(A, threshold=HALF) == candidates
+    assert len(compared) == len(candidates)
+
+
+def test_term_index_never_compares_a_term_sharing_only_the_commonest_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prefix pruning: at 0.5 a three-token query probes only its two rarest tokens.
+
+    Every term contains "crm", so a term sharing nothing else with "crm tool pricing" has
+    Jaccard at most 1/3 and is never compared; the result is unchanged.
+    """
+    compared: list[frozenset[str]] = []
+    real = text._meets
+
+    def counting(a: frozenset[str], b: frozenset[str], threshold: tuple[int, int]) -> bool:
+        compared.append(b)
+        return real(a, b, threshold)
+
+    monkeypatch.setattr(text, "_meets", counting)
+    fillers = [f"crm {word}" for word in ("a1", "b2", "c3", "d4", "e5")]
+    index = TermIndex([*fillers, "crm tool", "crm pricing guide", "tool pricing"])
+
+    assert index.similar(B, threshold=HALF) == ["crm tool", "crm pricing guide", "tool pricing"]
+    assert sorted(compared, key=sorted) == sorted(
+        [tokenize("crm tool"), tokenize("crm pricing guide"), tokenize("tool pricing")], key=sorted
+    )
+
+
+@pytest.mark.parametrize("limit", [-1, -5])
+def test_term_index_refuses_a_negative_limit(limit: int) -> None:
+    """A negative ``limit`` raises ValueError naming it."""
+    with pytest.raises(ValueError, match=rf"^limit must be at least 0, got {limit}$"):
+        TermIndex([A, B]).similar(A, threshold=HALF, limit=limit)
+
+
+@pytest.mark.parametrize("limit", [1.0, "2", True, Decimal(1)])
+def test_term_index_refuses_a_limit_that_is_not_an_int(limit: Any) -> None:
+    """A ``limit`` that is not an ``int`` (a ``bool`` included) raises TypeError naming its type."""
+    with pytest.raises(
+        TypeError, match=rf"^limit must be an int or None, got {type(limit).__name__}$"
+    ):
+        TermIndex([A, B]).similar(A, threshold=HALF, limit=limit)
+
+
+def test_term_index_refuses_items_or_queries_that_are_not_strings() -> None:
+    """An index item or a queried term that is not a string raises TypeError naming its type."""
+    items: Any = [A, 7]
+    query: Any = 7
+
+    with pytest.raises(TypeError, match=r"^terms must hold only strings, found int$"):
+        TermIndex(items)
+    with pytest.raises(TypeError, match=r"^term must be a string, got int$"):
+        TermIndex([A]).similar(query, threshold=HALF)
+
+
 # --- validation ---------------------------------------------------------------------------
 
 # "<function>-<parameter>" -> a call passing the value as that parameter.
@@ -801,6 +1061,7 @@ _THRESHOLD_PARAMETERS: dict[str, Callable[[Any], object]] = {
     ),
     "head_tokens-min_share": lambda value: head_tokens([A, B], min_share=value),
     "adjacent_terms-threshold": lambda value: adjacent_terms(A, [B], threshold=value),
+    "TermIndex.similar-threshold": lambda value: TermIndex([B]).similar(A, threshold=value),
 }
 
 
@@ -865,6 +1126,9 @@ _ACCEPTED_THRESHOLD_CALLS: dict[str, Callable[[Decimal], object]] = {
     "adjacent_terms-threshold": lambda value: adjacent_terms(
         A, _ADJACENT_CANDIDATES, threshold=value
     ),
+    "TermIndex.similar-threshold": lambda value: TermIndex(_ADJACENT_CANDIDATES).similar(
+        A, threshold=value
+    ),
 }
 
 # (case, value) -> the exact output of that call at that threshold.
@@ -906,6 +1170,9 @@ _ACCEPTED_THRESHOLD_OUTPUTS: dict[tuple[str, str], object] = {
     ("adjacent_terms-threshold", "1"): [TOOL_CRM],
     ("adjacent_terms-threshold", "1E-30"): [TOOL_CRM, B, "crm", C],
     ("adjacent_terms-threshold", "0.5"): [TOOL_CRM, B, "crm"],
+    ("TermIndex.similar-threshold", "1"): [TOOL_CRM],
+    ("TermIndex.similar-threshold", "1E-30"): [TOOL_CRM, B, "crm", C],
+    ("TermIndex.similar-threshold", "0.5"): [TOOL_CRM, B, "crm"],
 }
 # "1.000" is the threshold 1 written with trailing zeros, so it is held to the output of "1".
 _ACCEPTED_THRESHOLD_OUTPUTS |= {
@@ -942,6 +1209,10 @@ def test_threshold_validation_does_not_depend_on_the_input() -> None:
     ):
         adjacent_terms("the best", [], threshold=Decimal(0))
     with pytest.raises(
+        ValueError, match=r"^threshold must be a finite Decimal in \(0, 1\], got 0$"
+    ):
+        TermIndex([]).similar("the best", threshold=Decimal(0), limit=0)
+    with pytest.raises(
         ValueError, match=r"^min_share must be a finite Decimal in \(0, 1\], got 2$"
     ):
         head_tokens([], min_share=Decimal(2))
@@ -972,6 +1243,7 @@ def test_threshold_validation_does_not_depend_on_the_input() -> None:
             lambda: adjacent_terms(A, ONE_STRING, threshold=HALF),
             id="adjacent_terms",
         ),
+        pytest.param("terms", lambda: TermIndex(ONE_STRING), id="TermIndex"),
     ],
 )
 def test_a_single_string_is_refused_where_a_collection_of_strings_belongs(
@@ -1034,10 +1306,11 @@ def test_module_is_pure_and_imports_only_the_standard_library() -> None:
 
 
 def test_public_names_are_exactly_the_documented_api() -> None:
-    """The text module exports exactly its eight public names in ``__all__``."""
+    """The text module exports exactly its nine public names in ``__all__``."""
     assert sorted(text.__all__) == [
         "STOPWORDS",
         "TermCluster",
+        "TermIndex",
         "adjacent_terms",
         "cluster_terms",
         "contains_tokens",

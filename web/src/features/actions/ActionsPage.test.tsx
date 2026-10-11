@@ -84,6 +84,7 @@ import {
 } from '../../test/fixtures';
 import { feedbackConfirmationText, feedbackFlow } from '../../test/feedbackFlow';
 import { createTestQueryClient, renderWithProviders } from '../../test/render';
+import { byTextContent } from '../../test/text';
 import * as statusBarModule from '../status/StatusBar';
 import { ActionsPage, SECTION_COMPONENTS } from './ActionsPage';
 import * as sectionFrameModule from './sections/SectionFrame';
@@ -438,7 +439,11 @@ describe('ActionsPage', () => {
       if (banner === null) {
         throw new Error('no custom-window banner');
       }
-      expect(within(banner).getByText('Custom window 2026-09-26 – 2026-10-05')).toBeTruthy();
+      expect(
+        within(banner).getByText(
+          byTextContent('.ds-banner__title', 'Custom window 2026-09-26 – 2026-10-05'),
+        ),
+      ).toBeTruthy();
       expect(within(banner).getByText('10 days')).toBeTruthy();
       expect(banner.getAttribute('role')).toBeNull();
       // The discrepancy banner sits above everything; the custom-window banner follows it in the
@@ -498,7 +503,11 @@ describe('ActionsPage', () => {
         }
         return element;
       });
-      expect(within(banner).getByText('Older default run 2026-09-01 – 2026-09-28')).toBeTruthy();
+      expect(
+        within(banner).getByText(
+          byTextContent('.ds-banner__title', 'Older default run 2026-09-01 – 2026-09-28'),
+        ),
+      ).toBeTruthy();
       expect(within(banner).getByText('28 days · not the latest default run')).toBeTruthy();
       expect(banner.getAttribute('role')).toBeNull();
       expect(document.getElementById('banner-custom-window')).toBeNull();
@@ -1583,7 +1592,7 @@ describe('ActionsPage polls', () => {
 
     expect(await within(sourceChip('LinkedIn')).findByText('Incomplete')).toBeTruthy();
     expect(within(sourceChip('Google')).queryByText('Incomplete')).toBeNull();
-    expect(screen.getByText(movedMessage)).toBeTruthy();
+    expect(screen.getByText(byTextContent('.ds-banner__title', movedMessage))).toBeTruthy();
     expect(screen.queryByText(FIXTURE_BANNERS[3]?.message ?? '')).toBeNull();
     await settle({ queryClient, commits });
     expect(shownPage(queryClient).sections).toBe(shown.sections);

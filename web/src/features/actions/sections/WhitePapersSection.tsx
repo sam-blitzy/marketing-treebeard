@@ -30,7 +30,9 @@
  *    decision subject). A held row's hold notice is not in its details but in its Action cell;
  * 3. rows computed from replaced data (AAP 0.3.2: readable, every action disabled), never
  *    collapsed, in a table of their own captioned "White papers ({currency}) computed from
- *    replaced data", each with its replaced-data badge in the Action cell;
+ *    replaced data", each with its replaced-data badge in the Action cell. A row a refetch moves
+ *    there keeps keyboard focus that was on it or in its details, on its toggle in the new table
+ *    ({@link AssetCell}, WCAG 2.2 SC 2.4.3);
  * 4. the cohort's notes: its spend total in its own currency, as the backend computed it, the
  *    note that counts overlap across assets, and what the LinkedIn leads and meetings booked
  *    columns count;
@@ -71,7 +73,7 @@
  *
  * @packageDocumentation
  */
-import { createContext, useContext, useMemo } from 'react';
+import { createContext, useContext, useMemo, useRef } from 'react';
 import type { ReactElement } from 'react';
 
 import { useConfig } from '../../../api/queries';
@@ -90,6 +92,7 @@ import type {
 } from '../../../api/types';
 import { Badge, DataTable, Inline, Stack } from '../../../design-system';
 import type { DataTableColumn } from '../../../design-system';
+import { focusElement } from '../../../lib/focus';
 import {
   EM_DASH,
   UNAVAILABLE,
@@ -99,6 +102,7 @@ import {
   formatWindowChip,
 } from '../../../lib/format';
 import { EvidenceTable } from '../EvidenceTable';
+import { focusLeftWith, useCarriedFocus } from '../carriedFocus';
 import {
   WHITE_PAPER_METRIC_KEYS,
   cohortSummary,
@@ -122,6 +126,7 @@ import type { BatchNoun } from '../batches';
 import {
   HISTORICAL_LABEL,
   RecommendationActions,
+  focusIsLostOrWithin,
   historicalProvenanceText,
 } from '../RecommendationCard';
 import {
@@ -695,6 +700,26 @@ function floorFlags(item: Item): Flag[] {
 }
 
 /**
+ * Finds an asset row's expand toggle within its table row: the `DataTable` renders it as the
+ * row's one button carrying `aria-expanded` (and `aria-controls`, naming the row's details).
+ */
+const ROW_TOGGLE_SELECTOR = 'button[aria-expanded][aria-controls]';
+
+/**
+ * An asset row's details: the detail row its expand toggle names in `aria-controls`, which
+ * holds the expanded {@link AssetDetails}.
+ *
+ * @param tableRow - the asset's table row, holding its toggle and cells
+ * @returns the detail row, or `null` when the row names none on the page
+ */
+function rowDetails(tableRow: Element): HTMLElement | null {
+  const id = tableRow.querySelector(ROW_TOGGLE_SELECTOR)?.getAttribute('aria-controls');
+  return id === undefined || id === null || id === ''
+    ? null
+    : tableRow.ownerDocument.getElementById(id);
+}
+
+/**
  * The Asset cell, the row header, which states on the collapsed row what qualifies the row's
  * numbers, without the row being expanded: the asset's name, then its simulated-data badge
  * ({@link simulatedFlag}), then one badge per floor flag ({@link floorFlags}), each in its flag's
@@ -705,17 +730,50 @@ function floorFlags(item: Item): Flag[] {
  * Captions and the toggle's row name keep the plain name. In a batched table the name is the
  * row's focus target ({@link BatchEntryAnchor}), so focus lands on the row when a reveal shows it
  * first.
+ *
+ * A row React mounts in place of a row of the same asset that left the page holding keyboard
+ * focus, on its toggle, its cells or its expanded details, takes that focus on its own toggle
+ * (`../carriedFocus`, WCAG 2.2 SC 2.4.3). A refetch that finds the asset computed from replaced
+ * data moves its row this way, from the cohort's table into the replaced-data table, where it
+ * starts collapsed and the toggle's name says where it now stands, "Show details for {asset}
+ * ({currency}, computed from replaced data)".
  */
 function AssetCell({ row }: { row: AssetRowView }): ReactElement {
+  const nameRef = useRef<HTMLSpanElement>(null);
+  useCarriedFocus(itemIdentity(row.item), {
+    holdsFocus: () => {
+      const tableRow = nameRef.current?.closest('tr') ?? null;
+      const active = document.activeElement;
+      if (tableRow === null || active === null) {
+        return false;
+      }
+      return tableRow.contains(active) || (rowDetails(tableRow)?.contains(active) ?? false);
+    },
+    takeFocus: () => {
+      const tableRow = nameRef.current?.closest('tr') ?? null;
+      if (tableRow === null || !focusIsLostOrWithin(tableRow)) {
+        return;
+      }
+      const target = tableRow.querySelector<HTMLElement>(ROW_TOGGLE_SELECTOR) ?? nameRef.current;
+      if (target !== null) {
+        focusElement(target);
+      }
+    },
+  });
   const simulated = simulatedFlag(row.item);
   const badges = [...(simulated === null ? [] : [simulated]), ...floorFlags(row.item)];
-  const name = <BatchEntryAnchor id={row.focusId}>{row.name}</BatchEntryAnchor>;
+  const name = (
+    // The unstyled element the row is found by when keyboard focus is carried to or from it.
+    <span ref={nameRef}>
+      <BatchEntryAnchor id={row.focusId}>{row.name}</BatchEntryAnchor>
+    </span>
+  );
   if (badges.length === 0) {
     return name;
   }
   return (
     <Inline gap={2}>
-      <span>{name}</span>
+      {name}
       {badges.map((flag) => (
         <Badge key={flag.code} tone={flagTone(flag.code)}>
           {flagText(flag)}
@@ -1074,7 +1132,10 @@ function rowLabelOf(row: AssetRowView, scope: string, shared: ReadonlySet<string
  * Rows are keyed by their recommendation's identity across runs ({@link itemKeys}), never by the
  * per-run item id, and the table keeps a row's expansion by that key. A newer run's row of the
  * same asset therefore stays expanded, and its expand toggle and details keep their elements, so
- * keyboard focus on them, and the footer actions' state, survive the swap (WCAG 2.2 SC 2.4.3).
+ * keyboard focus on them, and the footer actions' state, survive the swap (WCAG 2.2 SC 2.4.3). A
+ * row that moves to another table, such as into the replaced-data table, mounts anew there,
+ * collapsed, and its toggle takes over the focus the row it replaces held ({@link AssetCell}); a
+ * batched table shows such a row at once.
  *
  * Each row's toggle shows "Show details" or "Hide details", and is named for its row through
  * {@link rowLabelOf}, "Show details for {asset} ({scope})", so every toggle on the page has its
@@ -1087,7 +1148,12 @@ function AssetTable({ caption, scope, items, mql }: AssetTableProps): ReactEleme
   const columns = useMemo(() => assetColumns(header), [header]);
   const rowKeys = useMemo(() => itemKeys(items), [items]);
   const shared = useMemo(() => sharedNames(items), [items]);
-  const batches = useBatches(items, { batchSize: ROW_BATCH_SIZE });
+  const batches = useBatches(items, {
+    batchSize: ROW_BATCH_SIZE,
+    // A row that takes over the focus of one the same commit removed elsewhere, such as a row a
+    // refetch moved into the replaced-data table, is shown at once ({@link AssetCell}).
+    mustShow: (item) => focusLeftWith(itemIdentity(item)),
+  });
   const rows = batches.shown.map((item, index) =>
     assetRowOf(item, batches.batched ? batches.entryId(index) : null),
   );

@@ -15,6 +15,7 @@ import { describe, expect, it } from 'vitest';
 
 import { CUSTOM_RUN_ID, DEFAULT_RUN_ID, makeRun } from '../../test/fixtures';
 import { renderWithProviders } from '../../test/render';
+import { byTextContent } from '../../test/text';
 import { CustomRunBanner, OlderDefaultRunBanner, isOlderDefaultRun } from './CustomRunBanner';
 
 /** The id of an older default run, opened at `/actions?run=6` after later default runs. */
@@ -46,7 +47,11 @@ describe('CustomRunBanner', () => {
     });
 
     const banner = customBanner(container);
-    expect(within(banner).getByText('Custom window 2026-07-08 – 2026-10-05')).toBeTruthy();
+    expect(
+      within(banner).getByText(
+        byTextContent('.ds-banner__title', 'Custom window 2026-07-08 – 2026-10-05'),
+      ),
+    ).toBeTruthy();
     expect(within(banner).getByText('90 days')).toBeTruthy();
     // Plain content: only the open-discrepancies banner is an alert (AAP 0.5.5).
     expect(banner.getAttribute('role')).toBeNull();
@@ -67,7 +72,11 @@ describe('CustomRunBanner', () => {
     });
 
     const banner = customBanner(container);
-    expect(within(banner).getByText('Custom window 2026-10-05 – 2026-10-05')).toBeTruthy();
+    expect(
+      within(banner).getByText(
+        byTextContent('.ds-banner__title', 'Custom window 2026-10-05 – 2026-10-05'),
+      ),
+    ).toBeTruthy();
     expect(within(banner).getByText('1 day')).toBeTruthy();
     expect(within(banner).queryByText('1 days')).toBeNull();
   });
@@ -179,7 +188,11 @@ describe('OlderDefaultRunBanner', () => {
     if (banner === null) {
       throw new Error('The older-default-run banner is not rendered.');
     }
-    expect(within(banner).getByText('Older default run 2026-09-01 – 2026-09-28')).toBeTruthy();
+    expect(
+      within(banner).getByText(
+        byTextContent('.ds-banner__title', 'Older default run 2026-09-01 – 2026-09-28'),
+      ),
+    ).toBeTruthy();
     expect(within(banner).getByText('28 days · not the latest default run')).toBeTruthy();
     // Plain content: only the open-discrepancies banner is an alert (AAP 0.5.5).
     expect(banner.getAttribute('role')).toBeNull();

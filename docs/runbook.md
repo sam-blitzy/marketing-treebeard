@@ -370,6 +370,9 @@ else from `.env`, else the default below; a blank value keeps the default.
 - **One worker**: a higher limit gives the worker more room and never adds a second worker
   process; the scheduler's advisory lock keeps a single active instance
   ([Locks](architecture.md#locks)).
+- **Two processes in `api`**: uvicorn and its analysis process, the child in which `POST /runs`
+  computes custom runs at a lower CPU priority (`nice` 10). Both share the `api` CPU and memory
+  ceilings, and the lower priority lets request handling win the CPU while a custom run computes.
 
 To raise a limit, set its variable in `.env`, then run `docker compose up -d`, which recreates the
 services whose configuration changed. `docker inspect` shows the values in force, CPU in

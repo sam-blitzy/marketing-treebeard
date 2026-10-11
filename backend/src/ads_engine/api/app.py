@@ -41,8 +41,11 @@ uvicorn serves the factory, never a module-level application::
   failure, an unknown path or an unexpected crash, is rendered as
   :class:`~ads_engine.api.schemas.ErrorResponse`, ``{"error": {"code", "message"}}``.
 * **Lifespan**: loads ``config/*.yaml`` at boot, so a broken file stops uvicorn instead of
-  failing the first request. On shutdown it waits, within a bound, for the requests the
-  deadline answered to finish their cleanup, then disposes the database pool.
+  failing the first request, and starts the analysis process in which ``POST /runs``
+  computes (:func:`~ads_engine.analysis.runner.start_analysis_process`); one that cannot
+  start is logged and the API serves on, the next ``POST /runs`` spawning it. On shutdown
+  it waits, within a bound, for the requests the deadline answered to finish their cleanup,
+  stops the analysis process, then disposes the database pool.
 
 No middleware beyond the session cookie, the HEAD handling, the request deadline and the
 no-store cache policy is installed. The SPA is served same-origin by nginx, which also
@@ -76,6 +79,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ads_engine import __version__
+from ads_engine.analysis import runner
 from ads_engine.analysis.lock import RunInProgress
 from ads_engine.analysis.thresholds import (
     CONFIG_FILES,
@@ -910,7 +914,7 @@ async def _drain_request_unwinds(app: FastAPI) -> None:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Load the configuration at boot; on shutdown, drain request cleanups, then the pool.
+    """Load the configuration and start the analysis process at boot; drain and stop on shutdown.
 
     Under uvicorn a missing or invalid ``config/*.yaml`` therefore fails at boot, before
     any request is served. A request never depends on this having run:
@@ -919,9 +923,17 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     Configuration already stored on ``app.state.thresholds``, for example by a test, is
     kept rather than reloaded.
 
+    The analysis process, in which every ``POST /runs`` computes, is spawned once the
+    configuration loaded (:func:`~ads_engine.analysis.runner.start_analysis_process`), so
+    the first custom run does not wait for it. One that cannot start is logged as
+    ``api.analysis_process_unavailable`` with its error class only, and the API serves on:
+    the next ``POST /runs`` spawns it.
+
     On shutdown the requests answered 503 at the request deadline are given up to
-    :data:`_REQUEST_UNWIND_DRAIN_S` to finish their cleanup (:func:`_drain_request_unwinds`),
-    and the database pool is disposed after that, even when the wait is cut short.
+    :data:`_REQUEST_UNWIND_DRAIN_S` to finish their cleanup (:func:`_drain_request_unwinds`).
+    The analysis process is stopped after that (a run still computing there is awaited),
+    and the database pool is disposed last; each step runs even when the one before it is
+    cut short.
 
     Args:
         app: The application being served.
@@ -948,13 +960,24 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         secure_cookies=secure_cookies,
     )
     try:
+        await runner.start_analysis_process()
+    except BaseException as exc:
+        # Interpreter exits and cancellation propagate; any other failure leaves the API
+        # serving, and the next POST /runs spawns the analysis process.
+        if not isinstance(exc, Exception):
+            raise
+        _log.warning("api.analysis_process_unavailable", error=type(exc).__name__)
+    try:
         yield
     finally:
         _log.info("api.stopping")
         try:
             await _drain_request_unwinds(app)
         finally:
-            await dispose_engine()
+            try:
+                await runner.stop_analysis_process()
+            finally:
+                await dispose_engine()
 
 
 # ---------------------------------------------------------------------------

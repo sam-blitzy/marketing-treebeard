@@ -108,7 +108,7 @@ from ads_engine.analysis.context import (
     search_term_external_id,
 )
 from ads_engine.analysis.metrics import Totals, window_totals
-from ads_engine.analysis.text import adjacent_terms, tokenize
+from ads_engine.analysis.text import TermIndex, tokenize
 from ads_engine.analysis.thresholds import Thresholds
 from ads_engine.decisions import minor_unit_exponent, round_to_minor_unit
 
@@ -1534,19 +1534,18 @@ class _AdjacentPool:
     """An account's eligible adjacent terms, already in K2's order, with a token index.
 
     Attributes:
-        ranked: Terms that are not keywords, never excluded and have at least
-            ``k2.adjacent_min_clicks`` clicks, ordered by conversions descending, then clicks
-            descending, then term.
-        by_term: ``ranked`` keyed by term.
-        postings: For each token, the positions in ``ranked`` of the terms containing it,
-            ascending. ``k2.adjacent_jaccard`` is above 0, so a term sharing no token with the
-            converting term can never be adjacent; the index narrows each lookup to the terms
-            that can, without changing the result.
+        by_term: The totals of each eligible term: not a keyword, never excluded and with at
+            least ``k2.adjacent_min_clicks`` clicks.
+        index: The eligible terms ordered by conversions descending, then clicks descending,
+            then term, each tokenised once (:class:`~ads_engine.analysis.text.TermIndex`).
+            ``k2.adjacent_jaccard`` is above 0, so a term sharing no token with the converting
+            term can never be adjacent; the index compares each converting term only with the
+            terms that can be, without changing the result, and returns matches in that
+            order, best ranked first.
     """
 
-    ranked: tuple[_TermTotals, ...]
     by_term: Mapping[str, _TermTotals]
-    postings: Mapping[str, tuple[int, ...]]
+    index: TermIndex
 
 
 def _adjacent_pool(ctx: AnalysisContext, cfg: _Config, account: _Account) -> _AdjacentPool:
@@ -1576,38 +1575,28 @@ def _adjacent_pool(ctx: AnalysisContext, cfg: _Config, account: _Account) -> _Ad
         entry[0] += row.cost
         entry[1] += row.clicks
         entry[2] += row.conversions
-    eligible: list[tuple[_TermTotals, frozenset[str]]] = []
+    eligible: list[_TermTotals] = []
     for term, (spend, clicks, conversions) in sums.items():
-        tokens = tokenize(term)
-        if term in excluded or clicks < cfg.k2_min_clicks or tokens in keyword_tokens:
+        # The cheap tests run first, so only a term that passes them is tokenised here.
+        if term in excluded or clicks < cfg.k2_min_clicks or tokenize(term) in keyword_tokens:
             continue
-        eligible.append((_TermTotals(term, spend, clicks, conversions), tokens))
-    eligible.sort(key=lambda pair: (-pair[0].conversions, -pair[0].clicks, pair[0].term))
-    postings: dict[str, list[int]] = {}
-    for position, (_, tokens) in enumerate(eligible):
-        for token in tokens:
-            postings.setdefault(token, []).append(position)
-    ranked = tuple(item for item, _ in eligible)
+        eligible.append(_TermTotals(term, spend, clicks, conversions))
+    eligible.sort(key=lambda item: (-item.conversions, -item.clicks, item.term))
     return _AdjacentPool(
-        ranked=ranked,
-        by_term={item.term: item for item in ranked},
-        postings={token: tuple(positions) for token, positions in postings.items()},
+        by_term={item.term: item for item in eligible},
+        index=TermIndex([item.term for item in eligible]),
     )
 
 
 def _adjacent(pool: _AdjacentPool, cfg: _Config, term: str) -> list[_TermTotals]:
     """Return up to ``k2.adjacent_max_terms`` adjacent terms for a converting ``term``.
 
-    The candidates are the pool's terms sharing a token with ``term``, in the pool's order;
-    :func:`text.adjacent_terms` keeps that order, applies the exact Jaccard threshold and drops
-    the term itself, so the first matches are the best ranked.
+    The pool's index returns, in the pool's order, the terms other than ``term`` itself at or
+    above the exact ``k2.adjacent_jaccard`` threshold, and stops at the
+    ``k2.adjacent_max_terms``-th match, so the matches are the best ranked.
     """
-    positions = sorted(
-        {position for token in tokenize(term) for position in pool.postings.get(token, ())}
-    )
-    names = [pool.ranked[position].term for position in positions]
-    matches = adjacent_terms(term, names, threshold=cfg.k2_jaccard)
-    return [pool.by_term[name] for name in matches[: cfg.k2_max_terms]]
+    matches = pool.index.similar(term, threshold=cfg.k2_jaccard, limit=cfg.k2_max_terms)
+    return [pool.by_term[name] for name in matches]
 
 
 def _k2_reason(evidence: Evidence) -> str:

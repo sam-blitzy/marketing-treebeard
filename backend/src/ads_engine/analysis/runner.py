@@ -60,20 +60,45 @@ Pipeline of one run (each step in its own short transaction where it touches the
    fresh request. A failure before the claim committed, the claim's own included, leaves
    every request pending.
 
-Off the event loop. Steps 5 to 7 and the rendering of step 8's rows are synchronous and
-CPU-bound (statistical tests, attribution, clustering). They run as one function on the
-analysis thread, a single-worker pool created on first use, so the API process keeps
-serving stored pages and lock conflicts while a custom run computes (AAP 0.1.1: stored
-reads under 2 s). The thread runs in a copy of the caller's context variables, so the
-bound log context stays on its lines, and only the thread touches the context while it
-computes. The event loop keeps every database step (AAP 0.11.1 async I/O).
+Off the event loop, and for ``POST /runs`` out of the API process. Steps 5 to 7 and the
+rendering of step 8's rows are synchronous and CPU-bound (statistical tests, attribution,
+clustering). They run on one of two paths:
+
+* **The analysis thread** (the worker, the CLI, every call without ``isolated``): one
+  function on a single-worker thread pool created on first use, so the caller's event loop
+  stays free. The thread runs in a copy of the caller's context variables, so the bound log
+  context stays on its lines, and only the thread touches the context while it computes.
+  The event loop keeps every database step (AAP 0.11.1 async I/O).
+* **The analysis process** (``run_analysis(..., isolated=True)``, which ``POST /runs``
+  passes): steps 4 to 8, the context load and the persistence included, run in one
+  persistent child of the API process behind a one-worker ``spawn``
+  ``ProcessPoolExecutor``, at a lower CPU priority (``nice`` 10). A thread would share the
+  API process's GIL, and a large custom run then slowed every request and lock conflict;
+  in the child it shares neither, so the API keeps serving stored pages and answers
+  contenders 409 at once (AAP 0.1.1: stored reads under 2 s). The API spawns it at startup
+  (:func:`start_analysis_process`) and stops it at shutdown
+  (:func:`stop_analysis_process`); a child that died is replaced on the next run, and one
+  spawned under another environment (another ``DATABASE_URL``) is replaced at the next
+  hand-off, so the child always reads the database the caller's lock connection reads.
+  Steps 1 to 3, the failure record of step 9 and both log lines stay with the caller, which
+  holds the lock until the child has finished the run, so contenders are refused before any
+  heavy work starts, exactly as on the thread path. The child dies with the API process (a
+  Linux parent-death signal, and a watchdog thread on every platform), and PostgreSQL ends
+  its sessions soon after, so no run outlives the lock even when the API process is killed
+  mid-run. Every exception that crosses back is checked to unpickle as itself, or else
+  replaced by :class:`AnalysisProcessError` naming its type, and the child's traceback
+  becomes the cause of the error the caller raises.
 
 Cancellation never outlives the lock. A cancellation of :func:`run_analysis` while the
 thread computes sets a stop flag, checked before the override check, before each rule
 module, before precedence and before row rendering; the cancellation, repeated ones
-included, is held until the thread has finished and then re-raised. The failure record of
-step 9 runs to completion despite cancellation, bounded by a timeout, so a cancelled run's
-row is ``failed`` before the lock is released.
+included, is held until the thread has finished and then re-raised. In the analysis
+process the same stop is a value shared with the API process naming the run's job: the
+same checkpoints honour it, and a database step in flight there is cancelled within 50 ms,
+its transaction rolled back. A run the analysis process stored before the stop took hold
+stays ``succeeded``, its summary is logged, and the cancellation is re-raised. The failure
+record of step 9 runs to completion despite cancellation, bounded by a timeout, so a
+cancelled run's row is ``failed`` before the lock is released.
 
 What each stored recommendation carries (AAP 0.5.3 ``Item``, 0.5.4.8): its section, group,
 rule id, rank, action, reason, data status, hold and required datasets as columns; its
@@ -102,20 +127,31 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import ctypes
 import functools
+import hashlib
+import itertools
+import multiprocessing
+import os
+import signal
+import sys
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+import traceback
+from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from multiprocessing.reduction import ForkingPickler
 from types import MappingProxyType
-from typing import Any, Final, Literal, get_args
+from typing import Any, Final, Literal, NoReturn, Protocol, get_args
 
-from sqlalchemy import ARRAY, BigInteger, any_, func, insert, literal, select, update
+import structlog
+from sqlalchemy import ARRAY, BigInteger, any_, event, func, insert, literal, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 
 from ads_engine.analysis import (
@@ -163,8 +199,14 @@ from ads_engine.db.models.analysis import (
     RunWithheld,
 )
 from ads_engine.db.repositories import active_datasets
-from ads_engine.db.session import run_to_completion, session_scope, use_session
-from ads_engine.logging import get_logger, mark_logged
+from ads_engine.db.session import (
+    dispose_engine,
+    get_engine,
+    run_to_completion,
+    session_scope,
+    use_session,
+)
+from ads_engine.logging import configure_logging, get_logger, mark_logged
 from ads_engine.settings import get_settings
 
 __all__ = [
@@ -172,6 +214,7 @@ __all__ = [
     "EVALUATION_ORDER",
     "PENDING_REASONS_LIMIT",
     "RUNNER_EXTRA_KEYS",
+    "AnalysisProcessError",
     "PendingRequests",
     "RunKind",
     "RunNoLongerRunning",
@@ -183,6 +226,8 @@ __all__ = [
     "list_runs",
     "pending_requests",
     "run_analysis",
+    "start_analysis_process",
+    "stop_analysis_process",
     "window_inputs",
 ]
 
@@ -293,6 +338,55 @@ touches ``analysis_request``.
 _executor_lock: Final = threading.Lock()
 _executor: ThreadPoolExecutor | None = None
 
+_STAGES: Final[tuple[str, ...]] = (
+    "insert",
+    "claim_requests",
+    "load_context",
+    "check_overrides",
+    "rules",
+    "precedence",
+    "persist",
+)
+"""Every value of ``_RunProgress.stage``, in run order; the analysis process reports an index."""
+
+_LOAD_STAGE: Final = "load_context"
+"""The stage a run is in when it is handed to the analysis process."""
+
+_ANALYSIS_NICENESS: Final = 10
+"""How much the analysis process lowers its own priority (``os.nice``), so the API process's
+request handling wins the CPU the two share."""
+
+_STOP_POLL_S: Final = 0.05
+"""How often, in seconds, the analysis process checks for a stop while a database step runs."""
+
+_PARENT_POLL_S: Final = 0.1
+"""How often, in seconds, the analysis process's watchdog checks that the API process that
+spawned it is still its parent (:func:`_watch_parent`)."""
+
+_PARENT_WATCH_THREAD: Final = f"{_ANALYSIS_THREAD_PREFIX}-parent-watch"
+"""The name of the analysis process's watchdog thread."""
+
+_ORPHANED_EXIT_CODE: Final = 70
+"""The exit status of an analysis process that outlived its API process: non-zero, and apart
+from the interpreter's own 1, so whoever reaps it can tell why it exited."""
+
+_PR_SET_PDEATHSIG: Final = 1
+"""Linux's ``prctl`` option that names the signal a process receives when its parent dies."""
+
+_CLIENT_CHECK_SQL: Final = "SET client_connection_check_interval = 1000"
+"""Make PostgreSQL check every second that the analysis process is still connected while one
+of its queries runs or waits for a lock, and end the session once it is gone.
+
+Without it a session whose client died is ended only when it next answers that client: a load
+blocked behind another session's table lock would wait on, and then run, after its process
+and the run's lock were long gone."""
+
+# The API's analysis process: one child, spawned on first use and guarded by its lock. The
+# analysis lock admits one run at a time, so the child never queues a second job. Each job
+# gets its own stop token, never its run id, which a test database may reuse.
+_process_lock: Final = threading.Lock()
+_job_tokens: Final = itertools.count(1)
+
 
 class RunNoLongerRunning(RuntimeError):  # noqa: N818 - names the state, like RunInProgress
     """The run's row stopped being ``running`` before its outputs were written.
@@ -313,6 +407,55 @@ class RunNoLongerRunning(RuntimeError):  # noqa: N818 - names the state, like Ru
         )
         self.run_id = run_id
         self.status = status
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        """Pickle as the constructor's arguments, so it crosses back from the analysis process.
+
+        The default reduction would call the constructor with the message alone. The
+        instance dict (its notes included) is restored as well.
+        """
+        return (type(self), (self.run_id, self.status), dict(vars(self)))
+
+
+class AnalysisProcessError(RuntimeError):
+    """A run handed to the API's analysis process could not report its own outcome.
+
+    Raised by :func:`run_analysis` with ``isolated=True`` when the analysis process shut down
+    before it ran the run, or when the error the run raised there cannot be handed back to
+    the API process intact (it does not pickle, or unpickles as another type). Then
+    :attr:`error_type` names that error's type, the message carries its text, and the
+    analysis process's traceback is the cause.
+
+    Attributes:
+        message: The human-readable message, also the exception's ``str()``.
+        error_type: The qualified type name of the error the analysis process could not hand
+            back, or ``None`` when there was none.
+    """
+
+    def __init__(self, message: str, error_type: str | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.error_type = error_type
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        """Pickle as the constructor's arguments and the instance dict, its notes included."""
+        return (type(self), (self.message, self.error_type), dict(vars(self)))
+
+
+class _RemoteTracebackError(Exception):
+    """The analysis process's formatted traceback, chained as the cause of the error it raised.
+
+    Its ``str()`` is the traceback text, so a log line of the error the API process raises
+    shows where the analysis process failed.
+    """
+
+    def __init__(self, text: str) -> None:
+        super().__init__(text)
+        self.text = text
+
+    def __str__(self) -> str:
+        """The analysis process's traceback, on lines of its own."""
+        return f"\n{self.text}"
 
 
 # ---------------------------------------------------------------------------
@@ -973,11 +1116,12 @@ _KeyedRow = tuple[dict[str, Any], _TypedKeys]
 
 @dataclass(frozen=True, slots=True)
 class _PreparedRun:
-    """Every output row of one run, rendered on the analysis thread before the write.
+    """Every output row of one run, rendered off the event loop before the write.
 
-    Built from the context and the precedence output, so that :func:`_persist` never reads
-    either: the event loop only adds the typed entity keys a stored row carries
-    (:func:`_known_ids`) and inserts. Rows keep section and rank order.
+    Built on the analysis thread, or in the analysis process, from the context and the
+    precedence output, so that :func:`_persist` never reads either: the event loop only adds
+    the typed entity keys a stored row carries (:func:`_known_ids`) and inserts. Rows keep
+    section and rank order.
 
     Attributes:
         recommendations: The ``recommendation`` rows, in ``PrecedenceOutput.all_items`` order.
@@ -1111,8 +1255,8 @@ async def _persist(run_id: int, prepared: _PreparedRun) -> AnalysisRun:
 
     The run row is locked first (``SELECT … FOR UPDATE``) and must still be ``running``: a
     process that took the ``analysis`` lock after this one lost its lock connection may have
-    marked it ``failed``, and then nothing is written. The rows were rendered on the analysis
-    thread (:class:`_PreparedRun`); here they only gain the typed entity keys a stored row
+    marked it ``failed``, and then nothing is written. The rows were rendered off the event
+    loop (:class:`_PreparedRun`); here they only gain the typed entity keys a stored row
     carries and are inserted in section and rank order with the ORM's bulk ``INSERT``;
     outputs are never updated afterwards. The requests the run serves were already claimed
     before its context was loaded (:func:`_claim_requests`), so nothing here touches
@@ -1334,26 +1478,45 @@ async def _load(
 
 
 # ---------------------------------------------------------------------------
-# The pure computation, on the analysis thread (AAP 0.11.1, 0.1.1)
+# The pure computation, on the analysis thread or in the analysis process (AAP 0.11.1, 0.1.1)
 # ---------------------------------------------------------------------------
 
 
 class _ComputationStoppedError(Exception):
-    """Raised on the analysis thread at a stop checkpoint once its run was cancelled.
+    """Raised at a stop checkpoint once its run was cancelled.
 
-    It never leaves the runner: :func:`_in_analysis_thread` replaces it with the caller's
-    :class:`asyncio.CancelledError` once the thread has stopped.
+    It never leaves the runner: :func:`_in_analysis_thread` and :func:`_in_analysis_process`
+    replace it with the caller's :class:`asyncio.CancelledError` once the computation has
+    stopped.
     """
+
+
+class _StopFlag(Protocol):
+    """A run's stop signal: set on the caller's cancellation, read at every checkpoint.
+
+    A :class:`threading.Event` on the analysis thread; a :class:`_JobStop` in the analysis
+    process.
+    """
+
+    def is_set(self) -> bool:
+        """Whether the run was stopped."""
+        ...
+
+    def set(self) -> None:
+        """Stop the run at its next checkpoint."""
+        ...
 
 
 @dataclass(slots=True)
 class _RunProgress:
-    """How far one run got, shared by :func:`run_analysis` and its analysis thread.
+    """How far one run got, shared by :func:`run_analysis` and its analysis thread or process.
 
     The event loop writes :attr:`stage` up to the hand-off to the analysis thread, the thread
     writes it while it computes, and the loop reads it again only after the thread has
     finished, for the ``analysis_run_failed`` line. :attr:`stop` goes the other way: the loop
-    sets it when the run is cancelled and the thread checks it at every checkpoint.
+    sets it when the run is cancelled and the thread checks it at every checkpoint. The
+    analysis process keeps a progress of its own, whose stages :attr:`report` mirrors to the
+    API process; the API process copies the stage the run failed in into its own progress.
 
     Attributes:
         stage: The step in progress: ``insert`` (the ``running`` row's commit and close),
@@ -1362,11 +1525,15 @@ class _RunProgress:
         run_id: The ``running`` row's id, recorded by :func:`_insert_running` once the row
             is flushed and before it commits; ``None`` while no row can exist.
         stop: Set once the run is cancelled; the computation stops at its next checkpoint.
+        report: Called with every stage :meth:`begin` records, or ``None``. The analysis
+            process writes it to the value it shares with the API process, which reads it
+            when the analysis process died mid-run.
     """
 
     stage: str
     run_id: int | None = None
-    stop: threading.Event = field(default_factory=threading.Event)
+    stop: _StopFlag = field(default_factory=threading.Event)
+    report: Callable[[str], None] | None = None
 
     def checkpoint(self) -> None:
         """Stop the computation here when its run was cancelled.
@@ -1377,6 +1544,12 @@ class _RunProgress:
         if self.stop.is_set():
             raise _ComputationStoppedError(self.stage)
 
+    def begin(self, stage: str) -> None:
+        """Record that ``stage`` begins, and pass it to :attr:`report` when one is set."""
+        self.stage = stage
+        if self.report is not None:
+            self.report(stage)
+
     def enter(self, stage: str) -> None:
         """Pass a checkpoint, then record that ``stage`` begins.
 
@@ -1385,7 +1558,7 @@ class _RunProgress:
                 run was cancelled in.
         """
         self.checkpoint()
-        self.stage = stage
+        self.begin(stage)
 
 
 def _evaluate(ctx: AnalysisContext, checkpoint: Callable[[], None]) -> tuple[RuleResult, ...]:
@@ -1415,8 +1588,9 @@ def _compute(
 ) -> tuple[_PreparedRun, float]:
     """Run the pure part of run ``run_id``: steps 5 to 7 and the row rendering of step 8.
 
-    Executes on the analysis thread (:func:`_in_analysis_thread`) and alone touches ``ctx``
-    meanwhile, including its per-run ``cache``. It checks the white-paper creative overrides,
+    Executes on the analysis thread (:func:`_in_analysis_thread`) or in the analysis process
+    (:func:`_run_in_process`) and alone touches ``ctx`` meanwhile, including its per-run
+    ``cache``. It checks the white-paper creative overrides,
     evaluates the rule modules, applies precedence and renders every output row with its
     typed keys and the summary counts. The override check and precedence are looked up when
     they run; the rule evaluators are the callables :data:`_RULES` bound at import, read
@@ -1465,7 +1639,7 @@ def _analysis_executor() -> ThreadPoolExecutor:
         return _executor
 
 
-async def _in_analysis_thread[T](compute: Callable[[], T], stop: threading.Event) -> T:
+async def _in_analysis_thread[T](compute: Callable[[], T], stop: _StopFlag) -> T:
     """Run ``compute`` on the analysis thread and await it without blocking the event loop.
 
     The rules are synchronous and CPU-bound (statistical tests, attribution, clustering), so
@@ -1511,6 +1685,671 @@ async def _in_analysis_thread[T](compute: Callable[[], T], stop: threading.Event
     if error is None or isinstance(error, _ComputationStoppedError):
         raise cancelled from None
     raise cancelled from error
+
+
+# ---------------------------------------------------------------------------
+# The analysis process: custom runs from the API, outside its GIL (AAP 0.1.1, 0.5.3)
+# ---------------------------------------------------------------------------
+
+
+class _SharedInt(Protocol):
+    """An integer in shared memory, as ``multiprocessing`` ``Value(code, 0, lock=False)``."""
+
+    value: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ProcessSignals:
+    """The two integers the API process shares with its analysis process.
+
+    Both live in shared memory without a lock (``Value(..., lock=False)``). Each is one
+    machine word that one side alone writes, and a lock held by an analysis process that was
+    killed would stall the API process's next read or write for good.
+
+    Attributes:
+        stop: The token of the last job the API process stopped; ``0`` before any.
+        stage: The index in :data:`_STAGES` of the step the current job is in. The analysis
+            process writes it; the API process resets it before each job and reads it when
+            the analysis process died.
+    """
+
+    stop: _SharedInt
+    stage: _SharedInt
+
+    def report(self, stage: str) -> None:
+        """Record that the current job entered ``stage``, one of :data:`_STAGES`."""
+        self.stage.value = _STAGES.index(stage)
+
+    def stage_name(self) -> str:
+        """The step the current job last reported."""
+        code = self.stage.value
+        return _STAGES[code] if 0 <= code < len(_STAGES) else _LOAD_STAGE
+
+
+@dataclass(frozen=True, slots=True)
+class _JobStop:
+    """One job's stop flag: set once the shared stop value holds the job's token.
+
+    The API process sets it when the run is cancelled; the analysis process reads it at every
+    checkpoint and while a database step runs. A later job has another token, so a stop never
+    outlives the job it was meant for.
+    """
+
+    signals: _ProcessSignals
+    token: int
+
+    def is_set(self) -> bool:
+        """Whether the API process stopped this job."""
+        return self.signals.stop.value == self.token
+
+    def set(self) -> None:
+        """Stop this job at its next checkpoint."""
+        self.signals.stop.value = self.token
+
+
+@dataclass(frozen=True, slots=True)
+class _AnalysisJob:
+    """What the analysis process needs to load, compute and persist one run.
+
+    Attributes:
+        token: The job's own stop token, from :data:`_job_tokens`.
+        run_id: The ``running`` row the calling process inserted and committed.
+        window: The run's window.
+        kind: ``default`` or ``custom``.
+        config: The configuration the run uses (the API's loaded thresholds).
+        instant: The run instant.
+        display_timezone: The zone of the instants in the run's frozen flag messages.
+        log_context: The caller's bound log context (scalar values only) and the run id,
+            bound around the job's log lines.
+    """
+
+    token: int
+    run_id: int
+    window: AnalysisWindow
+    kind: RunKind
+    config: Thresholds
+    instant: datetime
+    display_timezone: str
+    log_context: dict[str, str | int | float | bool | None]
+
+
+@dataclass(frozen=True, slots=True)
+class _ProcessSuccess:
+    """A job the analysis process stored ``succeeded``.
+
+    Attributes:
+        stored: The persisted run, detached.
+        summary: The per-section counts of the ``analysis_run_summary`` line.
+        load_ms: Milliseconds the context load took in the analysis process.
+        compute_ms: Milliseconds from the loaded context to the end of precedence.
+        persist_ms: Milliseconds of row rendering and the persistence transaction.
+    """
+
+    stored: AnalysisRun
+    summary: dict[str, Any]
+    load_ms: int
+    compute_ms: int
+    persist_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ProcessFailure:
+    """A job that failed or stopped in the analysis process; nothing of it was stored.
+
+    Attributes:
+        stage: The step it failed or stopped in.
+        error: Its error, or the :class:`AnalysisProcessError` standing in for one that
+            cannot cross back intact.
+        remote_traceback: The analysis process's formatted traceback of the error.
+        stopped: Whether it stopped on the API process's stop (a stop checkpoint, or a
+            cancelled database step).
+    """
+
+    stage: str
+    error: BaseException
+    remote_traceback: str
+    stopped: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _AnalysisProcess:
+    """The API's analysis process: its executor, its shared values and its environment.
+
+    Attributes:
+        executor: The one-worker ``spawn`` executor whose worker is the analysis process.
+        signals: The values shared with that worker.
+        fingerprint: The SHA-256 of the API process's environment when it was created.
+    """
+
+    executor: ProcessPoolExecutor
+    signals: _ProcessSignals
+    fingerprint: str
+
+
+_process: _AnalysisProcess | None = None
+"""The API process's analysis process, created on first use; guarded by ``_process_lock``."""
+
+_process_signals: _ProcessSignals | None = None
+"""In the analysis process, the values it shares with the API process, set by
+:func:`_init_analysis_process`; ``None`` in every other process."""
+
+_parent_pid: int | None = None
+"""In the analysis process, the pid of the API process that spawned it and whose lifetime it
+shares, set by :func:`_init_analysis_process`; ``None`` in every other process."""
+
+
+def _ms(seconds: float) -> int:
+    """``seconds`` as whole milliseconds."""
+    return round(seconds * 1000)
+
+
+def _set_parent_death_signal() -> bool:
+    """Ask Linux to ``SIGKILL`` this process the moment its parent dies; report whether it took.
+
+    ``prctl(PR_SET_PDEATHSIG, SIGKILL)`` through the C library. A library that cannot be
+    loaded or a refused call is logged, with the call's ``errno``, and the watchdog of
+    :func:`_bind_to_parent` then ends the process on its own.
+
+    Returns:
+        Whether the kernel accepted the death signal; ``False`` on every other platform.
+    """
+    if sys.platform != "linux":
+        return False
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        result: int = libc.prctl(ctypes.c_int(_PR_SET_PDEATHSIG), ctypes.c_ulong(signal.SIGKILL))
+    except (OSError, AttributeError) as exc:
+        _log.warning("analysis_process_death_signal_failed", error=type(exc).__name__)
+        return False
+    if result != 0:
+        _log.warning("analysis_process_death_signal_failed", errno=ctypes.get_errno())
+        return False
+    return True
+
+
+def _exit_orphaned(parent_pid: int) -> NoReturn:
+    """Log that the API process ``parent_pid`` is gone and end this process at once.
+
+    ``os._exit`` runs no cleanup: the executor's own shutdown would wait on a parent that can
+    no longer answer. The kernel closes the process's connections, and PostgreSQL ends their
+    sessions and rolls back their open transactions (:data:`_CLIENT_CHECK_SQL`).
+    """
+    _log.error("analysis_process_orphaned", parent_pid=parent_pid)
+    os._exit(_ORPHANED_EXIT_CODE)
+
+
+def _watch_parent(parent_pid: int) -> None:
+    """The watchdog thread's loop: end the process once ``parent_pid`` is no longer its parent.
+
+    A process whose parent died is re-parented (to ``init`` or a subreaper), so its
+    ``getppid`` changes; it is compared every :data:`_PARENT_POLL_S` seconds.
+    """
+    while os.getppid() == parent_pid:
+        time.sleep(_PARENT_POLL_S)
+    _exit_orphaned(parent_pid)
+
+
+def _bind_to_parent(parent_pid: int) -> None:
+    """Make the analysis process die with ``parent_pid``, the API process that spawned it.
+
+    The API process holds the run's ``analysis`` lock on its own connection, which
+    PostgreSQL releases the moment that process dies (``SIGKILL``, the OOM killer). An
+    analysis process that lived on would keep loading or computing a run whose lock any API
+    process, the worker or the CLI could then take, so two runs would execute at once. Two
+    guards end it instead:
+
+    * on Linux, the parent-death signal (:func:`_set_parent_death_signal`): the kernel kills
+      the process together with its parent;
+    * on every platform, a daemon watchdog thread, :data:`_PARENT_WATCH_THREAD`
+      (:func:`_watch_parent`), that ends the process within :data:`_PARENT_POLL_S` seconds of
+      its parent's death, should the signal be unavailable.
+
+    A parent that died before the signal was set left the process orphaned already: it
+    exits at once (:func:`_exit_orphaned`).
+    """
+    # The kernel sends the death signal when the *thread* that spawned this process ends.
+    # ProcessPoolExecutor spawns its worker in the thread that calls submit (CPython 3.14
+    # concurrent/futures/process.py: submit -> _adjust_process_count), and _submit runs on
+    # the API process's event-loop thread, which lives as long as the API process does.
+    _set_parent_death_signal()
+    if os.getppid() == parent_pid:
+        threading.Thread(
+            target=_watch_parent, args=(parent_pid,), name=_PARENT_WATCH_THREAD, daemon=True
+        ).start()
+    else:
+        _exit_orphaned(parent_pid)
+
+
+def _init_analysis_process(stop: _SharedInt, stage: _SharedInt, parent_pid: int) -> None:
+    """Prepare a freshly spawned analysis process: the executor's initializer.
+
+    Stores the values shared with the API process and that process's pid, ``parent_pid``;
+    ignores ``SIGINT``, which a terminal sends to the whole process group, so that only the
+    API process shuts its analysis process down; configures logging from the environment's
+    settings, as the API does; binds its own lifetime to the API process
+    (:func:`_bind_to_parent`), so it dies with that process and no run outlives the
+    ``analysis`` lock the API process holds; and lowers its own priority by
+    :data:`_ANALYSIS_NICENESS`, so the API's request handling wins the CPU the two share. A
+    refused priority change is logged and the process runs on.
+    """
+    global _process_signals, _parent_pid
+    _process_signals = _ProcessSignals(stop=stop, stage=stage)
+    _parent_pid = parent_pid
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    configure_logging()
+    _bind_to_parent(parent_pid)
+    try:
+        os.nice(_ANALYSIS_NICENESS)
+    except OSError as exc:
+        _log.warning(
+            "analysis_process_nice_failed", niceness=_ANALYSIS_NICENESS, error=type(exc).__name__
+        )
+
+
+def _analysis_process_pid() -> int:
+    """Return the analysis process's pid: the warm-up job of :func:`start_analysis_process`."""
+    return os.getpid()
+
+
+def _type_name(error: BaseException) -> str:
+    """``error``'s qualified type name, ``module.QualName``."""
+    kind = type(error)
+    return f"{kind.__module__}.{kind.__qualname__}"
+
+
+def _portable_error(error: BaseException) -> BaseException:
+    """Return ``error`` when it crosses back to the API process intact, else a stand-in.
+
+    The error is pickled and unpickled exactly as the executor hands a result back
+    (:class:`~multiprocessing.reduction.ForkingPickler`). One that cannot be pickled or
+    rebuilt (a constructor needing more than its message, say), or that comes back as
+    another type, is replaced by :class:`AnalysisProcessError` naming its type and text:
+    an unpickling failure in the API process would break the executor itself.
+    """
+    try:
+        restored: object = ForkingPickler.loads(ForkingPickler.dumps(error))
+    except BaseException as failure:
+        if not isinstance(failure, Exception):
+            raise
+        restored = None
+    if type(restored) is type(error):
+        return error
+    text = "".join(traceback.format_exception_only(error)).strip()
+    return AnalysisProcessError(
+        f"the analysis process raised {text}, which cannot be handed back intact",
+        _type_name(error),
+    )
+
+
+def _failure(stage: str, error: BaseException) -> _ProcessFailure:
+    """The outcome of a job that raised ``error`` in ``stage``, ready to cross back."""
+    return _ProcessFailure(
+        stage=stage,
+        error=_portable_error(error),
+        remote_traceback="".join(traceback.format_exception(error)),
+        stopped=isinstance(error, _ComputationStoppedError | asyncio.CancelledError),
+    )
+
+
+async def _until_stopped[T](step: Coroutine[Any, Any, T], progress: _RunProgress) -> T:
+    """Await one database step of a job, cancelling it once the API process stops the job.
+
+    The step runs as a task that is checked every :data:`_STOP_POLL_S` seconds. Once the job
+    is stopped the task is cancelled and awaited: its session rolls back
+    (:func:`~ads_engine.db.session.session_scope`), so a stopped step leaves nothing behind.
+    A step that finished before the cancellation took hold returns as usual.
+
+    Returns:
+        What the step returned.
+
+    Raises:
+        _ComputationStoppedError: When the step was cancelled because the job was stopped.
+        Exception: Whatever the step raised.
+    """
+    task = asyncio.create_task(step)
+    while True:
+        done, _ = await asyncio.wait((task,), timeout=_STOP_POLL_S)
+        if not done and progress.stop.is_set():
+            task.cancel()
+            await asyncio.wait((task,))
+        if task.done():
+            if task.cancelled():
+                raise _ComputationStoppedError(progress.stage)
+            return task.result()
+
+
+async def _dispose_process_engine() -> None:
+    """Dispose the analysis process's engine after a job; a failure is logged, never raised.
+
+    Each job runs on an event loop of its own, and an async connection belongs to the loop
+    that opened it, so no connection may outlive its job; the process then holds none
+    between runs either.
+    """
+    try:
+        await dispose_engine()
+    except (SQLAlchemyError, OSError) as exc:
+        _log.warning("analysis_process_dispose_failed", error=type(exc).__name__)
+
+
+def _check_clients_of(engine: AsyncEngine) -> None:
+    """Make PostgreSQL end each session ``engine`` opens soon after this process is gone.
+
+    Every new connection runs :data:`_CLIENT_CHECK_SQL` and commits it, so the setting
+    outlives the transaction the statement opened. A server that refuses the setting
+    (PostgreSQL accepts it only on systems that report closed sockets) is logged as
+    ``analysis_process_client_check_unavailable`` and the connection is used as it is.
+    Called once per job, on the engine the job opens.
+    """
+    dbapi_error: type[Exception] = engine.dialect.loaded_dbapi.Error
+
+    def check(dbapi_connection: Any, _record: Any) -> None:
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute(_CLIENT_CHECK_SQL)
+            dbapi_connection.commit()
+        except dbapi_error as exc:
+            dbapi_connection.rollback()
+            _log.warning("analysis_process_client_check_unavailable", error=type(exc).__name__)
+        finally:
+            cursor.close()
+
+    event.listen(engine.sync_engine, "connect", check)
+
+
+async def _run_in_process(
+    job: _AnalysisJob, signals: _ProcessSignals
+) -> _ProcessSuccess | _ProcessFailure:
+    """Load, compute and persist one job in the analysis process: steps 4 to 8 of a run.
+
+    The context is read in one read-only snapshot (:func:`_load`); the override check, the
+    rules, precedence and row rendering run in :func:`_compute`, whose checkpoints honour
+    the job's stop; and every output is written in one transaction (:func:`_persist`). The
+    two database steps run under :func:`_until_stopped`, so a stop cancels them within
+    :data:`_STOP_POLL_S` seconds. The job's engine checks that this process is still
+    connected (:func:`_check_clients_of`), so a database step outlives no orphaned process.
+    Every stage is reported through ``signals``, and the engine is disposed at the end
+    whatever happened.
+
+    Returns:
+        The stored run with its timings and summary, or the failure with the stage it
+        happened in. An ordinary error or a cancellation is never raised.
+    """
+    progress = _RunProgress(
+        stage=_LOAD_STAGE,
+        run_id=job.run_id,
+        stop=_JobStop(signals, job.token),
+        report=signals.report,
+    )
+    try:
+        try:
+            progress.enter(_LOAD_STAGE)
+            _check_clients_of(get_engine())
+            started = time.perf_counter()
+            ctx = await _until_stopped(
+                _load(
+                    job.window,
+                    job.config,
+                    job.kind,
+                    job.instant,
+                    display_timezone=job.display_timezone,
+                ),
+                progress,
+            )
+            loaded = time.perf_counter()
+            progress.begin("check_overrides")
+            prepared, computed = _compute(job.run_id, ctx, job.config, progress)
+            stored = await _until_stopped(_persist(job.run_id, prepared), progress)
+            finished = time.perf_counter()
+        finally:
+            await _dispose_process_engine()
+    except BaseException as error:
+        # Interpreter exits propagate; everything else becomes an outcome that crosses back.
+        if not isinstance(error, Exception | asyncio.CancelledError):
+            raise
+        return _failure(progress.stage, error)
+    return _ProcessSuccess(
+        stored=stored,
+        summary=prepared.summary,
+        load_ms=_ms(loaded - started),
+        compute_ms=_ms(computed - loaded),
+        persist_ms=_ms(finished - computed),
+    )
+
+
+def _execute_in_process(job: _AnalysisJob) -> _ProcessSuccess | _ProcessFailure:
+    """Run one job in the analysis process: the executor's task entry.
+
+    Binds the job's log context and runs :func:`_run_in_process` on an event loop of its
+    own; the executor hands the outcome back to the API process.
+
+    Raises:
+        RuntimeError: When called in a process :func:`_init_analysis_process` did not
+            prepare.
+    """
+    signals = _process_signals
+    if signals is None:
+        raise RuntimeError("the analysis process was not prepared by _init_analysis_process")
+    with structlog.contextvars.bound_contextvars(**job.log_context):
+        return asyncio.run(_run_in_process(job, signals))
+
+
+def _environment_fingerprint() -> str:
+    """The SHA-256 of the process environment, compared at every hand-off; never logged."""
+    digest = hashlib.sha256()
+    for name, value in sorted(os.environ.items()):
+        for part in (name, value):
+            digest.update(part.encode("utf-8", "surrogateescape"))
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _spawn(fingerprint: str) -> _AnalysisProcess:
+    """Create the analysis process's executor; its worker starts with the first submission.
+
+    The worker receives this process's pid, so it dies with this process
+    (:func:`_bind_to_parent`).
+    """
+    context = multiprocessing.get_context("spawn")
+    stop = context.Value("q", 0, lock=False)
+    stage = context.Value("i", _STAGES.index(_LOAD_STAGE), lock=False)
+    executor = ProcessPoolExecutor(
+        max_workers=1,
+        mp_context=context,
+        initializer=_init_analysis_process,
+        initargs=(stop, stage, os.getpid()),
+    )
+    return _AnalysisProcess(
+        executor=executor, signals=_ProcessSignals(stop=stop, stage=stage), fingerprint=fingerprint
+    )
+
+
+def _forget_locked(process: _AnalysisProcess) -> None:
+    """Forget ``process`` if current and shut it down without waiting; the lock is held."""
+    global _process
+    if _process is process:
+        _process = None
+    process.executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _discard(process: _AnalysisProcess) -> None:
+    """Forget ``process`` if current and shut it down without waiting."""
+    with _process_lock:
+        _forget_locked(process)
+
+
+def _current_process_locked() -> _AnalysisProcess:
+    """Return the analysis process for the current environment; ``_process_lock`` is held.
+
+    One spawned under another environment (a changed ``DATABASE_URL``, say) is shut down
+    without waiting and replaced, so the analysis process always reads the database the
+    calling process's lock connection reads.
+    """
+    global _process
+    fingerprint = _environment_fingerprint()
+    process = _process
+    if process is not None and process.fingerprint != fingerprint:
+        _log.info("analysis_process_replaced", reason="environment_changed")
+        _forget_locked(process)
+        process = None
+    if process is None:
+        process = _process = _spawn(fingerprint)
+    return process
+
+
+def _submit[T](
+    submit: Callable[[_AnalysisProcess], Future[T]],
+) -> tuple[_AnalysisProcess, Future[T]]:
+    """Hand work to the analysis process through ``submit``; replace a broken one once.
+
+    The analysis process is spawned on first use, and again when the environment changed.
+    One whose executor broke while idle (its worker died) is discarded, and the work goes to
+    a fresh one.
+
+    Returns:
+        The analysis process the work went to, and the work's future.
+
+    Raises:
+        BrokenProcessPool: When the fresh analysis process refuses it as well.
+        RuntimeError: When the interpreter is shutting down.
+    """
+    with _process_lock:
+        process = _current_process_locked()
+        try:
+            return process, submit(process)
+        except BrokenProcessPool:
+            _log.warning("analysis_process_replaced", reason="broken")
+            _forget_locked(process)
+        process = _current_process_locked()
+        return process, submit(process)
+
+
+def _hand_off(
+    job: _AnalysisJob, process: _AnalysisProcess
+) -> Future[_ProcessSuccess | _ProcessFailure]:
+    """Submit ``job`` to ``process``, whose reported stage is reset to the context load."""
+    process.signals.report(_LOAD_STAGE)
+    return process.executor.submit(_execute_in_process, job)
+
+
+def _job_log_context(run_id: int) -> dict[str, str | int | float | bool | None]:
+    """The caller's bound log context, scalar values only, and ``run_id``: a job's context."""
+    context: dict[str, str | int | float | bool | None] = {
+        key: value
+        for key, value in structlog.contextvars.get_contextvars().items()
+        if value is None or isinstance(value, str | int | float | bool)
+    }
+    context["run_id"] = run_id
+    return context
+
+
+async def _in_analysis_process(
+    job: _AnalysisJob, progress: _RunProgress
+) -> tuple[_ProcessSuccess, asyncio.CancelledError | None]:
+    """Run ``job`` in the analysis process and await it without blocking the event loop.
+
+    The counterpart of :func:`_in_analysis_thread` for steps 4 to 8 of a run. The wait is
+    cancellation-safe: the first cancellation of the caller sets the job's stop
+    (:class:`_JobStop`), on which the analysis process stops at its next checkpoint or
+    cancels the database step in flight; every cancellation is held until the job has
+    finished. The caller holds the analysis lock around this wait, so the lock is never
+    released while the job still runs.
+
+    Returns:
+        The stored run's outcome, and the cancellation that arrived meanwhile or ``None``:
+        a run stored before the stop took hold stays stored, and the caller re-raises the
+        cancellation once it has logged the run.
+
+    Raises:
+        asyncio.CancelledError: When the caller was cancelled and nothing was stored; an
+            error other than the stop is chained as the cause.
+        BrokenProcessPool: When the analysis process died. It is discarded, so the next
+            run spawns a fresh one, and ``progress.stage`` is the stage it last reported.
+        AnalysisProcessError: When the analysis process shut down before it ran the job,
+            the job stopped although nobody cancelled it, or the job's error could not
+            cross back intact.
+        Exception: The job's own error, with the analysis process's traceback as its cause;
+            ``progress.stage`` is the stage it failed in.
+    """
+    process, future = _submit(functools.partial(_hand_off, job))
+    waited = asyncio.wrap_future(future)
+    cancelled: asyncio.CancelledError | None = None
+    # Only this function holds the future, which completes only once the job has returned,
+    # raised or lost its process: from then on nothing runs in the process for this run.
+    while not waited.done():
+        try:
+            await asyncio.wait((waited,))
+        except asyncio.CancelledError as err:
+            _JobStop(process.signals, job.token).set()
+            if cancelled is None:
+                cancelled = err
+    error: BaseException
+    if waited.cancelled():
+        error = AnalysisProcessError("the analysis process shut down before it ran the run")
+    elif (raised := waited.exception()) is not None:
+        if isinstance(raised, BrokenProcessPool):
+            _discard(process)
+            progress.stage = process.signals.stage_name()
+        error = raised
+    else:
+        outcome = waited.result()
+        if isinstance(outcome, _ProcessSuccess):
+            return outcome, cancelled
+        progress.stage = outcome.stage
+        if outcome.stopped and cancelled is not None:
+            raise cancelled from None
+        error = (
+            AnalysisProcessError("the analysis process stopped a run nobody cancelled")
+            if outcome.stopped
+            else outcome.error
+        )
+        error.__cause__ = _RemoteTracebackError(outcome.remote_traceback)
+    if cancelled is not None:
+        raise cancelled from error
+    raise error
+
+
+async def start_analysis_process() -> int:
+    """Spawn the API's analysis process now and wait until it is ready; return its pid.
+
+    The API calls this at startup, so its first ``POST /runs`` does not wait for the spawn
+    and its imports; without it, the first isolated run spawns the process. A running
+    analysis process is reused while the environment is unchanged, and replaced otherwise.
+    Logs ``analysis_process_started`` with the pid and ``startup_ms``.
+
+    Returns:
+        The analysis process's pid.
+
+    Raises:
+        BrokenProcessPool: When the analysis process died while starting (its
+            initialisation failed, say); it is discarded, and the next run spawns another.
+        OSError: When the process cannot be created.
+        RuntimeError: When the interpreter is shutting down.
+    """
+    started = time.perf_counter()
+    process, future = _submit(lambda current: current.executor.submit(_analysis_process_pid))
+    try:
+        pid = await asyncio.wrap_future(future)
+    except BrokenProcessPool:
+        _discard(process)
+        raise
+    _log.info("analysis_process_started", pid=pid, startup_ms=_ms(time.perf_counter() - started))
+    return pid
+
+
+async def stop_analysis_process() -> None:
+    """Shut the API's analysis process down and wait until it has exited.
+
+    The API calls this when it stops. A job not yet started is cancelled (its run fails with
+    :class:`AnalysisProcessError`) and one running is awaited. Does nothing when no analysis
+    process exists; otherwise logs ``analysis_process_stopped``.
+    """
+    global _process
+    with _process_lock:
+        process, _process = _process, None
+    if process is None:
+        return
+    await asyncio.to_thread(process.executor.shutdown, wait=True, cancel_futures=True)
+    _log.info("analysis_process_stopped")
 
 
 def _check_default_shape(window: AnalysisWindow, config: Thresholds) -> None:
@@ -1593,6 +2432,7 @@ async def run_analysis(
     thresholds: Thresholds | None = None,
     now: datetime | None = None,
     display_timezone: str | None = None,
+    isolated: bool = False,
 ) -> AnalysisRun:
     """Compute one analysis run over ``window`` from stored data and persist it, frozen.
 
@@ -1604,12 +2444,21 @@ async def run_analysis(
     transaction. Any failure after the row exists marks it ``failed`` and re-raises; a run
     is never partial, and requests it claimed stay stamped with it.
 
-    The override check, the rules, precedence and the rendering of the output rows run on
-    the analysis thread, so the event loop stays free while the run computes. Cancelling
-    the call stops that computation at its next checkpoint (before a rule module,
-    precedence or row rendering); the lock is released only after the thread has stopped
-    and the row is ``failed`` (the requests it claimed stay stamped with it), and then
-    ``CancelledError`` propagates.
+    By default the override check, the rules, precedence and the rendering of the output
+    rows run on the analysis thread, so the event loop stays free while the run computes.
+    Cancelling the call stops that computation at its next checkpoint (before a rule
+    module, precedence or row rendering); the lock is released only after the thread has
+    stopped and the row is ``failed`` (the requests it claimed stay stamped with it), and
+    then ``CancelledError`` propagates.
+
+    With ``isolated=True`` (``POST /runs``) the context load, the computation and the
+    persistence run in the API's analysis process instead, so they share neither the
+    caller's GIL nor its CPU priority. The lock, the ``running`` row, the claim, the
+    failure record and both log lines stay with the caller, which holds the lock until the
+    analysis process has finished the run. Cancelling the call stops the run there at its
+    next checkpoint or cancels its database step in flight, with the same guarantees. A run
+    the analysis process already stored when the cancellation arrived stays ``succeeded``:
+    its summary is logged and then ``CancelledError`` propagates.
 
     ``kind="default"`` is the worker's run of the configured default window and must be
     given that window (:func:`default_window`); ``kind="custom"`` takes any valid window,
@@ -1633,6 +2482,9 @@ async def run_analysis(
         display_timezone: ``DISPLAY_TIMEZONE``, the IANA zone the instants inside the
             run's frozen flag messages are rendered in (the ``stale`` flag's "Data as of …");
             ``get_settings().display_timezone`` when ``None``. It never moves a day boundary.
+        isolated: Run steps 4 to 8 in the API's analysis process (:func:`start_analysis_process`
+            spawns it at API startup; the first isolated run otherwise), rather than on the
+            caller's event loop and analysis thread. Only ``POST /runs`` passes ``True``.
 
     Returns:
         The persisted ``succeeded`` run, readable after its session closed.
@@ -1655,8 +2507,14 @@ async def run_analysis(
         pydantic.ValidationError: When ``display_timezone`` is ``None`` and the settings
             cannot be loaded from the environment.
         sqlalchemy.exc.SQLAlchemyError: When the database fails.
+        BrokenProcessPool: With ``isolated``, when the analysis process died during the run
+            (the run is marked failed; the next isolated run spawns a fresh process).
+        AnalysisProcessError: With ``isolated``, when the analysis process shut down before
+            it ran the run, or the run's error could not cross back intact (the run is
+            marked failed).
         asyncio.CancelledError: When the call is cancelled, once the computation has
-            stopped and the run, if its row exists, is recorded ``failed``.
+            stopped and the run, if its row exists, is recorded ``failed``; or, with
+            ``isolated``, once the analysis process stored the run ``succeeded``.
     """
     window_value: object = window
     if not isinstance(window_value, AnalysisWindow):
@@ -1680,6 +2538,7 @@ async def run_analysis(
         if kind == "default":
             _check_default_shape(window, config)
         progress = _RunProgress(stage="insert")
+        cancelled: asyncio.CancelledError | None = None
         try:
             run = await _insert_running(window, kind, trigger, config, instant, progress)
             progress.stage = "claim_requests"
@@ -1696,21 +2555,42 @@ async def run_analysis(
                 requests=claimed,
                 config_hash=config.config_hash,
             )
-            progress.stage = "load_context"
-            ctx = await _load(window, config, kind, instant, display_timezone=zone)
-            loaded = time.perf_counter()
-            progress.stage = "check_overrides"
-            prepared, computed = await _in_analysis_thread(
-                functools.partial(_compute, run.id, ctx, config, progress), progress.stop
-            )
-            stored = await _persist(run.id, prepared)
+            progress.stage = _LOAD_STAGE
+            if isolated:
+                handed_off = time.perf_counter()
+                job = _AnalysisJob(
+                    token=next(_job_tokens),
+                    run_id=run.id,
+                    window=window,
+                    kind=kind,
+                    config=config,
+                    instant=instant,
+                    display_timezone=zone,
+                    log_context=_job_log_context(run.id),
+                )
+                done, cancelled = await _in_analysis_process(job, progress)
+                finished = time.perf_counter()
+                stored, summary = done.stored, done.summary
+                load_ms = _ms(handed_off - started) + done.load_ms
+                compute_ms, persist_ms = done.compute_ms, done.persist_ms
+            else:
+                ctx = await _load(window, config, kind, instant, display_timezone=zone)
+                loaded = time.perf_counter()
+                progress.stage = "check_overrides"
+                prepared, computed = await _in_analysis_thread(
+                    functools.partial(_compute, run.id, ctx, config, progress), progress.stop
+                )
+                stored = await _persist(run.id, prepared)
+                finished = time.perf_counter()
+                summary = prepared.summary
+                load_ms = _ms(loaded - started)
+                compute_ms, persist_ms = _ms(computed - loaded), _ms(finished - computed)
         except BaseException as exc:
             # From the flush of the running row on, every failure, cancellation included,
             # leaves that row failed before the lock is released.
             if progress.run_id is not None:
                 await _record_failure(progress.run_id, exc, progress.stage, started)
             raise
-        finished = time.perf_counter()
 
     _log.info(
         "analysis_run_summary",
@@ -1724,10 +2604,14 @@ async def run_analysis(
         data_modes=stored.data_modes,
         config_hash=config.config_hash,
         requests=claimed,
-        load_ms=round((loaded - started) * 1000),
-        compute_ms=round((computed - loaded) * 1000),
-        persist_ms=round((finished - computed) * 1000),
-        duration_ms=round((finished - started) * 1000),
-        **prepared.summary,
+        load_ms=load_ms,
+        compute_ms=compute_ms,
+        persist_ms=persist_ms,
+        duration_ms=_ms(finished - started),
+        **summary,
     )
+    if cancelled is not None:
+        # The analysis process stored the run before the stop took hold: the run stands,
+        # and the caller still learns that it was cancelled.
+        raise cancelled
     return stored

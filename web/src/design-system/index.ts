@@ -26,7 +26,7 @@
  * is imported once, by `src/main.tsx`.
  *
  * Exports follow the component order of AAP 0.4.2, one group per component, then the
- * identifier-break text helper, with the token constants last.
+ * identifier-break and whole-date text helpers, with the token constants last.
  *
  * GAP: bind to Blitzy OS on source arrival.
  *
@@ -137,6 +137,10 @@ export type { TabItem, TabsProps } from './components/Tabs';
 // Line-break opportunities after the underscores of long identifiers in API text, which Banner
 // and Badge apply themselves. GAP: keep applying it in the Blitzy OS bindings (see GAPS.md).
 export { withIdentifierBreaks } from './components/identifierBreaks';
+
+// Each standalone calendar date in a string held on one line, which Banner and Badge apply
+// themselves. GAP: keep applying it in the Blitzy OS bindings (see GAPS.md).
+export { withWholeDates } from './components/wholeDates';
 
 // Semantic token names, tones and spacing steps. GAP: bind to Blitzy OS on source arrival.
 // cssVar is not re-exported: tokens.ts reserves it for the wrappers, and feature code styles

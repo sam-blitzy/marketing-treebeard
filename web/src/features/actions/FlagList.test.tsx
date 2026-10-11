@@ -47,6 +47,7 @@ import {
   makeRecommendationsPage,
 } from '../../test/fixtures';
 import { renderWithProviders } from '../../test/render';
+import { byTextContent } from '../../test/text';
 import {
   FLAG_LABELS,
   FlagList,
@@ -475,7 +476,9 @@ describe('FlagList', () => {
     render(<FlagList flags={[]} current={[makeFlag('stale')]} />);
 
     expect(flagItems().map((entry) => entry.textContent)).toEqual([STALE_BADGE]);
-    expect(screen.getByText(STALE_BADGE).className).toBe('ds-badge ds-badge--warning');
+    expect(screen.getByText(byTextContent('.ds-badge', STALE_BADGE)).className).toBe(
+      'ds-badge ds-badge--warning',
+    );
   });
 
   it('names the Stale, Short window and Meeting time proxy labels before their messages', () => {
@@ -494,7 +497,9 @@ describe('FlagList', () => {
     ]);
     expect(screen.getByText(SHORT_WINDOW_BADGE).className).toBe('ds-badge ds-badge--warning');
     expect(screen.getByText(MEETING_PROXY_BADGE).className).toBe('ds-badge ds-badge--info');
-    expect(screen.getByText(STALE_BADGE).className).toBe('ds-badge ds-badge--warning');
+    expect(screen.getByText(byTextContent('.ds-badge', STALE_BADGE)).className).toBe(
+      'ds-badge ds-badge--warning',
+    );
   });
 
   it('renders nothing, not even an empty list, when no flag applies', () => {

@@ -21,7 +21,14 @@ runner itself:
   distinct ids than PostgreSQL's 65,535 bind parameters still persists in one transaction;
 * the lock, the single-running index, crash recovery, a failing rule, a contradicting
   override, a lost lock and a rule writing a runner-owned evidence key each leave the
-  database in the state the contract names.
+  database in the state the contract names;
+* an isolated run (``POST /runs``) loads, computes and persists in the API's analysis
+  process: it stores what the analysis thread stores, contenders are refused at once while
+  it runs, a cancellation, a lost row and a killed process each leave the run failed and
+  the lock free, an analysis process dies with its killed API process and leaves no session
+  waiting behind it, a run stored before its cancellation took hold stays succeeded, a process
+  that died idle or never started is replaced, a changed environment spawns a fresh
+  process, and the process's task entry, initializer and lifecycle behave as documented.
 
 Everything runs against the PostgreSQL 18 test database at ``TEST_DATABASE_URL`` (falling
 back to ``DATABASE_URL``), in a private schema holding every table, which the application's
@@ -29,23 +36,34 @@ engine is pointed at; an unreachable database fails the tests, never skips them.
 """
 
 import asyncio
+import ctypes
 import dataclasses
+import errno
 import itertools
+import multiprocessing
 import os
 import re
+import signal
+import subprocess
+import sys
 import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
-from contextlib import asynccontextmanager, contextmanager
+from concurrent.futures import Future
+from concurrent.futures.process import BrokenProcessPool
+from contextlib import asynccontextmanager, contextmanager, suppress
 from contextvars import ContextVar
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from multiprocessing.reduction import ForkingPickler
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from sqlalchemy import Executable, Update, create_engine, event, func, select, text
-from sqlalchemy.engine import URL, Result, make_url
+from sqlalchemy.engine import URL, Connection, Result, make_url
 from sqlalchemy.exc import ArgumentError, OperationalError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.pool import NullPool
@@ -144,6 +162,14 @@ def _database_url() -> URL:
 def anyio_backend() -> str:
     """Run every async test on asyncio, the loop psycopg's async driver uses here."""
     return "asyncio"
+
+
+@pytest.fixture(scope="module", autouse=True)
+async def _analysis_process_stopped(anyio_backend: str) -> AsyncIterator[None]:
+    """Stop the analysis process the module's isolated runs spawned, once the module ran."""
+    del anyio_backend  # Requested so anyio runs this fixture; the backend is always asyncio.
+    yield
+    await runner.stop_analysis_process()
 
 
 @pytest.fixture(scope="module")
@@ -1946,3 +1972,1168 @@ async def test_a_failure_to_record_the_failure_keeps_the_run_error(
     async with analysis_lock():
         pass
     assert [row.status for row in await _runs()] == ["failed"]
+
+
+# ---------------------------------------------------------------------------
+# The analysis process: isolated runs (POST /runs) outside the caller's GIL
+# ---------------------------------------------------------------------------
+
+
+def _refusing_rules() -> tuple[tuple[str, _Evaluate], ...]:
+    """``runner._RULES`` with every evaluator refusing to run in this, the calling, process."""
+
+    def wrap(name: str, evaluate: _Evaluate) -> _Evaluate:
+        def refused(ctx: AnalysisContext) -> Any:
+            raise AssertionError(f"rule module {name!r} ran in the calling process")
+
+        return refused
+
+    return _wrapped_rules(wrap)
+
+
+def _stored_shape(rows: list[Any]) -> list[dict[str, Any]]:
+    """Every column of stored run-output rows except their own id and their run's."""
+    return [
+        {
+            column.key: getattr(row, column.key)
+            for column in row.__table__.columns
+            if column.key not in {"id", "run_id"}
+        }
+        for row in rows
+    ]
+
+
+class _HeldTable:
+    """``fact_search_term_daily`` locked ``ACCESS EXCLUSIVE`` by a connection of its own.
+
+    Only the context load reads that table, so an isolated run blocks on it inside the
+    analysis process, after the calling process took the analysis lock and committed the
+    ``running`` row, until :meth:`release`.
+    """
+
+    def __init__(self, connection: Connection) -> None:
+        self._connection = connection
+        self._released = False
+
+    def waiters(self) -> int:
+        """How many sessions of this database wait for the table's lock."""
+        count = self._connection.execute(
+            text(
+                "SELECT count(*) FROM pg_locks"
+                " WHERE database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+                " AND relation = 'fact_search_term_daily'::regclass AND NOT granted"
+            )
+        ).scalar_one()
+        return int(count)
+
+    def wait_for_waiter(self) -> bool:
+        """Wait, at most :data:`_WAIT_S`, until a session waits for the table's lock."""
+        deadline = time.monotonic() + _WAIT_S
+        while time.monotonic() < deadline:
+            if self.waiters():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def release(self) -> None:
+        """End the transaction holding the lock; later calls do nothing."""
+        if not self._released:
+            self._released = True
+            self._connection.rollback()
+
+
+@contextmanager
+def _search_terms_locked(app_db: str) -> Iterator[_HeldTable]:
+    """Hold ``fact_search_term_daily`` locked for the block, released at its end at the latest."""
+    engine = create_engine(make_url(app_db), poolclass=NullPool)
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("LOCK TABLE fact_search_term_daily IN ACCESS EXCLUSIVE MODE"))
+            held = _HeldTable(connection)
+            try:
+                yield held
+            finally:
+                held.release()
+    finally:
+        engine.dispose()
+
+
+def _fail_runs_elsewhere(app_db: str) -> None:
+    """Mark every run ``failed`` from another session, as a process that took the lock would."""
+    engine = create_engine(make_url(app_db), poolclass=NullPool)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text("UPDATE analysis_run SET status = 'failed', finished_at = now()")
+            )
+    finally:
+        engine.dispose()
+
+
+def _exited(pid: int) -> bool:
+    """Wait, at most :data:`_WAIT_S`, until process ``pid`` has exited and been reaped."""
+    deadline = time.monotonic() + _WAIT_S
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+_BACKEND_DIR = Path(__file__).resolve().parents[2]
+"""``backend/``, the working directory of the test's own API process, whose config it reads."""
+
+_PID_MARKER = "analysis-process-pid="
+"""The prefix of the line on which :data:`_API_PARENT_PROGRAM` names its analysis process."""
+
+_API_PARENT_PROGRAM = """
+import asyncio
+import sys
+from datetime import date, datetime
+
+from ads_engine.analysis import runner
+
+
+async def main() -> None:
+    now = datetime.fromisoformat(sys.argv[1])
+    pid = await runner.start_analysis_process()
+    print(f"analysis-process-pid={pid}", flush=True)
+    window = await runner.custom_window(
+        date.fromisoformat(sys.argv[2]), date.fromisoformat(sys.argv[3]), now=now
+    )
+    await runner.run_analysis(window, "custom", "manual", now=now, isolated=True)
+
+
+asyncio.run(main())
+"""
+"""An API process in miniature: it spawns its analysis process, names its pid on stdout, then
+runs a custom run there (argv: the run instant, the window's first and last day)."""
+
+_ORPHAN_EXIT_S = 2.0
+"""The longest an analysis process may outlive its killed API process."""
+
+
+async def _drain(stream: asyncio.StreamReader, lines: list[str], named: asyncio.Event) -> None:
+    """Collect ``stream``'s lines until it closes; set ``named`` once the pid line arrived.
+
+    Draining keeps the pipe from filling while the API process and its analysis process log.
+    """
+    async for raw in stream:
+        line = raw.decode(errors="replace").rstrip("\n")
+        lines.append(line)
+        if line.startswith(_PID_MARKER):
+            named.set()
+
+
+def _named_pid(lines: list[str]) -> int:
+    """The pid on the first :data:`_PID_MARKER` line of ``lines``."""
+    marked = next(line for line in lines if line.startswith(_PID_MARKER))
+    return int(marked.removeprefix(_PID_MARKER))
+
+
+def _stat(pid: int) -> tuple[str, int, str] | None:
+    """Process ``pid``'s state, parent pid and start time from ``/proc``; ``None`` once reaped.
+
+    An orphan is re-parented to whichever process reaps orphans here, so a dead one may stay
+    a zombie (state ``Z``) for a while: :func:`_alive` reads the state rather than probing
+    with a signal, and the start time tells a reused pid from the original process.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError, ProcessLookupError:
+        return None
+    # The command name, in parentheses, may itself hold spaces and parentheses.
+    fields = stat[stat.rindex(")") + 2 :].split()
+    return fields[0], int(fields[1]), fields[19]
+
+
+def _alive(pid: int, started: str) -> bool:
+    """Whether process ``pid``, started at ``started`` (``/proc`` ticks), is running."""
+    stat = _stat(pid)
+    return stat is not None and stat[2] == started and stat[0] != "Z"
+
+
+def _dead_within(pid: int, started: str, seconds: float) -> bool:
+    """Wait, at most ``seconds``, until process ``pid`` (started at ``started``) has died."""
+    deadline = time.monotonic() + seconds
+    while _alive(pid, started):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+    return True
+
+
+def _no_waiters(held: _HeldTable) -> bool:
+    """Wait, at most :data:`_WAIT_S`, until no session waits for ``held``'s table lock."""
+    deadline = time.monotonic() + _WAIT_S
+    while held.waiters():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+async def _settled(task: asyncio.Task[Any]) -> None:
+    """Cancel ``task`` if it is still running and wait, at most :data:`_WAIT_S`, for it."""
+    if not task.done():
+        task.cancel()
+        await asyncio.wait((task,), timeout=_WAIT_S)
+
+
+def _signals() -> Any:
+    """Fresh shared values, as the analysis process receives them, for in-process tests."""
+    context = multiprocessing.get_context("spawn")
+    return runner._ProcessSignals(
+        stop=context.Value("q", 0, lock=False), stage=context.Value("i", 0, lock=False)
+    )
+
+
+async def _job(run_id: int, *, token: int = 1) -> Any:
+    """A job for the ``running`` row ``run_id``: the 28 days ending :data:`END`."""
+    config = Thresholds.load(resolve_config_dir())
+    window = await runner.custom_window(END - timedelta(days=27), END, now=NOW, thresholds=config)
+    return runner._AnalysisJob(
+        token=token,
+        run_id=run_id,
+        window=window,
+        kind="custom",
+        config=config,
+        instant=NOW,
+        display_timezone="UTC",
+        log_context={"run_id": run_id, "caller": "in-process test"},
+    )
+
+
+class _UnrebuildableError(Exception):
+    """An error whose constructor needs two arguments: it pickles but cannot be rebuilt."""
+
+    def __init__(self, code: int, detail: str) -> None:
+        super().__init__(f"{code}: {detail}")
+
+
+class _UnpicklableError(Exception):
+    """An error carrying a lambda, which cannot be pickled at all."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.callback = lambda: detail
+
+
+@pytest.mark.anyio
+async def test_an_isolated_run_computes_elsewhere_and_stores_what_the_thread_stores(
+    app_db: str, monkeypatch: pytest.MonkeyPatch, log: _LogRecorder
+) -> None:
+    await _seed()
+    pending = await _requests(1)
+    window = await runner.custom_window(END - timedelta(days=27), END, now=NOW)
+    threaded = await runner.run_analysis(window, "custom", "manual", now=NOW)
+    # Rules refused in this process: the isolated run computes in the analysis process.
+    monkeypatch.setattr(runner, "_RULES", _refusing_rules())
+    isolated = await runner.run_analysis(
+        window, "custom", "manual", reason="api", request_ids=pending, now=NOW, isolated=True
+    )
+
+    assert (isolated.status, isolated.kind, isolated.trigger) == ("succeeded", "custom", "manual")
+    assert isolated.id != threaded.id
+    assert isolated.finished_at is not None
+    assert (
+        isolated.window_start,
+        isolated.window_end,
+        isolated.config_hash,
+        isolated.data_modes,
+        isolated.dataset_ids,
+        isolated.source_day_boundaries,
+    ) == (
+        threaded.window_start,
+        threaded.window_end,
+        threaded.config_hash,
+        threaded.data_modes,
+        threaded.dataset_ids,
+        threaded.source_day_boundaries,
+    )
+    stored_rows = 0
+    for model in (Recommendation, RunFinding, RunWithheld, RunSuppression):
+        rows = await _rows(model, isolated.id)
+        stored_rows += len(rows)
+        assert _stored_shape(rows) == _stored_shape(await _rows(model, threaded.id)), model
+    assert stored_rows > 0
+    assert [row.status for row in await _runs()] == ["succeeded", "succeeded"]
+    assert await _served_by() == [isolated.id]
+    # The calling process logs both lines, with the same fields as on the analysis thread.
+    assert [entry["run_id"] for entry in log.named("analysis_run_started")] == [
+        threaded.id,
+        isolated.id,
+    ]
+    thread_summary, process_summary = log.named("analysis_run_summary")
+    assert set(process_summary) == set(thread_summary)
+    assert (process_summary["run_id"], process_summary["requests"]) == (isolated.id, 1)
+    assert process_summary["reason"] == "api"
+    for key in (
+        "items",
+        "items_total",
+        "held",
+        "withheld",
+        "withheld_total",
+        "findings_total",
+        "suppressed",
+        "allocations",
+        "data_modes",
+        "config_hash",
+        "days",
+    ):
+        assert process_summary[key] == thread_summary[key], key
+    timings = [process_summary[key] for key in ("load_ms", "compute_ms", "persist_ms")]
+    assert all(isinstance(value, int) and value >= 0 for value in timings)
+    assert process_summary["duration_ms"] >= process_summary["compute_ms"]
+    assert log.named("analysis_run_failed") == []
+
+
+@pytest.mark.anyio
+async def test_while_an_isolated_run_loads_contenders_are_refused_and_a_cancel_stops_it(
+    app_db: str, log: _LogRecorder
+) -> None:
+    await _seed()
+    pending = await _requests(1)
+    window = await runner.custom_window(END - timedelta(days=27), END, now=NOW)
+    ticks: list[float] = []
+    done = asyncio.Event()
+
+    async def ticking() -> None:
+        while not done.is_set():
+            ticks.append(time.perf_counter())
+            await asyncio.sleep(0.01)
+
+    with _search_terms_locked(app_db) as held:
+        task = asyncio.create_task(
+            runner.run_analysis(
+                window, "custom", "manual", request_ids=pending, now=NOW, isolated=True
+            )
+        )
+        ticker = asyncio.create_task(ticking())
+        try:
+            assert await asyncio.to_thread(held.wait_for_waiter), "the load never reached it"
+            # The run is blocked in the analysis process, holding the lock: contenders are
+            # refused at once, on either path, and this process's loop keeps ticking.
+            for isolated in (True, False):
+                started = time.perf_counter()
+                with pytest.raises(RunInProgress):
+                    await runner.run_analysis(
+                        window, "custom", "manual", now=NOW, isolated=isolated
+                    )
+                assert time.perf_counter() - started < 1.0
+            await asyncio.sleep(0.3)
+            assert not task.done()
+            assert [row.status for row in await _runs()] == ["running"]
+            task.cancel()
+            await asyncio.wait((task,), timeout=_WAIT_S)
+            assert task.done()
+            assert task.cancelled()
+        finally:
+            done.set()
+            await ticker
+            await _settled(task)
+
+    assert len(ticks) >= 20
+    assert max(later - earlier for earlier, later in itertools.pairwise(ticks)) < 0.2
+    (run,) = await _runs()
+    assert run.status == "failed"
+    assert run.finished_at is not None
+    assert await _served_by() == [run.id]
+    assert await _count(Recommendation) == 0
+    (failed,) = log.named("analysis_run_failed")
+    assert (failed["run_id"], failed["stage"], failed["error"]) == (
+        run.id,
+        "load_context",
+        "CancelledError",
+    )
+    assert log.named("analysis_run_summary") == []
+    async with analysis_lock():
+        pass  # the lock was released
+
+
+@pytest.mark.anyio
+async def test_a_run_failed_elsewhere_crosses_back_as_run_no_longer_running(
+    app_db: str, log: _LogRecorder
+) -> None:
+    await _seed()
+    window = await runner.custom_window(END - timedelta(days=27), END, now=NOW)
+    with _search_terms_locked(app_db) as held:
+        task = asyncio.create_task(
+            runner.run_analysis(window, "custom", "manual", now=NOW, isolated=True)
+        )
+        try:
+            assert await asyncio.to_thread(held.wait_for_waiter), "the load never reached it"
+            (running,) = await _runs()
+            # Another process took the lock and failed the row; then the load goes on.
+            await asyncio.to_thread(_fail_runs_elsewhere, app_db)
+            held.release()
+            with pytest.raises(runner.RunNoLongerRunning) as raised:
+                await asyncio.wait_for(task, _WAIT_S)
+        finally:
+            await _settled(task)
+
+    assert type(raised.value) is runner.RunNoLongerRunning
+    assert (raised.value.run_id, raised.value.status) == (running.id, "failed")
+    cause = raised.value.__cause__
+    assert isinstance(cause, runner._RemoteTracebackError)
+    assert "RunNoLongerRunning" in cause.text
+    assert "_persist" in cause.text
+    assert logged_as(raised.value) == "analysis_run_failed"
+    (run,) = await _runs()
+    assert run.status == "failed"
+    assert await _count(Recommendation) == 0
+    (failed,) = log.named("analysis_run_failed")
+    assert (failed["run_id"], failed["stage"], failed["error"]) == (
+        run.id,
+        "persist",
+        "RunNoLongerRunning",
+    )
+    async with analysis_lock():
+        pass  # the lock was released
+
+
+@pytest.mark.anyio
+async def test_a_killed_analysis_process_fails_its_run_and_the_next_run_respawns_it(
+    app_db: str, log: _LogRecorder
+) -> None:
+    await _seed()
+    window = await runner.custom_window(END - timedelta(days=27), END, now=NOW)
+    pid = await runner.start_analysis_process()
+    with _search_terms_locked(app_db) as held:
+        task = asyncio.create_task(
+            runner.run_analysis(window, "custom", "manual", now=NOW, isolated=True)
+        )
+        try:
+            assert await asyncio.to_thread(held.wait_for_waiter), "the load never reached it"
+            os.kill(pid, signal.SIGKILL)
+            with pytest.raises(BrokenProcessPool):
+                await asyncio.wait_for(task, _WAIT_S)
+        finally:
+            await _settled(task)
+
+    (run,) = await _runs()
+    assert run.status == "failed"
+    assert run.finished_at is not None
+    (failed,) = log.named("analysis_run_failed")
+    assert (failed["run_id"], failed["stage"], failed["error"]) == (
+        run.id,
+        "load_context",
+        "BrokenProcessPool",
+    )
+    async with analysis_lock():
+        pass  # the lock was released
+    assert await asyncio.to_thread(_exited, pid)
+    retried = await runner.run_analysis(window, "custom", "manual", now=NOW, isolated=True)
+    assert retried.status == "succeeded"
+    assert await runner.start_analysis_process() != pid
+
+
+@pytest.mark.anyio
+async def test_an_analysis_process_dies_with_its_killed_api_process(
+    app_db: str, tmp_path: Path
+) -> None:
+    await _seed()
+    first, last = END - timedelta(days=27), END
+    # The API process runs under this test's environment: app_db's DATABASE_URL, and none of
+    # the host's settings. Whatever temporary files its multiprocessing leaves stay here.
+    environment = dict(os.environ)
+    environment["TMPDIR"] = str(tmp_path)
+    lines: list[str] = []
+    named = asyncio.Event()
+    child: tuple[int, str] | None = None
+    with _search_terms_locked(app_db) as held:
+        api = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            _API_PARENT_PROGRAM,
+            NOW.isoformat(),
+            first.isoformat(),
+            last.isoformat(),
+            cwd=_BACKEND_DIR,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            limit=2**20,  # a log line of any realistic length still reads as one line
+        )
+        assert api.stdout is not None
+        reader = asyncio.create_task(_drain(api.stdout, lines, named))
+        try:
+            try:
+                await asyncio.wait_for(named.wait(), _WAIT_S)
+            except TimeoutError:
+                pytest.fail(f"the API process never named its analysis process: {lines}")
+            pid = _named_pid(lines)
+            stat = _stat(pid)
+            assert stat is not None, lines
+            assert stat[1] == api.pid  # the analysis process is the API process's own child
+            child = (pid, stat[2])
+            assert await asyncio.to_thread(held.wait_for_waiter), "the load never reached it"
+            with pytest.raises(RunInProgress):
+                async with analysis_lock():
+                    pass  # the API process holds the run's lock while its child loads
+            api.kill()
+            await asyncio.wait_for(api.wait(), _WAIT_S)
+            # The analysis process dies with the API process, and PostgreSQL then ends the
+            # session it left waiting for the table: no part of the run outlives the lock.
+            assert await asyncio.to_thread(_dead_within, *child, _ORPHAN_EXIT_S), lines
+            assert await asyncio.to_thread(_no_waiters, held), "the orphan's load still waits"
+            async with analysis_lock():
+                pass  # the lock died with the API process; taking it fails the orphan's run
+        finally:
+            if api.returncode is None:
+                with suppress(ProcessLookupError):
+                    api.kill()
+                await asyncio.wait_for(api.wait(), _WAIT_S)
+            if child is not None and _alive(*child):
+                os.kill(child[0], signal.SIGKILL)  # only the process the API process named
+            await asyncio.wait((reader,), timeout=_WAIT_S)
+            await _settled(reader)
+
+    (orphaned,) = await _runs()
+    assert orphaned.status == "failed"
+    assert orphaned.finished_at is not None
+    window = await runner.custom_window(first, last, now=NOW)
+    successor = await runner.run_analysis(window, "custom", "manual", now=NOW)
+    assert successor.status == "succeeded"
+    assert [(run.id, run.status) for run in await _runs()] == [
+        (orphaned.id, "failed"),
+        (successor.id, "succeeded"),
+    ]
+
+
+@pytest.mark.anyio
+async def test_a_changed_environment_spawns_a_fresh_analysis_process(
+    app_db: str, monkeypatch: pytest.MonkeyPatch, log: _LogRecorder
+) -> None:
+    await _seed()
+    first = await runner.start_analysis_process()
+    # An earlier test's process, spawned under that test's environment, may have been
+    # replaced just now; an unchanged environment replaces nothing.
+    replaced = len(log.named("analysis_process_replaced"))
+    assert await runner.start_analysis_process() == first
+    assert len(log.named("analysis_process_replaced")) == replaced
+    monkeypatch.setenv("ADS_ENGINE_ANALYSIS_PROCESS_TEST", uuid.uuid4().hex)
+    second = await runner.start_analysis_process()
+    assert second != first
+    assert log.named("analysis_process_replaced")[replaced:] == [{"reason": "environment_changed"}]
+    assert await asyncio.to_thread(_exited, first)
+    window = await runner.custom_window(END - timedelta(days=27), END, now=NOW)
+    run = await runner.run_analysis(window, "custom", "manual", now=NOW, isolated=True)
+    assert run.status == "succeeded"
+    assert await runner.start_analysis_process() == second
+
+
+@pytest.mark.anyio
+async def test_the_task_entry_loads_computes_and_stores_the_run(
+    app_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _seed()
+    run_id = await _insert_run("custom", "running", None)
+    signals = _signals()
+    monkeypatch.setattr(runner, "_process_signals", signals)
+    job = await _job(run_id)
+    # The entry runs on an event loop of its own and disposes the engine it opened there.
+    await dispose_engine()
+    outcome = await asyncio.to_thread(runner._execute_in_process, job)
+
+    assert isinstance(outcome, runner._ProcessSuccess), outcome
+    assert (outcome.stored.id, outcome.stored.status) == (run_id, "succeeded")
+    assert signals.stage.value == runner._STAGES.index("persist")
+    timings = (outcome.load_ms, outcome.compute_ms, outcome.persist_ms)
+    assert all(isinstance(value, int) and value >= 0 for value in timings)
+    assert outcome.summary["items_total"] == len(await _rows(Recommendation, run_id))
+    # The outcome crosses back as the executor hands it back, the detached run included.
+    crossed = ForkingPickler.loads(ForkingPickler.dumps(outcome))
+    assert isinstance(crossed, runner._ProcessSuccess)
+    assert (crossed.stored.id, crossed.stored.status, crossed.stored.data_modes) == (
+        run_id,
+        "succeeded",
+        outcome.stored.data_modes,
+    )
+    assert crossed.summary == outcome.summary
+    (stored,) = await _runs()
+    assert stored.status == "succeeded"
+
+
+@pytest.mark.anyio
+async def test_the_task_entry_of_a_stopped_job_stops_at_its_first_checkpoint(
+    app_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _seed()
+    run_id = await _insert_run("custom", "running", None)
+    signals = _signals()
+    monkeypatch.setattr(runner, "_process_signals", signals)
+    job = await _job(run_id, token=7)
+    signals.stop.value = 7
+    await dispose_engine()
+    outcome = await asyncio.to_thread(runner._execute_in_process, job)
+
+    assert isinstance(outcome, runner._ProcessFailure), outcome
+    assert (outcome.stage, outcome.stopped) == ("load_context", True)
+    assert type(outcome.error) is runner._ComputationStoppedError
+    assert "_ComputationStoppedError" in outcome.remote_traceback
+    (run,) = await _runs()
+    assert run.status == "running"
+    assert await _count(Recommendation) == 0
+
+
+@pytest.mark.parametrize(
+    "error",
+    [_UnrebuildableError(7, "seven"), _UnpicklableError("carries a lambda")],
+    ids=["cannot_be_rebuilt", "cannot_be_pickled"],
+)
+@pytest.mark.anyio
+async def test_an_error_that_cannot_cross_back_becomes_analysis_process_error(
+    app_db: str, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    await _seed()
+    run_id = await _insert_run("custom", "running", None)
+    signals = _signals()
+    monkeypatch.setattr(runner, "_process_signals", signals)
+    job = await _job(run_id)
+
+    async def failing(*_args: Any, **_kwargs: Any) -> AnalysisContext:
+        raise error
+
+    monkeypatch.setattr(runner, "_load", failing)
+    await dispose_engine()
+    outcome = await asyncio.to_thread(runner._execute_in_process, job)
+
+    assert isinstance(outcome, runner._ProcessFailure), outcome
+    assert (outcome.stage, outcome.stopped) == ("load_context", False)
+    assert type(outcome.error) is runner.AnalysisProcessError
+    assert outcome.error.error_type == f"{type(error).__module__}.{type(error).__qualname__}"
+    assert str(error) in outcome.error.message
+    assert type(error).__name__ in outcome.remote_traceback
+    crossed = ForkingPickler.loads(ForkingPickler.dumps(outcome))
+    assert type(crossed.error) is runner.AnalysisProcessError
+    assert (crossed.error.message, crossed.error.error_type) == (
+        outcome.error.message,
+        outcome.error.error_type,
+    )
+
+
+def test_errors_that_cross_back_keep_their_fields() -> None:
+    lost = runner.RunNoLongerRunning(5, "failed")
+    lost.add_note("raised while persisting")
+    assert runner._portable_error(lost) is lost
+    crossed = ForkingPickler.loads(ForkingPickler.dumps(lost))
+    assert type(crossed) is runner.RunNoLongerRunning
+    assert (crossed.run_id, crossed.status, str(crossed)) == (5, "failed", str(lost))
+    assert crossed.__notes__ == ["raised while persisting"]
+    deleted = ForkingPickler.loads(ForkingPickler.dumps(runner.RunNoLongerRunning(6, None)))
+    assert (deleted.run_id, deleted.status) == (6, None)
+    stand_in = runner.AnalysisProcessError("could not hand it back", "pkg.SomeError")
+    restored = ForkingPickler.loads(ForkingPickler.dumps(stand_in))
+    assert type(restored) is runner.AnalysisProcessError
+    assert (restored.message, restored.error_type, str(restored)) == (
+        "could not hand it back",
+        "pkg.SomeError",
+        "could not hand it back",
+    )
+    for portable in (
+        ConfigError("content_assets.yaml", "assets[0]", "contradicts"),
+        RunInProgress(),
+        asyncio.CancelledError(),
+        ValueError("plain"),
+    ):
+        assert runner._portable_error(portable) is portable
+
+
+def test_the_task_entry_refuses_a_process_it_was_not_prepared_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runner, "_process_signals", None)
+    with pytest.raises(RuntimeError, match="_init_analysis_process"):
+        runner._execute_in_process(SimpleNamespace())
+
+
+@pytest.mark.parametrize("refused", [False, True], ids=["niced", "nice_refused"])
+def test_the_initializer_prepares_the_process_it_runs_in(
+    monkeypatch: pytest.MonkeyPatch, log: _LogRecorder, refused: bool
+) -> None:
+    calls: list[tuple[Any, ...]] = []
+
+    def nice(increment: int) -> int:
+        calls.append(("nice", increment))
+        if refused:
+            raise PermissionError("lowering the priority is not permitted")
+        return increment
+
+    # Only the runner's own references are replaced: this process keeps its signal handlers,
+    # logging and priority, and is bound to no parent's death and runs no watchdog.
+    monkeypatch.setattr(runner, "os", SimpleNamespace(nice=nice))
+    monkeypatch.setattr(
+        runner,
+        "signal",
+        SimpleNamespace(
+            SIGINT=signal.SIGINT,
+            SIG_IGN=signal.SIG_IGN,
+            signal=lambda signum, handler: calls.append(("signal", signum, handler)),
+        ),
+    )
+    monkeypatch.setattr(runner, "configure_logging", lambda: calls.append(("configure_logging",)))
+    monkeypatch.setattr(runner, "_bind_to_parent", lambda pid: calls.append(("bind", pid)))
+    monkeypatch.setattr(runner, "_process_signals", None)
+    monkeypatch.setattr(runner, "_parent_pid", None)
+    signals = _signals()
+    runner._init_analysis_process(signals.stop, signals.stage, 4242)
+
+    assert runner._process_signals == signals
+    assert runner._parent_pid == 4242
+    assert calls == [
+        ("signal", signal.SIGINT, signal.SIG_IGN),
+        ("configure_logging",),
+        ("bind", 4242),
+        ("nice", 10),
+    ]
+    expected = [{"niceness": 10, "error": "PermissionError"}] if refused else []
+    assert log.named("analysis_process_nice_failed") == expected
+
+
+class _Libc:
+    """A stand-in C library whose ``prctl`` records its arguments and returns ``result``."""
+
+    def __init__(self, result: int) -> None:
+        self.result = result
+        self.calls: list[tuple[int, int]] = []
+
+    def prctl(self, option: ctypes.c_int, value: ctypes.c_ulong) -> int:
+        self.calls.append((option.value, value.value))
+        return self.result
+
+
+@pytest.mark.parametrize(
+    ("result", "loadable", "accepted", "logged"),
+    [
+        (0, True, True, []),
+        (-1, True, False, [{"errno": errno.EPERM}]),
+        (0, False, False, [{"error": "OSError"}]),
+    ],
+    ids=["accepted", "refused", "no_libc"],
+)
+def test_the_parent_death_signal_asks_the_kernel_and_logs_a_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+    log: _LogRecorder,
+    result: int,
+    loadable: bool,
+    accepted: bool,
+    logged: list[dict[str, int | str]],
+) -> None:
+    libc = _Libc(result)
+    loads: list[tuple[str | None, bool]] = []
+
+    def load(name: str | None, *, use_errno: bool) -> _Libc:
+        loads.append((name, use_errno))
+        if not loadable:
+            raise OSError("no C library")
+        return libc
+
+    # The runner's own ctypes reference only: this process's death signal stays unset.
+    monkeypatch.setattr(runner, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(
+        runner,
+        "ctypes",
+        SimpleNamespace(
+            CDLL=load, c_int=ctypes.c_int, c_ulong=ctypes.c_ulong, get_errno=lambda: errno.EPERM
+        ),
+    )
+    assert runner._set_parent_death_signal() is accepted
+    assert loads == [(None, True)]
+    assert libc.calls == ([(1, signal.SIGKILL.value)] if loadable else [])
+    assert log.named("analysis_process_death_signal_failed") == logged
+
+
+def test_the_parent_death_signal_is_linux_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    def load(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("the C library was loaded off Linux")
+
+    monkeypatch.setattr(runner, "sys", SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(runner, "ctypes", SimpleNamespace(CDLL=load))
+    assert runner._set_parent_death_signal() is False
+
+
+_DEATH_SIGNAL_PROGRAM = """
+import ctypes
+
+from ads_engine.analysis import runner
+
+accepted = runner._set_parent_death_signal()
+death_signal = ctypes.c_int(0)
+ctypes.CDLL(None, use_errno=True).prctl(ctypes.c_int(2), ctypes.byref(death_signal))
+print(accepted, death_signal.value)
+"""
+"""Sets the parent-death signal in a throwaway interpreter and prints whether the kernel
+accepted it and what ``prctl(PR_GET_PDEATHSIG)`` reads back."""
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="the parent-death signal is Linux's")
+def test_the_kernel_holds_the_parent_death_signal_the_runner_sets() -> None:
+    # A throwaway interpreter, so the test process itself never dies with its parent.
+    completed = subprocess.run(  # noqa: S603 - fixed interpreter and program, no user input
+        [sys.executable, "-c", _DEATH_SIGNAL_PROGRAM],
+        cwd=_BACKEND_DIR,
+        env=dict(os.environ),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.split() == ["True", str(signal.SIGKILL.value)]
+
+
+def test_the_binding_exits_at_once_when_the_parent_is_already_gone(
+    monkeypatch: pytest.MonkeyPatch, log: _LogRecorder
+) -> None:
+    calls: list[Any] = []
+
+    def death_signal() -> bool:
+        calls.append("death_signal")
+        return True
+
+    def thread(**kwargs: Any) -> None:
+        calls.append(("thread", kwargs))
+
+    monkeypatch.setattr(runner, "_set_parent_death_signal", death_signal)
+    monkeypatch.setattr(
+        runner,
+        "os",
+        SimpleNamespace(getppid=lambda: 1, _exit=lambda code: calls.append(("exit", code))),
+    )
+    monkeypatch.setattr(runner, "threading", SimpleNamespace(Thread=thread))
+    runner._bind_to_parent(4242)
+
+    # Re-parented before the signal was set: the process exits at once, and no watchdog starts.
+    assert calls == ["death_signal", ("exit", 70)]
+    assert log.named("analysis_process_orphaned") == [{"parent_pid": 4242}]
+
+
+def test_the_binding_starts_a_daemon_watchdog_while_the_parent_lives(
+    monkeypatch: pytest.MonkeyPatch, log: _LogRecorder
+) -> None:
+    started: list[dict[str, Any]] = []
+
+    class _Thread:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+        def start(self) -> None:
+            started.append(self.kwargs)
+
+    def exited(code: int) -> None:
+        raise AssertionError(f"exited {code} while the parent lives")
+
+    monkeypatch.setattr(runner, "_set_parent_death_signal", lambda: True)
+    monkeypatch.setattr(runner, "os", SimpleNamespace(getppid=lambda: 4242, _exit=exited))
+    monkeypatch.setattr(runner, "threading", SimpleNamespace(Thread=_Thread))
+    runner._bind_to_parent(4242)
+
+    assert started == [
+        {
+            "target": runner._watch_parent,
+            "args": (4242,),
+            "name": "ads-engine-analysis-parent-watch",
+            "daemon": True,
+        }
+    ]
+    assert log.named("analysis_process_orphaned") == []
+
+
+def test_the_watchdog_ends_the_process_once_its_parent_is_gone(
+    monkeypatch: pytest.MonkeyPatch, log: _LogRecorder
+) -> None:
+    parents = iter([4242, 4242])
+    seen: list[int] = []
+    exits: list[int] = []
+
+    def getppid() -> int:
+        # Re-parented to init after two polls.
+        seen.append(next(parents, 1))
+        return seen[-1]
+
+    monkeypatch.setattr(runner, "os", SimpleNamespace(getppid=getppid, _exit=exits.append))
+    watchdog = threading.Thread(target=runner._watch_parent, args=(4242,), daemon=True)
+    started = time.monotonic()
+    watchdog.start()
+    watchdog.join(_WAIT_S)
+
+    assert not watchdog.is_alive()
+    assert seen == [4242, 4242, 1]
+    assert time.monotonic() - started >= 2 * runner._PARENT_POLL_S
+    assert exits == [70]
+    assert log.named("analysis_process_orphaned") == [{"parent_pid": 4242}]
+
+
+@pytest.mark.anyio
+async def test_the_analysis_process_starts_niced_ignoring_sigint_and_stops(
+    log: _LogRecorder,
+) -> None:
+    await runner.stop_analysis_process()
+    stopped = len(log.named("analysis_process_stopped"))
+    pid = await runner.start_analysis_process()
+    try:
+        assert pid > 0
+        assert pid != os.getpid()
+        assert runner._analysis_process_pid() == os.getpid()  # the warm-up names its process
+        assert await runner.start_analysis_process() == pid
+        started = log.named("analysis_process_started")
+        assert [entry["pid"] for entry in started] == [pid, pid]
+        assert all(isinstance(entry["startup_ms"], int) for entry in started)
+        process = runner._process
+        assert process is not None
+        niceness = await asyncio.wrap_future(process.executor.submit(os.nice, 0))
+        assert niceness == min(os.nice(0) + 10, 19)
+        handler = await asyncio.wrap_future(
+            process.executor.submit(signal.getsignal, signal.SIGINT)
+        )
+        assert handler == signal.SIG_IGN
+        # The pid it is bound to is its actual parent's, this process's.
+        parent = await asyncio.wrap_future(process.executor.submit(os.getppid))
+        assert parent == os.getpid()
+    finally:
+        await runner.stop_analysis_process()
+    assert runner._process is None
+    assert await asyncio.to_thread(_exited, pid)
+    assert len(log.named("analysis_process_stopped")) == stopped + 1
+    await runner.stop_analysis_process()  # nothing left to stop
+    assert len(log.named("analysis_process_stopped")) == stopped + 1
+
+
+@pytest.mark.anyio
+async def test_a_job_the_stopping_process_never_ran_fails_with_analysis_process_error(
+    app_db: str,
+) -> None:
+    await _seed()
+    run_id = await _insert_run("custom", "running", None)
+    job = await _job(run_id)
+    await runner.start_analysis_process()
+    process = runner._process
+    assert process is not None
+    # Sleeps occupy the worker and fill the executor's call queue, so the job stays pending:
+    # exactly what a shutdown cancels.
+    sleeps = [process.executor.submit(time.sleep, 0.3) for _ in range(5)]
+    progress = runner._RunProgress(stage="load_context", run_id=run_id)
+    task = asyncio.create_task(runner._in_analysis_process(job, progress))
+    try:
+        await asyncio.sleep(0)  # the task hands the job off before its first wait
+        await runner.stop_analysis_process()
+        with pytest.raises(runner.AnalysisProcessError, match="shut down before it ran"):
+            await asyncio.wait_for(task, _WAIT_S)
+    finally:
+        await _settled(task)
+    assert any(sleep.cancelled() for sleep in sleeps)
+    assert progress.stage == "load_context"
+    (run,) = await _runs()
+    assert run.status == "running"
+
+
+@pytest.mark.anyio
+async def test_a_run_stored_before_its_cancellation_took_hold_stays_succeeded(
+    app_db: str, monkeypatch: pytest.MonkeyPatch, log: _LogRecorder
+) -> None:
+    await _seed()
+    pending = await _requests(1)
+    window = await runner.custom_window(END - timedelta(days=27), END, now=NOW)
+    await runner.start_analysis_process()
+    submit = runner._submit
+    handed: list[Future[Any]] = []
+    handed_off = asyncio.Event()
+    delivered: Future[Any] = Future()
+
+    def late(hand_off: Callable[[Any], Future[Any]]) -> tuple[Any, Future[Any]]:
+        # The analysis process runs the job for real; only its outcome reaches the calling
+        # process late, as when the cancellation arrives right after the commit. Called on
+        # the event loop's thread, by the run's own wait.
+        process, future = submit(hand_off)
+        handed.append(future)
+        handed_off.set()
+        return process, delivered
+
+    monkeypatch.setattr(runner, "_submit", late)
+    task = asyncio.create_task(
+        runner.run_analysis(window, "custom", "manual", request_ids=pending, now=NOW, isolated=True)
+    )
+    try:
+        await asyncio.wait_for(handed_off.wait(), _WAIT_S)
+        outcome = await asyncio.wait_for(asyncio.wrap_future(handed[0]), _WAIT_S)
+        assert isinstance(outcome, runner._ProcessSuccess), outcome
+        task.cancel()
+        await asyncio.sleep(0.1)
+        assert not task.done()  # the cancellation is held until the outcome arrives
+        process = runner._process
+        assert process is not None
+        assert process.signals.stop.value > 0  # and it stopped the job, too late
+        delivered.set_result(outcome)
+        await asyncio.wait((task,), timeout=_WAIT_S)
+        assert task.cancelled()
+    finally:
+        if not delivered.done():
+            delivered.cancel()
+        await _settled(task)
+
+    (run,) = await _runs()
+    assert (run.id, run.status) == (outcome.stored.id, "succeeded")
+    assert await _served_by() == [run.id]
+    assert await _count(Recommendation) == outcome.summary["items_total"]
+    (summary,) = log.named("analysis_run_summary")
+    assert (summary["run_id"], summary["requests"]) == (run.id, 1)
+    assert log.named("analysis_run_failed") == []
+    async with analysis_lock():
+        pass  # the lock was released
+
+
+@pytest.mark.anyio
+async def test_a_cancellation_that_meets_a_killed_analysis_process_fails_the_run(
+    app_db: str, log: _LogRecorder
+) -> None:
+    await _seed()
+    window = await runner.custom_window(END - timedelta(days=27), END, now=NOW)
+    pid = await runner.start_analysis_process()
+    caught: list[asyncio.CancelledError] = []
+
+    async def run() -> None:
+        try:
+            await runner.run_analysis(window, "custom", "manual", now=NOW, isolated=True)
+        except asyncio.CancelledError as cancelled:
+            caught.append(cancelled)
+            raise
+
+    with _search_terms_locked(app_db) as held:
+        task = asyncio.create_task(run())
+        try:
+            assert await asyncio.to_thread(held.wait_for_waiter), "the load never reached it"
+            # Killed first, so the analysis process never sees the stop the cancellation sets.
+            os.kill(pid, signal.SIGKILL)
+            task.cancel()
+            await asyncio.wait((task,), timeout=_WAIT_S)
+            assert task.cancelled()
+        finally:
+            await _settled(task)
+
+    (cancelled,) = caught
+    assert isinstance(cancelled.__cause__, BrokenProcessPool)
+    (run,) = await _runs()
+    assert run.status == "failed"
+    assert await _count(Recommendation) == 0
+    (failed,) = log.named("analysis_run_failed")
+    assert (failed["run_id"], failed["stage"], failed["error"]) == (
+        run.id,
+        "load_context",
+        "CancelledError",
+    )
+    async with analysis_lock():
+        pass  # the lock was released
+    assert await asyncio.to_thread(_exited, pid)
+
+
+@pytest.mark.anyio
+async def test_an_analysis_process_that_died_idle_is_replaced_at_the_next_hand_off(
+    app_db: str, log: _LogRecorder
+) -> None:
+    await _seed()
+    window = await runner.custom_window(END - timedelta(days=27), END, now=NOW)
+    pid = await runner.start_analysis_process()
+    replaced = len(log.named("analysis_process_replaced"))
+    os.kill(pid, signal.SIGKILL)
+    # The executor marks itself broken before it reaps its worker.
+    assert await asyncio.to_thread(_exited, pid)
+
+    run = await runner.run_analysis(window, "custom", "manual", now=NOW, isolated=True)
+
+    assert run.status == "succeeded"
+    assert log.named("analysis_process_replaced")[replaced:] == [{"reason": "broken"}]
+    assert log.named("analysis_run_failed") == []
+    assert await runner.start_analysis_process() != pid
+
+
+@pytest.mark.anyio
+async def test_an_analysis_process_that_cannot_start_is_discarded(
+    monkeypatch: pytest.MonkeyPatch, log: _LogRecorder
+) -> None:
+    await runner.stop_analysis_process()
+    with monkeypatch.context() as patch:
+        # A worker whose initialisation fails exits at once: this initializer takes none of
+        # the values it is called with.
+        patch.setattr(runner, "_init_analysis_process", runner._analysis_process_pid)
+        with pytest.raises(BrokenProcessPool):
+            await asyncio.wait_for(runner.start_analysis_process(), _WAIT_S)
+    assert runner._process is None
+    assert log.named("analysis_process_started") == []
+    pid = await runner.start_analysis_process()
+    assert pid != os.getpid()
+    assert [entry["pid"] for entry in log.named("analysis_process_started")] == [pid]
+
+
+@pytest.mark.anyio
+async def test_a_stopped_job_cancels_its_database_step_in_flight() -> None:
+    signals = _signals()
+    progress = runner._RunProgress(stage="persist", run_id=1, stop=runner._JobStop(signals, 3))
+    # Another job's stop leaves this job's step running to its end.
+    signals.stop.value = 2
+    assert await runner._until_stopped(asyncio.sleep(0.12, result="stored"), progress) == "stored"
+    rolled_back = asyncio.Event()
+
+    async def step() -> None:
+        try:
+            await asyncio.sleep(_WAIT_S)
+        except asyncio.CancelledError:
+            rolled_back.set()
+            raise
+
+    asyncio.get_running_loop().call_later(0.1, progress.stop.set)
+    started = time.perf_counter()
+    with pytest.raises(runner._ComputationStoppedError):
+        await runner._until_stopped(step(), progress)
+    assert rolled_back.is_set()
+    assert time.perf_counter() - started < 1.0
+    assert signals.stop.value == 3
+
+
+@pytest.mark.anyio
+async def test_a_failed_disposal_after_a_job_is_logged_and_never_raised(
+    monkeypatch: pytest.MonkeyPatch, log: _LogRecorder
+) -> None:
+    async def failing() -> None:
+        raise OSError("connection reset by peer")
+
+    monkeypatch.setattr(runner, "dispose_engine", failing)
+    await runner._dispose_process_engine()
+    assert log.named("analysis_process_dispose_failed") == [{"error": "OSError"}]
+
+
+async def _client_check_interval() -> str:
+    """``client_connection_check_interval`` as the application's sessions see it."""
+    async with session_scope() as session:
+        shown = await session.execute(text("SHOW client_connection_check_interval"))
+        return str(shown.scalar_one())
+
+
+@pytest.mark.anyio
+async def test_a_job_engine_has_postgresql_check_that_its_process_is_connected(
+    app_db: str, log: _LogRecorder
+) -> None:
+    await dispose_engine()
+    runner._check_clients_of(get_engine())
+    # Committed on connect, so it holds in every session on the connection, not only the first.
+    assert await _client_check_interval() == "1s"
+    assert await _client_check_interval() == "1s"
+    assert log.named("analysis_process_client_check_unavailable") == []
+
+
+@pytest.mark.anyio
+async def test_a_refused_client_check_is_logged_and_the_connection_still_serves(
+    app_db: str, monkeypatch: pytest.MonkeyPatch, log: _LogRecorder
+) -> None:
+    # PostgreSQL refuses a negative interval, as a server without the check refuses any.
+    monkeypatch.setattr(runner, "_CLIENT_CHECK_SQL", "SET client_connection_check_interval = -1")
+    await dispose_engine()
+    runner._check_clients_of(get_engine())
+    assert await _client_check_interval() == "0"
+    assert log.named("analysis_process_client_check_unavailable") == [
+        {"error": "InvalidParameterValue"}
+    ]

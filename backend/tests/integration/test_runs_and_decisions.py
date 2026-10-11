@@ -447,6 +447,14 @@ async def seeded(db: async_sessionmaker[AsyncSession], seed_snapshot: SeedSnapsh
     return seed_snapshot.seed
 
 
+@pytest.fixture(scope="module", autouse=True)
+async def _analysis_process_stopped(anyio_backend: str) -> AsyncIterator[None]:
+    """Stop the analysis process this module's ``POST /runs`` spawned, once the module ran."""
+    del anyio_backend  # Requested so anyio runs this fixture; the backend is always asyncio.
+    yield
+    await runner.stop_analysis_process()
+
+
 class _Identity(Protocol):
     """The part of ``conftest.test_identity`` this module reads."""
 
