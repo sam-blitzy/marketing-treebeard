@@ -29,7 +29,9 @@
  * - **The confirmation where a card stood.** That feedback's outcome also shows, as plain
  *   content (no second live region, no alert), in the hidden card's place inside its own
  *   section and group, right before the action focus moves to, while the navigation counts and
- *   "Not shown" count the item as hidden.
+ *   "Not shown" count the item as hidden. The outcome and the confirmation stay through a
+ *   refetch that still lists the item, and both leave once a rerun no longer lists it or
+ *   another run is opened, while the outcome region stays mounted, the same element, empty.
  * - **States.** "Loading actions" until the first response; "No analysis run yet" (404
  *   `not_found` or 409 `run_not_ready` for the default run) that fills in by itself; "Run not
  *   found" with "Back to default" for an unknown custom run (404 or 422); otherwise "Actions
@@ -601,7 +603,7 @@ describe('ActionsPage', () => {
       const region = refreshRegion();
       await within(region).findByText(REFRESH_TITLE);
       expect(
-        within(region).getByText('The API is restarting Showing the last loaded state.'),
+        within(region).getByText('The API is restarting. Showing the last loaded state.'),
       ).toBeTruthy();
       expect(recommendationReads(api)).toHaveLength(2);
       expect(sectionHeadings()).toEqual(SECTION_TITLES);
@@ -1650,5 +1652,85 @@ describe('ActionsPage: the confirmation where a card stood', () => {
     expect(
       api.calls.filter((call) => call.method === 'POST' && call.path === feedbackPath),
     ).toHaveLength(1);
+  });
+
+  /**
+   * Presses "Mark done" on the loaded page's C2 "Hold" card and waits until the card has left,
+   * its outcome is in the outcome region and its confirmation stands in its place.
+   */
+  async function markHoldDone(): Promise<{ text: string; region: HTMLElement; holdId: number }> {
+    const hold = findPageItem(makeRecommendationsPage(), FIXTURE_ITEM_IDS.c2Hold);
+    const card = document.getElementById(`item-${String(hold.id)}`);
+    if (card === null) {
+      throw new Error('the C2 Hold card is not on the page');
+    }
+    const region = outcomeRegion();
+    fireEvent.click(within(card).getByRole('button', { name: 'Mark done' }));
+    const text = feedbackConfirmationText('done', hold);
+    await waitFor(() => {
+      expect(document.getElementById(`item-${String(hold.id)}`)).toBeNull();
+    });
+    expect(outcomeRegion()).toBe(region);
+    expect(region.textContent).toBe(text);
+    // The announcement, and the confirmation in the card's place.
+    expect(screen.getAllByText(text)).toHaveLength(2);
+    return { text, region, holdId: hold.id };
+  }
+
+  it('empties the outcome region in place once a rerun no longer lists the hidden item', async () => {
+    const flow = feedbackFlow();
+    const { queryClient } = await renderPage(defaultHandlers(flow.handlers));
+    await loadedPage();
+    const { text, region, holdId } = await markHoldDone();
+
+    // A refetch that still lists the hidden item keeps the outcome and the confirmation.
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: queryKeys.recommendationsAll });
+    });
+    expect(outcomeRegion()).toBe(region);
+    expect(region.textContent).toBe(text);
+    expect(screen.getAllByText(text)).toHaveLength(2);
+
+    // The rerun that follows the feedback no longer lists the item.
+    flow.drop(holdId);
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: queryKeys.recommendationsAll });
+    });
+    await waitFor(() => {
+      expect(screen.queryByText(text)).toBeNull();
+    });
+    // The region stays mounted, the same element, empty; only the discrepancy banner alerts.
+    expect(outcomeRegion()).toBe(region);
+    expect(region.getAttribute('role')).toBe('status');
+    expect(region.childNodes).toHaveLength(0);
+    expect(screen.getAllByRole('alert')).toHaveLength(1);
+  });
+
+  it('empties the outcome region in place when another run is opened', async () => {
+    const flow = feedbackFlow();
+    const { queryClient, router } = await renderPage(
+      defaultHandlers({
+        ...flow.handlers,
+        [`GET /recommendations?run_id=${String(CUSTOM_RUN_ID)}`]: () => json(200, customPage()),
+      }),
+    );
+    await loadedPage();
+    const { text, region, holdId } = await markHoldDone();
+
+    // The window picker reads a run it created before opening it, so the page stays mounted.
+    queryClient.setQueryData(queryKeys.recommendations(CUSTOM_RUN_ID), customPage());
+    await act(() => router.navigate({ to: '/actions', search: { run: CUSTOM_RUN_ID } }));
+    await waitFor(() => {
+      expect(document.getElementById('banner-custom-window')).not.toBeNull();
+    });
+
+    expect(outcomeRegion()).toBe(region);
+    expect(region.getAttribute('role')).toBe('status');
+    expect(region.childNodes).toHaveLength(0);
+    // The custom run lists the same recommendation, not hidden: no outcome of the default page
+    // carries over, neither in the region nor in the card's place.
+    expect(document.getElementById(`item-${String(holdId)}`)).not.toBeNull();
+    expect(screen.queryByText(text)).toBeNull();
+    expect(screen.getAllByRole('alert')).toHaveLength(1);
   });
 });

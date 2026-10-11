@@ -66,6 +66,7 @@ import {
   formatTestLine,
   formatWindowChip,
   isDecimalString,
+  joinSentences,
   percentDigits,
   ratioMetricDigits,
   sourceLabel,
@@ -226,6 +227,7 @@ describe('constants', () => {
         'formatTestLine',
         'formatWindowChip',
         'isDecimalString',
+        'joinSentences',
         'percentDigits',
         'ratioMetricDigits',
         'sourceLabel',
@@ -1480,5 +1482,75 @@ describe('formatInstant', () => {
     expect(formatInstant('2026-10-06T15:22:00Z', 'Mars/Base')).toBe('Oct 6, 2026, 3:22 PM UTC');
     expect(formatInstant('2026-10-06T15:22:00Z', '')).toBe('Oct 6, 2026, 3:22 PM UTC');
     expect(formatInstant('2026-10-06T15:22:00Z', '  ')).toBe('Oct 6, 2026, 3:22 PM UTC');
+  });
+});
+
+describe('joinSentences', () => {
+  const SUFFIX = 'Showing the last loaded state.';
+
+  it.each([
+    ['Internal server error', 'Internal server error. Showing the last loaded state.'],
+    [
+      'The request did not complete in time',
+      'The request did not complete in time. Showing the last loaded state.',
+    ],
+    ['Database unavailable', 'Database unavailable. Showing the last loaded state.'],
+  ])('ends the unpunctuated reason %j with a full stop', (reason, expected) => {
+    expect(joinSentences(reason, SUFFIX)).toBe(expected);
+  });
+
+  it.each([
+    [
+      'The server is temporarily unavailable. Try again shortly.',
+      'The server is temporarily unavailable. Try again shortly. Showing the last loaded state.',
+    ],
+    ['The API is down!', 'The API is down! Showing the last loaded state.'],
+    ['Is the worker running?', 'Is the worker running? Showing the last loaded state.'],
+    ['Still waiting…', 'Still waiting… Showing the last loaded state.'],
+    ['Still waiting...', 'Still waiting... Showing the last loaded state.'],
+  ])('keeps the sentence end of %j and never doubles a period', (reason, expected) => {
+    expect(joinSentences(reason, SUFFIX)).toBe(expected);
+  });
+
+  it.each([
+    ['Retry "later."', 'Retry "later." Showing the last loaded state.'],
+    ["Retry 'later.'", "Retry 'later.' Showing the last loaded state."],
+    ['Retry “later.”', 'Retry “later.” Showing the last loaded state.'],
+    ['Retry ‘later!’', 'Retry ‘later!’ Showing the last loaded state.'],
+    ['Failed (see the log.)', 'Failed (see the log.) Showing the last loaded state.'],
+    ['Failed [timeout?]', 'Failed [timeout?] Showing the last loaded state.'],
+    ['Failed (“timeout.”)', 'Failed (“timeout.”) Showing the last loaded state.'],
+  ])('keeps the closing quotes or brackets after the sentence end of %j', (reason, expected) => {
+    expect(joinSentences(reason, SUFFIX)).toBe(expected);
+  });
+
+  it.each([
+    ['Unknown field "window"', 'Unknown field "window". Showing the last loaded state.'],
+    ['Upstream failed (502)', 'Upstream failed (502). Showing the last loaded state.'],
+    ['Rejected [window]', 'Rejected [window]. Showing the last loaded state.'],
+  ])('ends %j with a full stop when its closing mark ends no sentence', (reason, expected) => {
+    expect(joinSentences(reason, SUFFIX)).toBe(expected);
+  });
+
+  it('trims every part and joins the parts with exactly one space', () => {
+    expect(joinSentences('  Database unavailable \n', `\t${SUFFIX}  `)).toBe(
+      'Database unavailable. Showing the last loaded state.',
+    );
+    expect(joinSentences('One', 'two', 'three!')).toBe('One. two. three!');
+  });
+
+  it('skips blank parts, so no stray period or double space appears', () => {
+    expect(joinSentences('', SUFFIX)).toBe(SUFFIX);
+    expect(joinSentences('   ', SUFFIX, '\n')).toBe(SUFFIX);
+    expect(joinSentences('Database unavailable', '')).toBe('Database unavailable.');
+    expect(joinSentences('', '  ')).toBe('');
+    expect(joinSentences()).toBe('');
+  });
+
+  it('keeps the words of every part verbatim', () => {
+    expect(joinSentences('internal server error', 'see /sources')).toBe(
+      'internal server error. see /sources.',
+    );
+    expect(joinSentences('Single part')).toBe('Single part.');
   });
 });

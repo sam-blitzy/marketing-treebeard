@@ -679,10 +679,11 @@ function closeDialogSession(current: DialogSession): DialogSession {
  * the actions again. Once it succeeds, the actions stay disabled and a status line ("Marked done",
  * "Dismissed", "Snoozed") stands until the refetched recommendations hide the item. Inside an
  * {@link ActionOutcomeProvider} that outcome, and a recorded decision, is announced in the
- * provider's region, which outlives the card, instead of in the card's own line; a recorded
- * feedback is also recorded there under the item's recommendation identity
- * ({@link itemIdentity}), so its section shows the same confirmation in the item's place once
- * the refetched recommendations hide it. Keyboard focus, which the pressed button keeps while
+ * provider's region, which outlives the card, instead of in the card's own line, for the item's
+ * recommendation identity ({@link itemIdentity}), so it leaves the region once the page's run
+ * no longer lists that recommendation; a recorded feedback is also recorded there under that
+ * identity, so its section shows the same confirmation in the item's place once the refetched
+ * recommendations hide it. Keyboard focus, which the pressed button keeps while
  * its request runs and after it is disabled, or which is lost with a removed card, then moves
  * to the next card's first enabled action, else the previous card's, else the enclosing
  * section's heading, else `<main>`, unless the user has moved it elsewhere (WCAG 2.2 SC 2.4.3).
@@ -889,10 +890,13 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
       () => {
         setRecorded(kind);
         const confirmation = outcomeMessage(FEEDBACK_STATUS_MESSAGES[kind], item);
-        announce?.(confirmation);
+        const identity = itemIdentity(item);
+        // Announced for the recommendation, so it leaves the region once the run no longer
+        // lists it.
+        announce?.(confirmation, identity);
         // Recorded before the refetched page commits, so the section that drops the hidden
         // item shows this confirmation in its place from that commit on.
-        recordConfirmation?.(itemIdentity(item), confirmation);
+        recordConfirmation?.(identity, confirmation);
         if (origin !== null) {
           // This continuation runs before React commits the refetched page, because TanStack
           // Query notifies its observers from a zero-delay timer scheduled before it. A timer
@@ -973,7 +977,7 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
             const saved = decision ?? null;
             setSavedDecision(saved);
             setDecisionSaved(true);
-            announce?.(decisionRecordedMessage(saved, item));
+            announce?.(decisionRecordedMessage(saved, item), itemIdentity(item));
           }}
           onRetired={() => {
             // The subject's dataset was replaced. The form calls the onRetired it had when the

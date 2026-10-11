@@ -686,7 +686,7 @@ describe('EvidenceTable inside the app providers', () => {
     const first = await renderWithProviders(<EvidenceTable evidence={evidence} />);
 
     expect(screen.getByRole('table', { name: 'Evidence' })).toBeDefined();
-    expect(screen.getByText('Evidence').tagName).toBe('CAPTION');
+    expect(screen.getByText('Evidence').closest('caption')?.textContent).toBe('Evidence');
     first.unmount();
 
     await renderWithProviders(<EvidenceTable evidence={evidence} caption="Search term evidence" />);

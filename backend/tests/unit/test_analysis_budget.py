@@ -16,7 +16,7 @@ are read from ``ctx.thresholds``, never restated as literals. Pure: no database 
 network.
 """
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import ROUND_FLOOR, Decimal, InvalidOperation
@@ -223,6 +223,15 @@ def _budget_id(scenario: Scenario, key: str) -> int:
     return scenario.ids.id("google", "budget", key)
 
 
+def _unknown_dates(extra: Mapping[str, Any]) -> tuple[str, ...]:
+    """A budget card's unknown days: its changed-intraday and unobserved dates, ascending.
+
+    The evidence lists the two kinds separately, as it counts them; an unknown day is one of
+    either, so the union is the whole set.
+    """
+    return tuple(sorted({*extra["changed_intraday_dates"], *extra["unobserved_dates"]}))
+
+
 def _normalised(value: object) -> object:
     """Compare numbers by value: ``"3.0"``, ``3`` and ``Decimal("3.000000")`` are equal."""
     if value is None or isinstance(value, bool):
@@ -265,7 +274,7 @@ def _item_value(scenario: Scenario, item: Candidate, key: str, expected: object)
         assert expected in extra["changed_intraday_dates"], extra["changed_intraday_dates"]
         return expected
     if key == "unknown_days":
-        return extra["unknown_dates"]
+        return _unknown_dates(extra)
     metrics = _metrics(item)
     if key in metrics:
         return metrics[key]
@@ -1207,7 +1216,7 @@ def test_a_member_changing_budgets_during_a_day_makes_that_day_unknown() -> None
     """AAP 0.11.2: a member moving budgets during a day leaves the shared budget's day unknown."""
     scenario, ctx = _built("shared.member_changed_intraday.case")
     item = _only(budget.evaluate(ctx), B1)
-    unknown = item.evidence.extra["unknown_dates"]
+    unknown = _unknown_dates(item.evidence.extra)
     assert _normalised(unknown) == _normalised(scenario.expect.values["unknown_days"])
     metrics = _metrics(item)
     assert metrics["known_days"] == ctx.window.days - len(unknown)
@@ -1234,7 +1243,7 @@ def test_a_shared_amount_changed_during_a_day_leaves_that_day_without_a_known_bu
     assert timezone is not None
     item = _only(budget.evaluate(ctx), B1)
     extra = item.evidence.extra
-    unknown = extra["unknown_dates"]
+    unknown = _unknown_dates(extra)
     assert changed_at.astimezone(ZoneInfo(timezone)).date().isoformat() in unknown
     assert extra["changed_intraday_dates"] == unknown
     assert _metrics(item)["known_days"] == ctx.window.days - len(unknown)
@@ -1639,7 +1648,9 @@ def test_budget_cards_show_utilization_efficiency_outcomes_budget_and_window() -
     assert extra["day_counts"]["idle"] == values["idle_days"]
     max_gap = thresholds.int("budget.max_observation_gap_hours")
     assert extra["observation_assumption"].endswith(f"at most {max_gap} h apart")
-    assert extra["unknown_dates"] == ()
+    assert _unknown_dates(extra) == ()
+    # Unknown days are the changed-intraday and unobserved lists; no third list repeats them.
+    assert "unknown_dates" not in extra
     assert extra["day_boundary"] == {"source": "linkedin", "boundary": "UTC"}
     assert extra["objective_groups"] == (OBJ_LINKEDIN_LEAD_GEN,)
     assert extra["currency"] == "USD"

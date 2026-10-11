@@ -17,11 +17,16 @@
  *   {@link FeedbackConfirmation} where the hidden card stood, so the outcome is visible where
  *   the user acted, not only at the top of the page.
  *
+ * Both belong to the run view and the recommendation the user acted on. Each is dropped once
+ * the page's run no longer lists its recommendation (the provider's `identities`), as after the
+ * rerun that follows a feedback, and all of them are cleared when the user opens another run
+ * (the provider's `scope`). The region itself stays in place, empty.
+ *
  * This module imports neither `RecommendationCard` nor `SectionFrame`, so both can import it:
  * the card records, the frame reads, and no import cycle forms (the card imports the frame).
  * UI comes only from the design-system index (AAP 0.4.4): no raw buttons, headings or tables,
- * no inline styles and no stylesheet. Nothing here fetches (AAP 0.11.1); the confirmations are
- * client state that lives as long as the provider, which on `/actions` is the loaded page.
+ * no inline styles and no stylesheet. Nothing here fetches (AAP 0.11.1); the outcome and the
+ * confirmations are client state of the provider, which on `/actions` is the loaded page.
  *
  * @packageDocumentation
  */
@@ -29,12 +34,14 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useState,
   useSyncExternalStore,
 } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 
+import type { RunId } from '../../api/types';
 import { Banner } from '../../design-system';
 
 // ---------------------------------------------------------------------------------------------
@@ -47,15 +54,19 @@ import { Banner } from '../../design-system';
  *
  * @param message - the confirmation, for example "Marked done: Add "crm demo" as exact-match
  *   negative (Generic CRM — US)"
+ * @param identity - the recommendation identity of the item the outcome is about
+ *   (`SectionFrame`'s `itemIdentity`): the message then stays only while the provider's
+ *   `identities` list that recommendation. Omitted or blank, the message stays until the next
+ *   one replaces it or the provider's `scope` changes
  */
-export type AnnounceActionOutcome = (message: string) => void;
+export type AnnounceActionOutcome = (message: string, identity?: string) => void;
 
 /**
  * Records the confirmation of a feedback recorded on a card, under the card's recommendation
  * identity, so the sections show it where the card stood once the feedback hides the item. A
  * later feedback on the same recommendation replaces it. A blank identity or message is
- * ignored. Recording announces nothing: the card announces through
- * {@link AnnounceActionOutcome}.
+ * ignored, and so is an identity the provider's `identities` no longer list. Recording
+ * announces nothing: the card announces through {@link AnnounceActionOutcome}.
  *
  * @param identity - the item's recommendation identity (`SectionFrame`'s `itemIdentity`)
  * @param message - the confirmation, for example "Dismissed: Pause (Generic CRM — US)"
@@ -75,6 +86,13 @@ export const NO_FEEDBACK_CONFIRMATIONS: FeedbackConfirmations = new Map<string, 
 interface ActionOutcome {
   /** The text announced. */
   message: string;
+  /**
+   * The recommendation identity of the item the outcome is about; `undefined` for an outcome
+   * that names none, which no list of identities removes.
+   */
+  identity: string | undefined;
+  /** The provider's `scope` when the outcome was announced: the run view it belongs to. */
+  scope: RunId | undefined;
   /** Increases with every announcement, so each one renders as a new node. */
   sequence: number;
 }
@@ -92,6 +110,12 @@ interface ConfirmationStore {
   readonly current: () => FeedbackConfirmations;
   /** Records one confirmation, then notifies the listeners when it changed anything. */
   readonly record: RecordFeedbackConfirmation;
+  /**
+   * Keeps only the confirmations of `identities`, the recommendations the page's run lists
+   * now, then notifies the listeners when it dropped any. From then on, `record` ignores an
+   * identity outside the latest `identities` given.
+   */
+  readonly retain: (identities: ReadonlySet<string>) => void;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -101,7 +125,14 @@ interface ConfirmationStore {
 /** A new, empty {@link ConfirmationStore}. */
 function createConfirmationStore(): ConfirmationStore {
   let confirmations: FeedbackConfirmations = NO_FEEDBACK_CONFIRMATIONS;
+  // The identities `retain` last kept; `null` until it is first called.
+  let listed: ReadonlySet<string> | null = null;
   const listeners = new Set<() => void>();
+  const notify = () => {
+    for (const listener of [...listeners]) {
+      listener();
+    }
+  };
   return {
     subscribe: (listener) => {
       listeners.add(listener);
@@ -112,15 +143,33 @@ function createConfirmationStore(): ConfirmationStore {
     current: () => confirmations,
     record: (identity, message) => {
       const text = message.trim();
-      if (identity.trim() === '' || text === '' || confirmations.get(identity) === text) {
+      if (
+        identity.trim() === '' ||
+        text === '' ||
+        (listed !== null && !listed.has(identity)) ||
+        confirmations.get(identity) === text
+      ) {
         return;
       }
       const next = new Map(confirmations);
       next.set(identity, text);
       confirmations = next;
-      for (const listener of [...listeners]) {
-        listener();
+      notify();
+    },
+    retain: (identities) => {
+      listed = identities;
+      let next: Map<string, string> | null = null;
+      for (const identity of confirmations.keys()) {
+        if (!identities.has(identity)) {
+          next ??= new Map(confirmations);
+          next.delete(identity);
+        }
       }
+      if (next === null) {
+        return;
+      }
+      confirmations = next.size === 0 ? NO_FEEDBACK_CONFIRMATIONS : next;
+      notify();
     },
   };
 }
@@ -178,6 +227,45 @@ const ConfirmationStoreContext = createContext<ConfirmationStore | null>(null);
 export interface ActionOutcomeProviderProps {
   /** The content whose card actions announce their outcomes here: on `/actions`, the sections. */
   children?: ReactNode;
+  /**
+   * The run view the outcomes belong to: on `/actions`, the id of the run `/actions?run=<id>`
+   * addresses, or `undefined` for the default page. When it changes, as when the user opens
+   * another run, the latest outcome and every confirmation are cleared, while the region stays
+   * the same element, empty. Omitted, it never changes.
+   */
+  scope?: RunId | undefined;
+  /**
+   * The recommendation identity (`SectionFrame`'s `itemIdentity`) of every item the page's run
+   * lists, hidden items included. An outcome announced for a recommendation stays only while
+   * this set lists it, and a confirmation is dropped once it no longer does, as after the rerun
+   * that follows a feedback. Omitted, outcomes and confirmations are not tied to the run's
+   * list. A stable set (memoized on the page's sections) spares the confirmations a pass on
+   * every render.
+   */
+  identities?: ReadonlySet<string> | undefined;
+}
+
+/** The confirmation store of one run view, replaced by an empty one when the scope changes. */
+interface ScopedStore {
+  /** The provider's `scope` the store belongs to. */
+  readonly scope: RunId | undefined;
+  /** The confirmations recorded in that run view. */
+  readonly store: ConfirmationStore;
+}
+
+/**
+ * Whether `outcome` still belongs to the page: announced in `scope`, and, when it names a
+ * recommendation and `identities` is given, about one the run still lists.
+ */
+function outcomeBelongs(
+  outcome: ActionOutcome,
+  scope: RunId | undefined,
+  identities: ReadonlySet<string> | undefined,
+): boolean {
+  return (
+    Object.is(outcome.scope, scope) &&
+    (outcome.identity === undefined || identities === undefined || identities.has(outcome.identity))
+  );
 }
 
 /**
@@ -202,8 +290,16 @@ export interface ActionOutcomeProviderProps {
  * AAP 0.5.5 reserves for the discrepancy banner. It stays empty until the first outcome, and a
  * `Stack` takes an empty status child out of its column, so it adds no space until then. Each
  * message is a new child node, so the same text twice in a row (two cards dismissed with the
- * same action on the same entity) is announced twice. The latest message stays until the next
- * one replaces it. The confirmations last as long as the provider.
+ * same action on the same entity) is announced twice.
+ *
+ * Outcomes and confirmations belong to the run view and the recommendation the user acted on.
+ * The latest message stays until the next one replaces it, until `identities` no longer list
+ * the recommendation it was announced for (the rerun that follows a feedback drops the hidden
+ * item), or until `scope` changes (another run is opened). A confirmation stays while
+ * `identities` list its recommendation, and every one is cleared when `scope` changes. The
+ * region is never remounted for this: it stays the same element, empty, ready for the next
+ * message. A card's request that settles after another run view opened announces and records
+ * nothing there.
  *
  * The provider renders no element around its children: place it among the children of a
  * `Stack`, where the region and the children each take the column's gap.
@@ -215,31 +311,68 @@ export interface ActionOutcomeProviderProps {
  * ```tsx
  * <Stack gap={6}>
  *   <SectionNav sections={sections} />
- *   <ActionOutcomeProvider>
+ *   <ActionOutcomeProvider scope={runId} identities={identities}>
  *     <KeywordsSection section={keywords} run={run} overlay={overlay} />
  *     <BudgetSection section={budget} run={run} overlay={overlay} />
  *   </ActionOutcomeProvider>
  * </Stack>
  * ```
  */
-export function ActionOutcomeProvider({ children }: ActionOutcomeProviderProps): ReactElement {
+export function ActionOutcomeProvider({
+  scope,
+  identities,
+  children,
+}: ActionOutcomeProviderProps): ReactElement {
   const [outcome, setOutcome] = useState<ActionOutcome | null>(null);
-  // One store for the provider's lifetime.
-  const [store] = useState(createConfirmationStore);
-  // Stable for the provider's lifetime, so a card may call the announcer it captured from a
-  // request that settles after the card itself has unmounted.
-  const announce = useCallback<AnnounceActionOutcome>((message) => {
-    const text = message.trim();
-    if (text === '') {
-      return;
+  // One store per run view. Another view starts with an empty one, adjusted while rendering
+  // (React renders again at once, before it commits), so no commit shows the previous view's
+  // confirmations, and every reader subscribes to the new store.
+  const [scoped, setScoped] = useState<ScopedStore>(() => ({
+    scope,
+    store: createConfirmationStore(),
+  }));
+  let { store } = scoped;
+  if (!Object.is(scoped.scope, scope)) {
+    store = createConfirmationStore();
+    setScoped({ scope, store });
+  }
+  // An outcome of another run view, or about a recommendation the run no longer lists, leaves
+  // the region in the same render, so no commit shows it.
+  const shown = outcome !== null && outcomeBelongs(outcome, scope, identities) ? outcome : null;
+  if (outcome !== null && shown === null) {
+    setOutcome(null);
+  }
+  // Stable while the run view is unchanged, so a card may call the announcer it captured from
+  // a request that settles after the card itself has unmounted. Bound to that view: an outcome
+  // it announces once another view is shown never reaches the region.
+  const announce = useCallback<AnnounceActionOutcome>(
+    (message, identity) => {
+      const text = message.trim();
+      if (text === '') {
+        return;
+      }
+      const about = identity === undefined || identity.trim() === '' ? undefined : identity;
+      setOutcome((previous) => ({
+        message: text,
+        identity: about,
+        scope,
+        sequence: (previous?.sequence ?? 0) + 1,
+      }));
+    },
+    [scope],
+  );
+  // Confirmations of recommendations the run no longer lists are dropped after the commit:
+  // the store notifies its readers, which must not happen while this provider renders.
+  useEffect(() => {
+    if (identities !== undefined) {
+      store.retain(identities);
     }
-    setOutcome((previous) => ({ message: text, sequence: (previous?.sequence ?? 0) + 1 }));
-  }, []);
+  }, [store, identities]);
   return (
     <ActionOutcomeContext value={announce}>
       <ConfirmationStoreContext value={store}>
         <div role="status">
-          {outcome === null ? null : <span key={outcome.sequence}>{outcome.message}</span>}
+          {shown === null ? null : <span key={shown.sequence}>{shown.message}</span>}
         </div>
         {children}
       </ConfirmationStoreContext>
@@ -255,13 +388,13 @@ export function ActionOutcomeProvider({ children }: ActionOutcomeProviderProps):
  * The announcer of the nearest {@link ActionOutcomeProvider}, which `RecommendationActions`
  * uses to confirm its outcomes outside the card.
  *
- * @returns the announcer, or `null` outside a provider, where each card keeps its own polite
- *   status line
+ * @returns the announcer, stable while the provider's `scope` is unchanged; `null` outside a
+ *   provider, where each card keeps its own polite status line
  *
  * @example
  * ```tsx
  * const announce = useActionOutcome();
- * announce?.('Dismissed: Pause (Generic CRM — US)');
+ * announce?.('Dismissed: Pause (Generic CRM — US)', itemIdentity(item));
  * ```
  */
 export function useActionOutcome(): AnnounceActionOutcome | null {
@@ -273,8 +406,9 @@ export function useActionOutcome(): AnnounceActionOutcome | null {
  * `RecommendationActions` calls once a feedback is recorded, so the section shows the outcome
  * where the card stood after the feedback hides it.
  *
- * @returns the recorder, stable for the provider's lifetime, so a request that settles after
- *   its card unmounted may still call it; `null` outside a provider
+ * @returns the recorder, stable while the provider's `scope` is unchanged, so a request that
+ *   settles after its card unmounted may still call it (once another run view is shown, what
+ *   it records is never read); `null` outside a provider
  *
  * @example
  * ```tsx

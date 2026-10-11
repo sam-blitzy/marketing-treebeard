@@ -1,7 +1,8 @@
 /**
  * Display formatting for the Ads Action Engine SPA (AAP 0.5.5 Behaviour): amounts in the
  * account currency, counts, percentages, evidence metrics, sample and test lines,
- * source-labelled daily dates, and instants in `DISPLAY_TIMEZONE`.
+ * source-labelled daily dates, instants in `DISPLAY_TIMEZONE`, and notice texts joined from
+ * separate sentences.
  *
  * Four rules hold for every function here:
  *
@@ -221,6 +222,18 @@ const SPECIAL_SPACES = /[\u202F\u00A0]/g;
 
 /** A format part made only of spaces, of any kind ICU may emit: U+0020, U+00A0 or U+202F. */
 const SPACE_RUN = /^\s+$/u;
+
+/**
+ * The end of a sentence: a period, exclamation mark, question mark or ellipsis (U+2026),
+ * optionally followed by closing quotes or brackets, as in `Retry "later."` or `(see the log.)`.
+ */
+const SENTENCE_END = /[.!?…]["'”’)\]]*$/u;
+
+/** The full stop {@link joinSentences} ends a part with when the part has no sentence end. */
+const FULL_STOP = '.';
+
+/** Separator between the sentences {@link joinSentences} joins: one plain space. */
+const SENTENCE_SEPARATOR = ' ';
 
 // ---------------------------------------------------------------------------------------------
 // Input types
@@ -1569,4 +1582,45 @@ export function formatInstant(
   }
   const { formatter, label } = instantFormat(textOrNull(displayTimezone) ?? '');
   return normalizeSpaces(`${formatter.format(instant)} ${label}`);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Sentences. A notice often joins text from the API, such as an error message that may lack a
+// closing period ("Internal server error"), with the product's own sentence, so the two are
+// joined as separate sentences rather than run together.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Joins texts into one line of sentences, each separated from the next by one space:
+ * `joinSentences('Internal server error', 'Showing the last loaded state.')` →
+ * `"Internal server error. Showing the last loaded state."`.
+ *
+ * - Each part is trimmed, and a blank part is skipped, so the line never holds a stray period
+ *   or a double space.
+ * - A part that does not already end a sentence, with `.`, `!`, `?` or `…` optionally followed
+ *   by closing quotes or brackets (`"`, `'`, `”`, `’`, `)`, `]`), is ended with a full stop. A
+ *   part that does is kept as it is, so no period is ever doubled.
+ * - The words of every part are kept verbatim: nothing is capitalised, translated or reworded.
+ *
+ * @param parts - The texts to join, in reading order.
+ * @returns The joined sentences, or `''` when every part is blank.
+ *
+ * @example
+ * ```ts
+ * joinSentences('Database unavailable', 'Showing the last loaded state.');
+ * // "Database unavailable. Showing the last loaded state."
+ * joinSentences('Try again shortly.', 'Showing the last loaded state.');
+ * // "Try again shortly. Showing the last loaded state."
+ * joinSentences('  ', 'Showing the last loaded state.'); // "Showing the last loaded state."
+ * ```
+ */
+export function joinSentences(...parts: readonly string[]): string {
+  const sentences: string[] = [];
+  for (const part of parts) {
+    const text = textOrNull(part);
+    if (text !== null) {
+      sentences.push(SENTENCE_END.test(text) ? text : `${text}${FULL_STOP}`);
+    }
+  }
+  return sentences.join(SENTENCE_SEPARATOR);
 }

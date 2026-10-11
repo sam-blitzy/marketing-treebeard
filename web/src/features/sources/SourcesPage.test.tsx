@@ -1843,7 +1843,7 @@ describe('SourcesPage', () => {
       // The notice lands in the region that existed before the failure, so it is announced.
       expect(await within(region).findByText('Sources could not be refreshed')).toBeTruthy();
       expect(
-        within(region).getByText('Database unavailable Showing the last loaded state.'),
+        within(region).getByText('Database unavailable. Showing the last loaded state.'),
       ).toBeTruthy();
       expect(noticeRegion()).toBe(region);
       // Only the notice is announced: the sections, their tables and buttons stay outside it.
@@ -1880,7 +1880,7 @@ describe('SourcesPage', () => {
 
       expect(await within(region).findByText('Sources could not be refreshed')).toBeTruthy();
       expect(
-        within(region).getByText('Database unavailable Showing the last loaded state.'),
+        within(region).getByText('Database unavailable. Showing the last loaded state.'),
       ).toBeTruthy();
       expect(noticeRegion()).toBe(region);
       expect(region.contains(screen.getByText('No sources configured'))).toBe(false);

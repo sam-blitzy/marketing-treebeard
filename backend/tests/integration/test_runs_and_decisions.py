@@ -1526,7 +1526,7 @@ async def test_findings_withheld_suppressions_read_from_storage(
     names each bound to the sentry. A control calls the runner's own evaluation step and proves
     it reaches the sentry. ``GET /recommendations`` still returns, per section, exactly the stored
     ``run_finding``, ``run_withheld`` and ``run_suppression`` rows, and every item's stored
-    evidence.
+    evidence, whose runner-owned ``extra`` keys the item carries as ``entity`` and ``flags``.
     """
     first = await client.get(f"{API}/recommendations")
     assert first.status_code == 200, first.text
@@ -1631,6 +1631,59 @@ async def test_findings_withheld_suppressions_read_from_storage(
     assert set(items) == set(recommendations)
     for item_id, item in items.items():
         stored = recommendations[item_id].evidence
-        assert item["evidence"] == schemas.Evidence.model_validate(stored).model_dump(mode="json")
+        stored_extra = stored["extra"]
+        returned = {
+            **stored,
+            "extra": {
+                key: value
+                for key, value in stored_extra.items()
+                if key not in runner.RUNNER_EXTRA_KEYS
+            },
+        }
+        assert item["evidence"] == schemas.Evidence.model_validate(returned).model_dump(mode="json")
         assert item["evidence"]["thresholds"] == stored["thresholds"]
-        assert item["evidence"]["extra"] == stored.get("extra")
+        assert item["evidence"]["extra"] == returned["extra"]
+        # The runner-owned keys reach the page through the item's own fields.
+        assert item["entity"]["name"] == stored_extra["entity"]["name"]
+        assert {flag["code"]: flag["message"] for flag in item["flags"]} == stored_extra[
+            "flag_messages"
+        ]
+
+
+async def test_item_evidence_leaves_out_the_runner_owned_extra_keys(
+    seeded: Seed, client: httpx.AsyncClient, db: async_sessionmaker[AsyncSession]
+) -> None:
+    """Stored outputs: the page sends the runner-owned ``extra`` keys once, as item fields.
+
+    Every stored row of the default run keeps ``extra.entity`` and ``extra.flag_messages``
+    (``recommendation`` has no name column and its ``flags`` hold codes only). No item's
+    returned ``evidence.extra`` repeats either key; every other stored ``extra`` key is
+    returned, and the read leaves the stored rows exactly as they were.
+    """
+
+    async def stored_evidence() -> dict[int, Mapping[str, Any]]:
+        async with db() as session:
+            return {
+                row.id: row.evidence
+                for row in await session.scalars(
+                    select(Recommendation).where(Recommendation.run_id == seeded.default_run_id)
+                )
+            }
+
+    before = await stored_evidence()
+    assert before
+    for row_id, evidence in before.items():
+        assert set(evidence["extra"]) >= runner.RUNNER_EXTRA_KEYS, row_id
+    assert any(evidence["extra"]["flag_messages"] for evidence in before.values())
+
+    response = await client.get(f"{API}/recommendations")
+    assert response.status_code == 200, response.text
+    items = _items(response.json())
+    assert set(items) == set(before)
+    for item_id, item in items.items():
+        extra = item["evidence"]["extra"]
+        assert isinstance(extra, dict), item_id
+        assert runner.RUNNER_EXTRA_KEYS.isdisjoint(extra), (item_id, sorted(extra))
+        assert set(extra) == set(before[item_id]["extra"]) - runner.RUNNER_EXTRA_KEYS, item_id
+
+    assert await stored_evidence() == before

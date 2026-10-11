@@ -2260,7 +2260,8 @@ def test_intraday_budget_uncertainty_shows_in_the_c2_and_budget_day_counts(
         metrics["changed_intraday_days"],
         metrics["unobserved_days"],
     )
-    assert set(b1.evidence.extra["unknown_dates"]) == unknown_dates
+    b1_extra = b1.evidence.extra
+    assert {*b1_extra["changed_intraday_dates"], *b1_extra["unobserved_dates"]} == unknown_dates
 
 
 # ---------------------------------------------------------------------------

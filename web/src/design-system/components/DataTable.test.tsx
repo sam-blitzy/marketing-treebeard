@@ -5,7 +5,9 @@
  * They pin what feature code and assistive technology rely on, so a later Blitzy OS binding that
  * changes the wrapper's internals must still pass them:
  * - every table has a caption (AAP 0.5.5) and one non-empty name shared with its focusable
- *   scrolling `region`: a text caption names both, a rich caption needs `captionLabel`;
+ *   scrolling `region`: a text caption names both, a rich caption needs `captionLabel`; the
+ *   `<caption>`, the table's first child, holds its content in one `ds-datatable__caption-content`
+ *   wrapper, which `DataTable.css` keeps in view while the table scrolls;
  * - column headers are `columnheader` cells, the identifying column renders `rowheader` cells,
  *   and numeric columns (`align: 'end'`) align their header and cells to the end;
  * - default cells show only string and number properties, `render` overrides them, and an empty
@@ -364,6 +366,48 @@ describe('DataTable', () => {
 
       expect(screen.getByRole('table', { name })).toBeDefined();
       expect(screen.getByRole('region', { name })).toBeDefined();
+    });
+
+    it('holds a text caption in one content wrapper inside the caption, keeping the names', () => {
+      renderAssets();
+
+      const table = screen.getByRole('table', { name: 'White papers · EUR' });
+      const caption = table.querySelector(':scope > caption.ds-datatable__caption');
+      expect(table.firstElementChild).toBe(caption);
+      const wrappers = Array.from(caption?.children ?? []);
+      expect(wrappers).toHaveLength(1);
+      const wrapper = at(wrappers, 0);
+      expect(wrapper.tagName).toBe('DIV');
+      expect(wrapper.className).toBe('ds-datatable__caption-content');
+      expect(wrapper.textContent).toBe('White papers · EUR');
+      expect(wrapper.hasAttribute('id')).toBe(false);
+
+      const region = screen.getByRole('region', { name: 'White papers · EUR' });
+      expect(region.getAttribute('aria-labelledby')).toBe(caption?.id);
+      expect(region.getAttribute('tabindex')).toBe('0');
+    });
+
+    it('holds a rich caption in the same content wrapper, named by captionLabel', () => {
+      render(
+        <DataTable
+          caption={
+            <>
+              Evidence · <abbr title="Euro">EUR</abbr>
+            </>
+          }
+          captionLabel="Evidence · EUR"
+          columns={COLUMNS}
+          rows={ROWS}
+          getRowKey={slugOf}
+        />,
+      );
+
+      const table = screen.getByRole('table', { name: 'Evidence · EUR' });
+      const wrapper = table.querySelector(':scope > caption > div.ds-datatable__caption-content');
+      expect(wrapper?.innerHTML).toBe('Evidence · <abbr title="Euro">EUR</abbr>');
+      expect(screen.getByRole('region', { name: 'Evidence · EUR' }).getAttribute('tabindex')).toBe(
+        '0',
+      );
     });
 
     it('gives two tables on one page distinct caption ids', () => {

@@ -19,12 +19,14 @@
  *
  * @packageDocumentation
  */
+import { useMemo } from 'react';
 import type { ComponentType, ReactElement } from 'react';
 
 import { useRecommendations } from '../api/queries';
 import type { FeedbackKind, Item, RecommendationsPage, SectionKey } from '../api/types';
 import { ActionOutcomeProvider } from '../features/actions/ActionOutcomes';
 import { FEEDBACK_STATUS_MESSAGES } from '../features/actions/RecommendationCard';
+import { itemIdentity } from '../features/actions/sections/SectionFrame';
 import type { SectionComponentProps } from '../features/actions/sections/SectionFrame';
 import { makeFeedback, makeRecommendationsPage } from './fixtures';
 import { json } from './mockApi';
@@ -42,9 +44,26 @@ export interface LiveSectionProps {
 }
 
 /**
+ * The recommendation identity of every item `page` lists, hidden ones included, as `/actions`
+ * passes them to its `ActionOutcomeProvider`; empty before the first read answers.
+ */
+function pageIdentities(page: RecommendationsPage | undefined): ReadonlySet<string> {
+  const identities = new Set<string>();
+  for (const section of page?.sections ?? []) {
+    for (const group of section.groups) {
+      for (const item of group.items) {
+        identities.add(itemIdentity(item));
+      }
+    }
+  }
+  return identities;
+}
+
+/**
  * One section of the default `GET /recommendations` page, rendered with the page's run and
  * overlay inside an `ActionOutcomeProvider`, which stays mounted while the read refetches, as
- * on `/actions`. Nothing renders in the provider until the first read answers.
+ * on `/actions`, and which keeps an outcome or confirmation only while the page lists its
+ * recommendation, as there. Nothing renders in the provider until the first read answers.
  *
  * @param props - see {@link LiveSectionProps}
  * @returns the provider, holding the section once the page is read
@@ -55,8 +74,9 @@ export function LiveSection({
 }: LiveSectionProps): ReactElement {
   const page = useRecommendations().data;
   const section = page?.sections.find((candidate) => candidate.key === sectionKey);
+  const identities = useMemo(() => pageIdentities(page), [page]);
   return (
-    <ActionOutcomeProvider>
+    <ActionOutcomeProvider identities={identities}>
       {page === undefined || section === undefined ? null : (
         <SectionComponent section={section} run={page.run} overlay={page.overlay} />
       )}

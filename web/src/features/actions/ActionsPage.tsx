@@ -19,7 +19,9 @@
  *    card confirms an outcome there, such as "Dismissed: Pause (Generic CRM — US)": it outlives
  *    the card a recorded feedback removes and announces the outcome. The visible confirmation
  *    of a feedback stands where the card stood, inside its section, so the user sees it where
- *    they acted;
+ *    they acted. Both belong to the run view and the recommendation acted on: the region
+ *    empties, staying in place, once the run no longer lists that recommendation (the rerun
+ *    after a feedback) or when another run is opened, and the confirmation leaves with it;
  * 7. the five sections in the user's order ({@link SECTION_ORDER}): Keywords to adjust,
  *    Campaigns to pause or launch, Budget changes, Copy/creative changes, White papers, each
  *    rendered by its own component from {@link SECTION_COMPONENTS}.
@@ -42,12 +44,12 @@
  * - **Data**: the page above. A background refetch that fails keeps the last page on screen,
  *   because TanStack Query keeps `data` when a refetch errors; the hook's own polling recovers by
  *   itself once the API answers again. Meanwhile a warning "Actions could not be refreshed",
- *   with the failure's reason and "Showing the last loaded state.", sits in the page's refresh
- *   region, after the global banners and before the section navigation, so the
- *   open-discrepancies banner stays above everything (AAP 0.5.5) and the warning still precedes
- *   the cards it qualifies. It covers a failed refresh of the page itself, of the source chips,
- *   of the unresolved discrepancy list and of the configuration, and clears once each of them
- *   has been read again.
+ *   with the failure's reason and "Showing the last loaded state." as two sentences, sits in
+ *   the page's refresh region, after the global banners and before the section navigation, so
+ *   the open-discrepancies banner stays above everything (AAP 0.5.5) and the warning still
+ *   precedes the cards it qualifies. It covers a failed refresh of the page itself, of the
+ *   source chips, of the unresolved discrepancy list and of the configuration, and clears once
+ *   each of them has been read again.
  * - **Loading** (no data yet): the title and a `Spinner` labelled "Loading actions".
  * - **No analysis run yet** (default run only, 404 `not_found` or 409 `run_not_ready`): the first
  *   start, while the worker backfills and computes the first default run (AAP 0.11.2). The hook
@@ -79,7 +81,7 @@
  * @packageDocumentation
  */
 import { Link } from '@tanstack/react-router';
-import { memo, useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import type { ComponentType, ReactElement, ReactNode, Ref } from 'react';
 
 import {
@@ -94,6 +96,7 @@ import type { ApiError } from '../../api/queries';
 import { SECTION_ORDER } from '../../api/types';
 import type { RecommendationsPage, Run, RunId, Section, SectionKey } from '../../api/types';
 import { Banner, Button, EmptyState, PageShell, Spinner, Stack } from '../../design-system';
+import { joinSentences } from '../../lib/format';
 import {
   CustomRunBanner,
   OlderDefaultRunBanner,
@@ -109,6 +112,7 @@ import { BudgetSection } from './sections/BudgetSection';
 import { CampaignsSection } from './sections/CampaignsSection';
 import { CreativeSection } from './sections/CreativeSection';
 import { KeywordsSection } from './sections/KeywordsSection';
+import { itemIdentity } from './sections/SectionFrame';
 import type { SectionComponentProps } from './sections/SectionFrame';
 import { WhitePapersSection } from './sections/WhitePapersSection';
 
@@ -311,6 +315,26 @@ function firstSectionByKey(sections: readonly Section[]): ReadonlyMap<SectionKey
     }
   }
   return byKey;
+}
+
+/**
+ * The recommendation identity (`itemIdentity`) of every item the run lists: each item of each
+ * group of each section, hidden ones included, since a feedback hides its item while the run
+ * still lists it.
+ *
+ * @param sections - the sections, as `GET /recommendations` returned them
+ * @returns the identities, each once
+ */
+function listedIdentities(sections: readonly Section[]): ReadonlySet<string> {
+  const identities = new Set<string>();
+  for (const section of sections) {
+    for (const group of section.groups) {
+      for (const item of group.items) {
+        identities.add(itemIdentity(item));
+      }
+    }
+  }
+  return identities;
 }
 
 /**
@@ -558,15 +582,20 @@ function runNoticeFor(
  * {@link ActionOutcomeProvider}, whose polite region, between the navigation and the first
  * section, announces each card's outcome even after the card has left the page, and whose
  * record of each feedback by recommendation lets the section show that outcome in the hidden
- * card's place for as long as the page's run still lists it; inside one
+ * card's place, both for as long as the page's run still lists that recommendation (the
+ * provider's `identities`, every item of every section) and only in the run view it happened
+ * in (its `scope`: the run's id when `/actions?run=<id>` addressed it, else the default page),
+ * so a rerun that drops the item or a switch to another run empties the region in place;
+ * inside one
  * {@link BlockingDiscrepanciesProvider}, through which each held card links the discrepancies
  * that hold it, and inside one {@link B1CardsProvider}, through which each C2 "Scale" card links
  * the B1 card that carries its amount.
  *
  * While `refreshFailure` is set, a polite status region right after the global banners and
  * before the section navigation holds a warning `Banner` "Actions could not be refreshed" with
- * the failure's reason and "Showing the last loaded state.", so a failed poll of the page, the
- * source chips, the discrepancy list or the configuration never leaves the cards looking
+ * the failure's reason and "Showing the last loaded state." as two sentences, a reason without
+ * closing punctuation ended by a full stop ({@link joinSentences}), so a failed poll of the page,
+ * the source chips, the discrepancy list or the configuration never leaves the cards looking
  * current. It sits below the global banners, so the open-discrepancies banner, and the fixed
  * order of the banners after it, stay above it (AAP 0.5.5: the discrepancy banner sits above
  * everything), and above the sections and their cards. The region mounts with this content, so
@@ -592,6 +621,8 @@ const ActionsContent = memo(function ActionsContent({
   // is read, so a poll that leaves the latest default run unchanged renders nothing here.
   const latestDefaultRun = useDefaultRun().data;
   const sectionsByKey = firstSectionByKey(sections);
+  // A card's outcome stays only while the run lists its recommendation.
+  const identities = useMemo(() => listedIdentities(sections), [sections]);
 
   return (
     <ActionsFrame>
@@ -606,12 +637,13 @@ const ActionsContent = memo(function ActionsContent({
       <div role="status">
         {refreshFailure !== null && (
           <Banner tone="warning" title={REFRESH_ERROR_TITLE}>
-            {`${failureReason(refreshFailure)} ${REFRESH_ERROR_SUFFIX}`}
+            {joinSentences(failureReason(refreshFailure), REFRESH_ERROR_SUFFIX)}
           </Banner>
         )}
       </div>
       <SectionNav sections={sections} />
-      <ActionOutcomeProvider>
+      {/* Outcomes belong to this run view: opening another run empties the region in place. */}
+      <ActionOutcomeProvider scope={runAddressed ? run.id : undefined} identities={identities}>
         {/* Held cards link the discrepancies that hold them: the run's C0 cards or /decisions. */}
         <BlockingDiscrepanciesProvider sections={sections}>
           {/* C2 "Scale" cards link the run's B1 card for their subject, in Budget changes. */}
@@ -646,8 +678,8 @@ const ActionsContent = memo(function ActionsContent({
  *   `useActionsRefreshFailure(runId)` reports: while the page's own read, the source chips'
  *   `GET /sources`, the unresolved discrepancy list or `GET /config` last failed to refresh,
  *   a warning `Banner` "Actions could not be refreshed", below the global banners and above the
- *   section navigation, gives the reason and "Showing the last loaded state.", until the next
- *   successful read clears it;
+ *   section navigation, gives the reason and "Showing the last loaded state." as two sentences,
+ *   until the next successful read clears it;
  * - `PageShell.Title` "Actions" with a `Spinner` labelled "Loading actions" until the first
  *   response settles;
  * - without `runId`, an `EmptyState` "No analysis run yet" with "The first analysis is still

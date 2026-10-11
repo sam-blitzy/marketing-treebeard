@@ -7,6 +7,7 @@
  *     table.ds-datatable[.ds-datatable--compact]                only when density is compact
  *       [.ds-datatable--fixed]                                  fixed: every column has a width
  *       caption.ds-datatable__caption  every table has one
+ *         > div.ds-datatable__caption-content                   holds the caption's content
  *       colgroup > col.ds-datatable__col                        fixed tables only, one per column
  *       colgroup > col[.ds-datatable__col--share-1 … --share-12]  otherwise, when a column has a
  *                                                               share
@@ -28,12 +29,12 @@
  * The expand column's header and data cells also carry .ds-datatable__toggle-cell, and its
  * <col>, when there is a colgroup, has no class. A toggle's state span holds its visible text,
  * "Show details" or "Hide details", and its data-alternate attribute the other one. When the
- * table is expandable, its region also carries .ds-datatable__region--expandable, and every
- * data row is followed by its detail row, hidden while collapsed. A body cell's --start or
- * --end class follows its column's alignCell when it has one, and its column's align
- * otherwise; a header always follows align. Only the first column can be sticky. The compact
- * modifier styles only the table's own header, body and toggle cells, through child
- * combinators, so a table nested in its detail rows keeps its own density.
+ * table is expandable, its region also carries .ds-datatable__region--expandable, a marker with
+ * no styles of its own, and every data row is followed by its detail row, hidden while
+ * collapsed. A body cell's --start or --end class follows its column's alignCell when it has
+ * one, and its column's align otherwise; a header always follows align. Only the first column
+ * can be sticky. The compact modifier styles only the table's own header, body and toggle
+ * cells, through child combinators, so a table nested in its detail rows keeps its own density.
  *
  * The region scrolls a table wider than its container on the inline axis, so the page itself
  * never scrolls sideways at a 320 CSS px viewport (WCAG 2.2 SC 1.4.10 Reflow). It is focusable
@@ -62,9 +63,20 @@
  * expanded detail row's page background hides them across that row only), and the focus ring
  * is an outline outside the region, so it is unaffected. Colours are tokens ending in
  * transparent, and sizes are spacing tokens and the full-extent token.
+ *
+ * The region is also an inline-size query container, so content inside the table can be sized
+ * from the region's visible inline size rather than from the table's: the caption's content and
+ * an expanded row's detail content (both below). Inline-size containment sizes a box as if it
+ * had no content, which leaves a region that fills its container's inline size unchanged, but
+ * would collapse one that its container sizes to fit its content, such as a flex item that is
+ * not stretched. The region therefore takes the full inline size of its containing block itself:
+ * as a block or a stretched flex item, the size it has anyway; in a Stack aligned to start,
+ * center or end, or in an Inline row, that container's full inline size rather than nothing.
  */
 .ds-datatable__region {
+  container-type: inline-size;
   overflow-x: auto;
+  inline-size: var(--size-full);
   max-inline-size: var(--size-full);
   border: calc(var(--space-1) / 4) solid var(--color-border);
   border-radius: var(--radius-md);
@@ -86,17 +98,6 @@
     var(--space-3) var(--size-full);
   background-repeat: no-repeat;
   background-attachment: local, local, scroll, scroll;
-}
-
-/*
- * An expandable table's region is an inline-size query container, so its detail content (below)
- * can be sized from the region's visible inline size rather than from the table's. Only this
- * modifier carries it: inline-size containment sizes the region as if it had no content, which
- * leaves a region that fills its container's inline size unchanged, but would collapse one in a
- * shrink-to-fit context, such as an inline-block or a flex item that is not stretched.
- */
-.ds-datatable__region--expandable {
-  container-type: inline-size;
 }
 
 /* Restates the base :focus-visible ring from ../tokens.css so the region keeps it on rebinding. */
@@ -152,6 +153,26 @@
   padding: var(--space-3) var(--space-3) var(--space-2);
   font-size: var(--font-size-md);
   font-weight: var(--font-weight-semibold);
+}
+
+/*
+ * The caption's content. The caption is as wide as its table, which can be far wider than the
+ * region's visible area: content laid out at the caption's width would run past the region's
+ * edge, be clipped there and scroll away with the columns. The caption itself cannot stick, as
+ * it fills its table and so has no room to move. Its content wrapper is therefore at most the
+ * region's visible inline size (the query container, above) less the caption's inline padding on
+ * both sides, so it wraps within the visible area, and it sticks at that padding from the
+ * region's inline start, so it stays wholly in view while the table scrolls sideways beneath it;
+ * in right-to-left text it sticks at the right edge. The cap also bounds the caption's
+ * min-content width, so a caption never widens its table past the region. A single word longer
+ * than the visible area breaks within it rather than running out of view; break-word breaks
+ * only such a word, so the caption otherwise wraps between words.
+ */
+.ds-datatable__caption-content {
+  position: sticky;
+  inset-inline-start: var(--space-3);
+  max-inline-size: calc(var(--size-container-full) - 2 * var(--space-3));
+  overflow-wrap: break-word;
 }
 
 /* Column headers and body cells share padding and the row separator. */
@@ -502,7 +523,7 @@ th.ds-datatable__cell {
  * can be far wider than the region's visible area: content laid out at the cell's width would
  * put its far end, such as a nested table's end-aligned columns, out of view at every scroll
  * position. The wrapper is therefore at most the region's visible inline size (the query
- * container from .ds-datatable__region--expandable) less the cell's inline padding on both
+ * container from .ds-datatable__region) less the cell's inline padding on both
  * sides, which also stops it from widening the table. It sticks at the cell's padding from the
  * region's inline start, so it stays wholly in view while the row's columns scroll sideways
  * beneath it. A nested table wider than the wrapper scrolls in its own region.

@@ -5,7 +5,8 @@
  * exactly as written, because PageShell.tsx and PageShell.test.tsx depend on them.
  *
  *   .ds-pageshell                 frame: skip link, top bar, then the body row
- *   .ds-pageshell__skip           "Skip to main content" link; shared.css hides it until focused
+ *   .ds-pageshell__skip           "Skip to main content" link; shared.css hides it until focused,
+ *                                 then shows it on a line of its own above the top bar
  *   .ds-pageshell__header         <header> landmark holding TopBar
  *   .ds-pageshell__body           row of side navigation and main content
  *   .ds-pageshell__sidenav        plain container for SideNav, which supplies the <nav> landmark

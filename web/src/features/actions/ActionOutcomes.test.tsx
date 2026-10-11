@@ -5,6 +5,12 @@
  *   map of confirmations;
  * - the announcement: the provider's pre-mounted polite region shows each message trimmed and
  *   ignores a blank one, and is never an alert;
+ * - the outcome's run view and recommendation: a change of `scope` empties the same region and
+ *   clears every confirmation, and an announcer captured before it announces nothing after it;
+ *   an outcome or confirmation whose recommendation leaves `identities` is dropped, one still
+ *   listed stays, a confirmation for an unlisted recommendation is not recorded, and an
+ *   outcome naming no recommendation, or a provider without `identities`, is not tied to the
+ *   list;
  * - the provider's confirmation store: a confirmation is kept by recommendation identity, its
  *   message trimmed, a blank identity or message and an identical repeat change nothing, a
  *   later feedback on the same recommendation replaces it, and recording announces nothing;
@@ -25,7 +31,7 @@ import { useState } from 'react';
 import type { ReactNode } from 'react';
 import { describe, expect, it } from 'vitest';
 
-import type { Item } from '../../api/types';
+import type { Item, RunId } from '../../api/types';
 import { Button } from '../../design-system';
 import {
   FIXTURE_ITEM_IDS,
@@ -42,7 +48,7 @@ import {
   useFeedbackConfirmations,
   useRecordFeedbackConfirmation,
 } from './ActionOutcomes';
-import type { FeedbackConfirmations } from './ActionOutcomes';
+import type { AnnounceActionOutcome, FeedbackConfirmations } from './ActionOutcomes';
 import { FEEDBACK_LABELS, RecommendationCard } from './RecommendationCard';
 import { itemIdentity } from './sections/SectionFrame';
 
@@ -308,6 +314,155 @@ describe('ActionOutcomes: the announcement', () => {
     expect(region.firstChild).toBe(node);
     expect(region.getAttribute('role')).toBe('status');
     expect(screen.queryByRole('alert')).toBeNull();
+  });
+});
+
+describe("ActionOutcomes: the outcome's run view and recommendation", () => {
+  /** What a test drives the provider's props and announcer through. */
+  interface Control {
+    setScope?: (scope: RunId | undefined) => void;
+    setIdentities?: (identities: ReadonlySet<string> | undefined) => void;
+    announce?: AnnounceActionOutcome | null;
+  }
+
+  /** Captures the provider's announcer of the latest render. */
+  function Announcer({ control }: { control: Control }): ReactNode {
+    control.announce = useActionOutcome();
+    return null;
+  }
+
+  /**
+   * A provider on the default page (`scope` undefined) listing `alpha` and `beta`, whose props
+   * `control` changes, with a recorder and a reader for each identity.
+   */
+  function Host({ control, seen }: { control: Control; seen: Seen }): ReactNode {
+    const [scope, setScope] = useState<RunId | undefined>(undefined);
+    const [identities, setIdentities] = useState<ReadonlySet<string> | undefined>(
+      () => new Set(['alpha', 'beta']),
+    );
+    control.setScope = setScope;
+    control.setIdentities = setIdentities;
+    return (
+      <ActionOutcomeProvider scope={scope} identities={identities}>
+        <Announcer control={control} />
+        <Recorder label="Record alpha" identity="alpha" message="Marked done: Alpha" />
+        <Recorder label="Record beta" identity="beta" message="Dismissed: Beta" />
+        <Reader name="Alpha" identities={ALPHA} seen={seen} />
+        <Reader name="Beta" identities={BETA} seen={seen} />
+      </ActionOutcomeProvider>
+    );
+  }
+
+  /** Renders {@link Host} and returns its control and what its readers saw. */
+  function renderHost(): { control: Control; seen: Seen } {
+    const control: Control = {};
+    const seen = newSeen();
+    render(<Host control={control} seen={seen} />);
+    return { control, seen };
+  }
+
+  /** Announces `message` for `identity` through the provider's latest announcer. */
+  function announce(control: Control, message: string, identity?: string): void {
+    act(() => {
+      control.announce?.(message, identity);
+    });
+  }
+
+  it('empties the same region and clears every confirmation when another run view opens', () => {
+    const { control, seen } = renderHost();
+    announce(control, 'Marked done: Alpha', 'alpha');
+    record('Record alpha');
+    record('Record beta');
+    const region = outcomeRegion();
+    expect(region.textContent).toBe('Marked done: Alpha');
+    expect(seen.confirmations.get('Alpha')?.get('alpha')).toBe('Marked done: Alpha');
+    // Captured before the switch, as a card's request that settles after it holds it.
+    const earlier = control.announce;
+
+    act(() => {
+      control.setScope?.(79);
+    });
+
+    // In place: the same element, mounted and empty, and still never an alert.
+    expect(outcomeRegion()).toBe(region);
+    expect(region.isConnected).toBe(true);
+    expect(region.getAttribute('role')).toBe('status');
+    expect(region.childNodes).toHaveLength(0);
+    expect(screen.queryByRole('alert')).toBeNull();
+    // Every reader sees an empty map, the listed identities alike.
+    expect(seen.confirmations.get('Alpha')).toBe(NO_FEEDBACK_CONFIRMATIONS);
+    expect(seen.confirmations.get('Beta')).toBe(NO_FEEDBACK_CONFIRMATIONS);
+    // The previous view's announcer announces nothing in this one.
+    act(() => {
+      earlier?.('Snoozed: Alpha', 'alpha');
+    });
+    expect(region.childNodes).toHaveLength(0);
+
+    // The region still announces this view's outcomes.
+    announce(control, 'Dismissed: Beta', 'beta');
+    expect(outcomeRegion()).toBe(region);
+    expect(region.textContent).toBe('Dismissed: Beta');
+
+    // Back to the default page: nothing of either view comes back.
+    act(() => {
+      control.setScope?.(undefined);
+    });
+    expect(outcomeRegion()).toBe(region);
+    expect(region.childNodes).toHaveLength(0);
+    expect(seen.confirmations.get('Alpha')).toBe(NO_FEEDBACK_CONFIRMATIONS);
+  });
+
+  it('drops the outcome and the confirmation of a recommendation the run no longer lists, and keeps those it lists', () => {
+    const { control, seen } = renderHost();
+    announce(control, 'Marked done: Alpha', 'alpha');
+    record('Record alpha');
+    record('Record beta');
+    const region = outcomeRegion();
+    const beta = seen.confirmations.get('Beta');
+
+    // A new set that still lists both keeps everything.
+    act(() => {
+      control.setIdentities?.(new Set(['alpha', 'beta', 'gamma']));
+    });
+    expect(region.textContent).toBe('Marked done: Alpha');
+    expect(seen.confirmations.get('Alpha')?.get('alpha')).toBe('Marked done: Alpha');
+
+    // The rerun that follows the feedback no longer lists alpha.
+    act(() => {
+      control.setIdentities?.(new Set(['beta']));
+    });
+    expect(outcomeRegion()).toBe(region);
+    expect(region.childNodes).toHaveLength(0);
+    expect(seen.confirmations.get('Alpha')?.size ?? 0).toBe(0);
+    // Beta's confirmation stays, the very map its reader held.
+    expect(seen.confirmations.get('Beta')).toBe(beta);
+    expect(beta?.get('beta')).toBe('Dismissed: Beta');
+    // A confirmation for a recommendation no longer listed is not recorded again.
+    record('Record alpha');
+    expect(seen.confirmations.get('Alpha')?.size ?? 0).toBe(0);
+
+    // An outcome for a listed recommendation stays; one that names none is not tied to the list.
+    announce(control, 'Dismissed: Beta', 'beta');
+    expect(region.textContent).toBe('Dismissed: Beta');
+    announce(control, 'Decision recorded: Paused');
+    act(() => {
+      control.setIdentities?.(new Set(['gamma']));
+    });
+    expect(region.textContent).toBe('Decision recorded: Paused');
+    expect(seen.confirmations.get('Beta')?.size ?? 0).toBe(0);
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('ties nothing to the run list without identities', () => {
+    const { control, seen } = renderHost();
+    act(() => {
+      control.setIdentities?.(undefined);
+    });
+    announce(control, 'Marked done: Alpha', 'alpha');
+    record('Record alpha');
+
+    expect(outcomeRegion().textContent).toBe('Marked done: Alpha');
+    expect(seen.confirmations.get('Alpha')?.get('alpha')).toBe('Marked done: Alpha');
   });
 });
 

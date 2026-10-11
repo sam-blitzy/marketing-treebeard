@@ -913,8 +913,10 @@ def _history_extra(history: BudgetHistory) -> dict[str, Any]:
 
     ``day_counts`` (every count, including the capped, high-utilization and under-utilized
     days), ``observation_assumption`` ("unchanged across N observations, at most 6 h apart")
-    and the ISO dates of the known idle, changed-intraday, unobserved and unknown days.
-    Shared by :func:`budget_evidence` and the B4 card.
+    and the ISO dates of the known idle, changed-intraday and unobserved days, each listed
+    once. Changed-intraday and unobserved days are counted separately, and the unknown days
+    are exactly their union, so no third list repeats them. Shared by :func:`budget_evidence`
+    and the B4 card.
     """
     return {
         "day_counts": history.counts(),
@@ -922,7 +924,6 @@ def _history_extra(history: BudgetHistory) -> dict[str, Any]:
         "idle_dates": tuple(day.date.isoformat() for day in history.days if day.idle),
         "changed_intraday_dates": _dates(history, "changed_intraday"),
         "unobserved_dates": _dates(history, "unobserved"),
-        "unknown_dates": _dates(history, "changed_intraday", "unobserved"),
     }
 
 
@@ -951,9 +952,11 @@ def budget_evidence(
       (budget-active days for a shared budget) against ``budget.min_known_days`` in
       ``sample``, spending days and their share, the days meeting this gate's predicate and
       their share, known idle days, changed-intraday days and unobserved days. Each check's
-      observed against required is in ``extra.gate``; the dated day lists and
-      ``extra.observation_assumption`` ("unchanged across N observations, at most 6 h apart")
-      state what the counts rest on.
+      observed against required is in ``extra.gate``; the dates of the known idle,
+      changed-intraday and unobserved days (``extra.idle_dates``,
+      ``extra.changed_intraday_dates`` and ``extra.unobserved_dates``, whose union is the
+      unknown days) and ``extra.observation_assumption`` ("unchanged across N observations, at
+      most 6 h apart") state what the counts rest on.
     * **Efficiency**: cost per outcome beside the account baseline for the same source and
       objective group. Each reads "—" when its known outcome count is 0 (a zero denominator,
       never a finite cost) and is ``None``, shown "unavailable", only when that count is

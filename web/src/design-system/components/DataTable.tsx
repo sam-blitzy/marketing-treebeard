@@ -59,12 +59,16 @@
  *   are hidden, which disappears at that end of the scroll and never shows on a table that fits.
  * - A `sticky` first column stays at the region's inline start while the rest scrolls beneath
  *   it, and once the region is scrolled the cue at that edge moves to the column's inline end.
+ * - The caption's content wraps within the region's visible width and stays at the region's
+ *   inline start while a wider table scrolls sideways beneath it, so a caption longer than a
+ *   narrow viewport is read whole at every scroll position and never widens its table.
  *
  * The styling lives in `DataTable.css`, whose class names are the contract this component
  * renders: `ds-datatable__region` and, on an expandable table's region,
  * `ds-datatable__region--expandable`, `ds-datatable` and, on a compact table,
  * `ds-datatable--compact`, and, on a table laid out at fixed column widths,
- * `ds-datatable--fixed` with one `ds-datatable__col` per column, `ds-datatable__caption`,
+ * `ds-datatable--fixed` with one `ds-datatable__col` per column, `ds-datatable__caption` and
+ * the `ds-datatable__caption-content` wrapper of its content,
  * `ds-datatable__col--share-1` to `--share-12` on the `<col>` of a column with a `share`,
  * `ds-datatable__header`, `ds-datatable__cell`, `ds-datatable__cell--start` and `--end`,
  * `ds-datatable__cell--min-sm`, `--min-md`, `--min-lg` and `--min-xl`,
@@ -771,13 +775,17 @@ function unavailableReason(naming: CaptionNaming, hasColumns: boolean): string |
  * `useId` and the row index, so any row key is safe and ids never collide between two tables on
  * one page.
  *
- * The detail cell spans every column, so it is as wide as the whole table, which can be far
- * wider than the region's visible area. An expandable table's region therefore carries
+ * The caption and the detail cell are as wide as the whole table, which can be far wider than
+ * the region's visible area. The caption's content therefore sits in a
+ * `ds-datatable__caption-content` wrapper, a `<div>` because a rich caption may hold block
+ * content, and `DataTable.css` lays it out at most at the region's visible inline size and pins
+ * it at the region's inline start, so the whole caption stays in view while the table scrolls
+ * sideways. The `<caption>` itself, with its id, stays the table's first child, so the table and
+ * the region are named exactly as above. An expandable table's region also carries
  * `ds-datatable__region--expandable`, and the expanded content sits in a
- * `ds-datatable__detail-content` wrapper that `DataTable.css` lays out at the region's visible
- * inline size and pins at its inline start, so the whole of it stays in view while the row's
- * columns scroll sideways; a nested table wider than that scrolls in its own region. A table
- * without `renderExpanded` renders neither class.
+ * `ds-datatable__detail-content` wrapper laid out and pinned the same way, so the whole of it
+ * stays in view while the row's columns scroll sideways; a nested table wider than that scrolls
+ * in its own region. A table without `renderExpanded` renders neither class.
  *
  * When every column has a `width` and the table is not expandable, the table carries
  * `ds-datatable--fixed` and a `<colgroup>` after its caption, with one `ds-datatable__col` per
@@ -919,7 +927,7 @@ export function DataTable<Row>({
     >
       <table className={tableClassName(density, fixed !== null)} aria-label={label}>
         <caption id={captionId} className="ds-datatable__caption">
-          {caption}
+          <div className="ds-datatable__caption-content">{caption}</div>
         </caption>
         {fixed === null ? null : (
           <colgroup>

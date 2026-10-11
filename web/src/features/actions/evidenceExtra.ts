@@ -3,12 +3,14 @@
  * per section).
  *
  * `Evidence.extra` is open JSON (`Record<string, unknown>` in `src/api/types.ts`): each rule in
- * `backend/src/ads_engine/analysis/*.py` freezes its own detail there, and the API returns it
- * unchanged. The recommendation card and the five `/actions` sections all need some of those
- * keys, and several need the same section metric keys. This module is the one place that names
- * them, so a backend rename breaks one file, and every read is a runtime guard rather than a
- * cast: a reader returns `null`, `[]` or an empty field when its data is absent or malformed, and
- * never throws.
+ * `backend/src/ads_engine/analysis/*.py` freezes its own detail there, and the API returns each
+ * rule's keys as frozen. The entity and flag messages the runner stores beside them reach the
+ * client as `Item.entity` and `Item.flags` instead, never in `extra`, so this module reads the
+ * entity name from the item. The recommendation card and the five `/actions` sections all need
+ * some of those keys, and several need the same section metric keys. This module is the
+ * one place that names them, so a backend rename breaks one file, and every read is a runtime
+ * guard rather than a cast: a reader returns `null`, `[]` or an empty field when its data is
+ * absent or malformed, and never throws.
  *
  * Contract, decided once here:
  *

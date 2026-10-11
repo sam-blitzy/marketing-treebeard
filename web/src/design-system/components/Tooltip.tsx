@@ -213,14 +213,19 @@ function pixels(value: string, fallback: number): number {
 
 /**
  * Places the open bubble in the viewport with `position: fixed`, so no ancestor that clips or
- * scrolls its overflow can cut it off, against the wrapper's rectangle:
+ * scrolls its overflow can cut it off, against the wrapper's rectangle. `Tooltip.css` anchors
+ * the bubble's margin box at the viewport origin (physical `top: 0` and `left: 0`), and this
+ * function moves it from there with an inline `transform: translate(x, y)` only, never `top`
+ * or `left`. Its layout position therefore stays constant while it follows a trigger through
+ * scrolling, and a transform change is not a layout shift, so an open bubble adds nothing to
+ * Cumulative Layout Shift.
  *
  * 1. The bubble is narrowed to the viewport's inline extent less its inline margins when that
  *    is smaller than the stylesheet's `max-inline-size`, so it never overflows a narrow
  *    viewport.
  * 2. It opens below the trigger, unless the room below is smaller than the bubble with its
  *    block margins and the room above is larger; then it opens above (`data-placement="top"`,
- *    which moves the hover bridge in `Tooltip.css` to the bubble's lower edge).
+ *    which switches the hover bridge in `Tooltip.css` to the one along the bubble's lower edge).
  * 3. Its inline start is aligned with the trigger's (the left edge, or the right edge when the
  *    computed `direction` is `rtl`), then shifted so the bubble and its inline margins stay
  *    inside the viewport.
@@ -229,7 +234,7 @@ function pixels(value: string, fallback: number): number {
  * inline margins, read from its computed style, so both come from the tokens in
  * `Tooltip.css`. The viewport extent excludes a scrollbar (`clientWidth`), falling back to
  * `innerWidth` where no layout exists (jsdom reports `0`); there, every rectangle is empty and
- * the bubble is simply placed at the top-left, with no error.
+ * the bubble is simply left at the top-left (`translate(0px, 0px)`), with no error.
  *
  * @param anchor - the tooltip wrapper, whose box is the trigger's rectangle
  * @param bubble - the open `role="tooltip"` element
@@ -259,14 +264,14 @@ function placeBubble(anchor: HTMLElement, bubble: HTMLElement): void {
   const roomBelow = viewportHeight - trigger.bottom;
   const roomAbove = trigger.top;
   const placement = roomBelow < outerHeight && roomAbove > roomBelow ? 'top' : 'bottom';
-  // `top` and `left` position the margin box, so the margins themselves form the gaps.
+  // `top` and `left` are where the margin box goes, so the margins themselves form the gaps.
+  // Tooltip.css pins the margin box at the viewport origin, so translating by them puts it there.
   const top = placement === 'top' ? trigger.top - outerHeight : trigger.bottom;
   const start =
     style.direction === 'rtl' ? trigger.right - size.width - marginLeft : trigger.left - marginLeft;
   const left = Math.max(0, Math.min(start, viewportWidth - outerWidth));
 
-  bubble.style.left = `${String(left)}px`;
-  bubble.style.top = `${String(top)}px`;
+  bubble.style.transform = `translate(${String(left)}px, ${String(top)}px)`;
   bubble.dataset.placement = placement;
 }
 
@@ -280,16 +285,19 @@ function placeBubble(anchor: HTMLElement, bubble: HTMLElement): void {
  * hover and focus is in another field of the dialog. Escape while the tooltip is closed
  * propagates normally, so the next press closes the `Dialog`.
  *
- * Placement is viewport-aware. While open, the bubble is laid out with `position: fixed` from
+ * Placement is viewport-aware. While open, the bubble is placed with `position: fixed` from
  * the trigger's viewport rectangle: below the trigger, flipped above when there is not enough
  * room below and more above, and shifted and narrowed along the inline axis to stay inside the
  * viewport, in left-to-right and right-to-left text alike. It is placed before paint and again
  * after every render, on window resize and on scroll of any ancestor. A container that clips
  * or scrolls its overflow, such as a `DataTable` region or a `Dialog` panel, therefore never
- * clips it. The bubble is not portalled: it stays a DOM descendant of the wrapper, so it is
- * hoverable and the `aria-describedby` reference keeps resolving. An ancestor with
- * `transform`, `filter`, `perspective`, `contain` or a `will-change` of those would become
- * the bubble's containing block and offset it; no design-system wrapper sets them.
+ * clips it. The bubble stays laid out at the viewport origin and is moved by a
+ * `transform: translate()` alone, so following its trigger through scrolling is not a layout
+ * shift: open tooltips add nothing to Cumulative Layout Shift, however many the pointer opens
+ * while a page scrolls under it. The bubble is not portalled: it stays a DOM descendant of the
+ * wrapper, so it is hoverable and the `aria-describedby` reference keeps resolving. An
+ * ancestor with `transform`, `filter`, `perspective`, `contain` or a `will-change` of those
+ * would become the bubble's containing block and offset it; no design-system wrapper sets them.
  *
  * @example
  * ```tsx

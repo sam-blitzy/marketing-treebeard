@@ -748,9 +748,24 @@ describe('Tooltip placement', () => {
     const { bubble } = openAt(50, 100);
 
     expect(bubble.dataset.placement).toBe('bottom');
-    expect(bubble.style.top).toBe('120px');
-    expect(bubble.style.left).toBe('42px');
+    expect(bubble.style.transform).toBe('translate(42px, 120px)');
     expect(bubble.style.maxWidth).toBe('');
+  });
+
+  it('moves the bubble by its transform alone, never by an inline top or left', () => {
+    // Tooltip.css pins top and left at the viewport origin; moving the fixed bubble through
+    // them on scroll would be a layout shift, while a transform change is not.
+    const { bubble, wrapper } = openAt(50, 100);
+
+    expect(bubble.style.top).toBe('');
+    expect(bubble.style.left).toBe('');
+
+    setRect(wrapper, 50, 730, 100, 20);
+    fireEvent.scroll(window);
+    expect(bubble.dataset.placement).toBe('top');
+    expect(bubble.style.transform).toBe('translate(42px, 674px)');
+    expect(bubble.style.top).toBe('');
+    expect(bubble.style.left).toBe('');
   });
 
   it('flips above the trigger when there is not enough room below and more above', () => {
@@ -758,21 +773,21 @@ describe('Tooltip placement', () => {
     const { bubble } = openAt(50, 730);
 
     expect(bubble.dataset.placement).toBe('top');
-    expect(bubble.style.top).toBe('674px');
+    expect(bubble.style.transform).toBe('translate(42px, 674px)');
   });
 
   it('stays below when the room above is not larger than the room below', () => {
     const { bubble } = openAt(50, 10, 100, 740);
 
     expect(bubble.dataset.placement).toBe('bottom');
-    expect(bubble.style.top).toBe('750px');
+    expect(bubble.style.transform).toBe('translate(42px, 750px)');
   });
 
   it('shifts along the inline axis to stay inside the viewport', () => {
     const { bubble } = openAt(1000, 100);
 
     // 1024 viewport less the 216px margin box.
-    expect(bubble.style.left).toBe('808px');
+    expect(bubble.style.transform).toBe('translate(808px, 120px)');
   });
 
   it('aligns to the inline end in right-to-left text and never starts before the viewport', () => {
@@ -780,11 +795,11 @@ describe('Tooltip placement', () => {
     const { bubble, wrapper } = openAt(400, 100);
 
     // Trigger right edge 500, less the 200px bubble and its 8px start margin.
-    expect(bubble.style.left).toBe('292px');
+    expect(bubble.style.transform).toBe('translate(292px, 120px)');
 
     setRect(wrapper, 0, 100, 100, 20);
     fireEvent(window, new Event('resize'));
-    expect(bubble.style.left).toBe('0px');
+    expect(bubble.style.transform).toBe('translate(0px, 120px)');
   });
 
   it('narrows the bubble to a viewport narrower than its maximum width, and widens it again', () => {
@@ -816,15 +831,15 @@ describe('Tooltip placement', () => {
     setRect(wrapper, 50, 100, 100, 20);
     setRect(bubble, 0, 0, 200, 40);
     fireEvent.mouseEnter(wrapper);
-    expect(bubble.style.top).toBe('120px');
+    expect(bubble.style.transform).toBe('translate(42px, 120px)');
 
     setRect(wrapper, 50, 200, 100, 20);
     fireEvent(window, new Event('resize'));
-    expect(bubble.style.top).toBe('220px');
+    expect(bubble.style.transform).toBe('translate(42px, 220px)');
 
     setRect(wrapper, 50, 300, 100, 20);
     fireEvent.scroll(screen.getByTestId('scroller'));
-    expect(bubble.style.top).toBe('320px');
+    expect(bubble.style.transform).toBe('translate(42px, 320px)');
 
     setRect(wrapper, 60, 300, 100, 20);
     rerender(
@@ -832,13 +847,13 @@ describe('Tooltip placement', () => {
         <Tooltip content="Longer help.">Metric</Tooltip>
       </div>,
     );
-    expect(bubble.style.left).toBe('52px');
+    expect(bubble.style.transform).toBe('translate(52px, 320px)');
 
     fireEvent.mouseLeave(wrapper);
     setRect(wrapper, 50, 400, 100, 20);
     fireEvent(window, new Event('resize'));
     fireEvent.scroll(screen.getByTestId('scroller'));
-    expect(bubble.style.top).toBe('320px');
+    expect(bubble.style.transform).toBe('translate(52px, 320px)');
   });
 
   it('places the bubble at the top-left without error where no layout exists', () => {
@@ -847,8 +862,7 @@ describe('Tooltip placement', () => {
 
     fireEvent.mouseEnter(wrapper);
 
-    expect(bubble.style.top).toBe('0px');
-    expect(bubble.style.left).toBe('0px');
+    expect(bubble.style.transform).toBe('translate(0px, 0px)');
     expect(bubble.dataset.placement).toBe('bottom');
   });
 });

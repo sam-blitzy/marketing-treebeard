@@ -250,6 +250,15 @@ def _budget_id(scenario: Scenario, key: str) -> int:
     return scenario.ids.id("google", "budget", key)
 
 
+def _unknown_dates(extra: Mapping[str, Any]) -> tuple[str, ...]:
+    """A budget card's unknown days: its changed-intraday and unobserved dates, ascending.
+
+    The evidence lists the two kinds separately, as it counts them; an unknown day is one of
+    either, so the union is the whole set.
+    """
+    return tuple(sorted({*extra["changed_intraday_dates"], *extra["unobserved_dates"]}))
+
+
 def _topic(scenario: Scenario) -> str:
     """``"<topic>.<case>"`` of a scenario name (its variant dropped)."""
     return scenario.name.rsplit(".", 1)[0]
@@ -336,7 +345,7 @@ def _fired_value(
         assert expected in extra["changed_intraday_dates"], extra["changed_intraday_dates"]
         return expected
     if key == "unknown_days":
-        return tuple(extra["unknown_dates"])
+        return _unknown_dates(extra)
     metrics_by_key = evidence_metrics(item)
     if key in metrics_by_key:
         return metrics_by_key[key]
@@ -1408,7 +1417,7 @@ def test_a_member_changing_budgets_during_a_day_makes_that_day_unknown(
     m2 = _campaign_id(scenario, "m2", "google")
     assert all(day.isoformat() < "2026-09-27" for day in history.members[m2])
     item = _only(_run(ctx), BUDGET, B1)
-    assert tuple(item.evidence.extra["unknown_dates"]) == ("2026-09-27",)
+    assert _unknown_dates(item.evidence.extra) == ("2026-09-27",)
 
 
 def test_a_poor_member_blocks_the_budget_level_increase(make_context: ContextFactory) -> None:

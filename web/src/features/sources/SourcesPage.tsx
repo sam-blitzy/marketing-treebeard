@@ -85,6 +85,7 @@ import {
   formatCount,
   formatInstant,
   formatSourceDate,
+  joinSentences,
   sourceLabel,
 } from '../../lib/format';
 
@@ -119,6 +120,9 @@ const NO_SOURCES_TITLE = 'No sources configured';
 
 /** Title of the notice shown when a background refetch fails while earlier data is on screen. */
 const REFRESH_ERROR_TITLE = 'Sources could not be refreshed';
+
+/** What follows the failure's reason in that notice: the page keeps its last response. */
+const REFRESH_ERROR_SUFFIX = 'Showing the last loaded state.';
 
 /** Label of every source's sync button; the end-to-end specs press it by this name. */
 const SYNC_NOW_LABEL = 'Sync now';
@@ -997,9 +1001,10 @@ function SourceSection({
  * States, in precedence order:
  * - **Data**: one section per source in API order, never re-sorted; "No sources configured" for
  *   an empty list. A background refetch that fails keeps the last response on screen, the
- *   sections or the empty list alike, under a "Sources could not be refreshed" notice that ends
- *   "Showing the last loaded state.", because TanStack Query keeps `data` on a failed refetch.
- *   The hook's own polling recovers by itself, and the notice goes once a refetch succeeds.
+ *   sections or the empty list alike, under a "Sources could not be refreshed" notice with the
+ *   failure's reason and "Showing the last loaded state." as two sentences, because TanStack
+ *   Query keeps `data` on a failed refetch. The hook's own polling recovers by itself, and the
+ *   notice goes once a refetch succeeds.
  * - **Loading**: a `Spinner` labelled "Loading sources".
  * - **Failure** before any response: "Sources unavailable" with the API's message and a "Retry"
  *   button that reads the sources again. The failure stays on screen while the read runs again,
@@ -1059,7 +1064,7 @@ export function SourcesPage(): ReactElement {
     if (sources.error !== null) {
       notice = (
         <Banner tone="warning" title={REFRESH_ERROR_TITLE}>
-          {`${failureReason(sources.error)} Showing the last loaded state.`}
+          {joinSentences(failureReason(sources.error), REFRESH_ERROR_SUFFIX)}
         </Banner>
       );
     }

@@ -11,7 +11,9 @@ runner itself:
 * ``window_inputs``, ``default_window`` and ``custom_window`` read the Google account's time
   zone and the active day sources, and ``InvalidWindow`` propagates;
 * ``latest_default_run`` returns only the latest succeeded default run, so a manual 90-day
-  custom run never stands in for it; ``get_run`` and ``list_runs`` read any status;
+  custom run never stands in for it, and reads it in one backward probe of
+  ``ix_analysis_run_kind_status_finished`` however long the run history; ``get_run`` and
+  ``list_runs`` read any status;
 * ``run_analysis`` reads the context in one read-only ``REPEATABLE READ`` snapshot, writes
   every output once with the dataset ids and modes it read, stamps the requests it served,
   and is deterministic; on the simulated default world all five sections populate;
@@ -478,6 +480,187 @@ async def test_latest_default_run_ignores_custom_failed_and_running_runs(app_db:
         latest = await runner.latest_default_run(session)
         assert latest is not None
         assert latest.id == newer
+
+
+_LATEST_INDEX = "ix_analysis_run_kind_status_finished"
+"""The index ``latest_default_run`` reads: (``kind``, ``status``, ``finished_at``)."""
+
+_RUN_HISTORY = 5_000
+"""Older custom and default runs, succeeded and failed, finishing a minute apart."""
+
+
+async def _seed_run_history() -> tuple[int, int]:
+    """Insert a long run history, then the newer rows ``latest_default_run`` must tell apart.
+
+    :data:`_RUN_HISTORY` runs finish a minute apart before :data:`NOW`: every tenth is
+    ``custom``, every seventh ``failed``, the rest succeeded ``default`` runs. Newer than all
+    of them come a succeeded ``custom`` run, a ``failed`` and a ``running`` default run, a
+    succeeded default row without ``finished_at``, two succeeded default runs finishing at
+    the same instant, and last, with the highest id, a succeeded default run that finished
+    before those two. The table is then analysed, as autovacuum would after such a load.
+
+    Returns:
+        The ids of the two runs tied on the newest finish, lower id first.
+    """
+    async with session_scope() as session:
+        await session.execute(
+            text(
+                "INSERT INTO analysis_run (kind, window_start, window_end, "
+                "source_day_boundaries, trigger, data_modes, dataset_ids, config_hash, "
+                "default_days, trusted_min_days, status, started_at, finished_at) "
+                "SELECT CASE WHEN i % 10 = 0 THEN 'custom' ELSE 'default' END, "
+                ":window_start, :window_end, '[]'::jsonb, "
+                "CASE WHEN i % 10 = 0 THEN 'manual' ELSE 'scheduled' END, "
+                "'{}'::jsonb, '{}'::jsonb, :config_hash, 28, 14, "
+                "CASE WHEN i % 7 = 0 THEN 'failed' ELSE 'succeeded' END, "
+                ":base + make_interval(mins => i), :base + make_interval(mins => i + 1) "
+                "FROM generate_series(1, :total) AS i"
+            ),
+            {
+                "window_start": END - timedelta(days=27),
+                "window_end": END,
+                "config_hash": "0" * 64,
+                "base": NOW - timedelta(minutes=_RUN_HISTORY + 60),
+                "total": _RUN_HISTORY,
+            },
+        )
+    newest = NOW + timedelta(hours=1)
+    await _insert_run("custom", "succeeded", NOW + timedelta(hours=2))
+    await _insert_run("default", "failed", NOW + timedelta(hours=2))
+    await _insert_run("default", "running", None)
+    await _insert_run("default", "succeeded", None)
+    tied = (
+        await _insert_run("default", "succeeded", newest),
+        await _insert_run("default", "succeeded", newest),
+    )
+    await _insert_run("default", "succeeded", NOW)
+    async with session_scope() as session:
+        await session.execute(text("ANALYZE analysis_run"))
+    return tied
+
+
+async def _latest_default_run_sent() -> tuple[int | None, str, dict[str, Any]]:
+    """Call ``latest_default_run`` and return the run's id and the one statement it sent.
+
+    A ``before_cursor_execute`` listener records the ``analysis_run`` statement exactly as the
+    driver receives it, so the plan test explains what the function issues, not a re-creation
+    of it.
+
+    Returns:
+        The run's id (``None`` for no run), the statement and its parameters.
+    """
+    engine = get_engine().sync_engine
+    sent: list[tuple[str, dict[str, Any]]] = []
+
+    def record(
+        _conn: Any,
+        _cursor: Any,
+        statement: str,
+        parameters: object,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        if "FROM analysis_run" in statement:
+            assert isinstance(parameters, Mapping), parameters
+            sent.append((statement, dict(parameters)))
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        async with session_scope() as session:
+            run = await runner.latest_default_run(session)
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+    assert len(sent) == 1, sent
+    statement, parameters = sent[0]
+    return (None if run is None else run.id), statement, parameters
+
+
+def _numbered(statement: str, parameters: Mapping[str, Any]) -> str:
+    """Return ``statement`` with each ``%(name)s`` placeholder rewritten as ``$1``, ``$2``, …"""
+    numbers: dict[str, int] = {}
+
+    def number(match: re.Match[str]) -> str:
+        return f"${numbers.setdefault(match.group(1), len(numbers) + 1)}"
+
+    numbered = re.sub(r"%\((\w+)\)s", number, statement)
+    assert set(numbers) == set(parameters), (numbers, parameters)
+    return numbered
+
+
+def _plan_nodes(plan: Any) -> list[dict[str, Any]]:
+    """Return every node of a ``FORMAT JSON`` plan tree, parents before their children."""
+    pending: list[dict[str, Any]] = [plan[0]["Plan"]]
+    nodes: list[dict[str, Any]] = []
+    while pending:
+        node = pending.pop(0)
+        nodes.append(node)
+        pending.extend(node.get("Plans", []))
+    return nodes
+
+
+@pytest.mark.anyio
+async def test_latest_default_run_takes_the_newest_finish_then_the_highest_id(
+    app_db: str,
+) -> None:
+    """Among succeeded default runs the newest ``finished_at`` wins, ties going to the higher id.
+
+    Neither a newer custom, failed or running run, nor a succeeded row without
+    ``finished_at``, nor a later-inserted run that finished earlier displaces the winner.
+    """
+    tied = await _seed_run_history()
+
+    latest, _, _ = await _latest_default_run_sent()
+
+    assert latest == max(tied)
+
+
+@pytest.mark.parametrize("plan_kind", ["custom", "generic"])
+@pytest.mark.anyio
+async def test_latest_default_run_reads_one_backward_probe_of_its_index(
+    app_db: str, plan_kind: str
+) -> None:
+    """The statement ``latest_default_run`` sends is one backward probe of its index.
+
+    The plan is a ``Limit`` over an ``Incremental Sort`` presorted on ``finished_at`` over a
+    backward ``Index Scan`` of :data:`_LATEST_INDEX`, every predicate an index condition: no
+    sequential or bitmap scan and no full sort of the run history. That holds for the custom
+    plan of the bound values and for the generic plan a server-side prepared statement may
+    switch to (``EXPLAIN (GENERIC_PLAN)``). Nothing is disabled: on the analysed statistics
+    the planner chooses the index on cost. The executed custom plan reads only the two runs
+    tied on the newest finish and the next one, which closes their group, out of the
+    :data:`_RUN_HISTORY` older runs.
+    """
+    await _seed_run_history()
+    _, statement, parameters = await _latest_default_run_sent()
+
+    async with session_scope() as session:
+        connection = await session.connection()
+        if plan_kind == "custom":
+            result = await connection.exec_driver_sql(
+                "EXPLAIN (ANALYZE, TIMING OFF, FORMAT JSON) " + statement, parameters
+            )
+        else:
+            result = await connection.exec_driver_sql(
+                "EXPLAIN (GENERIC_PLAN, FORMAT JSON) " + _numbered(statement, parameters)
+            )
+        plan: list[dict[str, Any]] = result.scalar_one()
+
+    nodes = _plan_nodes(plan)
+    assert [node["Node Type"] for node in nodes] == ["Limit", "Incremental Sort", "Index Scan"], (
+        nodes
+    )
+    presorted, scan = nodes[1], nodes[2]
+    assert presorted["Presorted Key"] == ["finished_at"], presorted
+    assert (scan["Relation Name"], scan["Index Name"], scan["Scan Direction"]) == (
+        "analysis_run",
+        _LATEST_INDEX,
+        "Backward",
+    ), scan
+    assert "finished_at IS NOT NULL" in scan["Index Cond"], scan
+    assert "Filter" not in scan, scan
+    if plan_kind == "custom":
+        assert scan["Actual Loops"] == 1, scan
+        assert scan["Actual Rows"] <= 3, scan
 
 
 # ---------------------------------------------------------------------------

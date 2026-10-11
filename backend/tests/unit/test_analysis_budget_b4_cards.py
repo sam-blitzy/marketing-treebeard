@@ -96,7 +96,6 @@ HISTORY_EXTRA_KEYS: Final = (
     "idle_dates",
     "changed_intraday_dates",
     "unobserved_dates",
-    "unknown_dates",
 )
 
 B4_OWN_METRICS: Final = (
@@ -611,7 +610,9 @@ def test_a_b4_card_shows_its_own_budget_history(name: str) -> None:
     }
     assert extra["day_counts"] == history.counts()
     assert extra["observation_assumption"] == history.assumption
-    assert extra["unknown_dates"] == ()
+    # No unknown day: none changed intraday and none unobserved, each listed once.
+    assert extra["changed_intraday_dates"] == extra["unobserved_dates"] == ()
+    assert "unknown_dates" not in extra
     assert "members" not in extra
     # B4's own gate, sample, test and affordance are unchanged.
     assert set(extra["gate"]) == {"weekend_days", "weekdays", "outcomes"}

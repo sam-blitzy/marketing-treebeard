@@ -12,10 +12,13 @@ module repeating the check.
 
 **No business rules live here.** Everything a card shows comes from one of two places:
 
-* **Frozen run outputs**, returned exactly as the runner stored them, never re-derived:
+* **Frozen run outputs**, returned as the runner stored them, never re-derived:
   sections, groups, ranks, actions, reasons, evidence, flags, holds and decision subjects of
   ``recommendation``, plus ``run_finding``, ``run_withheld`` and ``run_suppression``. No rule is
-  evaluated and no evidence is rewritten on the read path.
+  evaluated and no stored evidence is rewritten on the read path. Every rule-written evidence
+  value is returned as recorded; the two keys the runner adds to ``evidence.extra``
+  (``RUNNER_EXTRA_KEYS``: ``entity`` and ``flag_messages``) are projected into ``Item.entity``
+  and ``Item.flags`` (below) and not repeated in the returned ``evidence.extra``.
 * **The read-time overlay** (:func:`ads_engine.analysis.overlay.overlay`): live holds from
   discrepancies detected after the run, historical-only marking, ``flags_now``,
   ``data_status_now``, ``hidden_by``, the page-level ``Overlay`` and the banners in their fixed
@@ -40,11 +43,13 @@ What this module adds is only the arrangement of those rows into the page:
   ever dropped. Items keep their stored rank order; held items are not moved, because the UI
   collapses them.
 * **Entity**: ``{source, type, id, name}`` with ``source``, ``type`` and the platform id taken
-  from the stored key ``{source}:{type}:{external_id}`` and the display name from
-  ``evidence.extra.entity``, where the runner stores it (``recommendation`` has no name column).
-* **Flag messages**: a stored flag's message is the one the run recorded in
+  from the stored key ``{source}:{type}:{external_id}`` and the display name from the stored
+  ``evidence.extra.entity``, where the runner keeps it (``recommendation`` has no name column).
+  The returned ``evidence.extra`` leaves ``entity`` out: ``Item.entity`` carries it.
+* **Flag messages**: a stored flag's message is the one the run recorded in the stored
   ``evidence.extra.flag_messages``; a current flag's message is the overlay's. A fixed label
-  (:data:`FLAG_LABELS`) stands in only when no recorded message exists.
+  (:data:`FLAG_LABELS`) stands in only when no recorded message exists. The returned
+  ``evidence.extra`` leaves ``flag_messages`` out: ``Item.flags`` carries each message.
 
 Performance: the page issues exactly four set-based loads (recommendations served by
 ``ix_recommendation_run_section_rank``, findings, withheld patterns and suppression counts) plus
@@ -122,7 +127,7 @@ from ads_engine.analysis.overlay import (
     item_provenance,
     overlay,
 )
-from ads_engine.analysis.runner import get_run, latest_default_run
+from ads_engine.analysis.runner import RUNNER_EXTRA_KEYS, get_run, latest_default_run
 from ads_engine.api import schemas
 from ads_engine.api.deps import (
     ApiError,
@@ -248,6 +253,34 @@ def _extra(evidence: object) -> Mapping[str, Any]:
     return extra if isinstance(extra, Mapping) else {}
 
 
+def _response_evidence(evidence: object) -> object:
+    """Return a stored evidence block as the page returns it: without the runner-owned keys.
+
+    The runner adds :data:`~ads_engine.analysis.runner.RUNNER_EXTRA_KEYS` (``entity`` and
+    ``flag_messages``) to every stored ``extra``; the item already carries them as
+    ``Item.entity`` and ``Item.flags[].message``, so the response leaves them out of
+    ``evidence.extra`` rather than send them twice. Every other key, of the evidence and of
+    its ``extra``, is returned as recorded. The stored value is never edited: a block with
+    runner-owned keys is copied (shallowly, with a new ``extra``), any other is returned as is.
+
+    Args:
+        evidence: The ``recommendation.evidence`` ``jsonb`` value.
+
+    Returns:
+        ``evidence`` with ``extra`` filtered, or ``evidence`` itself when it is not a JSON
+        object, has no ``extra`` object, or its ``extra`` holds no runner-owned key.
+    """
+    if not isinstance(evidence, Mapping):
+        return evidence
+    extra = evidence.get("extra")
+    if not isinstance(extra, Mapping) or RUNNER_EXTRA_KEYS.isdisjoint(extra):
+        return evidence
+    return {
+        **evidence,
+        "extra": {key: value for key, value in extra.items() if key not in RUNNER_EXTRA_KEYS},
+    }
+
+
 def _text(value: object) -> str | None:
     return value if isinstance(value, str) and value.strip() else None
 
@@ -348,8 +381,11 @@ def _item_overlay(view: ItemOverlayView) -> dict[str, Any]:
 def _item(row: Recommendation, current: ItemOverlayView) -> schemas.Item:
     """Return one ``Item``: the stored row exactly as frozen, plus its read-time overlay.
 
-    The evidence block is validated as stored and never edited, so its ``provenance`` keeps
-    the datasets the run read even after they were replaced (AAP 0.3.2).
+    The runner-owned ``evidence.extra`` keys are projected into the item, ``entity`` into
+    ``Item.entity`` and ``flag_messages`` into ``Item.flags[].message``, and are not repeated
+    in the returned ``evidence.extra`` (:func:`_response_evidence`). Every rule-written value
+    is returned as recorded and the stored row is never edited, so ``provenance`` keeps the
+    datasets the run read even after they were replaced (AAP 0.3.2).
 
     Args:
         row: The stored item.
@@ -370,7 +406,7 @@ def _item(row: Recommendation, current: ItemOverlayView) -> schemas.Item:
             "action": row.action,
             "reason": row.reason,
             "entity": _entity(row, extra),
-            "evidence": schemas.Evidence.model_validate(row.evidence),
+            "evidence": schemas.Evidence.model_validate(_response_evidence(row.evidence)),
             "flags": _stored_flags(row, extra),
             "data_status": row.data_status,
             "held": row.held,

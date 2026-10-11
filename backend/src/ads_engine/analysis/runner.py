@@ -258,6 +258,10 @@ RUNNER_EXTRA_KEYS: Final[frozenset[str]] = frozenset({_EXTRA_ENTITY, _EXTRA_FLAG
 no name column, and the page shows the entity's name. ``flag_messages`` is ``{code:
 message}`` for every code in the ``flags`` column, in the same order. A rule that sets either
 key itself breaks the contract, and the run fails rather than overwrite it.
+
+The stored evidence keeps both keys. ``GET /recommendations`` projects them into
+``Item.entity`` and ``Item.flags[].message`` and leaves them out of the ``evidence.extra`` it
+returns, so a page never sends them twice.
 """
 
 _SINGLE_RUNNING_INDEX: Final = "uq_analysis_run_single_running"
@@ -471,6 +475,15 @@ async def latest_default_run(session: AsyncSession) -> AnalysisRun | None:
     (ties by id), so a manual 90-day custom run never stands in for the default and a failed
     or running default run never replaces the last good one.
 
+    ``finished_at DESC`` (PostgreSQL's ``NULLS FIRST``) is the order a backward scan of
+    ``ix_analysis_run_kind_status_finished`` (``kind``, ``status``, ``finished_at``) returns,
+    so the read is one index probe, sorting only the runs that share the newest
+    ``finished_at`` by id, however long the run history grows; ``NULLS LAST`` would instead
+    scan and sort every succeeded default run. A run is marked ``succeeded`` together with its
+    ``finished_at``, so ``finished_at IS NOT NULL`` excludes no real run: it is an index
+    condition of the same probe, and it stops a succeeded row without a finish time from
+    sorting first.
+
     Args:
         session: The caller's session.
 
@@ -479,8 +492,12 @@ async def latest_default_run(session: AsyncSession) -> AnalysisRun | None:
     """
     result = await session.execute(
         select(AnalysisRun)
-        .where(AnalysisRun.kind == "default", AnalysisRun.status == "succeeded")
-        .order_by(AnalysisRun.finished_at.desc().nulls_last(), AnalysisRun.id.desc())
+        .where(
+            AnalysisRun.kind == "default",
+            AnalysisRun.status == "succeeded",
+            AnalysisRun.finished_at.is_not(None),
+        )
+        .order_by(AnalysisRun.finished_at.desc(), AnalysisRun.id.desc())
         .limit(1)
     )
     return result.scalar_one_or_none()
