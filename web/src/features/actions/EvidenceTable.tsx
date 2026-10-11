@@ -12,7 +12,9 @@
  *    "unavailable", never `0` (AAP 0.5.4.7, 0.11.1). Every percentage in the table, value or
  *    paired baseline, shows one fixed precision ({@link evidenceRatioDigits}), so compared rates
  *    read apart. All of that formatting is {@link formatMetric}'s; this file formats no number
- *    of its own.
+ *    of its own. Figures align to the end and text values and baselines to the start, and the
+ *    three columns take fixed shares of the table, so the Value column ends at the same place on
+ *    every card of the same width.
  * 2. The baselines no metric row carries (see {@link pairBaselines}), each in its own unit and
  *    currency when it records them, as C1's account cost per outcome does ("USD 37.99").
  * 3. The sample line, "Sample: {observed} / {required} {unit}", with its labelled projection when
@@ -53,9 +55,26 @@ import type {
   SourceName,
   StatTest,
 } from '../../api/types';
-import { DataTable, Inline, Stack, Tooltip, type DataTableColumn } from '../../design-system';
 import {
+  DataTable,
+  Inline,
+  Stack,
+  Tooltip,
+  type DataTableAlign,
+  type DataTableColumn,
+  type DataTableColumnShare,
+} from '../../design-system';
+import {
+  DAY_UNITS,
   EM_DASH,
+  MONEY_UNITS,
+  MULTIPLE_UNITS,
+  NOT_APPLICABLE,
+  PERCENT_POINT_UNITS,
+  P_VALUE_UNITS,
+  RATE_UNITS,
+  RATIO_UNITS,
+  TEXT_UNITS,
   UNAVAILABLE,
   formatDecimal,
   formatMetric,
@@ -89,6 +108,20 @@ export const OTHER_BASELINES_LABEL = 'Other baselines';
 
 /** The label of the unpaired baselines when no baseline sits in the table. */
 export const BASELINES_LABEL = 'Baselines';
+
+/**
+ * The Metric column's share of the evidence table, in twelfths. With {@link VALUE_SHARE} and
+ * {@link BASELINE_SHARE} it makes one column grid for every evidence table, so the Value
+ * column of every card of the same width ends at the same place, 8 twelfths across the table.
+ * A sibling table whose figures should end where the evidence values end takes the same shares.
+ */
+export const METRIC_SHARE: DataTableColumnShare = 5;
+
+/** The Value column's share of the evidence table, in twelfths (see {@link METRIC_SHARE}). */
+export const VALUE_SHARE: DataTableColumnShare = 3;
+
+/** The Baseline column's share of the evidence table, in twelfths (see {@link METRIC_SHARE}). */
+export const BASELINE_SHARE: DataTableColumnShare = 4;
 
 /** The name shown for a recorded test whose name is blank, so the line never starts with "·". */
 const UNNAMED_TEST = 'Statistical test';
@@ -538,27 +571,103 @@ function BaselineCell({ row }: { row: MetricRow }): ReactNode {
 }
 
 /**
+ * The units {@link formatMetric} renders as a figure by name: money, ratios, rates, percentage
+ * points, days, p-values and multiples. A metric with one of them, or with a currency, is a
+ * figure even when the backend pre-rendered its value as a placeholder.
+ */
+const FIGURE_UNIT_SETS: readonly ReadonlySet<string>[] = [
+  MONEY_UNITS,
+  RATIO_UNITS,
+  RATE_UNITS,
+  PERCENT_POINT_UNITS,
+  DAY_UNITS,
+  P_VALUE_UNITS,
+  MULTIPLE_UNITS,
+];
+
+/**
+ * The texts that stand in for a figure that cannot be shown: "unavailable", "—" (a cost with a
+ * zero denominator) and "n/a" (a utilization without a known-budget day), as `lib/format` and
+ * the backend render them.
+ */
+const FIGURE_PLACEHOLDERS: ReadonlySet<string> = new Set([UNAVAILABLE, EM_DASH, NOT_APPLICABLE]);
+
+/**
+ * The alignment of a metric's Value cell: `'end'` for a figure, so it lines up with the other
+ * numbers at the column's end in tabular figures and on one line; `'start'` for text, which then
+ * reads from the start and wraps between words (AAP 0.5.5: numbers beside the claim they
+ * support). The value's type decides, in the order {@link formatMetric} reads it:
+ *
+ * 1. A {@link TEXT_UNITS} metric (a search term, a matched keyword) is text, whatever its value,
+ *    even "unavailable" or a term that looks numeric such as "2024".
+ * 2. A boolean ("yes" or "no") is text.
+ * 3. An unavailable metric (`unavailable: true` or a `null` value) is a figure: the backend
+ *    records an absent number as `null`, never `0` (AAP 0.11.1), and its "unavailable" holds
+ *    the figure's place.
+ * 4. A number or a decimal string is a figure: money, a percentage, a count or day count, a
+ *    p-value or a multiple, floors ("≥ N", "≤ X") included.
+ * 5. Any other string is text the backend rendered itself, such as a status ("paused"), a
+ *    budget ("daily budget USD 50.00") or a match type, unless it is one of the
+ *    {@link FIGURE_PLACEHOLDERS} on a metric with a currency or a figure unit
+ *    ({@link FIGURE_UNIT_SETS}): a white paper's "—" cost or a lifetime budget's "n/a"
+ *    utilization holds a figure's place just as "unavailable" does.
+ *
+ * @param row - the metric row
+ * @returns the Value cell's alignment
+ */
+function valueAlign(row: MetricRow): DataTableAlign {
+  const { value, unit, currency, unavailable } = row.metric;
+  const normalizedUnit = typeof unit === 'string' ? unit.trim().toLowerCase() : '';
+  if (TEXT_UNITS.has(normalizedUnit) || typeof value === 'boolean') {
+    return 'start';
+  }
+  if (unavailable === true || value === null || typeof value === 'number') {
+    return 'end';
+  }
+  if (isDecimalString(value)) {
+    return 'end';
+  }
+  const isFigureMetric =
+    (typeof currency === 'string' && currency.trim() !== '') ||
+    FIGURE_UNIT_SETS.some((units) => units.has(normalizedUnit));
+  return isFigureMetric && FIGURE_PLACEHOLDERS.has(value.trim()) ? 'end' : 'start';
+}
+
+/**
  * The metrics table's columns: the metric label as the row header, then the value and its
- * baselines, both aligned to the end with tabular figures (AAP 0.5.5: numbers beside the claim
- * they support).
+ * baselines.
+ *
+ * - Value aligns each cell by its value's type ({@link valueAlign}): figures to the end in
+ *   tabular figures, text such as a search term to the start, wrapping between words. Its
+ *   header stays end-aligned over the figures.
+ * - Baseline is start-aligned text: each entry reads "{label}: {value}", one per line, and a
+ *   long label wraps between words.
+ * - The three columns take fixed shares of the table, {@link METRIC_SHARE},
+ *   {@link VALUE_SHARE} and {@link BASELINE_SHARE} twelfths, so every evidence table of a
+ *   given width has the same column grid: the Value column ends at the same place on every
+ *   card, whatever each table holds. A column whose content cannot fit its share at a narrow
+ *   width takes its content's minimum, and the table scrolls in its region past that.
  */
 const COLUMNS: readonly DataTableColumn<MetricRow>[] = [
   {
     key: 'metric',
     header: 'Metric',
     isRowHeader: true,
+    share: METRIC_SHARE,
     render: (row) => <MetricLabel metric={row.metric} />,
   },
   {
     key: 'value',
     header: 'Value',
     align: 'end',
+    alignCell: valueAlign,
+    share: VALUE_SHARE,
     render: (row) => formatMetric(row.metric, { ratioDigits: row.ratioDigits }),
   },
   {
     key: 'baseline',
     header: 'Baseline',
-    align: 'end',
+    share: BASELINE_SHARE,
     render: (row) => <BaselineCell row={row} />,
   },
 ];

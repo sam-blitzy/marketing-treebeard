@@ -844,11 +844,15 @@ async function checkKeywordsSection(region: Locator, section: Section): Promise<
  *
  * @param groupRegion - The cohort's group region.
  * @param caption - The table's caption, which names it.
+ * @param scope - What its rows' toggle names add after the asset, in parentheses: the cohort's
+ *   currency, then for the replaced-data and held tables the caption's suffix ("EUR, computed
+ *   from replaced data").
  * @param items - The items the table holds, in API order.
  */
 async function expectAssetRows(
   groupRegion: Locator,
   caption: string,
+  scope: string,
   items: readonly Item[],
 ): Promise<void> {
   const table = groupRegion.getByRole('table', { name: caption, exact: true });
@@ -868,7 +872,14 @@ async function expectAssetRows(
     ).toBeVisible();
 
     const detailId = await row
-      .getByRole('button', { name: `Details for ${name}`, exact: true })
+      .getByRole('button', {
+        // "Show details for {asset} ({scope})", with an id after the scope when another row of
+        // the table shows the same name (`rowLabelOf` in `WhitePapersSection.tsx`).
+        name: new RegExp(
+          `^Show details for ${escapeRegExp(name)} \\(${escapeRegExp(scope)}(?:, [^()]*)?\\)$`,
+          'u',
+        ),
+      })
       .getAttribute('aria-controls', { timeout: ACTION_TIMEOUT_MS });
     if (detailId === null) {
       throw new Error(`The details toggle of ${what} controls no detail row`);
@@ -904,15 +915,17 @@ async function checkWhitePapersSection(region: Locator, section: Section): Promi
       attributeSelector('id', groupAnchorId(section.key, group.key)),
     );
     await expect(groupRegion, `the white-paper cohort "${group.key}" is shown`).toBeVisible();
-    const caption = `White papers (${cohortCurrency(group)})`;
-    const tables: [string, Item[]][] = [
-      [caption, visible],
-      [`${caption}${HISTORICAL_TABLE_SUFFIX}`, historical],
-      [`${caption}${HELD_TABLE_SUFFIX}`, held],
+    const currency = cohortCurrency(group);
+    const caption = `White papers (${currency})`;
+    // Each table's caption, the scope its rows' toggle names carry, and its items.
+    const tables: [string, string, Item[]][] = [
+      [caption, currency, visible],
+      [`${caption}${HISTORICAL_TABLE_SUFFIX}`, `${currency},${HISTORICAL_TABLE_SUFFIX}`, historical],
+      [`${caption}${HELD_TABLE_SUFFIX}`, `${currency},${HELD_TABLE_SUFFIX}`, held],
     ];
-    for (const [tableCaption, items] of tables) {
+    for (const [tableCaption, scope, items] of tables) {
       if (items.length > 0) {
-        await expectAssetRows(groupRegion, tableCaption, items);
+        await expectAssetRows(groupRegion, tableCaption, scope, items);
         checked += items.length;
       }
     }

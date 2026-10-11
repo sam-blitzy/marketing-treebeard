@@ -18,6 +18,10 @@
  *   `window.source_days` recorded for the source. The
  *   window itself, provenance and `extra` belong to other parts of the card and are not
  *   rendered here.
+ * - The table's layout: Value cells end-align figures (numbers, decimal strings, unavailable
+ *   values and the figure placeholders "—" and "n/a" of money and ratio metrics) and start-align
+ *   text (text-unit terms, booleans and other pre-rendered strings) under an end-aligned header;
+ *   Baseline is start-aligned; Metric, Value and Baseline take 5, 3 and 4 twelfths.
  *
  * Evidence comes from `../../test/fixtures`, either as the backend-shaped page items (C1 pause,
  * B1 increase) or built in the test for a single edge case. The component makes no request, so
@@ -51,12 +55,15 @@ import { KEEP_SPACES, renderWithProviders } from '../../test/render';
 import { textWithoutTooltips } from '../../test/text';
 import {
   BASELINES_LABEL,
+  BASELINE_SHARE,
   DATASETS_LABEL,
   DEFAULT_EVIDENCE_CAPTION,
   EvidenceTable,
+  METRIC_SHARE,
   NO_METRICS_MESSAGE,
   OTHER_BASELINES_LABEL,
   THRESHOLDS_LABEL,
+  VALUE_SHARE,
   evidenceRatioDigits,
   formatThresholdValue,
   pairBaselines,
@@ -458,6 +465,119 @@ describe('EvidenceTable', () => {
       ['segment_cpl', 'EUR\u00a08.00', 'max_segment_cpl: unavailable'],
     ]);
     expect(screen.queryByText(/\bnull\b|\bundefined\b/)).toBeNull();
+  });
+
+  it('end-aligns figures and start-aligns text values, with the Value header at the end', () => {
+    const evidence = makeEvidence({
+      metrics: [
+        metric('term', 'Search term', 'free attribution software download', 'text'),
+        metric('year_term', 'Year term', '2024', 'text'),
+        metric('missing_term', 'Missing term', null, 'text'),
+        metric('spend', 'Spend', '517.85', 'currency', { currency: 'USD' }),
+        metric('conversions', 'Conversions', 0, 'conversions'),
+        metric('ql', 'Qualified Leads', null, 'leads', { unavailable: true }),
+        metric('mql', 'MQL', 12, 'leads', { floor: true }),
+        metric('cost_per_ql', 'Cost per Qualified Lead', '—', 'currency', { currency: 'EUR' }),
+        metric('utilization', 'Window utilization', 'n/a', 'ratio'),
+        metric('status', 'Platform status', 'paused', 'status'),
+        metric('status_none', 'Decided status', 'unavailable', 'status'),
+        metric('budget', 'Platform budget', 'daily budget USD 50.00', 'budget'),
+        metric('shared', 'Shared budget', true, null),
+        metric('match', 'Match type', 'n/a', null),
+      ],
+    });
+    render(<EvidenceTable evidence={evidence} />);
+
+    const table = screen.getByRole('table', { name: DEFAULT_EVIDENCE_CAPTION });
+    const valueHeader = within(table).getByRole('columnheader', { name: 'Value' });
+    expect(valueHeader.classList.contains('ds-datatable__cell--end')).toBe(true);
+    const alignments = within(table)
+      .getAllByRole('row')
+      .slice(1)
+      .map((row) => {
+        const value = row.querySelectorAll('td')[0];
+        const header = row.querySelector('th');
+        return [
+          header === null ? null : textWithoutTooltips(header),
+          value?.classList.contains('ds-datatable__cell--end') === true ? 'end' : 'start',
+        ];
+      });
+    expect(alignments).toEqual([
+      ['Search term', 'start'],
+      ['Year term', 'start'],
+      ['Missing term', 'start'],
+      ['Spend', 'end'],
+      ['Conversions', 'end'],
+      ['Qualified Leads', 'end'],
+      ['MQL', 'end'],
+      ['Cost per Qualified Lead', 'end'],
+      ['Window utilization', 'end'],
+      ['Platform status', 'start'],
+      ['Decided status', 'start'],
+      ['Platform budget', 'start'],
+      ['Shared budget', 'start'],
+      ['Match type', 'start'],
+    ]);
+    // Each start cell carries the explicit start class, so no value is left unaligned.
+    for (const row of within(table).getAllByRole('row').slice(1)) {
+      const value = row.querySelectorAll('td')[0];
+      expect(
+        value?.classList.contains('ds-datatable__cell--start') !==
+          value?.classList.contains('ds-datatable__cell--end'),
+      ).toBe(true);
+    }
+  });
+
+  it('start-aligns the Baseline header and every baseline cell', () => {
+    const evidence = makeEvidence({
+      metrics: [
+        metric('cost_per_outcome', 'Cost per outcome', '80.00', 'currency', { currency: 'USD' }),
+        metric('clicks', 'Clicks', 172, 'clicks'),
+      ],
+      baselines: [
+        baseline(
+          'account_cost_per_outcome',
+          'Account cost per lead (same source and objective)',
+          '32.08',
+        ),
+      ],
+    });
+    render(<EvidenceTable evidence={evidence} />);
+
+    const table = screen.getByRole('table', { name: DEFAULT_EVIDENCE_CAPTION });
+    const header = within(table).getByRole('columnheader', { name: 'Baseline' });
+    expect(header.classList.contains('ds-datatable__cell--start')).toBe(true);
+    const baselineCells = within(table)
+      .getAllByRole('row')
+      .slice(1)
+      .map((row) => row.querySelectorAll('td')[1]);
+    expect(baselineCells.map((cell) => cell?.textContent)).toEqual([
+      'Account cost per lead (same source and objective): USD\u00a032.08',
+      '—',
+    ]);
+    for (const cell of baselineCells) {
+      expect(cell?.classList.contains('ds-datatable__cell--start')).toBe(true);
+      expect(cell?.classList.contains('ds-datatable__cell--end')).toBe(false);
+    }
+  });
+
+  it('gives Metric, Value and Baseline the shared 5, 3 and 4 twelfths of every evidence table', () => {
+    render(
+      <>
+        <EvidenceTable evidence={pageItem(FIXTURE_ITEM_IDS.b1).evidence} caption="First" />
+        <EvidenceTable evidence={makeEvidence({ metrics: [] })} caption="Second" />
+      </>,
+    );
+
+    expect([METRIC_SHARE, VALUE_SHARE, BASELINE_SHARE]).toEqual([5, 3, 4]);
+    for (const caption of ['First', 'Second']) {
+      const table = screen.getByRole('table', { name: caption });
+      expect(Array.from(table.querySelectorAll('colgroup > col'), (col) => col.className)).toEqual([
+        'ds-datatable__col--share-5',
+        'ds-datatable__col--share-3',
+        'ds-datatable__col--share-4',
+      ]);
+    }
   });
 
   it('renders repeated metric, baseline and dataset keys apart, without key warnings', () => {

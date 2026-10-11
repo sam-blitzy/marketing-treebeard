@@ -4,22 +4,41 @@
  * Class contract with DataTable.tsx, which renders:
  *
  *   div.ds-datatable__region           role="region", tabindex="0", named by the caption
- *     table.ds-datatable [+ .ds-datatable--fixed]          fixed: every column has a width
+ *     table.ds-datatable[.ds-datatable--compact]                only when density is compact
+ *       [.ds-datatable--fixed]                                  fixed: every column has a width
  *       caption.ds-datatable__caption  every table has one
- *       colgroup > col.ds-datatable__col                    fixed tables only, one per column
+ *       colgroup > col.ds-datatable__col                        fixed tables only, one per column
+ *       colgroup > col[.ds-datatable__col--share-1 … --share-12]  otherwise, when a column has a
+ *                                                               share
  *       thead > tr > th.ds-datatable__header + .ds-datatable__cell--start | --end
+ *         [+ .ds-datatable__cell--min-sm | --min-md | --min-lg | --min-xl]
+ *         [+ .ds-datatable__cell--sticky]                       the first column, when sticky
  *       tbody > tr > td | th[scope=row].ds-datatable__cell + .ds-datatable__cell--start | --end
+ *         [+ .ds-datatable__cell--min-sm | --min-md | --min-lg | --min-xl]
+ *         [+ .ds-datatable__cell--sticky]                       the first column, when sticky
+ *         [+ .ds-datatable__cell--wrap-anywhere]
+ *         [> span.ds-datatable__cell-note]                      after the content, when noted
+ *       tbody > tr > td.ds-datatable__toggle-cell > button.ds-button[aria-expanded]
+ *         > span.ds-button__label > span.ds-datatable__toggle-state[data-alternate]
+ *                                   [+ " " + span.ds-visually-hidden]  "for {row}", if labelled
  *       tbody > tr.ds-datatable__detail-row[hidden] > td.ds-datatable__detail-cell
  *         > div.ds-datatable__detail-content                    only while the row is expanded
  *       tbody > tr > td.ds-datatable__empty                     when there are no rows
  *
- * The expand column's header and data cells also carry .ds-datatable__toggle-cell. When the
+ * The expand column's header and data cells also carry .ds-datatable__toggle-cell, and its
+ * <col>, when there is a colgroup, has no class. A toggle's state span holds its visible text,
+ * "Show details" or "Hide details", and its data-alternate attribute the other one. When the
  * table is expandable, its region also carries .ds-datatable__region--expandable, and every
- * data row is followed by its detail row, hidden while collapsed.
+ * data row is followed by its detail row, hidden while collapsed. A body cell's --start or
+ * --end class follows its column's alignCell when it has one, and its column's align
+ * otherwise; a header always follows align. Only the first column can be sticky. The compact
+ * modifier styles only the table's own header, body and toggle cells, through child
+ * combinators, so a table nested in its detail rows keeps its own density.
  *
  * The region scrolls a table wider than its container on the inline axis, so the page itself
  * never scrolls sideways at a 320 CSS px viewport (WCAG 2.2 SC 1.4.10 Reflow). It is focusable
  * so keyboard users can scroll it (SC 2.1.1), and shows a visible ring when focused (SC 2.4.7).
+ * It also shows a scroll cue on each edge beyond which columns are hidden (see below).
  *
  * Every colour, spacing, typography and radius value is a token from ../tokens.css. Border and
  * outline widths are derived from --space-1 (a quarter for hairlines, a half for the focus ring),
@@ -27,12 +46,46 @@
  * no px literal is needed. At the 16px root they are exactly 1px and 2px.
  */
 
+/*
+ * The scroll cue. A table wider than its region hides columns behind the inner scroll, and an
+ * overlay or hidden scrollbar gives no sign of them, so each edge beyond which content is hidden
+ * shows a shadow. The four background layers, topmost first:
+ * 1. and 2. covers in the surface colour, attached local, so they sit at the left and right ends
+ *    of the scrolled content and move with it; each is solid for the shadow's width, then fades;
+ * 3. and 4. shadows from the border colour to transparent, attached scroll, so they stay on the
+ *    region's left and right edges.
+ * While an end of the content is in view, its cover lies over that edge's shadow and hides it;
+ * scrolling that end out of view uncovers the shadow. A table that fits shows both ends, so no
+ * shadow at all. Physical left and right serve both directions: in right-to-left text the
+ * content starts at the right edge and overflows to the left, and the same covers and shadows
+ * follow it. The layers paint behind the cells, which have no background of their own (an
+ * expanded detail row's page background hides them across that row only), and the focus ring
+ * is an outline outside the region, so it is unaffected. Colours are tokens ending in
+ * transparent, and sizes are spacing tokens and the full-extent token.
+ */
 .ds-datatable__region {
   overflow-x: auto;
   max-inline-size: var(--size-full);
   border: calc(var(--space-1) / 4) solid var(--color-border);
   border-radius: var(--radius-md);
-  background: var(--color-surface);
+  background-color: var(--color-surface);
+  background-image:
+    linear-gradient(to right, var(--color-surface) var(--space-3), transparent),
+    linear-gradient(to left, var(--color-surface) var(--space-3), transparent),
+    linear-gradient(to right, var(--color-border), transparent),
+    linear-gradient(to left, var(--color-border), transparent);
+  background-position:
+    left center,
+    right center,
+    left center,
+    right center;
+  background-size:
+    var(--space-6) var(--size-full),
+    var(--space-6) var(--size-full),
+    var(--space-3) var(--size-full),
+    var(--space-3) var(--size-full);
+  background-repeat: no-repeat;
+  background-attachment: local, local, scroll, scroll;
 }
 
 /*
@@ -109,16 +162,45 @@
   vertical-align: top;
 }
 
-/* nowrap keeps each header on one line, which sets the column's minimum width. */
+/*
+ * Headers wrap between words. A table that fits its region with every column at its widest
+ * content keeps each header on one line; one that does not shrinks its columns towards their
+ * narrowest content first, so a header's longest word, not its whole text, sets its column's
+ * minimum width. overflow-wrap is reset, so an ancestor that lets long words break anywhere,
+ * such as a Stack with breakLongWords, cannot split a header mid-word.
+ */
 .ds-datatable__header {
   font-weight: var(--font-weight-semibold);
   color: var(--color-text-muted);
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: normal;
 }
 
 /* Row headers (th scope="row"), such as the asset name in a white paper row. */
 th.ds-datatable__cell {
   font-weight: var(--font-weight-semibold);
+}
+
+/*
+ * Compact density (density="compact"), for a wide table of many short columns such as the
+ * white-paper tables. Header and body cells take one --space-1 step of inline padding on each
+ * side instead of --space-3, and column headers are set in --font-size-xs, so each header's
+ * longest word and each nowrap figure, which set most such columns' minimum width, take less
+ * room; the table then fits a narrower region before it scrolls: the twelve white-paper columns,
+ * amounts labelled with their currency code included, fit the main column of a desktop page. Block padding, body text, the caption, the detail
+ * and empty cells (which are not .ds-datatable__cell) and the column minimums (border-box, so
+ * padding included) are unchanged. The expand column is excluded: its cells keep their own
+ * padding, which clears the toggle's focus ring (see .ds-datatable__toggle-cell). Child
+ * combinators keep the rules to this table's own cells, so a table nested in its detail rows
+ * keeps its own density. --color-text-muted is at least 4.5:1 on the surface at any text size.
+ */
+.ds-datatable--compact > thead > tr > .ds-datatable__header:not(.ds-datatable__toggle-cell),
+.ds-datatable--compact > tbody > tr > .ds-datatable__cell:not(.ds-datatable__toggle-cell) {
+  padding-inline: var(--space-1);
+}
+
+.ds-datatable--compact > thead > tr > .ds-datatable__header {
+  font-size: var(--font-size-xs);
 }
 
 /*
@@ -129,15 +211,110 @@ th.ds-datatable__cell {
   text-align: start;
 }
 
-/*
- * Numeric columns use tabular figures so digits line up down the column. They also stay on one
- * line: a wrapped value would break that alignment, and a floor such as "≥ 12" would leave its
- * sign on a line of its own. A wide value widens the column, and the region scrolls.
- */
+/* Numeric columns use tabular figures so digits line up down the column. */
 .ds-datatable__cell--end {
   text-align: end;
   font-variant-numeric: tabular-nums;
+}
+
+/*
+ * Numeric body cells also stay on one line: a wrapped value would break that alignment, and a
+ * floor such as "≥ 12" would leave its sign on a line of its own. A wide value widens the
+ * column, and the region scrolls. Only body cells: an end-aligned header wraps between words
+ * like every header, and a text value that alignCell starts in a numeric column wraps too.
+ */
+.ds-datatable__cell.ds-datatable__cell--end {
   white-space: nowrap;
+}
+
+/*
+ * Column shares (the share prop): the <col> of a column takes n twelfths of the table's inline
+ * size, so sibling tables of equal width that give their columns the same shares line their
+ * columns up. In the table's automatic layout a share is the column's preferred size: a column
+ * whose content cannot fit it keeps its content's minimum, and the others share the rest, or
+ * the table overflows and its region scrolls. Nothing is clipped.
+ */
+.ds-datatable__col--share-1 {
+  inline-size: calc(var(--size-full) * 1 / 12);
+}
+
+.ds-datatable__col--share-2 {
+  inline-size: calc(var(--size-full) * 2 / 12);
+}
+
+.ds-datatable__col--share-3 {
+  inline-size: calc(var(--size-full) * 3 / 12);
+}
+
+.ds-datatable__col--share-4 {
+  inline-size: calc(var(--size-full) * 4 / 12);
+}
+
+.ds-datatable__col--share-5 {
+  inline-size: calc(var(--size-full) * 5 / 12);
+}
+
+.ds-datatable__col--share-6 {
+  inline-size: calc(var(--size-full) * 6 / 12);
+}
+
+.ds-datatable__col--share-7 {
+  inline-size: calc(var(--size-full) * 7 / 12);
+}
+
+.ds-datatable__col--share-8 {
+  inline-size: calc(var(--size-full) * 8 / 12);
+}
+
+.ds-datatable__col--share-9 {
+  inline-size: calc(var(--size-full) * 9 / 12);
+}
+
+.ds-datatable__col--share-10 {
+  inline-size: calc(var(--size-full) * 10 / 12);
+}
+
+.ds-datatable__col--share-11 {
+  inline-size: calc(var(--size-full) * 11 / 12);
+}
+
+.ds-datatable__col--share-12 {
+  inline-size: var(--size-full);
+}
+
+/*
+ * Column minimums (the minWidth prop), in steps of --space-8, padding included (border-box):
+ * 2, 4, 6 and 8 steps, 64, 128, 192 and 256 px at the 16px root. Table layout takes a cell's
+ * min-inline-size as a floor of its column's minimum width, so the column stays this wide even
+ * when the table overflows its region and every other column shrinks to its narrowest content.
+ */
+.ds-datatable__cell--min-sm {
+  min-inline-size: calc(var(--space-8) * 2);
+}
+
+.ds-datatable__cell--min-md {
+  min-inline-size: calc(var(--space-8) * 4);
+}
+
+.ds-datatable__cell--min-lg {
+  min-inline-size: calc(var(--space-8) * 6);
+}
+
+.ds-datatable__cell--min-xl {
+  min-inline-size: calc(var(--space-8) * 8);
+}
+
+/*
+ * Break-anywhere body cells (wrap: 'anywhere'), for identifier, key and reason columns: an
+ * unbroken token such as HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY or a URN may break between any two
+ * characters. Unlike break-word, anywhere also lowers the column's minimum width to one
+ * character, which is what lets table layout fit the table to its region instead of
+ * overflowing it. It is opt-in per column, never on every cell, because it lets table layout
+ * squeeze a column until even ordinary words break mid-word (see the status chip rule below).
+ * A numeric (end) body cell stays on one line, so it never breaks.
+ */
+.ds-datatable__cell--wrap-anywhere {
+  overflow-wrap: anywhere;
 }
 
 /*
@@ -154,13 +331,159 @@ th.ds-datatable__cell {
 }
 
 /*
+ * A cell's note (the note prop), such as "(no QL yet)" after "—". It wraps between words even in
+ * an end-aligned cell, whose value stays on one line, so a long note never sets the column's
+ * minimum width beyond its longest word. The space before it belongs to the cell, so in an
+ * end-aligned cell the note's first word stays on the value's line. Muted, so the value reads
+ * first: --color-text-muted is at least 4.5:1 on the surface and on the page background of a
+ * detail row.
+ */
+.ds-datatable__cell-note {
+  white-space: normal;
+  color: var(--color-text-muted);
+}
+
+/*
+ * The sticky first column (the sticky prop), typically the row headers: its header and body
+ * cells stay at the region's inline start while the other columns scroll beneath them, so each
+ * row stays named while its far columns are read. In an expandable table the toggle column comes
+ * first: it scrolls out past the region's inline start before the sticky column reaches that edge
+ * and sticks. The surface background, the region's own, hides what scrolls beneath; it never
+ * shows on a table that fits, which does not scroll. inset-inline-start is logical, so in
+ * right-to-left text the column sticks at the right edge.
+ */
+.ds-datatable__cell--sticky {
+  position: sticky;
+  inset-inline-start: 0;
+  background-color: var(--color-surface);
+}
+
+/*
+ * The scroll cue of a sticky column. Once the region is scrolled away from its inline start,
+ * the columns hidden by the scroll lie beneath the sticky column, whose surface background also
+ * covers the region's own cue at that edge. The column's inline-end edge then shows the same
+ * shadow, from the border colour to transparent, over the columns scrolling beneath it, without
+ * taking their pointer events. Its gradient runs away from the column: to the right in
+ * left-to-right text, to the left in right-to-left text.
+ *
+ * The shadow is hidden until the region scrolls: a scroll-driven animation on the region's
+ * inline scroll makes it visible at any scroll position past the start, and visibility switches
+ * discretely, so the shadow is either off or fully on and never fades. In an expandable table it
+ * therefore shows while the toggle column is still scrolling out, before the sticky column sticks
+ * and anything lies beneath it. A table that fits has no scroll, so its animation never runs and
+ * the shadow stays hidden. A browser without scroll-driven animations keeps it hidden, and the
+ * sticky column still holds the row names in view. The reduced-motion override in ../tokens.css
+ * shortens only time-based durations, which a scroll-driven animation maps onto the whole
+ * scroll, so the cue behaves the same there.
+ */
+.ds-datatable__cell--sticky::after {
+  content: "";
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: var(--size-full);
+  inline-size: var(--space-3);
+  background-image: linear-gradient(to right, var(--color-border), transparent);
+  pointer-events: none;
+  visibility: hidden;
+}
+
+.ds-datatable__cell--sticky:dir(rtl)::after {
+  background-image: linear-gradient(to left, var(--color-border), transparent);
+}
+
+@supports (animation-timeline: scroll()) {
+  .ds-datatable__cell--sticky::after {
+    animation: ds-datatable-sticky-cue auto linear both;
+    animation-timeline: scroll(nearest inline);
+  }
+}
+
+@keyframes ds-datatable-sticky-cue {
+  from {
+    visibility: hidden;
+  }
+
+  to {
+    visibility: visible;
+  }
+}
+
+/*
  * The expand column shrinks to its toggle button. Table layout never sizes a column below its
  * min-content width, so a zero preferred inline size shrinks the column to the toggle button,
- * whose nowrap label sets that width. 0 is a keyword exception, not a design value.
+ * whose short, nowrap label sets that width (in a compact table, the longest word of its
+ * labels; see below). 0 is a keyword exception, not a design value. The button carries its
+ * own inline padding and the next cell starts with the cell padding, so the column keeps only
+ * the room its focus ring needs, in both densities: --space-1 at its inline end, the ring's
+ * width plus its offset (half of --space-1 each), so a sticky row header beside it, which paints
+ * over its neighbours, never covers the ring; and --space-2 at its inline start, which also
+ * keeps the ring clear of the region's clipping edge. Together they are one --space-3 step,
+ * half the cell padding, which keeps the column narrow.
  */
 .ds-datatable__toggle-cell {
   inline-size: 0;
+  padding-inline: var(--space-2) var(--space-1);
   white-space: nowrap;
+}
+
+/*
+ * The toggle's state label keeps one width in both states. Its ::after lays out the other
+ * label, from data-alternate, as a block of no height that is never painted, so the label is as
+ * wide as the longer of "Show details" and "Hide details" and the column never shifts when a
+ * row expands or collapses. visibility: hidden keeps the alternate text out of the accessibility
+ * tree, and the second content declaration, which a browser without alternative-text support
+ * drops, also gives it empty alternative text. The visible text stays centred in that width.
+ */
+.ds-datatable__toggle-state {
+  display: inline-block;
+}
+
+.ds-datatable__toggle-state::after {
+  content: attr(data-alternate);
+  content: attr(data-alternate) / "";
+  display: block;
+  block-size: 0;
+  overflow: hidden;
+  visibility: hidden;
+}
+
+/*
+ * In a compact table the toggle's state label wraps between its words, "Show" above "details",
+ * so the expand column is as narrow as the longest word of its two labels rather than a whole
+ * label; the alternate label wraps the same way, so both states keep one width. The column's
+ * zero preferred size keeps it at that width at every table width, so the label reads on two
+ * lines throughout the table and expanding a row still shifts nothing. overflow-wrap is reset
+ * from the button label's anywhere, so a word never breaks mid-word. The toggle cell keeps its
+ * nowrap, so the visually hidden row name, which is out of flow, is unaffected, and its padding,
+ * so the focus ring keeps its clearance. The button grows on the block axis only.
+ */
+.ds-datatable--compact > tbody > tr > .ds-datatable__toggle-cell .ds-datatable__toggle-state {
+  white-space: normal;
+  overflow-wrap: normal;
+}
+
+/*
+ * An expanded row's toggle (aria-expanded="true") is outlined in --color-accent and filled with
+ * --color-bg, the detail row's own background, so the open row reads as attached to its details.
+ * The state is not shown by colour alone (SC 1.4.1): the label also changes from "Show details"
+ * to "Hide details". Contrast with the placeholder tokens: the --color-accent outline is at least
+ * 3:1 against both the surface around it and its --color-bg fill (SC 1.4.11), and the quiet
+ * button's --color-accent text is at least 4.5:1 on that fill (SC 1.4.3). The border box is
+ * reserved by Button.css's transparent border, so the outline never shifts the layout.
+ */
+.ds-datatable__toggle-cell .ds-button[aria-expanded="true"] {
+  border-color: var(--color-accent);
+  background: var(--color-bg);
+}
+
+/*
+ * Forced colours (Windows contrast themes) replace the outline and fill, so there the expanded
+ * label is also underlined, as Button.css marks a pressed toggle.
+ */
+@media (forced-colors: active) {
+  .ds-datatable__toggle-cell .ds-button[aria-expanded="true"] .ds-datatable__toggle-state {
+    text-decoration: underline;
+  }
 }
 
 /*

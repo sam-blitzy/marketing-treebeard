@@ -11,7 +11,8 @@
  *   and predicate days against what the gate requires ("n/a" for a lifetime budget, "—" for a
  *   cost with no outcome);
  * - the "Budget days" table of every day count against its requirement, the stricter of two
- *   checks on one count, and "—" where no gate requires one;
+ *   checks on one count, and "—" where no gate requires one, on the evidence table's column
+ *   shares with breakable day type labels;
  * - outcomes, CRM Qualified Leads only when linked, the daily budget and the proposed amount;
  * - every member campaign of a shared budget with its member days;
  * - the B1 funding sentence and each B3 allocation as funding for a named B1, linked to that
@@ -47,6 +48,7 @@ import {
   makeSection,
   makeWithheld,
 } from '../../../test/fixtures';
+import { BASELINE_SHARE, METRIC_SHARE, VALUE_SHARE } from '../EvidenceTable';
 import { metricHelp } from '../metricHelp';
 import { BudgetSection } from './BudgetSection';
 
@@ -517,6 +519,37 @@ describe('B1 increase card', () => {
       ['Changed-intraday days (unknown budget)', '1', '—'],
       ['Unobserved days (unknown budget)', '1', '—'],
     ]);
+  });
+
+  it("lays the Budget days table on the card's evidence grid, its labels breakable", async () => {
+    await renderBudget(budgetWith([backendB1()]));
+
+    const b1 = card(B1_ACTION);
+    const shares = (caption: string): string[] =>
+      Array.from(
+        within(b1).getByRole('table', { name: caption }).querySelectorAll('colgroup > col'),
+        (col) => col.className,
+      );
+    // Day type, Observed and Required take the evidence table's Metric, Value and Baseline
+    // shares, so the Observed counts end where the evidence values end.
+    expect([METRIC_SHARE, VALUE_SHARE, BASELINE_SHARE]).toEqual([5, 3, 4]);
+    expect(shares('Budget days')).toEqual([
+      'ds-datatable__col--share-5',
+      'ds-datatable__col--share-3',
+      'ds-datatable__col--share-4',
+    ]);
+    expect(shares('Budget days')).toEqual(shares('Evidence'));
+
+    // Only the day type labels may break anywhere; the counts stay whole and end-aligned.
+    const daysTable = within(b1).getByRole('table', { name: 'Budget days' });
+    for (const row of within(daysTable).getAllByRole('row').slice(1)) {
+      const [label, observed, required] = [...row.querySelectorAll('th, td')];
+      expect(label?.classList.contains('ds-datatable__cell--wrap-anywhere')).toBe(true);
+      for (const count of [observed, required]) {
+        expect(count?.classList.contains('ds-datatable__cell--end')).toBe(true);
+        expect(count?.classList.contains('ds-datatable__cell--wrap-anywhere')).toBe(false);
+      }
+    }
   });
 
   it('shows outcomes, daily and proposed budget, no CRM QL when unlinked', async () => {

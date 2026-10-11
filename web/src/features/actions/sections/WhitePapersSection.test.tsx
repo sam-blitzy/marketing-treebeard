@@ -270,12 +270,23 @@ const PIPELINE_EUR_ASSET =
   `${simulatedAsset('The 2026 B2B Pipeline Report')}${ATTRIBUTION_FLOOR_12}`;
 
 /**
+ * Matches the accessible name of the expand toggle of the row named `name`, in either state and
+ * whatever its table's scope: "Show details for {name} ({scope})" while the row is collapsed,
+ * "Hide details for {name} ({scope})" while it is expanded.
+ */
+function rowToggle(name: string): (accessibleName: string) => boolean {
+  return (accessibleName) =>
+    accessibleName.startsWith(`Show details for ${name} (`) ||
+    accessibleName.startsWith(`Hide details for ${name} (`);
+}
+
+/**
  * The entries of the "Notes on {name}" list in the details of the row named `name` among
  * `container`'s rows, expanding the row first when it is collapsed; `[]` when its details show no
  * notes list.
  */
 function rowNotes(container: HTMLElement, name: string): (string | null)[] {
-  const toggle = within(container).getByRole('button', { name: `Details for ${name}` });
+  const toggle = within(container).getByRole('button', { name: rowToggle(name) });
   if (toggle.getAttribute('aria-expanded') !== 'true') {
     fireEvent.click(toggle);
   }
@@ -433,7 +444,7 @@ describe('WhitePapersSection', () => {
 
       expect(bodyRows(table('White papers (EUR)'))).toEqual([
         [
-          'Details for The 2026 B2B Pipeline Report',
+          'Show details for The 2026 B2B Pipeline Report (EUR)',
           PIPELINE_EUR_ASSET,
           'EUR\u00a02,840.00',
           '116',
@@ -447,7 +458,7 @@ describe('WhitePapersSection', () => {
           'Double down: increase spend on Lead Gen — Pipeline Report EMEA',
         ],
         [
-          'Details for The Attribution Playbook',
+          'Show details for The Attribution Playbook (EUR)',
           simulatedAsset('The Attribution Playbook'),
           'EUR\u00a01,500.00',
           '31',
@@ -630,7 +641,7 @@ describe('WhitePapersSection', () => {
       expect(row?.[cellIndex('cost_per_ql')]).toBe('unavailable');
       // The known counts beside it are unaffected, and MQL stays its own count.
       expect(row).toEqual([
-        'Details for Unbound QL Report',
+        'Show details for Unbound QL Report (USD)',
         'Unbound QL Report',
         'USD\u00a0600.00',
         '18',
@@ -644,7 +655,7 @@ describe('WhitePapersSection', () => {
         'No change warranted',
       ]);
 
-      fireEvent.click(screen.getByRole('button', { name: 'Details for Unbound QL Report' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Show details for Unbound QL Report (USD)' }));
       expect(bodyRows(table('Per creative: Unbound QL Report'))).toEqual([
         ['Variant Q', 'USD\u00a0600.00', '18', '4', 'unavailable', '1', '0', '0', 'unavailable', 'USD\u00a0600.00'],
       ]);
@@ -655,7 +666,7 @@ describe('WhitePapersSection', () => {
 
       expect(bodyRows(table('White papers (USD)'))).toEqual([
         [
-          'Details for Paid Media Benchmarks 2026',
+          'Show details for Paid Media Benchmarks 2026 (USD)',
           simulatedAsset('Paid Media Benchmarks 2026'),
           'USD\u00a01,210.00',
           '41',
@@ -711,7 +722,7 @@ describe('WhitePapersSection', () => {
       await renderDefault();
 
       const toggle = screen.getByRole('button', {
-        name: 'Details for The 2026 B2B Pipeline Report',
+        name: 'Show details for The 2026 B2B Pipeline Report (EUR)',
       });
       expect(toggle.getAttribute('aria-expanded')).toBe('false');
       fireEvent.click(toggle);
@@ -810,7 +821,9 @@ describe('WhitePapersSection', () => {
         ),
       });
 
-      fireEvent.click(screen.getByRole('button', { name: 'Details for The 2026 B2B Pipeline Report' }));
+      fireEvent.click(
+        screen.getByRole('button', { name: 'Show details for The 2026 B2B Pipeline Report (EUR)' }),
+      );
       const details = table('Per creative: The 2026 B2B Pipeline Report').closest('td');
       if (details === null) {
         throw new Error('the per-creative table is not inside the detail cell');
@@ -832,30 +845,228 @@ describe('WhitePapersSection', () => {
     });
   });
 
+  describe('row toggles and column sizing', () => {
+    /** The cells of a table's body rows, toggle first, as elements. */
+    function bodyCells(container: HTMLElement): HTMLElement[][] {
+      return within(container)
+        .getAllByRole('row')
+        .slice(1)
+        .filter((row) => row.closest('table') === container)
+        .map((row) => Array.from(row.children, (cell) => cell as HTMLElement));
+    }
+
+    it('shows a short "Show details" or "Hide details" toggle named for its asset and currency', async () => {
+      await renderDefault();
+
+      const toggle = screen.getByRole('button', {
+        name: 'Show details for The 2026 B2B Pipeline Report (EUR)',
+      });
+      expect(toggle.querySelector('.ds-datatable__toggle-state')?.textContent).toBe('Show details');
+      expect(toggle.querySelector('.ds-visually-hidden')?.textContent).toBe(
+        'for The 2026 B2B Pipeline Report (EUR)',
+      );
+
+      fireEvent.click(toggle);
+
+      expect(
+        screen.getByRole('button', { name: 'Hide details for The 2026 B2B Pipeline Report (EUR)' }),
+      ).toBe(toggle);
+      expect(toggle.querySelector('.ds-datatable__toggle-state')?.textContent).toBe('Hide details');
+      expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    });
+
+    it("names every toggle on the page apart: the asset's currency, its table and, for a shared name, its id", async () => {
+      const item = (id: number, name: string, entityId: string, overrides: Partial<Item> = {}) =>
+        whitePaperItem(
+          id,
+          { name, id: entityId },
+          makeEvidence({ extra: { cohort: { currency: entityId.split('|')[1] } } }),
+          overrides,
+        );
+      const eur = [
+        item(91, 'Shared Report', 'shared-report|EUR'),
+        item(92, 'Twin Report', 'twin-a|EUR'),
+        item(93, 'Twin Report', 'twin-b|EUR'),
+        item(94, 'Shared Report', 'shared-report|EUR', {
+          current: makeItemOverlay({ historical: true, data_status_now: 'live' }),
+        }),
+        item(95, 'Shared Report', 'shared-report|EUR', {
+          current: makeItemOverlay({ held_now: true, data_status_now: 'live' }),
+        }),
+      ];
+      const usd = [item(96, 'Shared Report', 'shared-report|USD')];
+      await renderWhitePapers(
+        makeSection('white_papers', {
+          groups: [
+            makeGroup({ key: 'cohort:EUR', title: 'EUR', items: eur }),
+            makeGroup({ key: 'cohort:USD', title: 'USD', items: usd }),
+          ],
+        }),
+      );
+      fireEvent.click(
+        screen.getByRole('button', { name: 'Held until discrepancies are resolved (1)' }),
+      );
+
+      const expected = [
+        'Show details for Shared Report (EUR)',
+        'Show details for Twin Report (EUR, twin-a|EUR)',
+        'Show details for Twin Report (EUR, twin-b|EUR)',
+        'Show details for Shared Report (EUR, computed from replaced data)',
+        'Show details for Shared Report (EUR, held until discrepancies are resolved)',
+        'Show details for Shared Report (USD)',
+      ];
+      // getByRole fails on a second match, so each name belongs to exactly one toggle.
+      for (const name of expected) {
+        expect(screen.getByRole('button', { name }).getAttribute('aria-expanded')).toBe('false');
+      }
+      const toggles = Array.from(
+        document.querySelectorAll('td.ds-datatable__toggle-cell button'),
+        (button) => button.textContent,
+      );
+      expect(toggles).toEqual(expected);
+      expect(new Set(toggles).size).toBe(toggles.length);
+      // The captions and row headers keep the plain name.
+      expect(
+        within(table('White papers (EUR)'))
+          .getAllByRole('rowheader')
+          .map((cell) => cell.textContent),
+      ).toEqual(['Shared Report', 'Twin Report', 'Twin Report']);
+    });
+
+    it('names a shared-name row by its item id when its asset has no id', async () => {
+      const blank = (id: number) =>
+        whitePaperItem(
+          id,
+          { name: 'Nameless Twin', id: '' },
+          makeEvidence({ extra: { cohort: { currency: 'EUR' } } }),
+        );
+      await renderWhitePapers(
+        makeSection('white_papers', {
+          groups: [makeGroup({ key: 'cohort:EUR', title: 'EUR', items: [blank(97), blank(98)] })],
+        }),
+      );
+
+      expect(
+        screen.getByRole('button', { name: 'Show details for Nameless Twin (EUR, item 97)' }),
+      ).toBeTruthy();
+      expect(
+        screen.getByRole('button', { name: 'Show details for Nameless Twin (EUR, item 98)' }),
+      ).toBeTruthy();
+    });
+
+    it('holds Asset and Action open, keeps Asset and Creative in view, and leaves the figures to their content', async () => {
+      await renderDefault();
+
+      const eur = table('White papers (EUR)');
+      const columnHeaders = within(eur).getAllByRole('columnheader');
+      const assetHeader = columnHeaders.find((header) => header.textContent === 'Asset');
+      const actionHeader = columnHeaders.at(-1);
+      expect(assetHeader?.classList).toContain('ds-datatable__cell--min-md');
+      expect(assetHeader?.classList).toContain('ds-datatable__cell--sticky');
+      expect(actionHeader?.textContent).toBe('Action');
+      expect(actionHeader?.classList).toContain('ds-datatable__cell--min-md');
+      expect(actionHeader?.classList).not.toContain('ds-datatable__cell--sticky');
+      for (const cells of bodyCells(eur)) {
+        expect(cells[1]?.tagName).toBe('TH');
+        expect(cells[1]?.classList).toContain('ds-datatable__cell--sticky');
+        expect(cells.at(-1)?.classList).toContain('ds-datatable__cell--min-md');
+        for (const figure of cells.slice(2, -1)) {
+          expect(figure.className).toBe('ds-datatable__cell ds-datatable__cell--end');
+        }
+      }
+      expect(eur.querySelectorAll('.ds-datatable__cell--sticky')).toHaveLength(
+        1 + bodyCells(eur).length,
+      );
+
+      fireEvent.click(
+        screen.getByRole('button', { name: 'Show details for The 2026 B2B Pipeline Report (EUR)' }),
+      );
+      const perCreative = table('Per creative: The 2026 B2B Pipeline Report');
+      for (const cells of bodyCells(perCreative)) {
+        expect(cells[0]?.classList).toContain('ds-datatable__cell--sticky');
+        expect(cells[0]?.className).not.toMatch(/ds-datatable__cell--min-/u);
+      }
+    });
+
+    it('sets the asset and per-creative tables compact, and leaves the evidence table at the default density', async () => {
+      await renderDefault();
+
+      for (const caption of ['White papers (EUR)', 'White papers (USD)']) {
+        expect(table(caption).className).toBe('ds-datatable ds-datatable--compact');
+        // Compact changes no column, header or order: the AAP 0.5.5 columns stay as they are.
+        expect(headers(table(caption))).toEqual(assetHeaders(MQL_BOUND));
+      }
+
+      fireEvent.click(
+        screen.getByRole('button', { name: 'Show details for The 2026 B2B Pipeline Report (EUR)' }),
+      );
+
+      expect(table('Per creative: The 2026 B2B Pipeline Report').className).toBe(
+        'ds-datatable ds-datatable--compact',
+      );
+      expect(table('Evidence for The 2026 B2B Pipeline Report').className).toBe('ds-datatable');
+    });
+
+    it("shows a '—' cost's reason as the cell's wrapping note after the dash, in the table and per creative", async () => {
+      await renderDefault();
+
+      const [cells] = bodyCells(table('White papers (USD)'));
+      for (const [key, note] of [
+        ['cost_per_ql', '(no QL yet)'],
+        ['cost_per_meeting', '(no meetings yet)'],
+      ] as const) {
+        const cell = cells?.[cellIndex(key)];
+        expect(cell?.className).toBe('ds-datatable__cell ds-datatable__cell--end');
+        expect(Array.from(cell?.childNodes ?? [], (node) => node.textContent)).toEqual([
+          '—',
+          ' ',
+          note,
+        ]);
+        expect(cell?.querySelector(':scope > .ds-datatable__cell-note')?.textContent).toBe(note);
+      }
+      // A figure carries no note.
+      expect(cells?.[cellIndex('spend')]?.querySelector('.ds-datatable__cell-note')).toBeNull();
+
+      fireEvent.click(
+        screen.getByRole('button', { name: 'Show details for Paid Media Benchmarks 2026 (USD)' }),
+      );
+      const notes = Array.from(
+        table('Per creative: Paid Media Benchmarks 2026').querySelectorAll(
+          'td > .ds-datatable__cell-note',
+        ),
+        (span) => [span.parentElement?.firstChild?.textContent, span.textContent],
+      );
+      expect(notes.length).toBeGreaterThan(0);
+      for (const [value, note] of notes) {
+        expect(value).toBe('—');
+        expect(note).toMatch(/^\(.+\)$/u);
+      }
+    });
+  });
+
   describe('the simulated-data label', () => {
     it("labels each collapsed row of simulated data in its Asset cell, in the flag's own words", async () => {
       await renderDefault();
 
-      for (const [caption, cells] of [
+      for (const [currency, cells] of [
         [
-          'White papers (EUR)',
+          'EUR',
           [
             ['The 2026 B2B Pipeline Report', PIPELINE_EUR_ASSET],
             ['The Attribution Playbook', simulatedAsset('The Attribution Playbook')],
           ],
         ],
-        [
-          'White papers (USD)',
-          [['Paid Media Benchmarks 2026', simulatedAsset('Paid Media Benchmarks 2026')]],
-        ],
+        ['USD', [['Paid Media Benchmarks 2026', simulatedAsset('Paid Media Benchmarks 2026')]]],
       ] as const) {
-        const cohort = table(caption);
+        const cohort = table(`White papers (${currency})`);
         for (const [name, text] of cells) {
           const cell = assetCell(cohort, name);
           expect(cell.textContent).toBe(text);
           expect(within(cell).getByText(SIMULATED_LINKEDIN_HUBSPOT)).toBeTruthy();
           // Nothing was expanded to show it, and the toggle keeps the plain name.
-          const toggle = within(cohort).getByRole('button', { name: `Details for ${name}` });
+          const toggle = within(cohort).getByRole('button', {
+            name: `Show details for ${name} (${currency})`,
+          });
           expect(toggle.getAttribute('aria-expanded')).toBe('false');
           expect(screen.queryByRole('table', { name: `Per creative: ${name}` })).toBeNull();
         }
@@ -913,9 +1124,9 @@ describe('WhitePapersSection', () => {
       // A row of live data only carries no label.
       expect(assetCell(cohort, 'Live Data Report').textContent).toBe('Live Data Report');
       expect(bodyRows(cohort).map((row) => row[0])).toEqual([
-        'Details for Mixed Data Report',
-        'Details for Recorded Simulation Report',
-        'Details for Live Data Report',
+        'Show details for Mixed Data Report (EUR)',
+        'Show details for Recorded Simulation Report (EUR)',
+        'Show details for Live Data Report (EUR)',
       ]);
     });
 
@@ -1024,7 +1235,9 @@ describe('WhitePapersSection', () => {
       expect(sectionBanners()).toEqual([]);
       // Expanding changes no Asset cell, and the toggle keeps the plain name.
       expect(assetCell(eur, 'Pipeline Report').textContent).toBe('Pipeline Report');
-      expect(within(eur).getByRole('button', { name: 'Details for Pipeline Report' })).toBeTruthy();
+      expect(
+        within(eur).getByRole('button', { name: 'Hide details for Pipeline Report (EUR)' }),
+      ).toBeTruthy();
     });
 
     it('reports the notes of rows computed from replaced data and of held rows on those rows', async () => {
@@ -1306,7 +1519,7 @@ describe('WhitePapersSection', () => {
       ]);
       expect(row?.[cellIndex('cost_per_ql')]).toBe('≤ USD\u00a01,216.24');
       expect(row?.[cellIndex('cost_per_meeting')]).toBe('≤ USD\u00a02,432.47');
-      const toggle = within(usd).getByRole('button', { name: `Details for ${name}` });
+      const toggle = within(usd).getByRole('button', { name: `Show details for ${name} (USD)` });
       expect(toggle.getAttribute('aria-expanded')).toBe('false');
       expect(screen.queryByRole('table', { name: `Per creative: ${name}` })).toBeNull();
 
@@ -1399,12 +1612,14 @@ describe('WhitePapersSection', () => {
       expect(headers(table('White papers (EUR)'))).toEqual(assetHeaders(MQL_BOUND));
       expect(headers(table('White papers (USD)'))).toEqual(assetHeaders(MQL_BOUND));
       expect(headers(table('White papers (GBP)'))).toEqual(assetHeaders('MQL (Demo held)'));
-      fireEvent.click(screen.getByRole('button', { name: 'Details for The 2026 B2B Pipeline Report' }));
+      fireEvent.click(
+        screen.getByRole('button', { name: 'Show details for The 2026 B2B Pipeline Report (EUR)' }),
+      );
       expect(headers(table('Per creative: The 2026 B2B Pipeline Report'))).toEqual([
         'Creative',
         ...metricHeaders(MQL_BOUND),
       ]);
-      fireEvent.click(screen.getByRole('button', { name: 'Details for UK Report' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Show details for UK Report (GBP)' }));
       expect(headers(table('Per creative: UK Report'))).toEqual([
         'Creative',
         ...metricHeaders('MQL (Demo held)'),
@@ -1466,8 +1681,8 @@ describe('WhitePapersSection', () => {
 
       expect(headers(table('White papers (EUR)'))).toEqual(assetHeaders('MQL'));
       // Each row's own frozen label heads its per-creative table.
-      fireEvent.click(screen.getByRole('button', { name: 'Details for First Binding Report' }));
-      fireEvent.click(screen.getByRole('button', { name: 'Details for Second Binding Report' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Show details for First Binding Report (EUR)' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Show details for Second Binding Report (EUR)' }));
       expect(headers(table('Per creative: First Binding Report'))).toContain(MQL_BOUND);
       expect(headers(table('Per creative: Second Binding Report'))).toContain('MQL (Demo held)');
     });
@@ -1614,7 +1829,11 @@ describe('WhitePapersSection', () => {
       expect(screen.queryByRole('link', { name: 'View open discrepancies' })).toBeNull();
 
       // The expanded details do not repeat the hold notice: the row shows its blocker once.
-      fireEvent.click(within(held).getByRole('button', { name: 'Details for The Attribution Playbook' }));
+      fireEvent.click(
+        within(held).getByRole('button', {
+          name: 'Show details for The Attribution Playbook (EUR, held until discrepancies are resolved)',
+        }),
+      );
       const details = detailCell('The Attribution Playbook');
       expect(within(details).queryByText(reason)).toBeNull();
       expect(
@@ -1649,7 +1868,11 @@ describe('WhitePapersSection', () => {
       ).toBe('#group-campaigns-discrepancies');
       expect(screen.queryByRole('link', { name: /^View blocking discrepancy/u })).toBeNull();
 
-      fireEvent.click(within(held).getByRole('button', { name: 'Details for The Attribution Playbook' }));
+      fireEvent.click(
+        within(held).getByRole('button', {
+          name: 'Show details for The Attribution Playbook (EUR, held until discrepancies are resolved)',
+        }),
+      );
       expect(
         within(detailCell('The Attribution Playbook')).queryByRole('link', {
           name: /^View (blocking|open) discrepanc/u,
@@ -1688,7 +1911,9 @@ describe('WhitePapersSection', () => {
       expect(row?.at(-1)).toBe('Insufficient dataComputed from replaced data');
 
       fireEvent.click(
-        within(historical).getByRole('button', { name: 'Details for Paid Media Benchmarks 2026' }),
+        within(historical).getByRole('button', {
+          name: 'Show details for Paid Media Benchmarks 2026 (USD, computed from replaced data)',
+        }),
       );
       const details = table('Per creative: Paid Media Benchmarks 2026').closest('td');
       if (details === null) {
@@ -1808,7 +2033,7 @@ describe('WhitePapersSection', () => {
           groups: [makeGroup({ key: 'cohort:EUR', title: 'EUR', items })],
         }),
       );
-      fireEvent.click(screen.getByRole('button', { name: `Details for ${name}` }));
+      fireEvent.click(screen.getByRole('button', { name: `Show details for ${name} (EUR)` }));
       const details = table(`Per creative: ${name}`).closest('td');
       if (details === null) {
         throw new Error(`no detail cell for ${name}`);
@@ -1895,7 +2120,9 @@ describe('WhitePapersSection', () => {
     it("never shows a count as 0 while the asset's own metric is unavailable", async () => {
       // The fixture's USD row: MQL unavailable, so its recorded 0 is not shown.
       await renderDefault();
-      fireEvent.click(screen.getByRole('button', { name: 'Details for Paid Media Benchmarks 2026' }));
+      fireEvent.click(
+        screen.getByRole('button', { name: 'Show details for Paid Media Benchmarks 2026 (USD)' }),
+      );
       const usd = table('Per creative: Paid Media Benchmarks 2026').closest('td');
       if (usd === null) {
         throw new Error('no detail cell for Paid Media Benchmarks 2026');
@@ -1908,7 +2135,9 @@ describe('WhitePapersSection', () => {
       ]);
       // The EUR double-down row: its skipped-stage note first, then one contact already MQL
       // before its touch, then the rest of what the causal check excluded and the orphan share.
-      fireEvent.click(screen.getByRole('button', { name: 'Details for The 2026 B2B Pipeline Report' }));
+      fireEvent.click(
+        screen.getByRole('button', { name: 'Show details for The 2026 B2B Pipeline Report (EUR)' }),
+      );
       const eur = table('Per creative: The 2026 B2B Pipeline Report').closest('td');
       if (eur === null) {
         throw new Error('no detail cell for The 2026 B2B Pipeline Report');
@@ -1995,8 +2224,13 @@ describe('WhitePapersSection', () => {
       const rows = bodyRows(table('White papers (EUR)'));
       const unavailableCells = Array.from({ length: 9 }, () => 'unavailable');
       expect(rows).toEqual([
-        ['Details for orphan-asset|EUR', 'orphan-asset|EUR', ...unavailableCells, 'No change warranted'],
-        ['Details for White paper 65', 'White paper 65', ...unavailableCells, 'No change warranted'],
+        [
+          'Show details for orphan-asset|EUR (EUR)',
+          'orphan-asset|EUR',
+          ...unavailableCells,
+          'No change warranted',
+        ],
+        ['Show details for White paper 65 (EUR)', 'White paper 65', ...unavailableCells, 'No change warranted'],
       ]);
       // A blank overlap note falls back to the backend's wording.
       expect(listEntries(document.body, 'Notes on the EUR white papers').slice(0, 2)).toEqual([
@@ -2004,7 +2238,7 @@ describe('WhitePapersSection', () => {
         'counts overlap across assets',
       ]);
 
-      fireEvent.click(screen.getByRole('button', { name: 'Details for orphan-asset|EUR' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Show details for orphan-asset|EUR (EUR)' }));
       const perCreative = table('Per creative: orphan-asset|EUR');
       expect(within(perCreative).getByText('No per-creative rows recorded for this white paper')).toBeTruthy();
       const details = perCreative.closest('td');
@@ -2019,7 +2253,7 @@ describe('WhitePapersSection', () => {
       expect(within(details).queryByText(/^Sample:/u)).toBeNull();
       expect(within(details).queryByRole('list', { name: 'Thresholds applied' })).toBeNull();
 
-      fireEvent.click(screen.getByRole('button', { name: 'Details for White paper 65' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Show details for White paper 65 (EUR)' }));
       const sparse = table('Evidence for White paper 65').closest('td');
       if (sparse === null) {
         throw new Error('no detail cell');
@@ -2163,7 +2397,7 @@ describe('long white-paper tables', () => {
     ]);
 
     // The expanded asset's per-creative table is bounded too, "unknown creative" kept last.
-    fireEvent.click(screen.getByRole('button', { name: 'Details for EUR asset 1' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Show details for EUR asset 1 (EUR)' }));
     const perCreative = table('Per creative: EUR asset 1');
     const creativeNames = (count: number) =>
       Array.from({ length: count }, (_, index) => `Creative ${String(index + 1)}`);
@@ -2292,8 +2526,9 @@ describe('WhitePapersSection rendered again', () => {
   it('keeps an expanded row open, with focus on its toggle, when a newer run gives its assets new ids', async () => {
     const section = defaultWhitePapers();
     const show = await renderReplaceable(section);
-    const name = 'Details for The 2026 B2B Pipeline Report';
-    const toggle = screen.getByRole('button', { name });
+    const toggle = screen.getByRole('button', {
+      name: 'Show details for The 2026 B2B Pipeline Report (EUR)',
+    });
     fireEvent.click(toggle);
     toggle.focus();
     expect(toggle.getAttribute('aria-expanded')).toBe('true');
@@ -2301,7 +2536,9 @@ describe('WhitePapersSection rendered again', () => {
 
     show(newerRun(section));
 
-    expect(screen.getByRole('button', { name })).toBe(toggle);
+    expect(
+      screen.getByRole('button', { name: 'Hide details for The 2026 B2B Pipeline Report (EUR)' }),
+    ).toBe(toggle);
     expect(toggle.getAttribute('aria-expanded')).toBe('true');
     expect(document.activeElement).toBe(toggle);
     const details = table('Per creative: The 2026 B2B Pipeline Report').closest('td');
@@ -2318,7 +2555,7 @@ describe('WhitePapersSection rendered again', () => {
     const creatives = vi.spyOn(evidenceExtraModule, 'creativeRows');
     const show = await renderReplaceable(section);
     fireEvent.click(
-      screen.getByRole('button', { name: 'Details for The 2026 B2B Pipeline Report' }),
+      screen.getByRole('button', { name: 'Show details for The 2026 B2B Pipeline Report (EUR)' }),
     );
     const caption = 'Per creative: The 2026 B2B Pipeline Report';
     expect(within(table(caption)).getByText('Variant A')).toBeTruthy();
@@ -2373,10 +2610,10 @@ describe('WhitePapersSection: the confirmation of a row hidden on the page', () 
       { path: '/actions' },
     );
     const name = String(item.entity.name);
-    fireEvent.click(await screen.findByRole('button', { name: `Details for ${name}` }));
+    fireEvent.click(await screen.findByRole('button', { name: rowToggle(name) }));
     fireEvent.click(await screen.findByRole('button', { name: action }));
     await waitFor(() => {
-      expect(screen.queryByRole('button', { name: `Details for ${name}` })).toBeNull();
+      expect(screen.queryByRole('button', { name: rowToggle(name) })).toBeNull();
     });
     return flow;
   }

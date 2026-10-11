@@ -15,6 +15,10 @@
  *   the default run's display time zone (UTC until a run names one) with its ISO 8601 value in
  *   `<time dateTime>`;
  * - the white paper registry and `config_hash`;
+ * - table sizing: only the key, mode, property, reason, slug and URN columns break unbroken tokens
+ *   anywhere, the resolved stage id never breaks, and the column shares that keep identifiers
+ *   whole at desktop widths: binding, property and reason in the resolved tables, and the
+ *   registry's title, with the resolved property and reason held at a minimum width;
  * - the read-only contract (no control, no request but `GET /config` and, while an instant is on
  *   screen, `GET /runs/latest`), text lines that are never paragraphs, loading, failure, and a
  *   failed background refresh that keeps the last configuration under a non-alert "Settings
@@ -788,6 +792,132 @@ describe('SettingsPage', () => {
           "Stored on every analysis run, so a run's evidence can be traced to this configuration.",
         ),
       ).toBeTruthy();
+    });
+  });
+
+  describe('table sizing', () => {
+    /**
+     * Each column's header text paired with whether every one of its body cells may break
+     * unbroken tokens anywhere (the DataTable `wrap: 'anywhere'` class), in column order.
+     */
+    function breakAnywhereColumns(tableElement: HTMLElement): [string, boolean][] {
+      const rows = within(tableElement).getAllByRole('row').slice(1);
+      return headers(tableElement).map((header, index): [string, boolean] => [
+        header,
+        rows.every((row) =>
+          row.children[index]?.classList.contains('ds-datatable__cell--wrap-anywhere'),
+        ),
+      ]);
+    }
+
+    it('lets only the key, mode, property, reason, slug and URN columns break tokens', async () => {
+      stubConfig();
+      await renderLoaded();
+
+      expect(breakAnywhereColumns(table('Analysis window settings'))).toEqual([
+        ['Setting', false],
+        ['Key', true],
+        ['Value', false],
+      ]);
+      expect(breakAnywhereColumns(table('Thresholds'))).toEqual([
+        ['Key', true],
+        ['Value', false],
+      ]);
+      expect(breakAnywhereColumns(table('MQL and Qualified Lead bindings'))).toEqual([
+        ['Count', false],
+        ['Mode', true],
+        ['Stage label(s)', false],
+        ['Property', true],
+      ]);
+      const resolved: [string, boolean][] = [
+        ['Binding', false],
+        ['Status', false],
+        ['Matched label', false],
+        ['Stage id', false],
+        ['Property', true],
+        ['Reason', true],
+      ];
+      const primary = table('Resolved stage properties (HubSpot)');
+      expect(breakAnywhereColumns(primary)).toEqual(resolved);
+      // A stage id never breaks, so it needs no minimum width to keep a numeric id on one line.
+      const stageIdCells = within(primary)
+        .getAllByRole('row')
+        .map((row) => row.children[3]);
+      expect(stageIdCells).toHaveLength(5);
+      for (const cell of stageIdCells) {
+        expect(cell?.className).not.toMatch(/ds-datatable__cell--min-/u);
+      }
+      // The property and reason hold the 'md' minimum, so a narrow region scrolls the table
+      // rather than splitting an identifier into a few characters per line.
+      for (const row of within(primary).getAllByRole('row')) {
+        for (const index of [4, 5]) {
+          expect(row.children[index]?.classList.contains('ds-datatable__cell--min-md')).toBe(true);
+        }
+      }
+      const companionSection = subsection('Resolved stage properties (simulated companion)');
+      expect(
+        breakAnywhereColumns(
+          table('Resolved stage properties (simulated companion)', companionSection),
+        ),
+      ).toEqual(resolved);
+      expect(breakAnywhereColumns(table('White paper registry'))).toEqual([
+        ['Slug', true],
+        ['Title', false],
+        ['Lead forms', true],
+        ['Creative overrides', true],
+      ]);
+      // Headers keep breaking between words only, and no status chip is ever split mid-word.
+      for (const header of screen.getAllByRole('columnheader')) {
+        expect(header.classList.contains('ds-datatable__cell--wrap-anywhere')).toBe(false);
+      }
+    });
+
+    /**
+     * Each column's header text paired with its share of the table's width in twelfths, the
+     * DataTable `share` prop that renders as a `ds-datatable__col--share-{n}` class on the
+     * column's `<col>`, or `null` for a column without one, in column order.
+     */
+    function columnShares(tableElement: HTMLElement): [string, number | null][] {
+      const cols = Array.from(tableElement.querySelectorAll('colgroup > col'));
+      return headers(tableElement).map((header, index): [string, number | null] => {
+        const share = /^ds-datatable__col--share-(\d+)$/u.exec(cols[index]?.className ?? '');
+        return [header, share === null ? null : Number(share[1])];
+      });
+    }
+
+    it('shares the width so identifiers stay whole wherever the table has room', async () => {
+      stubConfig();
+      await renderLoaded();
+
+      // Property and reason take a third each and the binding a sixth; the rest keep their
+      // content's width.
+      const resolved: [string, number | null][] = [
+        ['Binding', 2],
+        ['Status', null],
+        ['Matched label', null],
+        ['Stage id', null],
+        ['Property', 4],
+        ['Reason', 4],
+      ];
+      expect(columnShares(table('Resolved stage properties (HubSpot)'))).toEqual(resolved);
+      const companionSection = subsection('Resolved stage properties (simulated companion)');
+      expect(
+        columnShares(table('Resolved stage properties (simulated companion)', companionSection)),
+      ).toEqual(resolved);
+      // The title wraps within a sixth, leaving the rest to the slug and URN columns.
+      expect(columnShares(table('White paper registry'))).toEqual([
+        ['Slug', null],
+        ['Title', 2],
+        ['Lead forms', null],
+        ['Creative overrides', null],
+      ]);
+      for (const caption of [
+        'Analysis window settings',
+        'Thresholds',
+        'MQL and Qualified Lead bindings',
+      ]) {
+        expect(table(caption).querySelector('colgroup')).toBeNull();
+      }
     });
   });
 

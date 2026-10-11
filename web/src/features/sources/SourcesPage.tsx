@@ -426,6 +426,8 @@ function activeDatasetRows(source: Source): ActiveDatasetRow[] {
 /**
  * The columns of the active-datasets table. Mode and state are printed as the API returns them.
  * The numeric ID is end-aligned in tabular figures, as Rows is in the recent sync runs table.
+ * The reason may break between any two characters, so an unbroken token in it, such as a
+ * dataset or variable name, wraps inside the region instead of widening the table.
  *
  * @param displayTimezone - the IANA zone instants are shown in
  * @returns Dataset (row header), ID (end-aligned), Mode, State, Activated and Reason
@@ -447,6 +449,7 @@ function activeDatasetColumns(displayTimezone: string): DataTableColumn<ActiveDa
     {
       key: 'reason',
       header: 'Reason',
+      wrap: 'anywhere',
       render: (row) => visibleText(row.dataset.reason) ?? EM_DASH,
     },
   ];
@@ -541,7 +544,9 @@ function dayBoundaryLine(source: SourceName, dayBoundary: string | null): string
  *   display zone has a slash;
  * - Reason (12): a reason of about 45 characters on two lines.
  *
- * Headers wrap between words in these columns.
+ * Headers wrap between words in these columns, and a cell's text may break between any two
+ * characters, so an unbroken token longer than its column, such as a long reason's variable
+ * name, wraps inside the column instead of widening the table.
  *
  * @param displayTimezone - the IANA zone instants are shown in
  * @param source - the source whose datasets the table lists
@@ -611,7 +616,12 @@ function freshnessColumns(
 
 /**
  * The columns of the recent sync runs table. Job, dataset, status and completeness are printed as
- * the API returns them; a run still in progress reads "Running" in Finished.
+ * the API returns them; a run still in progress reads "Running" in Finished. The dataset and the
+ * error may break between any two characters, as in the freshness table; the job, a single word,
+ * breaks only between words. The dataset column takes a quarter of the table's width (its
+ * `share`), so its names stay whole at desktop widths: without the share, a column that may
+ * break anywhere is squeezed below its names whenever the other columns wrap. In a narrow region
+ * the share yields to the other columns' minimums, and only there does a name break.
  *
  * @param displayTimezone - the IANA zone instants are shown in
  * @returns Job, Dataset, Started, Finished, Status, Rows (end-aligned), Completeness and Error
@@ -619,7 +629,13 @@ function freshnessColumns(
 function syncRunColumns(displayTimezone: string): DataTableColumn<SyncRunView>[] {
   return [
     { key: 'job', header: 'Job', isRowHeader: true, render: (run) => run.job },
-    { key: 'dataset', header: 'Dataset', render: (run) => visibleText(run.dataset) ?? EM_DASH },
+    {
+      key: 'dataset',
+      header: 'Dataset',
+      share: 3,
+      wrap: 'anywhere',
+      render: (run) => visibleText(run.dataset) ?? EM_DASH,
+    },
     {
       key: 'started_at',
       header: 'Started',
@@ -638,7 +654,12 @@ function syncRunColumns(displayTimezone: string): DataTableColumn<SyncRunView>[]
       header: 'Completeness',
       render: (run) => (run.completeness === null ? EM_DASH : completenessBadge(run.completeness)),
     },
-    { key: 'error', header: 'Error', render: (run) => visibleText(run.error) ?? EM_DASH },
+    {
+      key: 'error',
+      header: 'Error',
+      wrap: 'anywhere',
+      render: (run) => visibleText(run.error) ?? EM_DASH,
+    },
   ];
 }
 

@@ -237,8 +237,18 @@ const CARD_BATCH_SIZE = 20;
 /** A batched list's reveal button: "Show 20 more actions", "Show 1 more creative". */
 const SHOW_MORE_BUTTON = /^Show \d[\d,]* more \S/u;
 
-/** A white-paper row's expand toggle, "Details for {asset}" (`WhitePapersSection.tsx`). */
-const DETAILS_TOGGLE = /^Details for /u;
+/**
+ * A white-paper row's expand toggle, named "Show details for {asset} ({scope})" while collapsed
+ * and "Hide details for …" while expanded (`DataTable.tsx`, `rowLabelOf` in
+ * `WhitePapersSection.tsx`).
+ */
+const DETAILS_TOGGLE = /^(?:Show|Hide) details for /u;
+
+/** The caption suffix, and toggle scope qualifier, of a cohort's replaced-data table. */
+const REPLACED_TABLE_QUALIFIER = 'computed from replaced data';
+
+/** The caption suffix, and toggle scope qualifier, of a cohort's held table. */
+const HELD_TABLE_QUALIFIER = 'held until discrepancies are resolved';
 
 /** The most presses one reveal makes, so controls that never settle fail the step. */
 const REVEAL_LIMIT = 500;
@@ -719,7 +729,7 @@ async function sectionNavCount(page: Page, key: SectionKey): Promise<number> {
  * re-read after every press, because a press reveals new ones.
  *
  * @param container - the section, group or tab panel to open
- * @param options - `expandRows`: also expand every "Details for {asset}" row
+ * @param options - `expandRows`: also expand every white-paper row from its "Show details" toggle
  * @returns how many presses it took
  */
 async function revealAll(
@@ -1511,9 +1521,40 @@ async function expectSectionCards(
 /** One asset table a cohort renders: its caption, its rows' items in order, its MQL header. */
 interface ExpectedAssetTable {
   caption: string;
+  /**
+   * What its rows' toggle names add after the asset, in parentheses: the cohort's currency,
+   * followed for the replaced-data and held tables by the table's qualifier.
+   */
+  scope: string;
   items: Item[];
   /** The MQL header the rows' frozen evidence records; `null` when none records one. */
   mql: string | null;
+}
+
+/**
+ * The name of an expanded white-paper row's toggle, independently of `rowLabelOf` in
+ * `WhitePapersSection.tsx`: "Hide details for {asset} ({scope})", and, when another row of the
+ * table shows the same asset name, "Hide details for {asset} ({scope}, {asset id})", the item
+ * id standing in for a blank asset id.
+ */
+function expandedToggleName(table: ExpectedAssetTable, item: Item): string {
+  const name = assetName(item);
+  const shared = table.items.filter((other) => assetName(other) === name).length > 1;
+  const entityId = item.entity.id?.trim() ?? '';
+  const id = entityId === '' ? `item ${String(item.id)}` : entityId;
+  return `Hide details for ${name} (${shared ? `${table.scope}, ${id}` : table.scope})`;
+}
+
+/**
+ * Either state's name of the toggle of a white-paper row named `name` in a table of `scope`,
+ * matched in full: "Show details for {name} ({scope})" or "Hide details for …", with any
+ * shared-name id after the scope.
+ */
+function detailsTogglePattern(name: string, scope: string): RegExp {
+  return new RegExp(
+    `^(?:Show|Hide) details for ${escapeRegExp(name)} \\(${escapeRegExp(scope)}(?:, [^()]*)?\\)$`,
+    'u',
+  );
 }
 
 /** "MQL ({label})", or "MQL" for a blank label or one that repeats it (`headerForLabel`). */
@@ -1565,6 +1606,15 @@ function cohortCurrency(group: Group): string {
 }
 
 /**
+ * The currency of the cohort an item belongs to, read from the item alone in the order
+ * {@link cohortCurrency} reads its group: its cross-asset view's, else the first currency its
+ * evidence names, else `fallback`, such as its group's title.
+ */
+function itemCurrency(item: Item, fallback: string): string {
+  return cohortSummary(item)?.currency ?? evidenceCurrency(item) ?? fallback;
+}
+
+/**
  * The asset tables one cohort renders, in order (AAP 0.5.5, 0.3.2): its visible rows, its rows
  * computed from replaced data, then the rows held behind its disclosure; hidden rows are only
  * counted.
@@ -1576,9 +1626,17 @@ function cohortTables(group: Group): ExpectedAssetTable[] {
   const visible = shown.filter((item) => !item.current.historical && !isHeld(item));
   const currency = cohortCurrency(group);
   return [
-    { caption: `White papers (${currency})`, items: visible },
-    { caption: `White papers (${currency}) computed from replaced data`, items: historical },
-    { caption: `White papers (${currency}) held until discrepancies are resolved`, items: held },
+    { caption: `White papers (${currency})`, scope: currency, items: visible },
+    {
+      caption: `White papers (${currency}) ${REPLACED_TABLE_QUALIFIER}`,
+      scope: `${currency}, ${REPLACED_TABLE_QUALIFIER}`,
+      items: historical,
+    },
+    {
+      caption: `White papers (${currency}) ${HELD_TABLE_QUALIFIER}`,
+      scope: `${currency}, ${HELD_TABLE_QUALIFIER}`,
+      items: held,
+    },
   ]
     .filter((table) => table.items.length > 0)
     .map((table) => ({ ...table, mql: tableMqlHeader(table.items) }));
@@ -1872,8 +1930,8 @@ async function expectWhitePaperRows(
     );
     expect(
       table.rows.map((row) => row.toggle?.label),
-      `"${cohort.caption}" lists its assets in API order, each with its toggle`,
-    ).toEqual(cohort.items.map((item) => `Details for ${assetName(item)}`));
+      `"${cohort.caption}" lists its assets in API order, each with its expanded toggle`,
+    ).toEqual(cohort.items.map((item) => expandedToggleName(cohort, item)));
     cohort.items.forEach((item, rowIndex) => {
       const name = assetName(item);
       const where =
@@ -2157,9 +2215,11 @@ function expectEdgeCaseCard(card: RenderedCard | undefined, currency: string): v
 /** Checks, literally, how the white-paper row {@link editAsset} edited renders. */
 function expectEdgeCaseAsset(tables: readonly RenderedTable[], asset: Item): void {
   const name = assetName(asset);
+  // The edited asset is open, so it sits in its cohort's table of visible rows.
+  const toggle = detailsTogglePattern(name, itemCurrency(asset, ''));
   const row = tables
     .flatMap((table) => table.rows)
-    .find((each) => each.toggle?.label === `Details for ${name}`);
+    .find((each) => toggle.test(each.toggle?.label ?? ''));
   const column = (key: WhitePaperMetricKey): number => WHITE_PAPER_METRIC_KEYS.indexOf(key) + 1;
   const ql = asset.evidence.metrics.find((metric) => metric.key === 'ql')?.value;
   if (typeof ql === 'number') {
@@ -2684,9 +2744,11 @@ function noFeedbackTargetMessage(recommendations: RecommendationsPage): string {
 async function revealTarget(page: Page, target: FeedbackTarget): Promise<RevealedTarget> {
   const region = sectionRegion(page, target.sectionKey);
   if (target.sectionKey === 'white_papers') {
+    // A target is open, so its row sits in its cohort's table of visible rows; the pattern
+    // matches the toggle in either state, so the locator still resolves once it is expanded.
+    const currency = itemCurrency(target.item, target.groupTitle);
     const toggle = region.getByRole('button', {
-      name: `Details for ${assetName(target.item)}`,
-      exact: true,
+      name: detailsTogglePattern(assetName(target.item), currency),
     });
     await expect(toggle).toBeVisible({ timeout: READ_TIMEOUT_MS });
     const detailId = await toggle.getAttribute('aria-controls', { timeout: READ_TIMEOUT_MS });

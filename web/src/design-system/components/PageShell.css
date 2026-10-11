@@ -157,7 +157,10 @@
   outline: 0;
 }
 
-/* Title bar: the page heading with its actions, wrapping the actions below on narrow widths. */
+/*
+ * Title bar: the page heading with its actions, wrapping the actions below on narrow widths and
+ * keeping them at the inline end there (see the action slot below).
+ */
 .ds-pageshell__titlebar {
   display: flex;
   flex-wrap: wrap;
@@ -214,11 +217,18 @@
   font-size: var(--font-size-md);
 }
 
-/* Action slot: the title bar's or a section header's controls, wrapping onto new lines. */
+/*
+ * Action slot: the title bar's or a section header's controls, wrapping onto new lines. The auto
+ * start margin keeps it at the row's inline end: beside the heading it takes the free space as
+ * space-between would, and when a long heading wraps it onto a line of its own, where
+ * space-between would leave a lone item at the line's start, it still ends at the inline end
+ * (the right in left-to-right text, the left in right-to-left text).
+ */
 .ds-pageshell__actions {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-2);
+  margin-inline-start: auto;
 }
 
 /*

@@ -18,6 +18,10 @@
  *   (Google's account zone, LinkedIn and HubSpot UTC, "not yet known" without one), apart from
  *   the display time zone of instants;
  * - the recent sync runs, finished, running and failed;
+ * - table sizing: every freshness table, primary and companion, at the same fixed column widths,
+ *   where a token longer than its column breaks; elsewhere only reasons and the sync runs'
+ *   dataset names and errors break unbroken tokens anywhere, and the sync runs' dataset column
+ *   takes a quarter of the table's width;
  * - "Sync now": the POST with its CSRF header, the 202, 409 `sync_pending` and failure outcomes
  *   kept to their own section, one POST for two presses within one frame, the button disabled
  *   and described by its outcome or the pending hint while the API reports a pending request,
@@ -680,9 +684,12 @@ describe('SourcesPage', () => {
       expect(
         freshnessTables.every((element) => element.classList.contains('ds-datatable--fixed')),
       ).toBe(true);
-      // The other tables keep sizing their columns from their content.
+      // The other tables keep the automatic layout: the active datasets size their columns from
+      // their content, the sync runs from their content and their dataset column's share.
       expect(table(hubspot, 'HubSpot active datasets').querySelector('colgroup')).toBeNull();
-      expect(table(hubspot, 'Recent sync runs (HubSpot)').querySelector('colgroup')).toBeNull();
+      const syncRuns = table(hubspot, 'Recent sync runs (HubSpot)');
+      expect(syncRuns.classList.contains('ds-datatable--fixed')).toBe(false);
+      expect(syncRuns.querySelector('col.ds-datatable__col')).toBeNull();
     });
 
     it('shows a dataset that is not active yet as not activated, without a reason', async () => {
@@ -951,6 +958,94 @@ describe('SourcesPage', () => {
           'n8n webhook answered HTTP 502',
         ],
       ]);
+    });
+  });
+
+  describe('table sizing', () => {
+    /**
+     * Each column's header text paired with whether every one of its body cells may break
+     * unbroken tokens anywhere (the DataTable `wrap: 'anywhere'` class), in column order.
+     */
+    function breakAnywhereColumns(tableElement: HTMLElement): [string, boolean][] {
+      const rows = within(tableElement).getAllByRole('row').slice(1);
+      return headers(tableElement).map((header, index): [string, boolean] => [
+        header,
+        rows.every((row) =>
+          row.children[index]?.classList.contains('ds-datatable__cell--wrap-anywhere'),
+        ),
+      ]);
+    }
+
+    it('lets only the reasons, the sync runs\' dataset names and errors break unbroken tokens', async () => {
+      stubPage();
+      await renderLoaded();
+
+      const google = section('Google');
+      expect(breakAnywhereColumns(table(google, 'Google active datasets'))).toEqual([
+        ['Dataset', false],
+        ['ID', false],
+        ['Mode', false],
+        ['State', false],
+        ['Activated', false],
+        ['Reason', true],
+      ]);
+      // The freshness table lays out at fixed widths, where any cell breaks a token longer than its
+      // column, so none of its columns needs the class.
+      const freshness = table(google, 'Google dataset freshness');
+      expect(freshness.classList.contains('ds-datatable--fixed')).toBe(true);
+      expect(breakAnywhereColumns(freshness).filter(([, anywhere]) => anywhere)).toEqual([]);
+      expect(breakAnywhereColumns(table(google, 'Recent sync runs (Google)'))).toEqual([
+        ['Job', false],
+        ['Dataset', true],
+        ['Started', false],
+        ['Finished', false],
+        ['Status', false],
+        ['Rows', false],
+        ['Completeness', false],
+        ['Error', true],
+      ]);
+      for (const header of screen.getAllByRole('columnheader')) {
+        expect(header.classList.contains('ds-datatable__cell--wrap-anywhere')).toBe(false);
+      }
+    });
+
+    /**
+     * Each column's header text paired with its share of the table's width in twelfths, the
+     * DataTable `share` prop that renders as a `ds-datatable__col--share-{n}` class on the
+     * column's `<col>`, or `null` for a column without one, in column order.
+     */
+    function columnShares(tableElement: HTMLElement): [string, number | null][] {
+      const cols = Array.from(tableElement.querySelectorAll('colgroup > col'));
+      return headers(tableElement).map((header, index): [string, number | null] => {
+        const share = /^ds-datatable__col--share-(\d+)$/u.exec(cols[index]?.className ?? '');
+        return [header, share === null ? null : Number(share[1])];
+      });
+    }
+
+    it("gives the sync runs' dataset column a quarter of the table, so names stay whole", async () => {
+      stubPage();
+      await renderLoaded();
+
+      const syncRuns: [string, number | null][] = [
+        ['Job', null],
+        ['Dataset', 3],
+        ['Started', null],
+        ['Finished', null],
+        ['Status', null],
+        ['Rows', null],
+        ['Completeness', null],
+        ['Error', null],
+      ];
+      for (const label of ['Google', 'LinkedIn', 'HubSpot'] as const) {
+        const region = section(label);
+        expect(columnShares(table(region, `Recent sync runs (${label})`))).toEqual(syncRuns);
+        // The freshness tables take fixed widths instead, which no share joins.
+        expect(
+          table(region, `${label} dataset freshness`).querySelector('[class*="col--share-"]'),
+        ).toBeNull();
+        // The active-datasets table holds no dataset name, so it keeps its content-sized columns.
+        expect(table(region, `${label} active datasets`).querySelector('colgroup')).toBeNull();
+      }
     });
   });
 

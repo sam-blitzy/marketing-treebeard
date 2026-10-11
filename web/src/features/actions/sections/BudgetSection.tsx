@@ -69,7 +69,12 @@ import {
   formatMoney,
   isDecimalString,
 } from '../../../lib/format';
-import { evidenceRatioDigits } from '../EvidenceTable';
+import {
+  BASELINE_SHARE,
+  METRIC_SHARE,
+  VALUE_SHARE,
+  evidenceRatioDigits,
+} from '../EvidenceTable';
 import { RecommendationCard } from '../RecommendationCard';
 import {
   allocations,
@@ -307,19 +312,38 @@ interface DayRow extends DayCount {
   readonly rowKey: string;
 }
 
-/** The columns of the "Budget days" table: the day type as row header, then the two counts. */
+/**
+ * The columns of the "Budget days" table: the day type as row header, then the two counts.
+ *
+ * - They take the evidence table's shares, {@link METRIC_SHARE}, {@link VALUE_SHARE} and
+ *   {@link BASELINE_SHARE} twelfths, so in the card, whose evidence table is as wide as this one,
+ *   the Observed counts end exactly where the evidence values end.
+ * - A day type label may break anywhere: the counts' one-word headers set the other two columns'
+ *   minimums, so only the label column can give way, and the table then fits its region at a
+ *   320 CSS px viewport instead of hiding the Required column (WCAG 2.2 SC 1.4.10 Reflow). The
+ *   label still breaks only between words wherever its share holds it.
+ */
 const DAY_COLUMNS: readonly DataTableColumn<DayRow>[] = Object.freeze([
-  { key: 'label', header: 'Day type', isRowHeader: true, render: (row: DayRow) => row.label },
+  {
+    key: 'label',
+    header: 'Day type',
+    isRowHeader: true,
+    share: METRIC_SHARE,
+    wrap: 'anywhere',
+    render: (row: DayRow) => row.label,
+  },
   {
     key: 'observed',
     header: 'Observed',
     align: 'end',
+    share: VALUE_SHARE,
     render: (row: DayRow) => formatCount(row.observed),
   },
   {
     key: 'required',
     header: 'Required',
     align: 'end',
+    share: BASELINE_SHARE,
     render: (row: DayRow) => (row.required === null ? EM_DASH : formatCount(row.required)),
   },
 ]);

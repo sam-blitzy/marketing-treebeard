@@ -354,9 +354,19 @@ function thresholdRows(thresholds: ConfigView['thresholds']): readonly Threshold
   }));
 }
 
-/** The thresholds table's columns: the dotted key as the row header, then the value. */
+/**
+ * The thresholds table's columns: the dotted key as the row header, then the value. The key may
+ * break between any two characters, so a long dotted key wraps inside a narrow region rather than
+ * widening the table past it (WCAG 2.2 SC 1.4.10 Reflow).
+ */
 const THRESHOLD_COLUMNS: readonly DataTableColumn<ThresholdRow>[] = [
-  { key: 'key', header: 'Key', isRowHeader: true, render: (row) => <code>{row.key}</code> },
+  {
+    key: 'key',
+    header: 'Key',
+    isRowHeader: true,
+    wrap: 'anywhere',
+    render: (row) => <code>{row.key}</code>,
+  },
   { key: 'value', header: 'Value' },
 ];
 
@@ -443,10 +453,13 @@ function windowRows(settings: WindowConfig): readonly WindowRow[] {
   ];
 }
 
-/** The window table's columns: the setting as the row header, its key and its value. */
+/**
+ * The window table's columns: the setting as the row header, its key and its value. The key may
+ * break between any two characters, as in the thresholds table.
+ */
 const WINDOW_COLUMNS: readonly DataTableColumn<WindowRow>[] = [
   { key: 'label', header: 'Setting', isRowHeader: true },
-  { key: 'key', header: 'Key', render: (row) => <code>{row.key}</code> },
+  { key: 'key', header: 'Key', wrap: 'anywhere', render: (row) => <code>{row.key}</code> },
   { key: 'value', header: 'Value', render: (row) => row.value },
 ];
 
@@ -466,17 +479,28 @@ interface MappingRow {
  * The configured bindings' columns. MQL's single `stage_label` arrives as a one-element
  * `stage_labels` list, so both rows render their labels the same way. In `stage_label` mode the
  * labels are tried in order; in `property` mode any configured labels are kept for display only
- * and shown as configured. The cell shows "—" only when the binding has no label.
+ * and shown as configured. The cell shows "—" only when the binding has no label. The mode and
+ * property identifiers may break between any two characters, so they wrap in a narrow region.
  */
 const MAPPING_COLUMNS: readonly DataTableColumn<MappingRow>[] = [
   { key: 'count', header: 'Count', isRowHeader: true },
-  { key: 'mode', header: 'Mode', render: (row) => <code>{row.binding.mode}</code> },
+  {
+    key: 'mode',
+    header: 'Mode',
+    wrap: 'anywhere',
+    render: (row) => <code>{row.binding.mode}</code>,
+  },
   {
     key: 'stage_labels',
     header: 'Stage label(s)',
     render: (row) => joinList(row.binding.stage_labels.filter(hasText), EM_DASH),
   },
-  { key: 'property', header: 'Property', render: (row) => codeOrDash(row.binding.property) },
+  {
+    key: 'property',
+    header: 'Property',
+    wrap: 'anywhere',
+    render: (row) => codeOrDash(row.binding.property),
+  },
 ];
 
 /** One row of a resolved bindings table. */
@@ -561,9 +585,24 @@ function bindingRows(bindings: CrmBindingsView): readonly BindingRow[] {
  * that keeps no display label. Qualified Lead tries its configured labels in order, so its row
  * states which one the portal resolved. The two bindings resolve independently, and only the MQL
  * binding's label heads the white-paper MQL column.
+ *
+ * The property and reason columns may break between any two characters: they hold unbroken
+ * identifiers, such as `hs_v2_date_entered_marketingqualifiedlead` or
+ * `HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY` in a reason, that would otherwise set the table wider than
+ * its region. Each takes a third of the table's width, so wherever the table has room a property
+ * such as `hs_v2_date_entered_990100000` and the reason's variable names stay whole, and only in
+ * a narrow region do they break; without a share, a column that may break anywhere is squeezed
+ * below its identifiers whenever the other columns wrap. Where the table cannot hold both whole,
+ * the reason, free text, breaks first. Each also holds the `'md'` minimum: in a region too narrow
+ * for the table's other columns, where the table scrolls anyway, an identifier then breaks into
+ * a few readable pieces rather than a handful of characters per line. The binding takes a sixth, so a name such as "Google
+ * touch-date property" keeps two lines rather than a word per line. The stage id never breaks: a
+ * lifecycle stage id is a numeric id such as `990100000` or a HubSpot stage name of at most 22
+ * characters, such as `marketingqualifiedlead`, short enough that the table still fits a desktop
+ * region with it whole.
  */
 const BINDING_COLUMNS: readonly DataTableColumn<BindingRow>[] = [
-  { key: 'binding', header: 'Binding', isRowHeader: true },
+  { key: 'binding', header: 'Binding', isRowHeader: true, share: 2 },
   {
     key: 'status',
     header: 'Status',
@@ -587,11 +626,17 @@ const BINDING_COLUMNS: readonly DataTableColumn<BindingRow>[] = [
   {
     key: 'property',
     header: 'Property',
+    share: 4,
+    minWidth: 'md',
+    wrap: 'anywhere',
     render: (row) => (row.available ? codeOrDash(row.property) : EM_DASH),
   },
   {
     key: 'reason',
     header: 'Reason',
+    share: 4,
+    minWidth: 'md',
+    wrap: 'anywhere',
     render: (row) => {
       if (hasText(row.reason)) {
         return row.reason;
@@ -686,18 +731,32 @@ function UrnList({ urns, label }: UrnListProps): ReactNode {
   );
 }
 
-/** The registry table's columns: the slug as the row header, the title and both URN lists. */
+/**
+ * The registry table's columns: the slug as the row header, the title and both URN lists. The
+ * slug and the URNs may break between any two characters, so they wrap in a narrow region; the
+ * title breaks only between words. The title takes a sixth of the table's width and wraps within
+ * it, which leaves the rest to the slug and URN columns, so at desktop widths a slug and a URN
+ * such as `urn:li:sponsoredCreative:990001301` stay whole rather than sharing the squeeze.
+ */
 const REGISTRY_COLUMNS: readonly DataTableColumn<ContentAssetView>[] = [
-  { key: 'slug', header: 'Slug', isRowHeader: true, render: (asset) => <code>{asset.slug}</code> },
-  { key: 'title', header: 'Title' },
+  {
+    key: 'slug',
+    header: 'Slug',
+    isRowHeader: true,
+    wrap: 'anywhere',
+    render: (asset) => <code>{asset.slug}</code>,
+  },
+  { key: 'title', header: 'Title', share: 2 },
   {
     key: 'lead_forms',
     header: 'Lead forms',
+    wrap: 'anywhere',
     render: (asset) => <UrnList urns={asset.lead_forms} label={`Lead forms of ${asset.slug}`} />,
   },
   {
     key: 'creative_overrides',
     header: 'Creative overrides',
+    wrap: 'anywhere',
     render: (asset) => (
       <UrnList urns={asset.creative_overrides} label={`Creative overrides of ${asset.slug}`} />
     ),

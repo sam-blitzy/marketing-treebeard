@@ -9,9 +9,11 @@
  * - `GET /decisions` with no filter, rendered as one `<h3>` section per subject (keyed by type
  *   and id) in the order of each subject's newest decision, rows kept newest first;
  * - the six columns, Decided, Origin, Decided by, Patch applied, Resulting expected state and
- *   Note, with instants in the default run's time zone (UTC until one exists), amounts in each
- *   subject's own currency, the patch read defensively from stored JSON, and the expected state
- *   rendered by decision shape, tombstones included;
+ *   Note, on one column grid shared by every subject's table (the same shares, minimums and
+ *   breakable columns whatever the rows hold, sized for a short display zone such as UTC or a
+ *   longer one such as America/New_York), with instants in the default run's time zone
+ *   (UTC until one exists), amounts in each subject's own currency, the patch read defensively
+ *   from stored JSON, and the expected state rendered by decision shape, tombstones included;
  * - the loading, failed, empty and row-limit states, and a failed refetch that keeps the log,
  *   each outcome in one polite status region kept from the first render (never an alert), with
  *   Retry, the last-loaded instant, no flicker while a poll reads again, and polling itself;
@@ -102,6 +104,13 @@ function bodyRows(table: HTMLElement): string[][] {
     .map((row) =>
       Array.from(row.querySelectorAll('th, td')).map((cell) => cell.textContent),
     );
+}
+
+/** A table cell's `minWidth` step, from its `ds-datatable__cell--min-{step}` class, or `null`. */
+function minimumOf(cell: Element): string | null {
+  const prefix = 'ds-datatable__cell--min-';
+  const step = Array.from(cell.classList).find((name) => name.startsWith(prefix));
+  return step === undefined ? null : step.slice(prefix.length);
 }
 
 /** The single body row of a table. */
@@ -573,6 +582,55 @@ describe('DecisionLog subjects', () => {
     expect(headers).toEqual(COLUMN_HEADERS);
     expect(within(table).getAllByRole('rowheader')).toHaveLength(2);
   });
+
+  it.each([
+    // Up to seven characters: Decided is held at its 'xl' minimum, the rest share the table.
+    { zone: 'UTC', shares: [1, 2, 3, 3, 1, 2], minimums: ['xl', 'md', null, null, 'md', null] },
+    { zone: 'Etc/UTC', shares: [1, 2, 3, 3, 1, 2], minimums: ['xl', 'md', null, null, 'md', null] },
+    // A longer zone: Decided takes a third of the table, with the 'lg' minimum.
+    {
+      zone: 'America/New_York',
+      shares: [4, 2, 1, 1, 1, 2],
+      minimums: ['lg', 'md', null, 'md', 'md', null],
+    },
+  ])(
+    "sizes every subject's table on one column grid for $zone instants, whatever its rows hold",
+    async ({ zone, shares, minimums }) => {
+      mockApi({
+        'GET /runs/latest': json(200, makeRun({ display_timezone: zone })),
+        [LOG_KEY]: json(200, defaultLog()),
+      });
+
+      await renderLog();
+
+      // The run may arrive after the log has rendered in the fallback zone.
+      const first = await findTable('Brand Search — US');
+      await waitFor(() => {
+        const [instant] = within(first).getAllByRole('rowheader');
+        expect(instant?.textContent.endsWith(` ${zone}`)).toBe(true);
+      });
+      const tables = await Promise.all(
+        ['Brand Search — US', 'Search Partners — US', 'Search Shared Budget'].map(findTable),
+      );
+      for (const table of tables) {
+        // The zone's shares, in twelfths of the whole table, independent of its rows.
+        const cols = Array.from(table.querySelectorAll('colgroup > col'), (col) => col.className);
+        expect(cols).toEqual(shares.map((share) => `ds-datatable__col--share-${String(share)}`));
+        // Every table's header and body cells hold the zone's minimums.
+        const headers = within(table).getAllByRole('columnheader');
+        expect(headers.map(minimumOf)).toEqual(minimums);
+        for (const row of within(table).getAllByRole('row').slice(1)) {
+          const cells = Array.from(row.querySelectorAll('th, td'));
+          expect(cells.map(minimumOf)).toEqual(minimums);
+          // Every column but Decided breaks long tokens anywhere, so no row's content sets a
+          // column's minimum; the instant breaks only between words.
+          expect(
+            cells.map((cell) => cell.classList.contains('ds-datatable__cell--wrap-anywhere')),
+          ).toEqual([false, true, true, true, true, true]);
+        }
+      }
+    },
+  );
 
   it('renders the origin, author, patch and state of baseline and user rows', async () => {
     mockApi(logHandlers(defaultLog()));

@@ -15,7 +15,8 @@
  *    ({@link AssetCell}) states on the collapsed row what qualifies its numbers: the row's
  *    simulated-data badge and its floor badges ({@link floorFlags}: attribution, creative and
  *    deal floors and unknown CRM evidence) beside the "≥ N" and "≤ X" cells they explain;
- * 2. each row expands ("Details for {asset}") to its per-creative rows, "unknown creative"
+ * 2. each row expands from its "Show details" toggle, named for its row ("Show details for
+ *    {asset} ({currency})", {@link AssetTable}), to its per-creative rows, "unknown creative"
  *    included, then the reason, the evidence it was judged on in the shared
  *    {@link EvidenceTable} (metrics against baselines, sample, test, thresholds applied, data
  *    used), the flags (floor flags among them), the row's notes ("Notes on {asset}": first its
@@ -48,11 +49,15 @@
  * AAP 0.1.1 "the five sections render from precomputed runs in under 2 s"), so a cohort of
  * hundreds of assets, or an asset of hundreds of creatives, mounts a bounded table.
  *
+ * Both kinds of table take the `DataTable`'s compact density, so their twelve and ten columns,
+ * the costs and the Action included, fit a desktop region before they scroll.
+ *
  * Rendering rules (AAP 0.5.5, 0.5.4.7), all decided by the backend and kept here:
  * - floors render "≥ N" for counts and "≤ X" for costs ({@link formatMetric});
  * - an unavailable count renders "unavailable", never 0;
  * - a cost whose known denominator is 0 renders "—" followed by its reason, "— (no QL yet)" or
- *   "— (no meetings yet)", never a finite value or a ceiling;
+ *   "— (no meetings yet)", never a finite value or a ceiling; in a table the reason is the
+ *   cell's note, which wraps, so it never widens its column;
  * - MQL and Qualified Lead are always two columns: no column, total or sort key combines them;
  * - LinkedIn leads are platform counts and are never added to a CRM count;
  * - nothing is summed or compared across currencies, and the client sums nothing at all: the
@@ -187,6 +192,18 @@ const LINKEDIN_LEADS_NOTE =
  */
 const MEETINGS_BOOKED_NOTE =
   "Meetings booked: booked (record created). HubSpot records no booking instant, so the meeting record's creation stands in for it";
+
+/**
+ * What the caption of a cohort's table of rows computed from replaced data adds after "White
+ * papers ({currency})", and its rows' toggle names after the currency.
+ */
+const REPLACED_TABLE_QUALIFIER = 'computed from replaced data';
+
+/**
+ * What the caption of a cohort's table of held rows adds after "White papers ({currency})", and
+ * its rows' toggle names after the currency.
+ */
+const HELD_TABLE_QUALIFIER = 'held until discrepancies are resolved';
 
 /** The hold reason when a held row arrives without one (precedence P1, AAP 0.5.4.2). */
 const HELD_REASON_FALLBACK = 'Resolve discrepancy first';
@@ -343,23 +360,45 @@ function isCostKey(key: WhitePaperMetricKey): boolean {
   return key === 'cost_per_ql' || key === 'cost_per_meeting';
 }
 
+/** One white-paper cell for display: its value, and the reason a "—" value has none. */
+interface CellView {
+  /** The value: a figure, "≥ N", "≤ X", "unavailable" or "—". */
+  readonly value: string;
+  /** Why a "—" value is missing, in parentheses, "(no QL yet)"; `null` for any other value. */
+  readonly note: string | null;
+}
+
 /**
- * One white-paper cell as display text, through {@link formatMetric}: "≥ N" and "≤ X" under a
+ * One white-paper cell for display, through {@link formatMetric}: "≥ N" and "≤ X" under a
  * floor, "unavailable" for a missing or unavailable value (never 0), and the backend's "—" for a
- * cost whose known denominator is 0, followed by its reason when the evidence gives one: "— (no
- * QL yet)", "— (no meetings yet)".
+ * cost whose known denominator is 0, noted with its reason when the evidence gives one: "(no QL
+ * yet)", "(no meetings yet)". A table shows the note as the cell's wrapping `note`, and
+ * {@link cellText} joins the two into one line elsewhere.
  *
  * @param metric - the cell, as the guarded readers return it; absent reads as unavailable
  * @param note - why the value is missing, read only after a "—"
- * @returns the cell text
+ * @returns the cell's value and note
  */
-function cellText(metric: Metric | null | undefined, note: string | null | undefined): string {
+function cellView(metric: Metric | null | undefined, note: string | null | undefined): CellView {
   if (metric === null || metric === undefined) {
-    return UNAVAILABLE;
+    return { value: UNAVAILABLE, note: null };
   }
   const text = formatMetric(metric);
   const reason = textOrNull(note);
-  return text.trim() === EM_DASH && reason !== null ? `${EM_DASH} (${reason})` : text;
+  return text.trim() === EM_DASH && reason !== null
+    ? { value: EM_DASH, note: `(${reason})` }
+    : { value: text, note: null };
+}
+
+/**
+ * A cell as one line of text, its note after its value: "— (no QL yet)"; "unavailable" for a
+ * cell the row does not have.
+ */
+function cellText(cell: CellView | undefined): string {
+  if (cell === undefined) {
+    return UNAVAILABLE;
+  }
+  return cell.note === null ? cell.value : `${cell.value} ${cell.note}`;
 }
 
 /** One asset row, formatted once for its table and its details. */
@@ -368,8 +407,8 @@ interface AssetRowView {
   readonly item: Item;
   /** The asset's display name: the row header and the per-creative caption. */
   readonly name: string;
-  /** Each metric's display text, keyed by `WHITE_PAPER_METRIC_KEYS`. */
-  readonly cells: ReadonlyMap<WhitePaperMetricKey, string>;
+  /** Each metric's value and note, keyed by `WHITE_PAPER_METRIC_KEYS`. */
+  readonly cells: ReadonlyMap<WhitePaperMetricKey, CellView>;
   /**
    * The id of the row header's focus target while its table shows rows in batches
    * (`BatchEntryAnchor`), so focus lands on the row when a reveal shows it first; `null` when
@@ -393,9 +432,9 @@ function assetName(item: Item): string {
 function toAssetRow(item: Item): AssetRowView {
   const metrics = whitePaperCells(item);
   const costNotes = whitePaperCostNotes(item);
-  const cells = new Map<WhitePaperMetricKey, string>();
+  const cells = new Map<WhitePaperMetricKey, CellView>();
   for (const key of WHITE_PAPER_METRIC_KEYS) {
-    cells.set(key, cellText(metrics[key], isCostKey(key) ? costNotes[key] : null));
+    cells.set(key, cellView(metrics[key], isCostKey(key) ? costNotes[key] : null));
   }
   return { item, name: assetName(item), cells, focusId: null, frozenMql: frozenMqlHeader(item) };
 }
@@ -428,11 +467,22 @@ interface CreativeRowView {
   readonly index: number;
   /** The per-creative row. */
   readonly row: WhitePaperRow;
+  /** Each metric's value and note ({@link cellView}), keyed by `WHITE_PAPER_METRIC_KEYS`. */
+  readonly cells: ReadonlyMap<WhitePaperMetricKey, CellView>;
   /**
    * The id of the row header's focus target while the per-creative table shows rows in batches
    * (`BatchEntryAnchor`); `null` when it is not batched.
    */
   readonly focusId: string | null;
+}
+
+/** A per-creative row's cells: each metric's value, and the reason after a "—" cost. */
+function creativeCells(row: WhitePaperRow): ReadonlyMap<WhitePaperMetricKey, CellView> {
+  const cells = new Map<WhitePaperMetricKey, CellView>();
+  for (const key of WHITE_PAPER_METRIC_KEYS) {
+    cells.set(key, cellView(row.cells[key], row.notes[key]));
+  }
+  return cells;
 }
 
 /** What an asset table counts in its batch control: "Showing 50 of 120 white papers". */
@@ -652,8 +702,8 @@ function floorFlags(item: Item): Flag[] {
  * row's skipped-stage notes are not here but first among its details' notes
  * ({@link AssetDetails}), so the cell stays as narrow as its name and badges.
  *
- * Captions and the expand label keep the plain name. In a batched table the name is the row's
- * focus target ({@link BatchEntryAnchor}), so focus lands on the row when a reveal shows it
+ * Captions and the toggle's row name keep the plain name. In a batched table the name is the
+ * row's focus target ({@link BatchEntryAnchor}), so focus lands on the row when a reveal shows it
  * first.
  */
 function AssetCell({ row }: { row: AssetRowView }): ReactElement {
@@ -726,6 +776,12 @@ function ActionCell({ item }: { item: Item }): ReactElement {
 /**
  * The asset table's columns, exactly in the order AAP 0.5.5 fixes: Asset (the row header),
  * the nine metric columns of `WHITE_PAPER_METRIC_KEYS` (numeric, aligned to the end), Action.
+ *
+ * Asset and Action hold a minimum width, so a table that is wider than its region, where every
+ * column shrinks to its narrowest content, still shows an asset name and an action a few words
+ * per line rather than one. Asset is sticky, so in such a table each row stays named while its
+ * costs and action are scrolled into view. A "—" cost's reason is the cell's note, which wraps,
+ * so it never widens its column.
  */
 function assetColumns(mql: string): DataTableColumn<AssetRowView>[] {
   return [
@@ -733,6 +789,8 @@ function assetColumns(mql: string): DataTableColumn<AssetRowView>[] {
       key: 'asset',
       header: ASSET_HEADER,
       isRowHeader: true,
+      minWidth: 'md',
+      sticky: true,
       render: (row) => <AssetCell row={row} />,
     },
     ...WHITE_PAPER_METRIC_KEYS.map(
@@ -740,16 +798,23 @@ function assetColumns(mql: string): DataTableColumn<AssetRowView>[] {
         key,
         header: metricHeader(key, mql),
         align: 'end',
-        render: (row) => row.cells.get(key) ?? UNAVAILABLE,
+        render: (row) => row.cells.get(key)?.value ?? UNAVAILABLE,
+        note: (row) => row.cells.get(key)?.note,
       }),
     ),
-    { key: 'action', header: ACTION_HEADER, render: (row) => <ActionCell item={row.item} /> },
+    {
+      key: 'action',
+      header: ACTION_HEADER,
+      minWidth: 'md',
+      render: (row) => <ActionCell item={row.item} />,
+    },
   ];
 }
 
 /**
- * The per-creative table's columns: Creative (the row header, "unknown creative" included),
- * then the same metric columns in the same order, without Action.
+ * The per-creative table's columns: Creative (the row header, "unknown creative" included, and
+ * sticky like Asset), then the same metric columns in the same order, without Action, a "—"
+ * value's reason again the cell's wrapping note.
  */
 function creativeColumns(mql: string): DataTableColumn<CreativeRowView>[] {
   return [
@@ -757,6 +822,7 @@ function creativeColumns(mql: string): DataTableColumn<CreativeRowView>[] {
       key: 'creative',
       header: CREATIVE_HEADER,
       isRowHeader: true,
+      sticky: true,
       render: ({ row, focusId }) => <BatchEntryAnchor id={focusId}>{row.label}</BatchEntryAnchor>,
     },
     ...WHITE_PAPER_METRIC_KEYS.map(
@@ -764,7 +830,8 @@ function creativeColumns(mql: string): DataTableColumn<CreativeRowView>[] {
         key,
         header: metricHeader(key, mql),
         align: 'end',
-        render: ({ row }) => cellText(row.cells[key], row.notes[key]),
+        render: ({ cells }) => cells.get(key)?.value ?? UNAVAILABLE,
+        note: ({ cells }) => cells.get(key)?.note,
       }),
     ),
   ];
@@ -887,6 +954,7 @@ function AssetDetails({ row, mql }: AssetDetailsProps): ReactElement {
   const creatives: CreativeRowView[] = batches.shown.map((creative, index) => ({
     index,
     row: creative,
+    cells: creativeCells(creative),
     focusId: batches.batched ? batches.entryId(index) : null,
   }));
   const columns = useMemo(() => creativeColumns(mql), [mql]);
@@ -902,6 +970,7 @@ function AssetDetails({ row, mql }: AssetDetailsProps): ReactElement {
         rows={creatives}
         getRowKey={(creative) => `${creative.index}-${creative.row.key}`}
         emptyMessage={NO_CREATIVE_ROWS}
+        density="compact"
       />
       <BatchControl batches={batches} noun={CREATIVE_ROW_NOUN} />
       {reason === null ? null : <div>{reason}</div>}
@@ -934,6 +1003,13 @@ function AssetDetails({ row, mql }: AssetDetailsProps): ReactElement {
 interface AssetTableProps {
   /** The caption, which names the table. */
   caption: string;
+  /**
+   * What tells the table's rows apart from the same assets' rows in the page's other tables,
+   * set in parentheses after each asset's name in its toggle's name: the cohort's currency,
+   * "EUR", followed for the replaced-data and held tables by what sets them apart, "EUR,
+   * computed from replaced data" ({@link rowLabelOf}).
+   */
+  scope: string;
   /** The white-paper items, one row each, in API order. */
   items: readonly Item[];
   /**
@@ -941,6 +1017,44 @@ interface AssetTableProps {
    * of the table records its frozen header ({@link tableMqlHeader}).
    */
   mql: string;
+}
+
+/**
+ * The names that more than one of a table's items shows ({@link assetName}): two assets of one
+ * cohort whose registry entries share a display name.
+ */
+function sharedNames(items: readonly Item[]): ReadonlySet<string> {
+  const seen = new Set<string>();
+  const shared = new Set<string>();
+  for (const item of items) {
+    const name = assetName(item);
+    if (seen.has(name)) {
+      shared.add(name);
+    }
+    seen.add(name);
+  }
+  return shared;
+}
+
+/**
+ * The name an asset row's toggle completes its accessible name with (`getRowLabel`), so the
+ * toggle reads "Show details for {asset} ({scope})": the asset's name, then the table's scope
+ * in parentheses, the cohort's currency first, so the same asset's rows in the EUR and USD
+ * tables, or in a cohort's visible, replaced-data and held tables, never share a name. When
+ * another row of the table shows the same name, the asset's id follows the scope ("{asset}
+ * (EUR, {id})"), else the item's.
+ *
+ * @param row - the asset row
+ * @param scope - the table's scope ({@link AssetTableProps.scope})
+ * @param shared - the names more than one row of the table shows ({@link sharedNames})
+ * @returns the row's label, unique on the page
+ */
+function rowLabelOf(row: AssetRowView, scope: string, shared: ReadonlySet<string>): string {
+  if (!shared.has(row.name)) {
+    return `${row.name} (${scope})`;
+  }
+  const id = textOrNull(row.item.entity.id) ?? `item ${String(row.item.id)}`;
+  return `${row.name} (${scope}, ${id})`;
 }
 
 /**
@@ -961,11 +1075,18 @@ interface AssetTableProps {
  * per-run item id, and the table keeps a row's expansion by that key. A newer run's row of the
  * same asset therefore stays expanded, and its expand toggle and details keep their elements, so
  * keyboard focus on them, and the footer actions' state, survive the swap (WCAG 2.2 SC 2.4.3).
+ *
+ * Each row's toggle shows "Show details" or "Hide details", and is named for its row through
+ * {@link rowLabelOf}, "Show details for {asset} ({scope})", so every toggle on the page has its
+ * own name while its visible text stays short and the toggle column narrow. The table takes the
+ * compact density, as each row's per-creative table does, so its twelve columns fit a desktop
+ * region before it scrolls.
  */
-function AssetTable({ caption, items, mql }: AssetTableProps): ReactElement {
+function AssetTable({ caption, scope, items, mql }: AssetTableProps): ReactElement {
   const header = useMemo(() => tableMqlHeader(items, mql), [items, mql]);
   const columns = useMemo(() => assetColumns(header), [header]);
   const rowKeys = useMemo(() => itemKeys(items), [items]);
+  const shared = useMemo(() => sharedNames(items), [items]);
   const batches = useBatches(items, { batchSize: ROW_BATCH_SIZE });
   const rows = batches.shown.map((item, index) =>
     assetRowOf(item, batches.batched ? batches.entryId(index) : null),
@@ -978,7 +1099,8 @@ function AssetTable({ caption, items, mql }: AssetTableProps): ReactElement {
         rows={rows}
         getRowKey={(row) => rowKeys.get(row.item) ?? itemIdentity(row.item)}
         renderExpanded={(row) => <AssetDetails row={row} mql={row.frozenMql ?? header} />}
-        expandLabel={(row) => `Details for ${row.name}`}
+        getRowLabel={(row) => rowLabelOf(row, scope, shared)}
+        density="compact"
       />
       <BatchControl batches={batches} noun={ASSET_ROW_NOUN} />
     </>
@@ -1002,7 +1124,7 @@ function WhitePaperItemFallback({ item, mql }: { item: Item; mql: string }): Rea
     ...WHITE_PAPER_METRIC_KEYS.map((key) => ({
       key,
       label: metricHeader(key, header),
-      value: row.cells.get(key) ?? UNAVAILABLE,
+      value: cellText(row.cells.get(key)),
     })),
     { key: 'action', label: ACTION_HEADER, value: <ActionCell item={item} /> },
   ];
@@ -1080,12 +1202,18 @@ function CohortTables({ parts, mql }: CohortTablesProps): ReactElement {
   return (
     <Stack gap={4}>
       {parts.visible.length > 0 ? (
-        <AssetTable caption={`White papers (${currency})`} items={parts.visible} mql={mql} />
+        <AssetTable
+          caption={`White papers (${currency})`}
+          scope={currency}
+          items={parts.visible}
+          mql={mql}
+        />
       ) : null}
       <ConfirmedItems items={placed.visible} confirmations={confirmations} />
       {parts.historical.length > 0 ? (
         <AssetTable
-          caption={`White papers (${currency}) computed from replaced data`}
+          caption={`White papers (${currency}) ${REPLACED_TABLE_QUALIFIER}`}
+          scope={`${currency}, ${REPLACED_TABLE_QUALIFIER}`}
           items={parts.historical}
           mql={mql}
         />
@@ -1103,7 +1231,8 @@ function CohortTables({ parts, mql }: CohortTablesProps): ReactElement {
       */}
       <HeldDisclosure id={`${parts.anchorId}-held`} count={parts.held.length}>
         <AssetTable
-          caption={`White papers (${currency}) held until discrepancies are resolved`}
+          caption={`White papers (${currency}) ${HELD_TABLE_QUALIFIER}`}
+          scope={`${currency}, ${HELD_TABLE_QUALIFIER}`}
           items={parts.held}
           mql={mql}
         />

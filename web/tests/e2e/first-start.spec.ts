@@ -28,8 +28,8 @@
  *      headed with the item's action and showing its entity line, "{name} · {Source}".
  *    - White papers: the first visible asset row names an asset of the section that feedback
  *      does not hide, its Action cell reads that asset's action and every cell holds a value;
- *      its "Details for {asset}" toggle opens the "Per creative: {asset}" table with at least
- *      one creative row.
+ *      its "Show details" toggle, named "Show details for {asset} ({currency})", opens the
+ *      "Per creative: {asset}" table with at least one creative row.
  * 5. **Simulated labelling**: at least one source chip in the status bar reads "Simulated".
  *
  * Its second test, declared after the first so the first-start sign-in is never preceded by a
@@ -199,11 +199,19 @@ const CARD_SELECTOR = 'article[id^="item-"]';
 /** The toggle of a collapsed held list, "Held until discrepancies are resolved ({count})". */
 const HELD_DISCLOSURE = /^Held until discrepancies are resolved/u;
 
-/** The start of a white-paper row's toggle, "Details for {asset}" (`WhitePapersSection.tsx`). */
-const ASSET_TOGGLE_PREFIX = 'Details for ';
+/**
+ * A white-paper row's toggle, matched by its accessible name: "Show details for {asset}
+ * ({scope})" while collapsed, "Hide details for …" while expanded, the scope being the cohort's
+ * currency and, outside its table of visible rows, the table's qualifier (`DataTable.tsx`,
+ * `rowLabelOf` in `WhitePapersSection.tsx`).
+ */
+const ASSET_TOGGLE = /^(?:Show|Hide) details for /u;
 
-/** A white-paper row's toggle, matched by its accessible name. */
-const ASSET_TOGGLE = /^Details for /u;
+/**
+ * A white-paper toggle's name taken apart: the asset (group 1), then the scope in its closing
+ * parentheses (group 2), which holds none of its own.
+ */
+const ASSET_TOGGLE_NAME = /^(?:Show|Hide) details for (.+) \(([^()]+)\)$/u;
 
 /** The start of an expanded white-paper row's table caption, "Per creative: {asset}". */
 const PER_CREATIVE_CAPTION_PREFIX = 'Per creative: ';
@@ -212,7 +220,7 @@ const PER_CREATIVE_CAPTION_PREFIX = 'Per creative: ';
 const HISTORICAL_LABEL = 'Computed from replaced data';
 
 /**
- * The cells of a white-paper row besides its Asset row header: the "Details for" toggle, the
+ * The cells of a white-paper row besides its Asset row header: the "Show details" toggle, the
  * nine figure columns between Asset and Action (spend through cost per meeting), and Action.
  */
 const ASSET_ROW_CELL_COUNT = 1 + 9 + 1;
@@ -606,7 +614,7 @@ async function expectRenderedCard(
 
 /**
  * Asserts that the White papers section renders an asset row that matches the API and reveals
- * its per-creative breakdown. The first visible row with a "Details for {asset}" toggle, or the
+ * its per-creative breakdown. The first visible row with a "Show details" toggle, or the
  * first held one when only held rows exist, must name an asset of this section that feedback
  * does not hide, with that asset's action in its Action cell and text in every cell; expanding
  * it must show the "Per creative: {asset}" table with at least one creative row.
@@ -637,7 +645,14 @@ async function expectRenderedAssetRow(
 
   const toggle = row.getByRole('button', { name: ASSET_TOGGLE });
   const toggleText = normalizeText((await toggle.textContent({ timeout: READ_TIMEOUT_MS })) ?? '');
-  const name = toggleText.slice(ASSET_TOGGLE_PREFIX.length);
+  const toggleName = ASSET_TOGGLE_NAME.exec(toggleText);
+  if (toggleName === null) {
+    throw new Error(
+      `The first asset row of the "${title}" section of ${runLabel} has the toggle ` +
+        `"${toggleText}", which is not "Show details for {asset} ({currency})"`,
+    );
+  }
+  const name = toggleName[1] ?? '';
   const cells = row.getByRole('cell');
   const actionText = normalizeText(
     (await cells.last().textContent({ timeout: READ_TIMEOUT_MS })) ?? '',

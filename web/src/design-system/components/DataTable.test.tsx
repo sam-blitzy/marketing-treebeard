@@ -10,10 +10,22 @@
  *   and numeric columns (`align: 'end'`) align their header and cells to the end;
  * - default cells show only string and number properties, `render` overrides them, and an empty
  *   table shows `emptyMessage` across every column;
+ * - column sizing and wrapping: a `share` renders a `<colgroup>` after the caption with one
+ *   `<col>` per column (an expandable table's toggle col first, classless), classed
+ *   `ds-datatable__col--share-{n}`, and no colgroup without a valid share; `minWidth` classes the
+ *   column's header and body cells; `alignCell` sets each body cell's alignment while the header
+ *   keeps `align`; `wrap: 'anywhere'` classes the column's body cells only; a `note` follows the
+ *   cell's content after a space in its note span; `sticky` classes the first column's header and
+ *   body cells only;
+ * - density: `density: 'compact'` adds `ds-datatable--compact` to its own `<table>` only, leaving
+ *   the region, every cell's classes and the toggle as they are, and never reaches a table nested
+ *   in a detail row; any other value renders the default density;
  * - expandable rows: one native toggle button per row with `aria-expanded` and `aria-controls`
  *   pointing at its detail row, which is hidden and empty until expanded, remembered by row key;
- *   an expandable table's region carries the expandable modifier and an expanded row's content
- *   sits in the detail content wrapper, while a table that cannot expand renders neither;
+ *   the toggle shows "Show details" or "Hide details", carries the other label for its width, and
+ *   is named that text followed by `getRowLabel`'s visually hidden row name; an expandable
+ *   table's region carries the expandable modifier and an expanded row's content sits in the
+ *   detail content wrapper, while a table that cannot expand renders neither;
  * - keyboard operation, exercised with Tab, Shift+Tab, Enter and Space: the region and then each
  *   toggle are stops in the Tab order, a collapsed detail row adds none and an expanded row's
  *   focusable content follows its toggle, and Enter or Space on a toggle expands and collapses
@@ -33,7 +45,12 @@ import { createPortal } from 'react-dom';
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
-import { DataTable, type DataTableColumn, type DataTableColumnWidth } from './DataTable';
+import {
+  DataTable,
+  type DataTableColumn,
+  type DataTableColumnWidth,
+  type DataTableDensity,
+} from './DataTable';
 
 /** A white-paper row, with properties of every kind the default cell must handle. */
 interface AssetRow {
@@ -95,7 +112,8 @@ interface AssetTableOverrides {
   rows?: readonly AssetRow[];
   emptyMessage?: ReactNode;
   renderExpanded?: (row: AssetRow) => ReactNode;
-  expandLabel?: (row: AssetRow, expanded: boolean) => string;
+  getRowLabel?: (row: AssetRow) => string;
+  density?: DataTableDensity;
 }
 
 /** Renders the white-paper table captioned "White papers · EUR", with the given overrides. */
@@ -714,24 +732,83 @@ describe('DataTable', () => {
       expectRow(second, 'Creatives of State report');
     });
 
-    it('names each toggle with expandLabel, from its row and state', () => {
-      const expandLabel = vi.fn(
-        (row: AssetRow, expanded: boolean) => `${expanded ? 'Hide' : 'Show'} creatives for ${row.asset}`,
-      );
-      renderAssets({ renderExpanded: renderDetail, expandLabel });
+    /** The toggle's visible state label span. */
+    const stateOf = (toggle: HTMLElement): HTMLElement | null =>
+      toggle.querySelector<HTMLElement>('.ds-datatable__toggle-state');
 
-      const toggle = screen.getByRole('button', { name: 'Show creatives for State report' });
-      expect(screen.getByRole('button', { name: 'Show creatives for Buyer guide' })).toBeDefined();
+    it('shows the state in short visible text and carries the other label to reserve its width', () => {
+      renderAssets({ renderExpanded: renderDetail });
+      const toggle = at(screen.getAllByRole('button', { name: 'Show details' }), 0);
+
+      const label = toggle.querySelector(':scope > .ds-button__label');
+      expect(Array.from(label?.children ?? [], (child) => child.className)).toEqual([
+        'ds-datatable__toggle-state',
+      ]);
+      expect(stateOf(toggle)?.textContent).toBe('Show details');
+      expect(stateOf(toggle)?.getAttribute('data-alternate')).toBe('Hide details');
+      expect(toggle.querySelector('.ds-visually-hidden')).toBeNull();
 
       fireEvent.click(toggle);
 
-      expect(screen.getByRole('button', { name: 'Hide creatives for State report' })).toBe(toggle);
-      expect(expandLabel).toHaveBeenCalledWith(ROWS[1], true);
+      expect(stateOf(toggle)?.textContent).toBe('Hide details');
+      expect(stateOf(toggle)?.getAttribute('data-alternate')).toBe('Show details');
+      expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    });
+
+    it('names each toggle by its visible text followed by the visually hidden row label', () => {
+      const getRowLabel = vi.fn((row: AssetRow) => `${row.asset} (EUR)`);
+      renderAssets({ renderExpanded: renderDetail, getRowLabel });
+
+      const toggle = screen.getByRole('button', { name: 'Show details for State report (EUR)' });
+      expect(
+        screen.getByRole('button', { name: 'Show details for Buyer guide (EUR)' }),
+      ).toBeDefined();
+      expect(stateOf(toggle)?.textContent).toBe('Show details');
+      const label = toggle.querySelector(':scope > .ds-button__label');
+      expect(Array.from(label?.childNodes ?? [], (node) => node.textContent)).toEqual([
+        'Show details',
+        ' ',
+        'for State report (EUR)',
+      ]);
+      expect(toggle.querySelector('.ds-visually-hidden')?.textContent).toBe(
+        'for State report (EUR)',
+      );
+      expect(toggle.textContent).toBe('Show details for State report (EUR)');
+
+      fireEvent.click(toggle);
+
+      expect(screen.getByRole('button', { name: 'Hide details for State report (EUR)' })).toBe(
+        toggle,
+      );
+      expect(stateOf(toggle)?.textContent).toBe('Hide details');
+      expect(getRowLabel).toHaveBeenCalledWith(ROWS[1]);
+    });
+
+    it.each([
+      ['a blank label', () => '   '],
+      ['a non-string label, which only an untyped caller can return', () => 7 as unknown as string],
+    ])('names the toggle by its visible text alone for %s', (_kind, getRowLabel) => {
+      renderAssets({ renderExpanded: renderDetail, getRowLabel });
+
+      const toggles = screen.getAllByRole('button', { name: 'Show details' });
+      expect(toggles).toHaveLength(2);
+      for (const toggle of toggles) {
+        expect(toggle.querySelector('.ds-visually-hidden')).toBeNull();
+        expect(toggle.textContent).toBe('Show details');
+      }
+    });
+
+    it('trims the row label before naming the toggle with it', () => {
+      renderAssets({ renderExpanded: renderDetail, getRowLabel: (row) => `  ${row.asset}  ` });
+
+      expect(screen.getByRole('button', { name: 'Show details for Buyer guide' })).toBeDefined();
+      expect(
+        at(screen.getAllByRole('button'), 0).querySelector('.ds-visually-hidden')?.textContent,
+      ).toBe('for Buyer guide');
     });
 
     it('keeps a row expanded by its key when the rows are re-rendered in another order', () => {
-      const expandLabel = (row: AssetRow, expanded: boolean): string =>
-        `${expanded ? 'Hide' : 'Show'} ${row.asset}`;
+      const getRowLabel = (row: AssetRow): string => row.asset;
       const { rerender } = render(
         <DataTable
           caption="White papers · EUR"
@@ -739,10 +816,10 @@ describe('DataTable', () => {
           rows={ROWS}
           getRowKey={slugOf}
           renderExpanded={renderDetail}
-          expandLabel={expandLabel}
+          getRowLabel={getRowLabel}
         />,
       );
-      fireEvent.click(screen.getByRole('button', { name: 'Show State report' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Show details for State report' }));
 
       rerender(
         <DataTable
@@ -751,7 +828,7 @@ describe('DataTable', () => {
           rows={[...ROWS].reverse()}
           getRowKey={slugOf}
           renderExpanded={renderDetail}
-          expandLabel={expandLabel}
+          getRowLabel={getRowLabel}
         />,
       );
 
@@ -759,13 +836,15 @@ describe('DataTable', () => {
         'State report',
         'Buyer guide',
       ]);
-      const open = screen.getByRole('button', { name: 'Hide State report' });
+      const open = screen.getByRole('button', { name: 'Hide details for State report' });
       expect(open.getAttribute('aria-expanded')).toBe('true');
       expect(document.getElementById(open.getAttribute('aria-controls') ?? '')?.textContent).toBe(
         'Creatives of State report',
       );
       expect(
-        screen.getByRole('button', { name: 'Show Buyer guide' }).getAttribute('aria-expanded'),
+        screen
+          .getByRole('button', { name: 'Show details for Buyer guide' })
+          .getAttribute('aria-expanded'),
       ).toBe('false');
     });
 
@@ -782,6 +861,365 @@ describe('DataTable', () => {
       expect(document.querySelector('.ds-datatable__detail-content')).toBeNull();
     });
   });
+
+  describe('column shares, minimums, per-row alignment and wrapping', () => {
+    /** The class lists of the rendered `<col>` elements, in order (`''` for a col without one). */
+    function colClasses(): string[] {
+      return Array.from(
+        document.querySelectorAll('table > colgroup > col'),
+        (col) => col.className,
+      );
+    }
+
+    /** The first body row's cells, its row header included. */
+    function firstRowCells(): HTMLElement[] {
+      return cellsOf(at(screen.getAllByRole('row'), 1));
+    }
+
+    /** The same column list with props merged into the column at `index`. */
+    function withColumn(
+      index: number,
+      props: Partial<DataTableColumn<AssetRow>>,
+    ): DataTableColumn<AssetRow>[] {
+      return COLUMNS.map((column, position) =>
+        position === index ? { ...column, ...props } : column,
+      );
+    }
+
+    it('renders no colgroup when no column takes a share', () => {
+      renderAssets();
+
+      expect(document.querySelector('colgroup')).toBeNull();
+    });
+
+    it('renders one col per column after the caption, classed by its share in twelfths', () => {
+      const widths: readonly DataTableColumn<AssetRow>['share'][] = [5, 3, 12];
+      const columns = COLUMNS.map((column, index) => ({ ...column, share: widths[index] }));
+      renderAssets({ columns });
+
+      const table = screen.getByRole('table', { name: 'White papers · EUR' });
+      expect(Array.from(table.children, (child) => child.tagName)).toEqual([
+        'CAPTION',
+        'COLGROUP',
+        'THEAD',
+        'TBODY',
+      ]);
+      expect(colClasses()).toEqual([
+        'ds-datatable__col--share-5',
+        'ds-datatable__col--share-3',
+        'ds-datatable__col--share-12',
+        '',
+        '',
+        '',
+        '',
+      ]);
+    });
+
+    it('gives an expandable table a classless toggle col before the data cols', () => {
+      renderAssets({ columns: withColumn(0, { share: 4 }), renderExpanded: () => 'detail' });
+
+      expect(colClasses()).toEqual(['', 'ds-datatable__col--share-4', '', '', '', '', '', '']);
+      expect(colClasses()).toHaveLength(COLUMNS.length + 1);
+    });
+
+    it.each([
+      ['zero', 0],
+      ['thirteen', 13],
+      ['a fraction', 2.5],
+      ['a string', '3'],
+    ])('ignores a share of %s, which only an untyped caller can pass', (_kind, width) => {
+      renderAssets({
+        columns: withColumn(1, { share: width as unknown as DataTableColumn<AssetRow>['share'] }),
+      });
+
+      expect(document.querySelector('colgroup')).toBeNull();
+      expect(document.querySelector('[class*="ds-datatable__col--"]')).toBeNull();
+    });
+
+    it("adds a column's minimum-width step to its header and body cells only", () => {
+      renderAssets({ columns: withColumn(0, { minWidth: 'lg' }) });
+
+      const headers = screen.getAllByRole('columnheader');
+      expect(at(headers, 0).className).toBe(
+        'ds-datatable__header ds-datatable__cell--start ds-datatable__cell--min-lg',
+      );
+      for (const row of screen.getAllByRole('row').slice(1)) {
+        expect(at(cellsOf(row), 0).classList.contains('ds-datatable__cell--min-lg')).toBe(true);
+      }
+      const others = [...headers.slice(1), ...firstRowCells().slice(1)];
+      for (const cell of others) {
+        expect(cell.className).not.toMatch(/ds-datatable__cell--min-/);
+      }
+    });
+
+    it.each(['sm', 'md', 'lg', 'xl'] as const)('renders the %s minimum-width class', (step) => {
+      renderAssets({ columns: withColumn(2, { minWidth: step }) });
+
+      expect(at(screen.getAllByRole('columnheader'), 2).classList).toContain(
+        `ds-datatable__cell--min-${step}`,
+      );
+      expect(at(firstRowCells(), 2).classList).toContain(`ds-datatable__cell--min-${step}`);
+    });
+
+    it('ignores a minimum width outside the scale', () => {
+      renderAssets({
+        columns: withColumn(0, {
+          minWidth: 'xxl' as unknown as DataTableColumn<AssetRow>['minWidth'],
+        }),
+      });
+
+      expect(document.querySelector('[class*="ds-datatable__cell--min-"]')).toBeNull();
+    });
+
+    it("aligns each body cell by alignCell and keeps the header on the column's align", () => {
+      const alignCell = vi.fn(
+        (row: AssetRow): 'start' | 'end' => (row.spend > 0 ? 'end' : 'start'),
+      );
+      renderAssets({ columns: withColumn(1, { alignCell }) });
+
+      const header = at(screen.getAllByRole('columnheader'), 1);
+      expect(header.className).toBe('ds-datatable__header ds-datatable__cell--end');
+      const bodyRows = screen.getAllByRole('row').slice(1);
+      expect(at(cellsOf(at(bodyRows, 0)), 1).className).toBe(
+        'ds-datatable__cell ds-datatable__cell--end',
+      );
+      expect(at(cellsOf(at(bodyRows, 1)), 1).className).toBe(
+        'ds-datatable__cell ds-datatable__cell--start',
+      );
+      expect(alignCell.mock.calls.map(([row]) => row.slug)).toEqual(['guide', 'report']);
+    });
+
+    it("falls back to the column's align when alignCell returns another value", () => {
+      renderAssets({
+        columns: withColumn(1, {
+          alignCell: () => 'center' as unknown as 'start',
+        }),
+      });
+
+      expect(at(firstRowCells(), 1).className).toBe('ds-datatable__cell ds-datatable__cell--end');
+    });
+
+    it('lets a start column end-align a numeric row through alignCell', () => {
+      renderAssets({ columns: withColumn(4, { alignCell: () => 'end' }) });
+
+      expect(at(screen.getAllByRole('columnheader'), 4).classList).toContain(
+        'ds-datatable__cell--start',
+      );
+      expect(at(firstRowCells(), 4).classList).toContain('ds-datatable__cell--end');
+    });
+
+    it("adds the break-anywhere class to a wrap: 'anywhere' column's body cells only", () => {
+      renderAssets({ columns: withColumn(5, { wrap: 'anywhere', minWidth: 'sm' }) });
+
+      expect(at(screen.getAllByRole('columnheader'), 5).className).toBe(
+        'ds-datatable__header ds-datatable__cell--start ds-datatable__cell--min-sm',
+      );
+      for (const row of screen.getAllByRole('row').slice(1)) {
+        expect(at(cellsOf(row), 5).className).toBe(
+          'ds-datatable__cell ds-datatable__cell--start ds-datatable__cell--min-sm ds-datatable__cell--wrap-anywhere',
+        );
+      }
+      expect(document.querySelectorAll('.ds-datatable__cell--wrap-anywhere')).toHaveLength(
+        ROWS.length,
+      );
+    });
+
+    it('breaks no cell anywhere and holds no column open by default', () => {
+      renderAssets({ renderExpanded: () => 'detail' });
+
+      expect(document.querySelector('.ds-datatable__cell--wrap-anywhere')).toBeNull();
+      expect(document.querySelector('[class*="ds-datatable__cell--min-"]')).toBeNull();
+      expect(document.querySelector('colgroup')).toBeNull();
+      expect(document.querySelector('.ds-datatable__cell--sticky')).toBeNull();
+      expect(document.querySelector('.ds-datatable__cell-note')).toBeNull();
+    });
+
+    it("follows a body cell's content with its note after a space, in the note span", () => {
+      const note = vi.fn((row: AssetRow) => (row.spend === 0 ? '(no spend yet)' : null));
+      renderAssets({ columns: withColumn(1, { note }) });
+
+      const bodyRows = screen.getAllByRole('row').slice(1);
+      const noted = at(cellsOf(at(bodyRows, 1)), 1);
+      expect(noted.className).toBe('ds-datatable__cell ds-datatable__cell--end');
+      expect(Array.from(noted.childNodes, (node) => node.textContent)).toEqual([
+        'EUR 0.00',
+        ' ',
+        '(no spend yet)',
+      ]);
+      expect(noted.querySelector(':scope > span.ds-datatable__cell-note')?.textContent).toBe(
+        '(no spend yet)',
+      );
+      expect(noted.textContent).toBe('EUR 0.00 (no spend yet)');
+      const plain = at(cellsOf(at(bodyRows, 0)), 1);
+      expect(plain.textContent).toBe('EUR 1200.00');
+      expect(plain.querySelector('.ds-datatable__cell-note')).toBeNull();
+      expect(at(screen.getAllByRole('columnheader'), 1).textContent).toBe('Spend');
+      expect(note.mock.calls.map(([row]) => row.slug)).toEqual(['guide', 'report']);
+    });
+
+    it('notes a row header cell and a default cell alike, trimming the note', () => {
+      renderAssets({
+        columns: COLUMNS.map((column, index) =>
+          index === 0 || index === 2 ? { ...column, note: () => '  (floor)  ' } : column,
+        ),
+      });
+
+      const [header, , mql] = firstRowCells();
+      expect(header?.tagName).toBe('TH');
+      expect(header?.textContent).toBe('Buyer guide (floor)');
+      expect(mql?.textContent).toBe('4 (floor)');
+      expect(document.querySelectorAll('.ds-datatable__cell-note')).toHaveLength(ROWS.length * 2);
+    });
+
+    it.each([
+      ['undefined', () => undefined],
+      ['a blank string', () => '   '],
+      ['a non-string, which only an untyped caller can return', () => 3 as unknown as string],
+    ])('shows no note for %s', (_kind, note) => {
+      renderAssets({ columns: withColumn(1, { note }) });
+
+      expect(document.querySelector('.ds-datatable__cell-note')).toBeNull();
+      expect(at(firstRowCells(), 1).textContent).toBe('EUR 1200.00');
+    });
+
+    it("classes the sticky first column's header and body cells, and no other cell", () => {
+      renderAssets({ columns: withColumn(0, { sticky: true, minWidth: 'md' }) });
+
+      expect(at(screen.getAllByRole('columnheader'), 0).className).toBe(
+        'ds-datatable__header ds-datatable__cell--start ds-datatable__cell--min-md ds-datatable__cell--sticky',
+      );
+      for (const row of screen.getAllByRole('row').slice(1)) {
+        expect(at(cellsOf(row), 0).className).toBe(
+          'ds-datatable__cell ds-datatable__cell--start ds-datatable__cell--min-md ds-datatable__cell--sticky',
+        );
+      }
+      expect(document.querySelectorAll('.ds-datatable__cell--sticky')).toHaveLength(
+        1 + ROWS.length,
+      );
+    });
+
+    it('ignores sticky on any column but the first', () => {
+      renderAssets({ columns: withColumn(2, { sticky: true }) });
+
+      expect(document.querySelector('.ds-datatable__cell--sticky')).toBeNull();
+    });
+
+    it('leaves the toggle column of an expandable table unstuck before its sticky first column', () => {
+      renderAssets({ columns: withColumn(0, { sticky: true }), renderExpanded: () => 'detail' });
+
+      for (const toggleCell of document.querySelectorAll('.ds-datatable__toggle-cell')) {
+        expect(toggleCell.classList.contains('ds-datatable__cell--sticky')).toBe(false);
+      }
+      const stuck = Array.from(document.querySelectorAll('.ds-datatable__cell--sticky'));
+      expect(stuck.map((cell) => cell.textContent)).toEqual(['Asset', 'Buyer guide', 'State report']);
+    });
+  });
+
+  describe('density', () => {
+    /** The columns with a sticky first column held open, as the white-paper tables have it. */
+    const STICKY_COLUMNS: readonly DataTableColumn<AssetRow>[] = COLUMNS.map((column, index) =>
+      index === 0 ? { ...column, sticky: true, minWidth: 'md' } : column,
+    );
+
+    /** The class lists of a table's own header and body cells, in document order. */
+    function ownCellClasses(table: HTMLElement): string[] {
+      return Array.from(
+        table.querySelectorAll(':scope > thead > tr > th, :scope > tbody > tr > th, :scope > tbody > tr > td'),
+        (cell) => cell.className,
+      );
+    }
+
+    it('renders the default density with no compact modifier anywhere', () => {
+      renderAssets({ columns: STICKY_COLUMNS, renderExpanded: () => 'detail' });
+
+      expect(screen.getByRole('table', { name: 'White papers · EUR' }).className).toBe(
+        'ds-datatable',
+      );
+      expect(document.querySelector('[class*="compact"]')).toBeNull();
+    });
+
+    it('marks a compact table with the compact modifier, and leaves its region and cells as they are', () => {
+      const { unmount } = renderAssets({ columns: STICKY_COLUMNS, renderExpanded: () => 'detail' });
+      const defaultCells = ownCellClasses(screen.getByRole('table', { name: 'White papers · EUR' }));
+      unmount();
+
+      renderAssets({ columns: STICKY_COLUMNS, renderExpanded: () => 'detail', density: 'compact' });
+
+      const table = screen.getByRole('table', { name: 'White papers · EUR' });
+      expect(table.className).toBe('ds-datatable ds-datatable--compact');
+      expect(screen.getByRole('region', { name: 'White papers · EUR' }).className).toBe(
+        'ds-datatable__region ds-datatable__region--expandable',
+      );
+      expect(ownCellClasses(table)).toEqual(defaultCells);
+      expect(document.querySelectorAll('[class*="compact"]')).toHaveLength(1);
+    });
+
+    it('keeps the toggle, its labels and its row name in a compact table', () => {
+      renderAssets({
+        renderExpanded: (row) => `Details of ${row.asset}`,
+        getRowLabel: (row) => `${row.asset} (EUR)`,
+        density: 'compact',
+      });
+
+      const toggle = screen.getByRole('button', { name: 'Show details for Buyer guide (EUR)' });
+      const state = toggle.querySelector('.ds-datatable__toggle-state');
+      expect(state?.textContent).toBe('Show details');
+      expect(state?.getAttribute('data-alternate')).toBe('Hide details');
+      expect(toggle.closest('td')?.className).toBe('ds-datatable__cell ds-datatable__toggle-cell');
+
+      fireEvent.click(toggle);
+
+      expect(screen.getByRole('button', { name: 'Hide details for Buyer guide (EUR)' })).toBe(toggle);
+      expect(toggle.getAttribute('aria-expanded')).toBe('true');
+      expect(screen.getByText('Details of Buyer guide')).toBeTruthy();
+    });
+
+    it('applies only to its own table: a table nested in a detail row takes its own density', () => {
+      const nested = (density?: 'compact') => (row: AssetRow) => (
+        <DataTable
+          caption={`Per creative: ${row.asset}`}
+          columns={COLUMNS}
+          rows={[row]}
+          getRowKey={slugOf}
+          density={density}
+        />
+      );
+      const { unmount } = renderAssets({ renderExpanded: nested(), density: 'compact' });
+      fireEvent.click(at(screen.getAllByRole('button', { name: 'Show details' }), 0));
+
+      expect(screen.getByRole('table', { name: 'White papers · EUR' }).className).toBe(
+        'ds-datatable ds-datatable--compact',
+      );
+      expect(screen.getByRole('table', { name: 'Per creative: Buyer guide' }).className).toBe(
+        'ds-datatable',
+      );
+      unmount();
+
+      renderAssets({ renderExpanded: nested('compact') });
+      fireEvent.click(at(screen.getAllByRole('button', { name: 'Show details' }), 0));
+
+      expect(screen.getByRole('table', { name: 'White papers · EUR' }).className).toBe(
+        'ds-datatable',
+      );
+      expect(screen.getByRole('table', { name: 'Per creative: Buyer guide' }).className).toBe(
+        'ds-datatable ds-datatable--compact',
+      );
+    });
+
+    it.each([
+      ['default', 'default'],
+      ['undefined', undefined],
+      ['an unknown value, which only an untyped caller can pass', 'dense'],
+    ])('renders %s as the default density', (_kind, density) => {
+      renderAssets({ density: density as DataTableDensity | undefined });
+
+      expect(screen.getByRole('table', { name: 'White papers · EUR' }).className).toBe(
+        'ds-datatable',
+      );
+    });
+  });
+
+
 
   describe('fixed column widths', () => {
     /** A width on the scale for each of the white-paper columns, in their order. */

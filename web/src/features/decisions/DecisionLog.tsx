@@ -89,6 +89,51 @@ import { RETRY_LABEL, lastLoadedText, useRetry, useSettledFailure } from './read
 const FALLBACK_TIMEZONE = 'UTC';
 
 /**
+ * The longest display zone, in characters, whose instants take {@link COMPACT_COLUMN_SIZES}.
+ * `formatInstant` labels every instant with its zone id, so a zone of up to seven characters,
+ * such as "UTC" or "Etc/UTC", keeps a long instant such as "May 30, 2026, 10:59 AM Etc/UTC" on
+ * one line in the compact Decided column. A longer zone, such as "America/New_York", takes
+ * {@link WIDE_COLUMN_SIZES}.
+ */
+const COMPACT_ZONE_LENGTH = 7;
+
+/**
+ * The decision-log column sizes for a short display zone ({@link COMPACT_ZONE_LENGTH}). Decided
+ * holds the `'xl'` minimum, a fixed 256 CSS px at the 16 px root because its 1-twelfth share is
+ * always narrower, which keeps its instants on one line at any viewport. That leaves Decided by
+ * and Patch applied 3 twelfths each and Note 2, so at a 1280 CSS px viewport an author such as
+ * "admin@example.com", a large amount such as "€1,234,567.89" and ordinary words of a note stay
+ * whole, as "Recommendation" does in Origin's 2 twelfths.
+ */
+const COMPACT_COLUMN_SIZES: Readonly<Record<DecisionColumnKey, DecisionColumnSize>> =
+  Object.freeze({
+    decided: { share: 1, minWidth: 'xl' },
+    origin: { share: 2, minWidth: 'md' },
+    decided_by: { share: 3 },
+    patch: { share: 3 },
+    expected_state: { share: 1, minWidth: 'md' },
+    note: { share: 2 },
+  });
+
+/**
+ * The decision-log column sizes for a longer display zone. Decided takes 4 twelfths and holds the
+ * `'lg'` minimum, so an instant labelled "America/New_York" stays on one line from a 1280 CSS px
+ * viewport and takes at most two lines below it. Origin, Patch applied, Resulting expected state
+ * and Note keep "Recommendation", amounts and ordinary words of a note whole at 1280, which leaves
+ * Decided by one twelfth: at that width an author as long as "admin@example.com" breaks. No sizes
+ * of the twelfths and minimums `DataTable` offers keep that instant and that author both whole
+ * there.
+ */
+const WIDE_COLUMN_SIZES: Readonly<Record<DecisionColumnKey, DecisionColumnSize>> = Object.freeze({
+  decided: { share: 4, minWidth: 'lg' },
+  origin: { share: 2, minWidth: 'md' },
+  decided_by: { share: 1 },
+  patch: { share: 1, minWidth: 'md' },
+  expected_state: { share: 1, minWidth: 'md' },
+  note: { share: 2 },
+});
+
+/**
  * The most rows `GET /decisions` returns without a `limit` (`DEFAULT_LIMIT` in the backend's
  * `api/routes/decisions.py`). A log of exactly this many rows may omit older decisions, and says
  * so.
@@ -195,6 +240,12 @@ const FIELD_LABELS: Readonly<Record<keyof DecisionPatchView, string>> = Object.f
 // ---------------------------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------------------------
+
+/** The key of each decision-log column, in display order. */
+type DecisionColumnKey = 'decided' | 'origin' | 'decided_by' | 'patch' | 'expected_state' | 'note';
+
+/** A decision-log column's share of the table's width and its minimum width. */
+type DecisionColumnSize = Pick<DataTableColumn<Decision>, 'share' | 'minWidth'>;
 
 /** One subject's decisions, newest first. */
 interface SubjectGroup {
@@ -500,6 +551,23 @@ export function describeExpectedState(
  * Patch applied, Resulting expected state, Note. The decision instant identifies the row, so its
  * cells are the row headers.
  *
+ * The subject tables are stacked and equally wide, so their columns are sized from the table's
+ * width and fixed minimums rather than from each table's own rows, and the tables share one
+ * column grid:
+ *
+ * - The shares and minimums follow the display zone, the one part of an instant whose length is
+ *   open, and are the same in every subject's table: {@link COMPACT_COLUMN_SIZES} for a zone of
+ *   up to {@link COMPACT_ZONE_LENGTH} characters, such as "UTC", and {@link WIDE_COLUMN_SIZES}
+ *   for a longer one, such as "America/New_York".
+ * - Origin and Resulting expected state hold the `'md'` minimum, so "Resolution", "Baseline" and
+ *   a shared budget id stay whole wherever the table is too narrow for every share.
+ * - Every column but Decided may break a token anywhere, so no row's content sets its column's
+ *   minimum: no row moves its table's grid, and no long author, patch or note pushes the table
+ *   past its region. A token breaks only where its column is narrower than it, for example
+ *   "Recommendation" at a 1024 CSS px viewport, where Origin is held at its minimum. Decided
+ *   breaks only between words, and no instant moves its minimum between tables: the minimum
+ *   holds the date and time, and the zone is the same in every table.
+ *
  * @param displayTimezone - The IANA zone instants are shown in.
  * @param budgetNames - Shared budget names by internal id, for members' expected states.
  * @returns The column definitions.
@@ -508,28 +576,43 @@ function decisionColumns(
   displayTimezone: string,
   budgetNames: ReadonlyMap<number, string>,
 ): DataTableColumn<Decision>[] {
+  const sizes =
+    displayTimezone.length <= COMPACT_ZONE_LENGTH ? COMPACT_COLUMN_SIZES : WIDE_COLUMN_SIZES;
   return [
     {
       key: 'decided',
       header: 'Decided',
       isRowHeader: true,
+      ...sizes.decided,
       render: (decision) => formatInstant(decision.decided_at, displayTimezone),
     },
-    { key: 'origin', header: 'Origin', render: originLabel },
+    { key: 'origin', header: 'Origin', ...sizes.origin, wrap: 'anywhere', render: originLabel },
     {
       key: 'decided_by',
       header: 'Decided by',
+      ...sizes.decided_by,
+      wrap: 'anywhere',
       render: (decision) => textOrNull(decision.decided_by) ?? SYSTEM_AUTHOR,
     },
-    { key: 'patch', header: 'Patch applied', render: describePatch },
+    {
+      key: 'patch',
+      header: 'Patch applied',
+      ...sizes.patch,
+      wrap: 'anywhere',
+      render: describePatch,
+    },
     {
       key: 'expected_state',
       header: 'Resulting expected state',
+      ...sizes.expected_state,
+      wrap: 'anywhere',
       render: (decision) => describeExpectedState(decision, budgetNames),
     },
     {
       key: 'note',
       header: 'Note',
+      ...sizes.note,
+      wrap: 'anywhere',
       render: (decision) => textOrNull(decision.note) ?? EM_DASH,
     },
   ];
