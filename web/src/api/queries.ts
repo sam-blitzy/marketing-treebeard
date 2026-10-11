@@ -200,9 +200,9 @@ const DEFAULT_CUSTOM_RUNS_LIMIT = 20;
  * The `limit` the first `GET /discrepancies` page of {@link useDiscrepancies} asks for: the
  * largest that the API accepts (`MAX_LIMIT` in
  * `backend/src/ads_engine/api/routes/discrepancies.py`), so a long list takes the fewest pages.
- * Later pages carry it in the `Link` header's next target. It bounds the rows the API reads for
- * a page, not the discrepancies the page returns: a page can hold fewer while more follow, so a
- * page's length never decides whether the list is complete.
+ * Later pages carry it in the `Link` header's next target. It bounds the rows a page holds, and
+ * the API leaves out a row whose subject it cannot load, so a page can hold fewer discrepancies
+ * while more follow: a page's length never decides whether the list is complete.
  */
 const DISCREPANCY_PAGE_LIMIT = 500;
 
@@ -686,14 +686,15 @@ const REPEATED_PAGE_MESSAGE = 'The server returned a link to a page it had alrea
 /**
  * Reads every discrepancy in `states`, oldest first, by following the API's `Link` cursor.
  *
- * `GET /discrepancies` reads at most `limit` rows per page (200 by default) and, when it read
- * that many, names the next page in a `Link: <…>; rel="next"` header. Discrepancies are
- * resolved before anything else is trusted (AAP 0.5.4.2 P1), so every page is read: the first
- * at {@link DISCREPANCY_PAGE_LIMIT}, then each `next` page from {@link apiFetchPage}, exactly
- * as the API named it, until a page names none. A page's length never ends the list.
+ * A `GET /discrepancies` page holds at most `limit` rows (200 by default), and the API names the
+ * next page in a `Link: <…>; rel="next"` header only while more rows follow, so the last page
+ * never links to an empty one. Discrepancies are resolved before anything else is trusted
+ * (AAP 0.5.4.2 P1), so every page is read: the first at {@link DISCREPANCY_PAGE_LIMIT}, then
+ * each `next` page from {@link apiFetchPage}, exactly as the API named it, until a page names
+ * none. A page's length never ends the list.
  * The API leaves out a discrepancy whose subject it cannot load, so a page can hold fewer
  * discrepancies than `limit`, or none, while a next page follows, and only the API's cursor,
- * the id of the last row it read, steps past a row it left out.
+ * the id of the page's last row, steps past a row it left out.
  *
  * Two failures reject or restart the read rather than end the list short:
  *

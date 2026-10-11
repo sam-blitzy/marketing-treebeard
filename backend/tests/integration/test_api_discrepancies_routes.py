@@ -1,10 +1,10 @@
 """HTTP tests for ``GET /discrepancies`` paging (``ads_engine.api.routes.discrepancies``).
 
 The route lists the C0 discrepancies of the active datasets oldest ``detected_at`` first,
-then by id (AAP 0.5.4.4), as a ``Discrepancy[]`` body (AAP 0.5.3). It reads at most
+then by id (AAP 0.5.4.4), as a ``Discrepancy[]`` body (AAP 0.5.3). It lists at most
 ``limit`` rows (1 to 500, default 200) per page, continues after the ``after`` cursor's
 ``(detected_at, id)`` position, and names the next page in an RFC 8288 ``Link: rel="next"``
-header whenever it read a full page of rows. These tests drive it over HTTP through
+header whenever more rows follow the page. These tests drive it over HTTP through
 ``httpx.ASGITransport`` and check that following the ``Link`` header returns every row
 exactly once, in order, across ``detected_at`` ties, resolved cursor rows and rows whose
 subject is unavailable, and that bad paging parameters are 422s, never database errors.
@@ -601,10 +601,29 @@ async def test_following_links_lists_every_row_once_in_order(
     assert ids == world.unresolved_ids()
     assert len(ids) == len(set(ids))
     rows = len(UNRESOLVED_ORDER)
-    # A full last page cannot tell that nothing follows, so it links to an empty page.
-    assert len(pages) == rows // limit + 1
+    # The last page links nowhere, a full one included, so no page comes back empty.
+    assert len(pages) == -(-rows // limit)
+    assert all(_ids(page) for page in pages)
     assert all(len(_ids(page)) == limit for page in pages[:-1])
     assert "link" not in pages[-1].headers
+
+
+@pytest.mark.anyio
+async def test_exactly_full_last_page_carries_no_link(
+    world: World, client: httpx.AsyncClient
+) -> None:
+    """A last page holding exactly ``limit`` rows ends the list instead of naming an empty one."""
+    expected = world.unresolved_ids()
+    total = str(len(UNRESOLVED_ORDER))
+    whole = await client.get(PATH, params={"limit": len(UNRESOLVED_ORDER)})
+    assert _ids(whole) == expected
+    assert "link" not in whole.headers
+    assert whole.headers[discrepancies.TOTAL_COUNT_HEADER] == total
+    ids, pages = await _walk(client, f"{PATH}?limit=3")
+    assert ids == expected
+    assert [_ids(page) for page in pages] == [expected[:3], expected[3:]]
+    assert "link" not in pages[1].headers
+    assert [page.headers[discrepancies.TOTAL_COUNT_HEADER] for page in pages] == [total, total]
 
 
 @pytest.mark.anyio
@@ -718,7 +737,7 @@ async def test_cursor_from_another_dataset_positions_the_page(
 async def test_page_of_unavailable_subjects_still_links_onward(
     world: World, sessions: Sessions, client: httpx.AsyncClient
 ) -> None:
-    """A full read of rows links onward even when every row's subject is unavailable."""
+    """A page with rows behind it links onward even when every row's subject is unavailable."""
     async with sessions() as session, session.begin():
         unavailable = [
             await _discrepancy(

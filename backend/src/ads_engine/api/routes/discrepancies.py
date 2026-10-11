@@ -85,7 +85,7 @@ router = APIRouter(tags=["discrepancies"])
 _log = get_logger(__name__)
 
 DEFAULT_LIMIT: Final = 200
-"""Rows a ``GET /discrepancies`` page reads when the request names no ``limit``."""
+"""The most rows a ``GET /discrepancies`` page holds when the request names no ``limit``."""
 
 MAX_LIMIT: Final = 500
 """The largest ``limit`` ``GET /discrepancies`` accepts."""
@@ -270,7 +270,7 @@ def _next_link(request: Request, after: int) -> str:
 
     Args:
         request: The current request.
-        after: The id of the last discrepancy row the current page read.
+        after: The id of the last discrepancy row of the current page.
 
     Returns:
         ``<{path}?{query}>; rel="next"``.
@@ -311,7 +311,7 @@ async def list_discrepancies(
             ge=1,
             le=MAX_LIMIT,
             description=(
-                f"The most discrepancies the page reads, 1 to {MAX_LIMIT} "
+                f"The most discrepancies the page holds, 1 to {MAX_LIMIT} "
                 f"(default {DEFAULT_LIMIT})."
             ),
         ),
@@ -338,17 +338,18 @@ async def list_discrepancies(
     its (kind, shape) pair in their fixed display order, so the resolver renders exactly
     that row (AAP 0.5.5).
 
-    **Paging.** A page reads at most ``limit`` discrepancy rows (1 to 500, default 200).
+    **Paging.** A page holds at most ``limit`` discrepancy rows (1 to 500, default 200).
     ``after`` continues the list after the discrepancy with that id: the page holds the rows
     whose ``(detected_at, id)`` sorts after the cursor row's. The cursor row is found
     whatever its current state or dataset, because ``detected_at`` never changes, so a
-    cursor stays valid after its discrepancy is resolved. When the page read ``limit``
-    rows, more may follow, and the response carries an RFC 8288 ``Link`` header naming the
-    next page as a relative reference, for example
+    cursor stays valid after its discrepancy is resolved. The page reads one row past
+    ``limit`` to learn whether more follow, and only then does the response carry an
+    RFC 8288 ``Link`` header naming the next page as a relative reference, for example
     ``</api/v1/discrepancies?state=resolved&limit=50&after=812>; rel="next"``: the same
     path and query, each repeated ``state`` included, with ``after`` set to the id of the
-    last row read. Without that header the list is complete, so following it until it no
-    longer comes back returns every row exactly once.
+    page's last row. Without that header the list is complete, and the last page never
+    links to an empty one, so following it until it no longer comes back returns every
+    row exactly once.
 
     A discrepancy whose subject the domain reports as not found is left out and logged as
     ``discrepancies.subject_unavailable``: no resolution could be applied to it. A page can
@@ -370,8 +371,8 @@ async def list_discrepancies(
         user: The signed-in user; the route requires a session and reads nothing else from it.
         session: The request's session.
         state: The states to list; ``open`` and ``awaiting_platform`` by default.
-        limit: At most this many rows are read for the page; a ``limit`` outside 1-500 is
-            a 422 validation error.
+        limit: The page holds at most this many rows; a ``limit`` outside 1-500 is a 422
+            validation error.
         after: The id of the last discrepancy of the previous page, from the ``Link``
             header; ``None`` for the first page. An id outside 1 to ``2**63 - 1`` is a 422
             validation error.
@@ -398,11 +399,15 @@ async def list_discrepancies(
         statement = statement.where(
             tuple_(Discrepancy.detected_at, Discrepancy.id) > tuple_(*cursor),
         )
-    rows: Sequence[Discrepancy] = (
+    read: Sequence[Discrepancy] = (
         await session.scalars(
-            statement.order_by(Discrepancy.detected_at, Discrepancy.id).limit(limit)
+            statement.order_by(Discrepancy.detected_at, Discrepancy.id).limit(limit + 1)
         )
     ).all()
+    # The row past ``limit`` only tells whether more follow: its subject is never loaded,
+    # and it is never logged or listed.
+    more = len(read) > limit
+    rows: Sequence[Discrepancy] = read[:limit]
     # The decision shape is a property of the subject, not of the discrepancy: every distinct
     # subject of the page is loaded once, all of them in one set-based domain call whose
     # statement count does not grow with the number of subjects.
@@ -417,9 +422,10 @@ async def list_discrepancies(
         elif ref not in unavailable:
             unavailable.add(ref)
             _report_unavailable(row, ref, loaded.not_found[ref])
-    if len(rows) == limit:
-        # A full read of rows may have more behind it; a page of fewer views does not end
-        # the list, because rows whose subject is unavailable are left out of the views.
+    if more:
+        # Rows follow the page, so it links onward from its own last row; a page of fewer
+        # views does not end the list, because rows whose subject is unavailable are left
+        # out of the views.
         response.headers["Link"] = _next_link(request, rows[-1].id)
     return views
 
