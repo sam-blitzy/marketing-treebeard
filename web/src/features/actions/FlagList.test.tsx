@@ -213,7 +213,7 @@ describe('flagText', () => {
       'Qualified Lead count unavailable: r',
       'Pipeline unavailable: Qualified Lead count unavailable: r',
     ],
-  ])('puts the %s label before a message that does not name it', (code, message, text) => {
+  ])('puts the %s label before a message that does not name it: "%s"', (code, message, text) => {
     expect(flagText({ code, message })).toBe(text);
   });
 

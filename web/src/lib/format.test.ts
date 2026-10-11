@@ -149,6 +149,20 @@ function clockMinutes(text: string): number {
   return ((Number(hours) % 12) + (meridiem === 'PM' ? 12 : 0)) * 60 + Number(minutes);
 }
 
+/**
+ * Each value beside the label an `it.each` title shows for it through `%s`: the value as `%j`
+ * prints it, except that a number is written as JavaScript writes it. `%j` prints `NaN`,
+ * `Infinity` and `-Infinity` all as `null`, and `-0` as `0`, so those cases would share a title.
+ */
+function labelled<T>(values: readonly T[]): [label: string, value: T][] {
+  return values.map((value) => {
+    if (typeof value === 'number') {
+      return [Object.is(value, -0) ? '-0' : String(value), value];
+    }
+    return [value === undefined ? 'undefined' : JSON.stringify(value), value];
+  });
+}
+
 describe('constants', () => {
   it('fixes the locale and the placeholder texts', () => {
     expect(LOCALE).toBe('en');
@@ -329,9 +343,9 @@ describe('formatMoney', () => {
     expect(formatMoney('-0.001', 'USD')).toBe('USD\u00a00.00');
   });
 
-  it.each([null, undefined, '', '  ', 'abc', Number.NaN, Number.POSITIVE_INFINITY])(
-    'renders %j as unavailable',
-    (value) => {
+  it.each(labelled([null, undefined, '', '  ', 'abc', Number.NaN, Number.POSITIVE_INFINITY]))(
+    'renders %s as unavailable',
+    (_, value) => {
       expect(formatMoney(value, 'USD')).toBe(UNAVAILABLE);
       expect(formatMoney(value, 'USD')).not.toBe('0');
     },
@@ -445,12 +459,11 @@ describe('formatExactMoney', () => {
     expect(formatExactMoney('-40', 'USD')).toBe('USD\u00a0-40.00');
   });
 
-  it.each([null, undefined, '', '  ', 'abc', Number.NaN, Number.POSITIVE_INFINITY, '1e400'])(
-    'renders %j as unavailable',
-    (value) => {
-      expect(formatExactMoney(value, 'USD')).toBe(UNAVAILABLE);
-    },
-  );
+  it.each(
+    labelled([null, undefined, '', '  ', 'abc', Number.NaN, Number.POSITIVE_INFINITY, '1e400']),
+  )('renders %s as unavailable', (_, value) => {
+    expect(formatExactMoney(value, 'USD')).toBe(UNAVAILABLE);
+  });
 });
 
 describe('currencyMinorDigits and currencyStep', () => {
@@ -593,9 +606,9 @@ describe('formatDecimal', () => {
     expect(formatDecimal('0.123456789012345678901234', 25)).toBe('0.1234567890123456789');
   });
 
-  it.each([null, undefined, '', 'n/a', Number.NaN, Number.NEGATIVE_INFINITY])(
-    'renders %j as unavailable',
-    (value) => {
+  it.each(labelled([null, undefined, '', 'n/a', Number.NaN, Number.NEGATIVE_INFINITY]))(
+    'renders %s as unavailable',
+    (_, value) => {
       expect(formatDecimal(value)).toBe(UNAVAILABLE);
     },
   );
@@ -627,9 +640,12 @@ describe('formatCount', () => {
     expect(formatCount('1e-1000000')).toBe('< 0.01');
   });
 
-  it.each([null, undefined, '', 'abc', Number.NaN])('renders %j as unavailable', (value) => {
-    expect(formatCount(value)).toBe(UNAVAILABLE);
-  });
+  it.each(labelled([null, undefined, '', 'abc', Number.NaN]))(
+    'renders %s as unavailable',
+    (_, value) => {
+      expect(formatCount(value)).toBe(UNAVAILABLE);
+    },
+  );
 });
 
 describe('formatPercent', () => {
@@ -648,9 +664,12 @@ describe('formatPercent', () => {
     expect(formatPercent(0.004, 0)).toBe('< 1%');
   });
 
-  it.each([null, undefined, '', 'n/a', Number.NaN])('renders %j as unavailable', (value) => {
-    expect(formatPercent(value)).toBe(UNAVAILABLE);
-  });
+  it.each(labelled([null, undefined, '', 'n/a', Number.NaN]))(
+    'renders %s as unavailable',
+    (_, value) => {
+      expect(formatPercent(value)).toBe(UNAVAILABLE);
+    },
+  );
 
   it('shows exactly `digits` fraction digits when fixed, trailing zeros included', () => {
     expect(formatPercent('0.008', 2, { fixed: true })).toBe('0.80%');
@@ -738,9 +757,12 @@ describe('percentDigits', () => {
 });
 
 describe('formatCost', () => {
-  it.each([0, -0, '0', '0.000', '-0.00'])('renders an em dash for the known zero %j', (zero) => {
-    expect(formatCost('300', zero, 'USD')).toBe(EM_DASH);
-  });
+  it.each(labelled([0, -0, '0', '0.000', '-0.00']))(
+    'renders an em dash for the known zero %s',
+    (_, zero) => {
+      expect(formatCost('300', zero, 'USD')).toBe(EM_DASH);
+    },
+  );
 
   it('renders a zero denominator as a dash, never a finite cost or a ceiling', () => {
     expect(formatCost('500', 0, 'USD')).toBe('—');
@@ -761,18 +783,20 @@ describe('formatCost', () => {
     },
   );
 
-  it.each([
-    null,
-    undefined,
-    '',
-    'abc',
-    Number.NaN,
-    Number.POSITIVE_INFINITY,
-    Number.NEGATIVE_INFINITY,
-    '1e400',
-    -1,
-    '-0.5',
-  ])('renders the absent, unusable or negative denominator %j as unavailable', (denominator) => {
+  it.each(
+    labelled([
+      null,
+      undefined,
+      '',
+      'abc',
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+      '1e400',
+      -1,
+      '-0.5',
+    ]),
+  )('renders the absent, unusable or negative denominator %s as unavailable', (_, denominator) => {
     expect(formatCost('300', denominator, 'USD')).toBe(UNAVAILABLE);
     expect(formatCost('300', denominator, 'USD', 'no QL yet')).toBe(UNAVAILABLE);
   });
