@@ -85,12 +85,15 @@
 name: ads-engine
 
 # The one backend image behind migrate, api and worker. Each service's `command:` selects
-# the process. `image:` is a local tag only, never pushed, so the three services share one
-# build instead of producing three identical images.
+# the process. `image:` is a local tag only, never pushed. Only migrate builds it: a `build:`
+# here would give each of the three services its own build, which Compose labels with that
+# service's name, so three different images would race for this one tag and every
+# `up --build` would recreate api and worker with nothing changed. api and worker run the tag
+# migrate builds and never build or pull it (`pull_policy: never`), so a re-run with no change
+# keeps their containers and a new image recreates both. They depend on migrate, so `up`
+# builds the image before starting them; `run --no-deps api|worker` on a host without it
+# needs `docker compose build migrate` (or `make init`) first.
 x-backend: &backend
-  build:
-    context: ./backend
-    dockerfile: Dockerfile
   image: ads-engine-backend:local
   # DATA_MODE precedence: a non-blank shell value, then .env, then settings' default auto.
   # Later env files override earlier ones. Compose reads docker-compose.data-mode.env, whose
@@ -185,6 +188,10 @@ services:
 
   migrate:
     <<: *backend
+    # The only build of the backend image, for migrate, api and worker (x-backend, above).
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
     command: ["sh", "-c", "ads-engine migrate && ads-engine ensure-admin"]
     depends_on:
       db:
@@ -198,6 +205,8 @@ services:
 
   api:
     <<: *backend
+    # Runs the image migrate builds; the tag is local only, so it is never pulled.
+    pull_policy: never
     # Behind nginx. The login limit (5 attempts per minute per IP) keys on the client address
     # uvicorn takes from X-Forwarded-For. `--forwarded-allow-ips *` overrides the image's
     # loopback-only FORWARDED_ALLOW_IPS, so that address is the client nginx served, not
@@ -232,6 +241,10 @@ services:
       retries: 12
       start_period: 15s
     restart: unless-stopped
+    # Time after SIGTERM for the shutdown to wait, up to 15 s, for requests answered 503 at the
+    # request deadline to finish their cleanup before it closes the database pool. Docker's
+    # 10 s default would send SIGKILL first.
+    stop_grace_period: 20s
     deploy:
       resources:
         limits:
@@ -240,6 +253,8 @@ services:
 
   worker:
     <<: *backend
+    # Runs the image migrate builds; the tag is local only, so it is never pulled.
+    pull_policy: never
     command: ["python", "-m", "ads_engine.worker.main"]
     depends_on:
       migrate:

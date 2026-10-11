@@ -128,6 +128,11 @@ make check-tools
    password out of your shell history, see [First start](docs/runbook.md#first-start) in the
    runbook.
 
+   GNU make drops leading spaces and tabs from a command-line value. Pass a password that begins
+   with whitespace, or is only whitespace, through the environment, which keeps it unchanged:
+   `ADMIN_PASSWORD='<choose-a-password>' make init`. On Linux `make init` refuses such a
+   password on the command line; elsewhere it can refuse only one that make left empty.
+
 2. Build and start the stack:
 
    ```bash
@@ -284,7 +289,10 @@ Who reads each variable, and how to rotate secrets:
 Overridable variables (`COMPOSE`, `APP_URL`, `HEALTH_TIMEOUT`, `TEST_DB_PORT`, `PYTEST_ARGS`,
 `PLAYWRIGHT_INSTALL`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`) are
 described at the top of the `Makefile` and in [Make targets](docs/runbook.md#make-targets) in the
-runbook.
+runbook. GNU make drops the leading spaces and tabs of a command-line value, so give an
+`ADMIN_PASSWORD` that begins with whitespace through the environment
+(`ADMIN_PASSWORD='<value>' make init`); `make init` and `make e2e` refuse it on the command line
+(on Linux; elsewhere only when make left it empty).
 
 ## Configuration files
 

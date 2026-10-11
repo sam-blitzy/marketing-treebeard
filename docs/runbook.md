@@ -75,13 +75,19 @@ make check-tools
    ```
 
    To keep the password out of the command line and the history entirely, read it first and
-   pass it through the environment, which `make init` accepts unchanged:
+   pass it through the environment, which `make init` accepts unchanged (`IFS=` keeps `read`
+   from trimming spaces and tabs at either end):
 
    ```bash
-   read -rs -p 'Admin password: ' ADMIN_PASSWORD; echo
+   IFS= read -rs -p 'Admin password: ' ADMIN_PASSWORD; echo
    ADMIN_PASSWORD="$ADMIN_PASSWORD" make init
    unset ADMIN_PASSWORD
    ```
+
+   A password that begins with a space or tab, or is only whitespace, must take this route:
+   GNU make drops leading spaces and tabs from a command-line value, so `make init` refuses
+   such a password on the command line rather than hash a different one (on Linux; elsewhere,
+   where make's own arguments cannot be read, only one that make left empty).
 
    `make init` then:
    - runs `make check-tools`;
@@ -1230,16 +1236,20 @@ at the first failing command.
 |--------|--------------|
 | `help` | Lists the targets (the default goal) |
 | `check-tools` | Verifies Docker Compose `>=5.5.1,<6` and Docker Engine `>=29`, and prints the found versions and the required range |
-| `init` | `check-tools`; requires `ADMIN_PASSWORD`; refuses an existing `.env`; makes `config/` readable to the backend containers (`chmod -R a+rX config/`); copies `.env.example` to `.env` (mode 600); writes a random `SESSION_SECRET`; builds the backend image (`docker compose build migrate`) and writes the single-quoted argon2id `APP_ADMIN_PASSWORD_HASH` from `ads-engine hash-password`; removes the partial `.env` on failure |
+| `init` | `check-tools`; requires `ADMIN_PASSWORD`, and refuses a command-line value that begins with whitespace or is only whitespace (on Linux; elsewhere only one make left empty), which goes through the environment instead; refuses an existing `.env`; makes `config/` readable to the backend containers (`chmod -R a+rX config/`); copies `.env.example` to `.env` (mode 600); writes a random `SESSION_SECRET`; builds the backend image (`docker compose build migrate`) and writes the single-quoted argon2id `APP_ADMIN_PASSWORD_HASH` from `ads-engine hash-password`; removes the partial `.env` on failure |
 | `up` | `check-tools`; requires `.env`; `docker compose up -d --build`; waits up to `HEALTH_TIMEOUT` (default 180) seconds for `APP_URL/api/v1/healthz` (default `http://localhost:8080`) to answer 200, and prints the containers' state and recent logs when it does not |
 | `down` | `docker compose down`: stops and removes the containers and keeps the `pgdata` volume |
 | `migrate` | Requires `.env`; `docker compose run --rm migrate`, which runs `ads-engine migrate && ads-engine ensure-admin` |
 | `seed-simulated` | Requires `.env`; `docker compose run --rm migrate sh -c 'ads-engine migrate && ads-engine seed-simulated'` |
 | `test` | Backend pytest on a disposable `postgres:18.6` of its own (`ads-engine-testdb-<random token>` on `127.0.0.1:TEST_DB_PORT`, default 55432, `0` for a free port; a container it did not create is never reused or removed), then the web unit tests. On exit, Ctrl-C included, it removes that container and its anonymous volume and checks for up to about 10 s that they are gone; a removal it cannot confirm fails the target, even when the tests passed, and prints the `docker` command that finds or removes what remains. `PYTEST_ARGS` passes extra pytest arguments |
 | `lint` | `uv sync --frozen`, then `ruff format --check`, `ruff check`, `mypy --strict src`; `npm ci`, then `npm run lint`, `npm run typecheck` |
-| `e2e` | `check-tools`; requires `.env` and `ADMIN_PASSWORD`; starts the stack with `DATA_MODE=simulated` as `up` does; `npm ci`; `PLAYWRIGHT_INSTALL`; `npm run e2e` with `E2E_COMPOSE` set to `COMPOSE`; leaves the stack running |
+| `e2e` | `check-tools`; requires `.env` and `ADMIN_PASSWORD`, and refuses a command-line value that begins with whitespace or is only whitespace, as `init` does; starts the stack with `DATA_MODE=simulated` as `up` does; `npm ci`; `PLAYWRIGHT_INSTALL`; `npm run e2e` with `E2E_COMPOSE` set to `COMPOSE`; leaves the stack running |
 | `secret-scan` | Runs the pinned `zricethezav/gitleaks:v8.30.1` image as published: pulls it only when it is not present locally, and never builds, patches or tags an image; checks that its gitleaks reports `v8.30.1`; then runs it with `--network none`, a read-only checkout and `.gitleaks.toml` over every commit (`gitleaks git --redact --exit-code 1`); a finding fails it |
 
 Overridable variables, on the command line or in the environment: `COMPOSE` (default
 `docker compose`; add `-p` or `-f` flags here), `APP_URL`, `HEALTH_TIMEOUT`, `TEST_DB_PORT`,
-`PYTEST_ARGS`, `PLAYWRIGHT_INSTALL`, `ADMIN_EMAIL` and `ADMIN_PASSWORD`.
+`PYTEST_ARGS`, `PLAYWRIGHT_INSTALL`, `ADMIN_EMAIL` and `ADMIN_PASSWORD`. GNU make drops the
+leading spaces and tabs of a command-line value, so an `ADMIN_PASSWORD` that begins with
+whitespace, or is only whitespace, goes through the environment
+(`ADMIN_PASSWORD='<value>' make init`, which passes it unchanged); `make init` and `make e2e`
+refuse it on the command line (on Linux; elsewhere only when make left it empty).

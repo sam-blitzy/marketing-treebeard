@@ -16,9 +16,12 @@ test database; nothing reaches the network. The guarantees proven here:
   TCP and never answers, as a paused or partitioned PostgreSQL does, makes ``/healthz`` answer
   503 ``database_unavailable`` within its 3 s bound, logged as ``health.database_unavailable``;
   a request still running at the request deadline, a database-backed one included, is
-  cancelled and answered 503 ``request_timeout``, logged as ``api.request_timeout``. A request
-  that finishes in time, a ``TimeoutError`` of the application's own, a response already
-  started, other ASGI scopes and an outside cancellation are left alone.
+  answered 503 ``request_timeout`` at the deadline, logged as ``api.request_timeout``, and
+  cancelled, while its cleanup unwinds in the background: what it sends meanwhile is dropped,
+  a failure of the unwind is logged once without its text, and the lifespan waits for the
+  unwinds, within a bound, before it disposes the pool. A request that finishes in time, a
+  ``TimeoutError`` of the application's own, a response already started and other ASGI scopes
+  are left alone, and an outside cancellation propagates once the request has unwound.
 * **HEAD requests** (RFC 9110 §9.3.2): ``HEAD`` answers every ``GET`` route, signed in or
   anonymous, with ``GET``'s status and headers and no body, while the OpenAPI document publishes
   no ``head`` operation; a 405's ``Allow`` that names ``GET`` names ``HEAD`` too, and ``HEAD`` on
@@ -65,6 +68,7 @@ would open for it, and one default-window run.
 
 import asyncio
 import functools
+import gc
 import json
 import logging
 import os
@@ -1073,6 +1077,13 @@ LOG_FIELDS: Final = frozenset({"event", "level", "logger", "timestamp"})
 SHORT_DEADLINE_S: Final = 0.5
 """The request deadline the deadline tests patch in, instead of the production 45 s."""
 
+UNWIND_S: Final = 1.5
+"""How long a slow-to-unwind application keeps cleaning up after its cancellation.
+
+It stands in for psycopg, which on a server that stopped answering spends up to about 10 s
+cancelling the query of a request the deadline cancelled (a cancel request, then a wait).
+"""
+
 
 @asynccontextmanager
 async def silent_server() -> AsyncIterator[tuple[int, list[asyncio.StreamWriter]]]:
@@ -1119,6 +1130,23 @@ async def point_database_at(set_env: Callable[..., None], port: int, password: s
 def events_named(captured_logs: CapturedLogs, event: str) -> list[dict[str, Any]]:
     """Return the captured log records of ``event``."""
     return [record for record in captured_logs() if record.get("event") == event]
+
+
+async def settle_unwinds(unwinding: set[asyncio.Task[None]]) -> None:
+    """Wait until every request the deadline let go has finished unwinding and been released.
+
+    Such a request keeps unwinding after its 503; waiting for it keeps the assertions that
+    follow deterministic and leaves no task pending when the test's event loop closes.
+
+    Args:
+        unwinding: The deadline middleware's set, ``app.state.request_unwinds`` for an
+            application ``create_app`` built.
+    """
+    if unwinding:
+        await asyncio.wait(set(unwinding), timeout=UNWIND_S + 5.0)
+    # Yield once more, so the done-callbacks that release each request have all run.
+    await asyncio.sleep(0)
+    assert unwinding == set()
 
 
 async def test_healthz_503_within_its_bound_when_the_database_never_answers(
@@ -1208,6 +1236,8 @@ async def test_database_backed_request_past_the_deadline_is_503_request_timeout(
             )
             elapsed = loop.time() - started
             assert test_identity.session_cookie not in client.cookies
+        # The cancelled login unwinds after its 503; it ends while the server is still silent.
+        await settle_unwinds(app.state.request_unwinds)
         assert len(accepted) == 1
 
     error = assert_error(response, 503, "request_timeout")
@@ -1269,6 +1299,8 @@ async def test_request_deadline_answers_only_a_request_still_running(
         stalled_response = await client.get(api(f"/test-stalled?marker={marker}"))
         fast_response = await client.get(api("/test-fast"))
         own_response = await client.get(api("/test-own-timeout"))
+    # The 503 is sent at the deadline; the stalled route's cancellation unwinds after it.
+    await settle_unwinds(app.state.request_unwinds)
 
     assert_error(stalled_response, 503, "request_timeout")
     assert cancelled.is_set()
@@ -1329,6 +1361,7 @@ async def test_request_deadline_never_starts_a_second_response(
 
     middleware = api_app._RequestDeadlineMiddleware(started_then_stalled, timeout=0.2)
     await middleware(http_scope("/api/v1/stream"), receive_nothing, collect)
+    await settle_unwinds(middleware.unwinding)
 
     assert sent == [start]
     [record] = events_named(captured_logs, "api.request_timeout")
@@ -1370,6 +1403,333 @@ async def test_request_deadline_leaves_other_scopes_and_outside_cancellation_alo
         await task
     assert task.cancelled()
     assert sent == []
+    await settle_unwinds(middleware.unwinding)
+
+
+async def test_request_deadline_answers_at_the_deadline_while_the_request_unwinds(
+    captured_logs: CapturedLogs,
+) -> None:
+    """The 503 goes out at the deadline, not after the cancelled request's cleanup.
+
+    With a database that stopped answering, psycopg spends up to about 10 s cancelling the query
+    of a request the deadline cancelled. Here the application keeps cleaning up for 1.5 s after
+    its cancellation under a 0.2 s deadline: the 503 ``request_timeout`` start and body are sent,
+    and ``api.request_timeout`` is logged, at the deadline, while the request is still held in
+    the middleware's ``unwinding`` set. The unwind completes afterwards, and the response the
+    application tries to start during it is dropped, never forwarded to the finished answer.
+    """
+    captured_logs.configure(settings=get_settings())
+    captured_logs.clear()
+    loop = asyncio.get_running_loop()
+    deadline_s = 0.2
+    late: Message = {"type": "http.response.start", "status": 500, "headers": []}
+    unwound_at: list[float] = []
+
+    async def slow_to_unwind(scope: Scope, receive: Receive, send: Send) -> None:
+        """Stall; once cancelled, clean up for a while, try to answer, then end cancelled."""
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(UNWIND_S)
+            await send(late)
+            unwound_at.append(loop.time())
+            raise
+
+    sent: list[tuple[float, Message]] = []
+
+    async def collect(message: Message) -> None:
+        """Record what the middleware sends, and when."""
+        sent.append((loop.time(), message))
+
+    unwinding: set[asyncio.Task[None]] = set()
+    middleware = api_app._RequestDeadlineMiddleware(
+        slow_to_unwind, timeout=deadline_s, unwinding=unwinding
+    )
+    started = loop.time()
+    await middleware(http_scope("/api/v1/slow"), receive_nothing, collect)
+    returned_after = loop.time() - started
+    timeout_records = events_named(captured_logs, "api.request_timeout")
+    still_unwinding = len(unwinding)
+    unwound_before_return = list(unwound_at)
+    await settle_unwinds(unwinding)
+
+    assert deadline_s - 0.05 <= returned_after < deadline_s + 0.5
+    assert unwound_before_return == []
+    assert still_unwinding == 1
+    [(start_at, start), (body_at, body)] = sent
+    assert start["type"] == "http.response.start"
+    assert start["status"] == 503
+    assert body["type"] == "http.response.body"
+    assert json.loads(body["body"]) == {
+        "error": {"code": "request_timeout", "message": "The request did not complete in time"}
+    }
+    assert start_at - started < deadline_s + 0.5
+    assert body_at - started < deadline_s + 0.5
+    [unwound] = unwound_at
+    assert unwound - started >= deadline_s + UNWIND_S - 0.05
+    assert late not in [message for _, message in sent]
+    [record] = timeout_records
+    assert set(record) == LOG_FIELDS | {"method", "path", "timeout_s", "response_started"}
+    assert record["level"] == "warning"
+    assert (record["method"], record["path"]) == ("GET", "/api/v1/slow")
+    assert record["timeout_s"] == deadline_s
+    assert record["response_started"] is False
+    assert events_named(captured_logs, "api.request_timeout") == [record]
+    assert events_named(captured_logs, "api.request_unwind_failed") == []
+
+
+@pytest.mark.parametrize("owner", [None, "analysis_run_failed"])
+async def test_request_deadline_logs_a_failed_unwind_once_without_its_text(
+    owner: str | None, captured_logs: CapturedLogs
+) -> None:
+    """A request that fails while unwinding past the deadline is logged once, never its text.
+
+    The application raises a ``RuntimeError`` carrying a marker instead of ending cancelled. The
+    503 is still sent at the deadline, and the failure is logged once as
+    ``api.request_unwind_failed`` with the method, the path without its query string and the
+    error class: at ERROR level, or as a WARNING naming ``logged_as`` when its owner already
+    logged it. The marker appears in no log line, and asyncio never reports the task's
+    exception as unretrieved.
+    """
+    captured_logs.configure(settings=get_settings())
+    captured_logs.clear()
+    marker = "-".join(("unwind", "marker", "8812"))
+    loop = asyncio.get_running_loop()
+    reported: list[dict[str, Any]] = []
+    previous_handler = loop.get_exception_handler()
+
+    def report(_: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+        """Record what asyncio reports, such as an exception never retrieved."""
+        reported.append(context)
+
+    async def fails_while_unwinding(scope: Scope, receive: Receive, send: Send) -> None:
+        """Stall; once cancelled, fail with an error of its own."""
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            error = RuntimeError(marker)
+            if owner is not None:
+                ads_logging.mark_logged(error, owner)
+            raise error from None
+
+    sent: list[Message] = []
+
+    async def collect(message: Message) -> None:
+        """Record what the middleware sends."""
+        sent.append(message)
+
+    unwinding: set[asyncio.Task[None]] = set()
+    middleware = api_app._RequestDeadlineMiddleware(
+        fails_while_unwinding, timeout=0.2, unwinding=unwinding
+    )
+    loop.set_exception_handler(report)
+    try:
+        await middleware(http_scope("/api/v1/failing"), receive_nothing, collect)
+        [request] = unwinding
+        await settle_unwinds(unwinding)
+        assert request.done()
+        assert not request.cancelled()
+        # An unretrieved exception is reported when its task is collected.
+        del request
+        gc.collect()
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert [message["type"] for message in sent] == ["http.response.start", "http.response.body"]
+    assert sent[0]["status"] == 503
+    [record] = events_named(captured_logs, "api.request_unwind_failed")
+    expected = {"method", "path", "error_type"} | ({"logged_as"} if owner is not None else set())
+    assert set(record) == LOG_FIELDS | expected
+    assert record["level"] == ("error" if owner is None else "warning")
+    assert record["logger"] == "ads_engine.api.app"
+    assert (record["method"], record["path"]) == ("GET", "/api/v1/failing")
+    assert record["error_type"] == "RuntimeError"
+    assert record.get("logged_as") == owner
+    assert marker not in captured_logs.text
+    assert "secret=1" not in captured_logs.text
+    assert [context for context in reported if marker in str(context.get("exception"))] == []
+
+
+async def test_request_deadline_outside_cancellation_waits_for_the_unwind(
+    captured_logs: CapturedLogs,
+) -> None:
+    """An outside cancellation propagates once the request has unwound, with nothing sent.
+
+    One cancellation from outside (a client disconnect, a server shutdown) is held until the
+    application has finished unwinding, as it would be had the application run in the caller's
+    task, so a graceful shutdown still covers the cleanup. A second cancellation ends the
+    middleware at once, while the request stays held in ``unwinding`` until it ends; its
+    outcome, a failure here, is then retrieved and logged once.
+    """
+    captured_logs.configure(settings=get_settings())
+    captured_logs.clear()
+    marker = "-".join(("outside", "marker", "3307"))
+    release = asyncio.Event()
+    unwound: list[str] = []
+
+    async def unwinds_on_release(scope: Scope, receive: Receive, send: Send) -> None:
+        """Stall; once cancelled, unwind only when released, failing on ``/twice``."""
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()
+            unwound.append(scope["path"])
+            if scope["path"] == "/api/v1/twice":
+                raise RuntimeError(marker) from None
+            raise
+
+    sent: list[Message] = []
+
+    async def collect(message: Message) -> None:
+        """Record what the middleware sends."""
+        sent.append(message)
+
+    unwinding: set[asyncio.Task[None]] = set()
+    middleware = api_app._RequestDeadlineMiddleware(
+        unwinds_on_release, timeout=30.0, unwinding=unwinding
+    )
+
+    once = asyncio.create_task(middleware(http_scope("/api/v1/once"), receive_nothing, collect))
+    await asyncio.sleep(0.05)
+    once.cancel()
+    await asyncio.sleep(0.05)
+    assert not once.done()
+    assert len(unwinding) == 1
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await once
+    assert once.cancelled()
+    assert unwound == ["/api/v1/once"]
+    await settle_unwinds(unwinding)
+
+    release.clear()
+    twice = asyncio.create_task(middleware(http_scope("/api/v1/twice"), receive_nothing, collect))
+    await asyncio.sleep(0.05)
+    twice.cancel()
+    await asyncio.sleep(0.05)
+    twice.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await twice
+    assert twice.cancelled()
+    assert unwound == ["/api/v1/once"]
+    assert len(unwinding) == 1
+    release.set()
+    await settle_unwinds(unwinding)
+
+    assert unwound == ["/api/v1/once", "/api/v1/twice"]
+    assert sent == []
+    [record] = events_named(captured_logs, "api.request_unwind_failed")
+    assert (record["method"], record["path"]) == ("GET", "/api/v1/twice")
+    assert record["error_type"] == "RuntimeError"
+    assert marker not in captured_logs.text
+    assert events_named(captured_logs, "api.request_timeout") == []
+
+
+def add_slow_to_unwind_route(
+    app: FastAPI, path: str, unwind: Callable[[], Awaitable[object]]
+) -> None:
+    """Add ``GET path`` to ``app``: a route that stalls, and once cancelled awaits ``unwind()``."""
+
+    async def slow_to_unwind() -> dict[str, bool]:
+        """Stall; once cancelled, keep unwinding until ``unwind()`` completes."""
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await unwind()
+            raise
+        return {"finished": True}
+
+    app.add_api_route(api(path), slow_to_unwind, methods=["GET"])
+
+
+async def test_lifespan_drains_request_unwinds_before_disposing_the_pool(
+    monkeypatch: pytest.MonkeyPatch, captured_logs: CapturedLogs
+) -> None:
+    """Shutdown waits for the requests answered at the deadline to finish their cleanup.
+
+    uvicorn waits only for its own request tasks, while a request answered 503 at the deadline
+    keeps unwinding after its task has ended. The lifespan therefore waits for the deadline's
+    ``app.state.request_unwinds`` before ``dispose_engine``: a request still unwinding when
+    shutdown begins has finished, and been released, by the time the pool is disposed, and no
+    ``api.request_unwinds_pending`` warning is logged.
+    """
+    monkeypatch.setattr(api_app, "_REQUEST_TIMEOUT_S", SHORT_DEADLINE_S)
+    app = create_app()
+    app.state.thresholds = Thresholds.load(CONFIG_DIR)
+    unwound = asyncio.Event()
+
+    async def unwind() -> None:
+        """Clean up for a while, then note the cleanup finished."""
+        await asyncio.sleep(UNWIND_S)
+        unwound.set()
+
+    add_slow_to_unwind_route(app, "/test-slow-unwind", unwind)
+    disposed: list[tuple[bool, int]] = []
+
+    async def recording_dispose_engine() -> None:
+        """Record whether the cleanup had finished, and how many requests were still held."""
+        disposed.append((unwound.is_set(), len(app.state.request_unwinds)))
+
+    monkeypatch.setattr(api_app, "dispose_engine", recording_dispose_engine)
+    captured_logs.configure(settings=get_settings())
+    captured_logs.clear()
+    async with api_app._lifespan(app):
+        async with serve(app) as client:
+            response = await client.get(api("/test-slow-unwind"))
+        assert_error(response, 503, "request_timeout")
+        held_at_shutdown = len(app.state.request_unwinds)
+        unwound_at_shutdown = unwound.is_set()
+
+    assert (held_at_shutdown, unwound_at_shutdown) == (1, False)
+    assert disposed == [(True, 0)]
+    assert len(events_named(captured_logs, "api.stopping")) == 1
+    assert events_named(captured_logs, "api.request_unwinds_pending") == []
+
+
+async def test_lifespan_disposes_the_pool_once_the_unwind_bound_passes(
+    monkeypatch: pytest.MonkeyPatch, captured_logs: CapturedLogs
+) -> None:
+    """A cleanup still running after the drain's bound is logged, and the pool is disposed.
+
+    Under a 0.2 s bound, a request whose cleanup never ends on its own leaves shutdown waiting
+    only that long: one ``api.request_unwinds_pending`` WARNING names the one request still
+    unwinding and the bound, then ``dispose_engine`` runs with it still held.
+    """
+    drain_s = 0.2
+    monkeypatch.setattr(api_app, "_REQUEST_TIMEOUT_S", SHORT_DEADLINE_S)
+    monkeypatch.setattr(api_app, "_REQUEST_UNWIND_DRAIN_S", drain_s)
+    app = create_app()
+    app.state.thresholds = Thresholds.load(CONFIG_DIR)
+    release = asyncio.Event()
+    add_slow_to_unwind_route(app, "/test-stuck-unwind", release.wait)
+    disposed: list[int] = []
+
+    async def recording_dispose_engine() -> None:
+        """Record how many requests were still unwinding when the pool was disposed."""
+        disposed.append(len(app.state.request_unwinds))
+
+    monkeypatch.setattr(api_app, "dispose_engine", recording_dispose_engine)
+    captured_logs.configure(settings=get_settings())
+    captured_logs.clear()
+    loop = asyncio.get_running_loop()
+    try:
+        async with api_app._lifespan(app):
+            async with serve(app) as client:
+                response = await client.get(api("/test-stuck-unwind"))
+            assert_error(response, 503, "request_timeout")
+            stopping_at = loop.time()
+        shutdown_took = loop.time() - stopping_at
+    finally:
+        release.set()
+        await settle_unwinds(app.state.request_unwinds)
+
+    assert disposed == [1]
+    assert drain_s - 0.05 <= shutdown_took < drain_s + 1.0
+    [record] = events_named(captured_logs, "api.request_unwinds_pending")
+    assert set(record) == LOG_FIELDS | {"pending", "timeout_s"}
+    assert record["level"] == "warning"
+    assert record["logger"] == "ads_engine.api.app"
+    assert (record["pending"], record["timeout_s"]) == (1, drain_s)
 
 
 async def test_openapi_document_401_without_session(
@@ -1688,6 +2048,7 @@ async def test_head_errors_rendered_outside_the_middleware_log_the_real_method(
     async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as client:
         timed_out = await client.head(api("/test-stalled"))
         failed = await client.head(api("/test-crashed"))
+    await settle_unwinds(app.state.request_unwinds)
 
     for response, status in ((timed_out, 503), (failed, 500)):
         assert response.status_code == status, response.headers
@@ -1844,6 +2205,7 @@ async def test_deadline_503_and_catch_all_500_are_no_store(monkeypatch: pytest.M
         failed = await client.get(api("/test-crashed"))
         timed_out_head = await client.head(api("/test-stalled"))
         failed_head = await client.head(api("/test-crashed"))
+    await settle_unwinds(app.state.request_unwinds)
 
     assert_error(timed_out, 503, "request_timeout")
     assert_error(failed, 500, "internal_error")

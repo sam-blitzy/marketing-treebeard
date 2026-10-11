@@ -31,13 +31,20 @@
 #   PYTEST_ARGS         extra pytest arguments for `make test`, such as tests/unit
 #   PLAYWRIGHT_INSTALL  browser install step of `make e2e`; empty skips it
 #   ADMIN_EMAIL         e2e login, the APP_ADMIN_EMAIL of .env
-#   ADMIN_PASSWORD      init: the admin password to hash; e2e: the password given to init
+#   ADMIN_PASSWORD      init: the admin password to hash; e2e: the password given to init.
+#                       make drops leading spaces and tabs from a command-line value, so give
+#                       a password that begins with whitespace, or is only whitespace,
+#                       through the environment, which keeps it unchanged:
+#                       ADMIN_PASSWORD='<value>' make init. init and e2e refuse such a
+#                       command-line value (where make's arguments cannot be read, as on
+#                       macOS, only one that make left empty)
 # Each is one of two kinds:
 #   data                APP_URL, HEALTH_TIMEOUT, TEST_DB_PORT, ADMIN_EMAIL and ADMIN_PASSWORD
 #                       reach the recipes through their environment and are expanded there in
 #                       double quotes, never pasted into shell source, so a quote, `$` or
 #                       backtick in a value stays text; HEALTH_TIMEOUT and TEST_DB_PORT are
-#                       also checked as numbers
+#                       also checked as numbers. Only leading whitespace is lost, and only on
+#                       the command line, where make drops it (see ADMIN_PASSWORD)
 #   trusted shell text  COMPOSE, PYTEST_ARGS and PLAYWRIGHT_INSTALL are commands and argument
 #                       lists the operator writes, and the recipes run them as written, with
 #                       shell quoting, expansion and word splitting; never fill them from
@@ -110,14 +117,22 @@ HEALTH_TIMEOUT ?= 180
 PYTEST_ARGS ?=
 PLAYWRIGHT_INSTALL ?= npx playwright install --with-deps chromium
 
-# ADMIN_PASSWORD, ADMIN_EMAIL, APP_URL and HEALTH_TIMEOUT are data: they are exported, and the
-# recipes read them from their environment in double quotes ("$$APP_URL"), never as make text
-# pasted into their shell source, where a quote in a value would end the quoting and the rest
-# of the value would run as commands. STACK_UP checks HEALTH_TIMEOUT before anything starts.
-# A command-line value would be expanded by make before it reaches the recipe environment, so
-# `make init ADMIN_PASSWORD='pa$word'` would hash "paord". Re-binding each as a simple variable
-# from its unexpanded text passes the value through byte for byte; an environment value is
-# passed through unchanged already.
+# ADMIN_PASSWORD, ADMIN_EMAIL, APP_URL, HEALTH_TIMEOUT and TEST_DB_PORT are data: they are
+# exported, and the recipes read them from their environment in double quotes ("$$APP_URL"),
+# never as make text pasted into their shell source, where a quote in a value would end the
+# quoting and the rest of the value would run as commands. STACK_UP checks HEALTH_TIMEOUT, and
+# test TEST_DB_PORT, before anything starts.
+# A command-line value would be expanded by make before it reaches the recipe environment, on
+# every target: `make init ADMIN_PASSWORD='pa$word'` would hash "paord", and a $(shell ...) in
+# a command-line TEST_DB_PORT would run even for `make help`. Re-binding each as a simple
+# variable from its unexpanded text keeps every character make received; an environment value
+# is passed through unchanged already. make has by then dropped the leading spaces and tabs of
+# a command-line value: it strips them while it reads VAR=value, before any makefile text runs,
+# and keeps trailing ones. A password that begins with whitespace therefore goes through the
+# environment, and init and e2e refuse such a command-line ADMIN_PASSWORD
+# (REFUSE_STRIPPED_ADMIN_PASSWORD). ADMIN_PASSWORD_ORIGIN keeps the origin from before the
+# re-binding, which turns it into override.
+override ADMIN_PASSWORD_ORIGIN := $(origin ADMIN_PASSWORD)
 ifeq ($(origin ADMIN_PASSWORD),command line)
 override ADMIN_PASSWORD := $(value ADMIN_PASSWORD)
 endif
@@ -129,6 +144,9 @@ override APP_URL := $(value APP_URL)
 endif
 ifeq ($(origin HEALTH_TIMEOUT),command line)
 override HEALTH_TIMEOUT := $(value HEALTH_TIMEOUT)
+endif
+ifeq ($(origin TEST_DB_PORT),command line)
+override TEST_DB_PORT := $(value TEST_DB_PORT)
 endif
 export ADMIN_PASSWORD ADMIN_EMAIL APP_URL HEALTH_TIMEOUT
 
@@ -143,6 +161,16 @@ if [ ! -f .env ]; then
 fi
 endef
 
+# Runs ahead of the first docker command of every target that uses docker (check-tools included),
+# so a missing docker gets this one message, derived from the tool bounds, rather than a shell
+# "command not found" after output about a pull or a container that never happened.
+define REQUIRE_DOCKER
+if ! command -v docker >/dev/null 2>&1; then
+	echo 'docker not found on PATH; required: Docker Engine >=$(ENGINE_MIN) with the Compose plugin >=$(COMPOSE_MIN),<$(COMPOSE_MAX)' >&2
+	exit 1
+fi
+endef
+
 # Shows why the stack is not serving: every container's state and the latest log lines of the
 # services on the request path.
 define DEFINE_STACK_DIAGNOSTICS
@@ -151,6 +179,52 @@ stack_diagnostics() {
 	$(COMPOSE) ps --all >&2 || true
 	$(COMPOSE) logs --no-color --tail=50 migrate api web >&2 || true
 }
+endef
+
+# Refuses a command-line ADMIN_PASSWORD that make has shortened: make drops the leading spaces
+# and tabs of a command-line value before any makefile text sees it, so init would hash, and
+# e2e sign in with, a password other than the one typed. On Linux the recipe's bash is make's
+# child, and /proc/$PPID/cmdline holds make's own arguments as given, NUL-separated: each one
+# defining ADMIN_PASSWORD (=, :=, ::=, :::=, ?= or +=, blanks allowed before the operator) is
+# refused when its value begins with a space or tab. Where those arguments cannot be read
+# (macOS has no /proc) or define no ADMIN_PASSWORD (the value came through MAKEFLAGS), only an
+# empty value shows the loss, and it is refused; a password that begins with whitespace must
+# then be given through the environment, ADMIN_PASSWORD='<value>' make init, which keeps it
+# unchanged. An argument with an empty value is left to the recipe's usage message. The value
+# is never printed and never placed on a command line.
+define REFUSE_STRIPPED_ADMIN_PASSWORD
+if [ '$(ADMIN_PASSWORD_ORIGIN)' = 'command line' ]; then
+	password_args_read=0
+	if [ -r "/proc/$$PPID/cmdline" ]; then
+		while IFS= read -r -d '' make_arg; do
+			case "$$make_arg" in
+				ADMIN_PASSWORD[=:?+[:blank:]]*) ;;
+				*) continue ;;
+			esac
+			password_def="$${make_arg#ADMIN_PASSWORD}"
+			password_def="$${password_def#"$${password_def%%[![:blank:]]*}"}"
+			case "$$password_def" in
+				':::='*) password_value="$${password_def#:::=}" ;;
+				'::='*) password_value="$${password_def#::=}" ;;
+				':='*) password_value="$${password_def#:=}" ;;
+				'?='* | '+='*) password_value="$${password_def#??}" ;;
+				'='*) password_value="$${password_def#=}" ;;
+				*) continue ;;
+			esac
+			password_args_read=1
+			case "$$password_value" in
+				[[:blank:]]*)
+					echo "ADMIN_PASSWORD on the make command line begins with a space or tab, which make drops, so make $@ would use another password; pass it through the environment instead, which keeps it unchanged: ADMIN_PASSWORD='<value>' make $@" >&2
+					exit 1
+					;;
+			esac
+		done < "/proc/$$PPID/cmdline"
+	fi
+	if [ "$$password_args_read" -eq 0 ] && [ -z "$${ADMIN_PASSWORD:-}" ]; then
+		echo "ADMIN_PASSWORD on the make command line is empty, possibly because make dropped its leading spaces and tabs; pass a password that begins with whitespace, or is only whitespace, through the environment, which keeps it unchanged: ADMIN_PASSWORD='<value>' make $@" >&2
+		exit 1
+	fi
+fi
 endef
 
 # Builds and starts the stack, then polls the API through nginx until it answers 200. The poll
@@ -244,10 +318,7 @@ check-tools: ## Verify Docker Compose >=5.5.1,<6 and Docker Engine >=29
 	min_major="$$release_major"
 	min_minor="$$release_minor"
 	min_patch="$$release_patch"
-	if ! command -v docker >/dev/null 2>&1; then
-		echo "docker not found on PATH; required: Docker Engine $$engine_range with the Compose plugin $$compose_range" >&2
-		exit 1
-	fi
+	$(REQUIRE_DOCKER)
 	if ! compose_version="$$($(COMPOSE) version --short 2>/dev/null)" || [ -z "$$compose_version" ]; then
 		echo "Docker Compose not found ('$(COMPOSE) version --short' failed); required $$compose_range" >&2
 		exit 1
@@ -288,7 +359,8 @@ check-tools: ## Verify Docker Compose >=5.5.1,<6 and Docker Engine >=29
 #   APP_ADMIN_EMAIL stays admin@example.com and every other variable keeps its default.
 init: export CHECKOUT_DIR := $(CURDIR)
 init: check-tools ## First start: write .env with SESSION_SECRET and the admin hash (make init ADMIN_PASSWORD=<value>)
-	@if [ -z "$${ADMIN_PASSWORD:-}" ]; then
+	@$(REFUSE_STRIPPED_ADMIN_PASSWORD)
+	if [ -z "$${ADMIN_PASSWORD:-}" ]; then
 		echo "usage: make init ADMIN_PASSWORD=<value>" >&2
 		exit 1
 	fi
@@ -389,23 +461,27 @@ up: check-tools ## Build and start the stack, then wait for /api/v1/healthz to a
 
 # The pgdata volume is kept; `docker compose down -v` also deletes the database for a full reset.
 down: ## Stop and remove the stack's containers (the database volume is kept)
-	@$(COMPOSE) down
+	@$(REQUIRE_DOCKER)
+	$(COMPOSE) down
 
 migrate: ## Run the one-shot migrate service: ads-engine migrate && ads-engine ensure-admin
-	@$(REQUIRE_ENV_FILE)
+	@$(REQUIRE_DOCKER)
+	$(REQUIRE_ENV_FILE)
 	$(COMPOSE) run --rm migrate
 
 # `ads-engine migrate` runs first: it is idempotent, and seeding needs the schema, which a fresh
 # pgdata volume does not have until the stack has been started once.
 seed-simulated: ## Seed simulated datasets for every source and compute the default-window run
-	@$(REQUIRE_ENV_FILE)
+	@$(REQUIRE_DOCKER)
+	$(REQUIRE_ENV_FILE)
 	$(COMPOSE) run --rm migrate sh -c 'ads-engine migrate && ads-engine seed-simulated'
 
 # Coverage gates live in backend/pyproject.toml and web/vite.config.ts, not here. Backend tools
 # run with `uv run --frozen` here and in lint, so a run never re-resolves or rewrites uv.lock:
 # the lock is used exactly as committed, as `uv sync --frozen` installed it.
 test: ## Backend tests on a disposable postgres:18.6 (removed on exit; an unconfirmed removal fails the target), then the web unit tests
-	@test_db_port=''
+	@$(REQUIRE_DOCKER)
+	test_db_port=''
 	case "$${TEST_DB_PORT:-}" in
 		'' | *[!0-9]*) ;;
 		*)
@@ -642,6 +718,7 @@ lint: ## ruff format --check, ruff check, mypy --strict; eslint, stylelint and t
 e2e: override export E2E_COMPOSE = $(COMPOSE)
 e2e: check-tools ## Playwright against the stack in DATA_MODE=simulated (make e2e ADMIN_PASSWORD=<value>)
 	@$(REQUIRE_ENV_FILE)
+	$(REFUSE_STRIPPED_ADMIN_PASSWORD)
 	if [ -z "$${ADMIN_PASSWORD:-}" ]; then
 		echo "usage: make e2e ADMIN_PASSWORD=<value>   (the password given to make init)" >&2
 		exit 1
@@ -676,7 +753,8 @@ e2e: check-tools ## Playwright against the stack in DATA_MODE=simulated (make e2
 secret-scan: export CHECKOUT_DIR := $(CURDIR)
 secret-scan: export GITLEAKS_IMAGE := $(GITLEAKS_IMAGE)
 secret-scan: ## gitleaks v8.30.1 from the pinned image, as published, over every commit with .gitleaks.toml; a finding fails
-	@if ! docker image inspect "$$GITLEAKS_IMAGE" >/dev/null 2>&1; then
+	@$(REQUIRE_DOCKER)
+	if ! docker image inspect "$$GITLEAKS_IMAGE" >/dev/null 2>&1; then
 		echo "Pulling $$GITLEAKS_IMAGE"
 		docker pull "$$GITLEAKS_IMAGE"
 	fi

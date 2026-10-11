@@ -24,9 +24,10 @@ uvicorn serves the factory, never a module-level application::
   OpenAPI document publishes no ``head`` operation, and a 405's ``Allow`` that names ``GET``
   names ``HEAD`` too.
 * **Request deadline**: every HTTP request runs under a 45 s deadline. A request still
-  running then, typically one waiting on a database that stopped answering, is cancelled
-  and answered 503 ``request_timeout`` in the error envelope, and logged as one
-  ``api.request_timeout`` WARNING naming its method and path.
+  running then, typically one waiting on a database that stopped answering, is answered
+  503 ``request_timeout`` in the error envelope at the deadline itself, and logged as one
+  ``api.request_timeout`` WARNING naming its method and path. It is cancelled, and its
+  cleanup finishes in the background without delaying the answer.
 * **No caching**: every HTTP response carries exactly one ``Cache-Control: no-store``, so no
   browser or shared cache keeps an API answer, signed-in evidence, decisions and identity
   included, after sign-out (CWE-525). :class:`_NoStoreMiddleware`, the outermost user
@@ -40,7 +41,8 @@ uvicorn serves the factory, never a module-level application::
   failure, an unknown path or an unexpected crash, is rendered as
   :class:`~ads_engine.api.schemas.ErrorResponse`, ``{"error": {"code", "message"}}``.
 * **Lifespan**: loads ``config/*.yaml`` at boot, so a broken file stops uvicorn instead of
-  failing the first request, and disposes the database pool on shutdown.
+  failing the first request. On shutdown it waits, within a bound, for the requests the
+  deadline answered to finish their cleanup, then disposes the database pool.
 
 No middleware beyond the session cookie, the HEAD handling, the request deadline and the
 no-store cache policy is installed. The SPA is served same-origin by nginx, which also
@@ -115,16 +117,28 @@ _OPENAPI_PATH: Final = f"{API_PREFIX}/openapi.json"
 """Where :func:`_serve_openapi` serves the OpenAPI document to a signed-in session."""
 
 _REQUEST_TIMEOUT_S: Final = 45.0
-"""Seconds an HTTP request may run before it is cancelled and answered 503 ``request_timeout``.
+"""Seconds an HTTP request may run before it is answered 503 ``request_timeout`` and cancelled.
 
 The deadline must clear the slowest legitimate request: ``POST /runs`` computes a
 custom-window run synchronously, which the product's performance budget allows up to 30 s.
-It must also leave room for the answer to reach the client: cancelling a query that is in
-flight costs psycopg up to about 10 s more (a cancel request to the server, then a wait for
-it) before the 503 can be sent, and nginx gives up on an upstream after its
-``proxy_read_timeout`` with a bare 504 that has neither the error envelope nor an API log
-line. 45 s plus that unwind lands at about 55 s, inside the 120 s ``web/nginx.conf`` sets for
-``/api/`` and inside nginx's 60 s default as well.
+It must also sit inside nginx's ``proxy_read_timeout``, after which nginx gives up on an
+upstream with a bare 504 that has neither the error envelope nor an API log line. The 503 is
+sent at the deadline itself, so 45 s is inside the 120 s ``web/nginx.conf`` sets for
+``/api/`` and inside nginx's 60 s default as well. The cancelled request's cleanup finishes in
+the background after the answer: on a server that stopped answering, cancelling a query in
+flight costs psycopg up to about 10 s (a cancel request to the server, then a wait for it)
+before it closes the connection, which :data:`_REQUEST_UNWIND_DRAIN_S` bounds at shutdown.
+"""
+
+_REQUEST_UNWIND_DRAIN_S: Final = 15.0
+"""Seconds the shutdown waits for requests answered at the deadline to finish their cleanup.
+
+Such a request keeps unwinding after its 503: psycopg spends up to 5 s on a cancel request to
+a server that stopped answering and 5 s more waiting for the query to end before it closes
+the connection, then the session's rollback and close run. 15 s covers that worst case of
+about 10 s with room to spare. The database pool is disposed once every cleanup has
+finished, or once the bound passes with some still running, which is then logged as
+``api.request_unwinds_pending``.
 """
 
 _REQUEST_TIMEOUT_CODE: Final = "request_timeout"
@@ -649,26 +663,52 @@ class _NoStoreMiddleware:
 class _RequestDeadlineMiddleware:
     """Bound every HTTP request by a deadline, so none hangs without an answer or a log line.
 
-    A pure ASGI middleware: a request still running when the deadline passes, for example
-    one waiting on a pooled connection to a database that stopped answering, is cancelled
-    through :func:`asyncio.timeout`. When no response has started, it is answered 503
-    ``request_timeout`` in the error envelope. It is logged either way as one
-    ``api.request_timeout`` WARNING with the method, the path without its query string, the
-    deadline and whether the response had already started. A response already under way is
-    never started a second time; the server then closes the connection.
+    A pure ASGI middleware. The wrapped application runs in a task of its own, which the
+    middleware waits on for at most the deadline:
 
-    Only the deadline's own expiry is handled. A ``TimeoutError`` the application raised for
-    another reason, and any cancellation from outside (a client disconnect, a server
-    shutdown), propagate unchanged. Lifespan and websocket scopes pass through untouched.
+    * **Finished in time**: its outcome propagates unchanged. A ``TimeoutError`` the
+      application raised for another reason stays an ordinary error, and a cancellation of
+      its own stays a cancellation.
+    * **Deadline passed**: a request still running then, for example one waiting on a pooled
+      connection to a database that stopped answering, is let go. Its send channel is closed
+      first, so anything it sends afterwards is dropped, and it is cancelled. It is logged at
+      once as one ``api.request_timeout`` WARNING with the method, the path without its query
+      string, the deadline and whether the response had already started. When no response
+      has started, it is answered 503 ``request_timeout`` in the error envelope at once,
+      without waiting for the cancellation to unwind: psycopg spends up to about 10 s
+      cancelling a query on a server that stopped answering. A response already under way is
+      never started a second time; the server then closes the connection.
+    * **Cancelled from outside** (a client disconnect, a server shutdown): the request is
+      cancelled and waited for until it has finished unwinding, exactly as if it had run in
+      the caller's task, so a graceful shutdown still covers its cleanup; then the
+      cancellation propagates, and the middleware sends nothing of its own.
+
+    A request the middleware stops waiting for, past the deadline or on a second outside
+    cancellation, is held in ``unwinding`` until it has finished, so it is neither garbage
+    collected mid-cleanup nor forgotten by the lifespan's drain. Its outcome is always
+    retrieved: a cancellation is the expected end and stays silent, and any other exception
+    is logged once as ``api.request_unwind_failed`` with the method, the path and the error
+    class, never the exception's text, at ERROR level, or as a WARNING naming the event that
+    already logged it (``logged_as``). Lifespan and websocket scopes pass through untouched.
 
     Args:
         app: The ASGI application it wraps.
         timeout: The deadline in seconds.
+        unwinding: The set holding every request still unwinding after the middleware let it
+            go; :func:`create_app` shares it with the lifespan through ``app.state``, which
+            waits for it before disposing the database pool. A set of its own when omitted.
     """
 
-    def __init__(self, app: ASGIApp, *, timeout: float) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        timeout: float,
+        unwinding: set[asyncio.Task[None]] | None = None,
+    ) -> None:
         self.app = app
         self.timeout = timeout
+        self.unwinding: set[asyncio.Task[None]] = set() if unwinding is None else unwinding
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """Serve one ASGI connection, answering 503 ``request_timeout`` past the deadline.
@@ -677,41 +717,103 @@ class _RequestDeadlineMiddleware:
             scope: The connection scope.
             receive: The ASGI receive channel.
             send: The ASGI send channel.
+
+        Raises:
+            asyncio.CancelledError: When the request was cancelled from outside, once the
+                application has finished unwinding, or at once on a second cancellation.
         """
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
         response_started = False
+        send_closed = False
 
         async def send_tracked(message: Message) -> None:
-            """Forward ``message``, noting when the response has started."""
+            """Forward ``message``, noting a response start; drop it once the channel closed."""
             nonlocal response_started
+            if send_closed:
+                return
             if message["type"] == "http.response.start":
                 response_started = True
             await send(message)
 
-        deadline = asyncio.timeout(self.timeout)
+        async def serve() -> None:
+            """Run the wrapped application on the tracked send channel."""
+            await self.app(scope, receive, send_tracked)
+
+        request = asyncio.create_task(serve())
         try:
-            async with deadline:
-                await self.app(scope, receive, send_tracked)
-        except TimeoutError:
-            if not deadline.expired():
-                raise
-            _log.warning(
-                "api.request_timeout",
-                method=scope.get("method"),
-                path=scope.get("path"),
-                timeout_s=self.timeout,
-                response_started=response_started,
-            )
-            if response_started:
+            await asyncio.wait({request}, timeout=self.timeout)
+        except asyncio.CancelledError:
+            # Held before the wait, so a second cancellation that cuts the wait short still
+            # leaves the request tracked and its outcome retrieved.
+            self._hold_until_unwound(request, scope)
+            request.cancel()
+            await asyncio.wait({request})
+            raise
+        if request.done():
+            # Finished in time, a finish on the deadline's own boundary included: the outcome
+            # propagates unchanged.
+            await request
+            return
+        send_closed = True
+        request.cancel()
+        self._hold_until_unwound(request, scope)
+        _log.warning(
+            "api.request_timeout",
+            method=scope.get("method"),
+            path=scope.get("path"),
+            timeout_s=self.timeout,
+            response_started=response_started,
+        )
+        if response_started:
+            return
+        response = _error_response(
+            http.HTTPStatus.SERVICE_UNAVAILABLE,
+            _REQUEST_TIMEOUT_CODE,
+            _REQUEST_TIMEOUT_MESSAGE,
+        )
+        await response(scope, receive, send)
+
+    def _hold_until_unwound(self, request: asyncio.Task[None], scope: Scope) -> None:
+        """Hold ``request`` in :attr:`unwinding` until it ends, then retrieve its outcome.
+
+        Args:
+            request: The task running the wrapped application, cancelled or about to be.
+            scope: Its connection scope, whose method and path name a failure in the log.
+        """
+        method: object = scope.get("method")
+        path: object = scope.get("path")
+        unwinding = self.unwinding
+
+        def settle(ended: asyncio.Task[None]) -> None:
+            """Release ``ended``, logging an exception other than its cancellation once."""
+            unwinding.discard(ended)
+            if ended.cancelled():
                 return
-            response = _error_response(
-                http.HTTPStatus.SERVICE_UNAVAILABLE,
-                _REQUEST_TIMEOUT_CODE,
-                _REQUEST_TIMEOUT_MESSAGE,
-            )
-            await response(scope, receive, send)
+            error = ended.exception()
+            if error is None:
+                return
+            owner = logged_as(error)
+            if owner is None:
+                _log.error(
+                    "api.request_unwind_failed",
+                    method=method,
+                    path=path,
+                    error_type=type(error).__name__,
+                )
+                mark_logged(error, "api.request_unwind_failed")
+            else:
+                _log.warning(
+                    "api.request_unwind_failed",
+                    method=method,
+                    path=path,
+                    error_type=type(error).__name__,
+                    logged_as=owner,
+                )
+
+        unwinding.add(request)
+        request.add_done_callback(settle)
 
 
 # ---------------------------------------------------------------------------
@@ -779,9 +881,36 @@ class _HeadAsGetMiddleware:
 # ---------------------------------------------------------------------------
 
 
+async def _drain_request_unwinds(app: FastAPI) -> None:
+    """Wait for the requests the deadline let go to finish unwinding, within a bound.
+
+    uvicorn's shutdown waits only for its own request tasks, and a request answered 503 at the
+    deadline has already left its task while its cleanup (psycopg's query cancellation, the
+    session's rollback and close) runs on. Waiting here keeps that cleanup ahead of
+    :func:`~ads_engine.db.session.dispose_engine`. After :data:`_REQUEST_UNWIND_DRAIN_S` the
+    wait gives up: the number still running is logged as one ``api.request_unwinds_pending``
+    WARNING and the shutdown proceeds. An application without the shared set, or with none
+    pending, returns at once.
+
+    Args:
+        app: The application being shut down; its ``app.state.request_unwinds`` is the set
+            :func:`create_app` gave the request deadline.
+    """
+    held: object = getattr(app.state, "request_unwinds", None)
+    if not isinstance(held, set) or not held:
+        return
+    _, pending = await asyncio.wait(set(held), timeout=_REQUEST_UNWIND_DRAIN_S)
+    if pending:
+        _log.warning(
+            "api.request_unwinds_pending",
+            pending=len(pending),
+            timeout_s=_REQUEST_UNWIND_DRAIN_S,
+        )
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Load the configuration at boot and dispose the database pool on shutdown.
+    """Load the configuration at boot; on shutdown, drain request cleanups, then the pool.
 
     Under uvicorn a missing or invalid ``config/*.yaml`` therefore fails at boot, before
     any request is served. A request never depends on this having run:
@@ -789,6 +918,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     :func:`~ads_engine.api.deps.get_thresholds` then loads the files on first use.
     Configuration already stored on ``app.state.thresholds``, for example by a test, is
     kept rather than reloaded.
+
+    On shutdown the requests answered 503 at the request deadline are given up to
+    :data:`_REQUEST_UNWIND_DRAIN_S` to finish their cleanup (:func:`_drain_request_unwinds`),
+    and the database pool is disposed after that, even when the wait is cut short.
 
     Args:
         app: The application being served.
@@ -818,7 +951,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         _log.info("api.stopping")
-        await dispose_engine()
+        try:
+            await _drain_request_unwinds(app)
+        finally:
+            await dispose_engine()
 
 
 # ---------------------------------------------------------------------------
@@ -939,8 +1075,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
        served from the session cookie inwards as ``GET``, and answered with ``GET``'s status
        and headers and no body.
     6. Install the request deadline around that: an HTTP request still running after
-       :data:`_REQUEST_TIMEOUT_S` is cancelled, answered 503 ``request_timeout`` and logged
-       as ``api.request_timeout``.
+       :data:`_REQUEST_TIMEOUT_S` is answered 503 ``request_timeout`` at once, logged as
+       ``api.request_timeout`` and cancelled. Its cleanup unwinds in the background, held in
+       the set stored as ``app.state.request_unwinds``, which the lifespan drains before it
+       disposes the database pool.
     7. Install the cache policy around that (:class:`_NoStoreMiddleware`), inside only
        Starlette's own server-error middleware: every HTTP response carries exactly one
        ``Cache-Control: no-store``, the deadline's 503 included. The error envelope carries
@@ -1037,8 +1175,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # inwards sees a HEAD as GET, while the deadline's log names the client's real method.
     app.add_middleware(_HeadAsGetMiddleware)
     # Around the HEAD handling and inside only the cache policy: its deadline covers the HEAD
-    # handling, the session cookie, the routers and their error handlers.
-    app.add_middleware(_RequestDeadlineMiddleware, timeout=_REQUEST_TIMEOUT_S)
+    # handling, the session cookie, the routers and their error handlers. The requests it
+    # lets go unwind in a set the lifespan drains on shutdown.
+    request_unwinds: set[asyncio.Task[None]] = set()
+    app.state.request_unwinds = request_unwinds
+    app.add_middleware(
+        _RequestDeadlineMiddleware, timeout=_REQUEST_TIMEOUT_S, unwinding=request_unwinds
+    )
     # Added last, so it is the outermost user middleware: its Cache-Control: no-store covers
     # every answer inside it, the deadline's 503 included. Only Starlette's server-error
     # middleware, which renders the catch-all 500, sits outside it; _error_response puts the

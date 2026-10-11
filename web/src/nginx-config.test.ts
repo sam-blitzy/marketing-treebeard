@@ -4,8 +4,9 @@
  *
  * The file is parsed with nginx's own token rules (quotes, backslash escapes, `#` comments,
  * `{ }` blocks and `;`-terminated directives) into a directive tree, and the tree is held to the
- * properties that keep the edge from leaking what the API never logs, and from answering an
- * `/api/` error the SPA cannot read:
+ * properties that keep the edge from leaking what the API never logs, from answering an `/api/`
+ * error the SPA cannot read, from answering a well-known file with the SPA document, and from
+ * compressing at nginx's weakest gzip level:
  * - nginx's error log has no format, and every line it writes about a request names the raw
  *   request line, query string included, and the referer. The listening socket and every
  *   request on it, before nginx picks a location and after, log to the server's error_log, so
@@ -17,6 +18,11 @@
  * - `/api/` gives up on an unreachable API well before nginx's 60 s default, and every error
  *   nginx makes there is answered by a named location in the API's error envelope,
  *   `{"error":{"code","message"}}`, as uncacheable application/json.
+ * - gzip is on at level 5 or 6, never nginx's default 1, set once for the whole server.
+ * - `/robots.txt` answers 200 text/plain with valid robots.txt lines that leave every screen,
+ *   `/` included, crawlable and keep crawlers out of `/api/`; `/llms.txt` and `/sitemap.xml`
+ *   answer 404. None of the three declares a header or an access log of its own, so each keeps
+ *   the server-level security headers and is logged.
  *
  * Whether nginx accepts the file is `nginx -t`'s job on nginx:1.30.5; these tests hold the file
  * to what it must say.
@@ -283,11 +289,107 @@ const KNOWN_LOCATIONS = [
   '/assets/',
   '= /index.html',
   '= /favicon.ico',
+  '= /robots.txt',
+  '= /llms.txt',
+  '= /sitemap.xml',
   '/',
 ];
 
 /** The errors nginx itself can make under /api/, each of which needs a JSON answer. */
 const API_ERROR_STATUSES = ['400', '405', '413', '500', '502', '503', '504'];
+
+/** The well-known files nginx answers itself instead of falling back to the SPA document. */
+const WELL_KNOWN_LOCATIONS = ['= /robots.txt', '= /llms.txt', '= /sitemap.xml'];
+
+/** The SPA's screens, which robots.txt must leave crawlable. */
+const SPA_SCREENS = ['/', '/login', '/actions', '/decisions', '/sources', '/settings'];
+
+/**
+ * One line of a robots.txt file as RFC 9309 reads it, keys in any letter case: a `user-agent`
+ * line naming a product token or `*`, an `allow` or `disallow` line with an empty path or one
+ * starting with `/` or `*`, each with an optional trailing `#` comment; a `sitemap` line naming
+ * an absolute URL; a comment; or a blank line.
+ */
+const ROBOTS_LINE = new RegExp(
+  [
+    String.raw`^\s*(?:`,
+    String.raw`(?:user-agent\s*:\s*(?:\*|[A-Za-z_-]+)`,
+    String.raw`|(?:allow|disallow)\s*:\s*(?:[/*][^\s#]*)?)\s*(?:#.*)?`,
+    String.raw`|sitemap\s*:\s*https?://\S+\s*`,
+    String.raw`|#.*`,
+    String.raw`)?$`,
+  ].join(''),
+  'i',
+);
+
+/** One allow or disallow rule of a robots.txt group, with its path pattern. */
+interface RobotsRule {
+  readonly allow: boolean;
+  readonly pattern: string;
+}
+
+/**
+ * The allow and disallow rules robots.txt `body` sets for every crawler: the rules of each group
+ * whose user-agent lines include `*`. A group is a run of user-agent lines and the rules after it,
+ * up to the next user-agent line.
+ */
+function rulesForEveryCrawler(body: string): RobotsRule[] {
+  const rules: RobotsRule[] = [];
+  let agents: string[] = [];
+  let inRules = false;
+  for (const raw of body.split('\n')) {
+    const match = /^([A-Za-z-]+)\s*:\s*([^#]*)/.exec(raw.trim());
+    const key = match?.[1]?.toLowerCase();
+    const value = match?.[2]?.trim() ?? '';
+    if (key === 'user-agent') {
+      if (inRules) {
+        agents = [];
+        inRules = false;
+      }
+      agents.push(value);
+    } else if (key === 'allow' || key === 'disallow') {
+      inRules = true;
+      if (agents.includes('*')) {
+        rules.push({ allow: key === 'allow', pattern: value });
+      }
+    }
+  }
+  return rules;
+}
+
+/**
+ * A robots.txt path pattern as a regular expression anchored at the path's start: `*` matches
+ * any run of characters, a final `$` anchors the end, and every other character is literal.
+ */
+function robotsPattern(pattern: string): RegExp {
+  const anchored = pattern.endsWith('$');
+  const literal = anchored ? pattern.slice(0, -1) : pattern;
+  const source = literal
+    .split('*')
+    .map((part) => part.replace(/[.+?^${}()|[\]\\]/g, '\\$&'))
+    .join('.*');
+  return new RegExp(`^${source}${anchored ? '$' : ''}`);
+}
+
+/**
+ * Whether `rules` let a crawler fetch `path`, by RFC 9309's precedence: the matching rule with
+ * the longest pattern decides, an allow wins a tie, and a path no rule matches is allowed. An
+ * empty pattern matches nothing.
+ */
+function robotsAllows(rules: readonly RobotsRule[], path: string): boolean {
+  let decisive: RobotsRule | undefined;
+  for (const rule of rules) {
+    if (rule.pattern === '' || !robotsPattern(rule.pattern).test(path)) {
+      continue;
+    }
+    const longer = decisive === undefined || rule.pattern.length > decisive.pattern.length;
+    const tieWon = decisive?.pattern.length === rule.pattern.length && rule.allow;
+    if (longer || tieWon) {
+      decisive = rule;
+    }
+  }
+  return decisive?.allow ?? true;
+}
 
 const config = parse(readFileSync(NGINX_CONF_URL, 'utf8'));
 const servers = directivesNamed(config, 'server');
@@ -395,6 +497,60 @@ describe('web/nginx.conf caching', () => {
     expect(cacheControl.map(({ args }) => args)).toEqual([['Cache-Control', 'no-store', 'always']]);
     expect(descendants(document.block).filter(({ name }) => name === 'expires')).toEqual([]);
   });
+});
+
+describe('web/nginx.conf compression', () => {
+  it('turns gzip on at level 5 or 6, never the default 1, with no other level anywhere', () => {
+    expect(directivesNamed(server?.block, 'gzip').map(({ args }) => args)).toEqual([['on']]);
+    const levels = descendants(config).filter(({ name }) => name === 'gzip_comp_level');
+    expect(levels).toHaveLength(1);
+    expect(directivesNamed(server?.block, 'gzip_comp_level')).toEqual(levels);
+    expect(['5', '6']).toContain(levels[0]?.args.join(' '));
+  });
+});
+
+describe('web/nginx.conf well-known files', () => {
+  const robots = locationBlock(locations, '= /robots.txt');
+  const robotsReturns = directivesNamed(robots.block, 'return');
+  const robotsBody = robotsReturns[0]?.args[1] ?? '';
+
+  it('answers /robots.txt itself with a 200 as text/plain', () => {
+    expect(robotsReturns.map(({ args }) => args[0])).toEqual(['200']);
+    expect(directivesNamed(robots.block, 'default_type').map(({ args }) => args)).toEqual([
+      ['text/plain'],
+    ]);
+  });
+
+  it('writes /robots.txt as valid robots.txt lines with a group for every crawler', () => {
+    const lines = robotsBody.split('\n');
+    for (const [index, line] of lines.entries()) {
+      expect(ROBOTS_LINE.test(line), `robots.txt line ${String(index + 1)}: ${line}`).toBe(true);
+    }
+    expect(lines).toContain('User-agent: *');
+  });
+
+  it('keeps every screen crawlable, `/` itself included, and keeps crawlers out of /api/', () => {
+    const rules = rulesForEveryCrawler(robotsBody);
+    for (const path of SPA_SCREENS) {
+      expect(robotsAllows(rules, path), path).toBe(true);
+    }
+    expect(robotsAllows(rules, '/api/v1/healthz')).toBe(false);
+  });
+
+  it.each(['= /llms.txt', '= /sitemap.xml'])('answers %s with a plain 404', (key) => {
+    const { block } = locationBlock(locations, key);
+    expect(directivesNamed(block, 'return').map(({ args }) => args)).toEqual([['404']]);
+  });
+
+  it.each(WELL_KNOWN_LOCATIONS)(
+    '%s declares no header or access log of its own, so it keeps the server-level ones',
+    (key) => {
+      const own = descendants(locationBlock(locations, key).block)
+        .filter(({ name }) => name.startsWith('add_header') || name === 'access_log')
+        .map(({ line, name, args }) => `line ${String(line)}: ${name} ${args.join(' ')}`);
+      expect(own).toEqual([]);
+    },
+  );
 });
 
 describe('web/nginx.conf /api/ errors', () => {
