@@ -27,13 +27,16 @@ Window rules (AAP 0.5.4.1, 0.5.3):
 * The default window is ``window.default_days`` complete days ending on :func:`default_end`:
   the latest date complete in every active source's native day, the earlier of yesterday in
   the Google account's time zone and yesterday UTC. Today is always excluded as a partial day.
-* A custom window ends no later than the default end and spans 1 to ``window.max_days`` days;
-  anything else raises :class:`InvalidWindow`, which the API maps to 422 with its ``code``.
-  ``custom`` has two call shapes that share one validation:
+* A custom window ends no later than the default end, starts no earlier than
+  :func:`earliest_start` (the first date whose lookbacks, ``k1.baseline_days``,
+  ``crm.lead_maturity_days`` and ``budget.max_observation_gap_hours``, stay inside the
+  calendar) and spans 1 to ``window.max_days`` days; anything else raises
+  :class:`InvalidWindow`, which the API maps to 422 with its ``code`` before any run row is
+  written. ``custom`` has two call shapes that share one validation:
   ``AnalysisWindow.custom(start, end, config=..., sources=..., now=...)`` on the class builds
   the window from the loaded configuration and the sources' boundaries at ``now``, and
   ``window.custom(start, end)`` on a configured window (AAP 0.5.1) reuses that window's
-  configuration, boundaries and default end.
+  configuration, boundaries, default end and earliest start.
 * A window shorter than ``window.trusted_min_days`` is a short window; sustained-pattern rules
   need at least ``window.sustained_min_days``; C3a segment evidence exists only for a window in
   ``window.presets`` ending on the default end. Every one of these values is read from
@@ -81,12 +84,15 @@ __all__ = [
     "SourceDayInfo",
     "SourceDays",
     "default_end",
+    "earliest_start",
 ]
 
 DaySource = Literal["google", "linkedin"]
 """A source with native daily rows. HubSpot holds instants only and has no day boundary."""
 
-InvalidWindowCode = Literal["end_before_start", "end_after_default_end", "too_long", "too_short"]
+InvalidWindowCode = Literal[
+    "end_before_start", "end_after_default_end", "start_before_earliest", "too_long", "too_short"
+]
 """The machine codes :class:`InvalidWindow` carries; ``POST /runs`` returns them with 422."""
 
 DAY_SOURCES: Final[tuple[DaySource, ...]] = ("google", "linkedin")
@@ -99,6 +105,13 @@ UTC_BOUNDARY: Final = "UTC"
 """The boundary of LinkedIn days, and of Google days while no account time zone is known."""
 
 _ONE_DAY: Final = timedelta(days=1)
+
+_ZONE_REACH: Final = timedelta(hours=15)
+"""How far a native day's midnight can lie before the same date's UTC midnight.
+
+The widest UTC offset of any IANA zone (14 h, ``Pacific/Kiritimati``) plus one hour of slack,
+the same bound ``analysis/metrics.py`` uses as ``_MAX_UTC_OFFSET``.
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -113,9 +126,10 @@ class InvalidWindow(ValueError):  # noqa: N818 - contract name used by api/app.p
     and ``ads-engine analyze`` exits with code 2.
 
     Attributes:
-        code: One of ``end_before_start``, ``end_after_default_end``, ``too_long`` or
-            ``too_short``.
-        message: A sentence naming the offending dates or day counts.
+        code: One of ``end_before_start``, ``end_after_default_end``,
+            ``start_before_earliest``, ``too_long`` or ``too_short``.
+        message: A sentence naming the offending dates or day counts, and the bound they
+            break.
     """
 
     code: InvalidWindowCode
@@ -206,23 +220,85 @@ def _aware_now(now: datetime | None) -> datetime:
     return candidate
 
 
-def _check_span(start: date, end: date, latest: date, max_days: int) -> None:
+def earliest_start(config: Thresholds) -> date:
+    """Return the earliest window start the analysis can compute: its calendar floor.
+
+    A run reads data before its window, and each of those reads subtracts a configured
+    lookback from a window date or instant. A start so early that one of them would fall
+    before ``date.min`` (0001-01-01) or ``datetime.min`` cannot be computed, so the window
+    bounds refuse it up front, with ``start_before_earliest``, rather than letting the run
+    fail with ``OverflowError``. The floor is ``date.min`` plus the longest reach, rounded up
+    to whole days:
+
+    * ``k1.baseline_days``: K1's trailing conversion-rate baseline starts
+      ``k1.baseline_days - 1`` native Google days before the window end
+      (``analysis/metrics.py`` ``google_rate_baseline``; ``analysis/keywords.py`` assesses
+      the same span when no baseline fact exists).
+    * ``crm.lead_maturity_days``: the maturity cutoff of the C1b and C2 veto cohorts and of
+      the white-paper attribution populations lies ``crm.lead_maturity_days`` before the
+      window's end instant, in UTC or in the Google account's zone
+      (``analysis/campaigns.py``, ``analysis/attribution.py``).
+    * ``budget.max_observation_gap_hours``: budget-day classification reads snapshots from
+      the longer of two days and 15 hours plus ``budget.max_observation_gap_hours`` before
+      the window's first UTC instant (``analysis/metrics.py`` observation bounds and
+      membership brackets).
+    * A 15-hour zone reach (the widest UTC offset, 14 h, plus 1 h) on top of the longest of
+      those: a native day in a zone east of UTC starts before the same date's UTC midnight
+      (:meth:`AnalysisWindow.day_bounds`).
+
+    With the shipped configuration (``k1.baseline_days: 90``, ``crm.lead_maturity_days: 14``,
+    ``budget.max_observation_gap_hours: 6``) the longest reach is 89 days, plus 15 hours of
+    zone reach, so the floor is 90 days after ``date.min``: 0001-04-01.
+
+    Args:
+        config: The loaded configuration; the three lookback keys are read from it.
+
+    Returns:
+        The earliest admissible window start, or ``date.max`` when the configured lookbacks
+        reach past the whole calendar, in which case no window is admissible.
+
+    Raises:
+        ConfigError: When a lookback key is missing or is not an integer.
+    """
+    baseline_days = config.int("k1.baseline_days")
+    maturity_days = config.int("crm.lead_maturity_days")
+    gap_hours = config.int("budget.max_observation_gap_hours")
+    try:
+        reach = (
+            max(
+                timedelta(days=baseline_days - 1),
+                timedelta(days=maturity_days),
+                timedelta(days=2),
+                _ZONE_REACH + timedelta(hours=gap_hours),
+            )
+            + _ZONE_REACH
+        )
+        whole_days = -(-reach // _ONE_DAY)
+        return date.min + timedelta(days=whole_days)
+    except OverflowError:
+        # A lookback longer than the calendar itself: no start leaves room for it.
+        return date.max
+
+
+def _check_span(start: date, end: date, latest: date, max_days: int, earliest: date) -> None:
     """Enforce the window bounds of AAP 0.5.3 ``POST /runs`` and 0.5.4.1, in a fixed order.
 
-    The end is no later than ``latest``, the default window end, and the span runs from 1 day
-    to ``max_days`` (``window.max_days``). Every path that builds or constructs a window
-    applies this one check, so a bound is reported with the same code and message whichever
-    path met it.
+    The end is no later than ``latest``, the default window end; the start is no earlier
+    than ``earliest`` (:func:`earliest_start`); and the span runs from 1 day to ``max_days``
+    (``window.max_days``). Every path that builds or constructs a window applies this one
+    check, so a bound is reported with the same code and message whichever path met it.
 
     Args:
         start: The first native date, inclusive.
         end: The last native date, inclusive.
         latest: The default window end the window may not pass.
         max_days: ``window.max_days``, the longest window in days.
+        earliest: The earliest start the analysis's lookbacks allow.
 
     Raises:
         InvalidWindow: ``end_before_start``, ``end_after_default_end`` (the message names
-            ``latest``), ``too_long`` above ``max_days``, or ``too_short`` below 1 day.
+            ``latest``), ``start_before_earliest`` (the message names ``earliest``),
+            ``too_long`` above ``max_days``, or ``too_short`` below 1 day.
     """
     if end < start:
         raise InvalidWindow("end_before_start", f"Window end {end} is before its start {start}")
@@ -231,6 +307,13 @@ def _check_span(start: date, end: date, latest: date, max_days: int) -> None:
             "end_after_default_end",
             f"Window end {end} is after the default window end {latest}, the latest date "
             "complete in every source's native day",
+        )
+    if start < earliest:
+        raise InvalidWindow(
+            "start_before_earliest",
+            f"Window start {start} is before {earliest}, the earliest date the analysis "
+            "supports: its lookbacks (k1.baseline_days, crm.lead_maturity_days and "
+            "budget.max_observation_gap_hours) reach back from the window",
         )
     days = (end - start).days + 1
     if days > max_days:
@@ -495,8 +578,9 @@ class AnalysisWindow:
       default end from ``sources`` at ``now``.
     * ``window.custom(start, end)`` on a configured window, for example
       ``AnalysisWindow.default(config, sources).custom(start, end)`` (AAP 0.5.1): it reuses
-      that window's ``window.*`` values, its sources and boundaries and its
-      :attr:`default_end`, so it needs no configuration and no clock.
+      that window's ``window.*`` values, its sources and boundaries, its
+      :attr:`default_end` and its :attr:`earliest_start`, so it needs no configuration and
+      no clock.
 
     Both shapes validate through one routine and raise the same :class:`InvalidWindow` codes
     and messages. Whether a run is ``default`` or ``custom`` is the caller's decision (AAP
@@ -521,12 +605,18 @@ class AnalysisWindow:
         max_days: ``window.max_days``, the longest window; ``window.custom(start, end)``
             rejects a longer span. It is configuration, not evidence, so :meth:`to_json`
             leaves it out.
+        earliest_start: The earliest admissible start, :func:`earliest_start` of the
+            configuration the window was built with; ``window.custom(start, end)`` rejects
+            an earlier start. ``date.min`` (no floor beyond the calendar's) when the window
+            is constructed directly without it. Like ``max_days`` it is configuration, not
+            evidence, so :meth:`to_json` leaves it out.
 
     Raises:
         InvalidWindow: On construction, ``end_before_start`` when ``end`` precedes ``start``,
-            ``end_after_default_end`` when ``end`` is after ``default_end`` and ``too_long``
-            when the window spans more than ``max_days`` days, with the messages ``custom``
-            raises.
+            ``end_after_default_end`` when ``end`` is after ``default_end``,
+            ``start_before_earliest`` when ``start`` is before ``earliest_start`` and
+            ``too_long`` when the window spans more than ``max_days`` days, with the
+            messages ``custom`` raises.
         TypeError: On construction, when a date field is not a native ``date``.
         ValueError: On construction, when ``source_days`` is empty, repeats a source or
             disagrees with ``start``/``end``, or a day count is not a positive integer.
@@ -541,6 +631,7 @@ class AnalysisWindow:
     sustained_min_days: int
     presets: tuple[int, ...]
     max_days: int
+    earliest_start: date = date.min
 
     custom = _CustomConstructor()
 
@@ -549,7 +640,8 @@ class AnalysisWindow:
         start = _native_date(self.start, "start")
         end = _native_date(self.end, "end")
         latest = _native_date(self.default_end, "default_end")
-        _check_span(start, end, latest, _positive_int(self.max_days, "max_days"))
+        earliest = _native_date(self.earliest_start, "earliest_start")
+        _check_span(start, end, latest, _positive_int(self.max_days, "max_days"), earliest)
 
         raw_days: object = self.source_days
         if not isinstance(raw_days, tuple | list):
@@ -592,10 +684,12 @@ class AnalysisWindow:
         """Return the configured default window (AAP 0.5.4.1).
 
         The window is ``window.default_days`` complete days ending on :func:`default_end`:
-        ``start = end - (default_days - 1)``.
+        ``start = end - (default_days - 1)``. It carries :func:`earliest_start` of ``config``,
+        which its bound ``custom`` form applies.
 
         Args:
-            config: The loaded configuration; ``window.*`` values are read from it.
+            config: The loaded configuration; ``window.*`` values and the lookbacks behind
+                :func:`earliest_start` are read from it.
             sources: The sources' native day boundaries.
             now: The current instant; ``datetime.now(UTC)`` when omitted. Must be tz-aware.
 
@@ -603,6 +697,8 @@ class AnalysisWindow:
             The default window, with one :class:`SourceDays` per day source.
 
         Raises:
+            InvalidWindow: ``start_before_earliest`` when the configured lookbacks put
+                :func:`earliest_start` after the default window's start.
             TypeError: When ``now`` is not a ``datetime``.
             ValueError: When ``now`` is naive.
         """
@@ -627,15 +723,17 @@ class AnalysisWindow:
         ``ads-engine analyze`` do; on a configured window, ``window.custom(start, end)``
         builds the same window without restating the configuration.
 
-        The end is no later than the default window end, and the span runs from 1 day to
+        The end is no later than the default window end, the start is no earlier than
+        :func:`earliest_start` of ``config``, and the span runs from 1 day to
         ``window.max_days`` (LinkedIn's daily retention). A window equal to the default is
         valid; the caller still records it as a ``custom`` run.
 
         Args:
             start: The first native date, inclusive.
             end: The last native date, inclusive.
-            config: The loaded configuration; ``window.*`` values are read from it. Required;
-                the static type of ``AnalysisWindow.custom`` marks it so.
+            config: The loaded configuration; ``window.*`` values and the lookbacks behind
+                :func:`earliest_start` are read from it. Required; the static type of
+                ``AnalysisWindow.custom`` marks it so.
             sources: The sources' native day boundaries. Required, like ``config``.
             now: The current instant; ``datetime.now(UTC)`` when omitted. Must be tz-aware.
 
@@ -644,8 +742,8 @@ class AnalysisWindow:
 
         Raises:
             InvalidWindow: ``end_before_start``, ``end_after_default_end`` (the message names
-                the default end), ``too_long`` above ``window.max_days``, or ``too_short``
-                below 1 day.
+                the default end), ``start_before_earliest`` (the message names the earliest
+                start), ``too_long`` above ``window.max_days``, or ``too_short`` below 1 day.
             TypeError: When ``config`` or ``sources`` is missing, ``start`` or ``end`` is not
                 a native ``date``, or ``now`` is not a ``datetime``.
             ValueError: When ``now`` is naive.
@@ -664,7 +762,9 @@ class AnalysisWindow:
         first = _native_date(start, "start")
         last = _native_date(end, "end")
         latest = default_end(sources, now=now)
-        return cls._custom_window(first, last, latest, config, sources.boundaries())
+        return cls._custom_window(
+            first, last, latest, config, sources.boundaries(), earliest_start(config)
+        )
 
     def _custom_within(self, start: date, end: date) -> AnalysisWindow:
         """Return a validated custom window on this window's configuration: the AAP 0.5.1 form.
@@ -672,10 +772,11 @@ class AnalysisWindow:
         Reached as ``window.custom(start, end)``. The new window keeps this window's
         ``window.*`` values (:attr:`trusted_min_days`, :attr:`default_days`,
         :attr:`sustained_min_days`, :attr:`presets`, :attr:`max_days`), its day sources and
-        boundaries in order, and its :attr:`default_end`, which bounds the new end. No clock
-        is read: on a window from ``AnalysisWindow.default(config, sources, now=now)`` it
-        returns exactly what ``AnalysisWindow.custom(start, end, config=config,
-        sources=sources, now=now)`` returns. For a later instant build a fresh default window.
+        boundaries in order, its :attr:`default_end`, which bounds the new end, and its
+        :attr:`earliest_start`, which bounds the new start. No clock is read: on a window
+        from ``AnalysisWindow.default(config, sources, now=now)`` it returns exactly what
+        ``AnalysisWindow.custom(start, end, config=config, sources=sources, now=now)``
+        returns. For a later instant build a fresh default window.
 
         Args:
             start: The first native date, inclusive.
@@ -686,12 +787,15 @@ class AnalysisWindow:
 
         Raises:
             InvalidWindow: ``end_before_start``, ``end_after_default_end`` (the message names
-                :attr:`default_end`), ``too_long`` above :attr:`max_days`, or ``too_short``
-                below 1 day.
+                :attr:`default_end`), ``start_before_earliest`` (the message names
+                :attr:`earliest_start`), ``too_long`` above :attr:`max_days`, or
+                ``too_short`` below 1 day.
             TypeError: When ``start`` or ``end`` is not a native ``date``.
         """
         boundaries = {item.source: item.boundary for item in self.source_days}
-        return type(self)._custom_window(start, end, self.default_end, self, boundaries)
+        return type(self)._custom_window(
+            start, end, self.default_end, self, boundaries, self.earliest_start
+        )
 
     @classmethod
     def _custom_window(
@@ -701,6 +805,7 @@ class AnalysisWindow:
         latest: date,
         settings: _WindowSettings,
         boundaries: Mapping[DaySource, str],
+        earliest: date,
     ) -> AnalysisWindow:
         """Validate and assemble a custom window; both ``custom`` call shapes end here.
 
@@ -712,8 +817,8 @@ class AnalysisWindow:
         last = _native_date(end, "end")
         # Checked before assembly: SourceDays would otherwise reject a reversed range with a
         # plain ValueError instead of the InvalidWindow code POST /runs returns.
-        _check_span(first, last, latest, settings.max_days)
-        return cls._assemble(first, last, latest, settings, boundaries)
+        _check_span(first, last, latest, settings.max_days, earliest)
+        return cls._assemble(first, last, latest, settings, boundaries, earliest)
 
     @classmethod
     def _build(
@@ -724,7 +829,9 @@ class AnalysisWindow:
         config: Thresholds,
         sources: SourceDayInfo,
     ) -> AnalysisWindow:
-        return cls._assemble(start, end, latest, config, sources.boundaries())
+        return cls._assemble(
+            start, end, latest, config, sources.boundaries(), earliest_start(config)
+        )
 
     @classmethod
     def _assemble(
@@ -734,6 +841,7 @@ class AnalysisWindow:
         latest: date,
         settings: _WindowSettings,
         boundaries: Mapping[DaySource, str],
+        earliest: date,
     ) -> AnalysisWindow:
         """Assemble a window: the same dates for every day source, each with its boundary."""
         source_days = tuple(
@@ -750,6 +858,7 @@ class AnalysisWindow:
             sustained_min_days=settings.sustained_min_days,
             presets=settings.presets,
             max_days=settings.max_days,
+            earliest_start=earliest,
         )
 
     # -- flags (AAP 0.5.4.1, 0.5.4.2 P5, 0.3.2) ------------------------------------------

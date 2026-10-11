@@ -290,6 +290,12 @@ export type ApiErrorCode =
   | 'end_before_start'
   /** 422: a custom window that ends after the default window end. */
   | 'end_after_default_end'
+  /**
+   * 422: a custom window that starts before the earliest date the analysis supports, the
+   * first date its lookbacks (`k1.baseline_days`, `crm.lead_maturity_days`,
+   * `budget.max_observation_gap_hours`) can reach back from; the message names that date.
+   */
+  | 'start_before_earliest'
   /** 422: a custom window longer than `window.max_days`. */
   | 'too_long'
   /** 422: a custom window shorter than 1 day. */

@@ -250,7 +250,7 @@ Probes, failure handling, token bootstrap and HubSpot scopes:
 | HubSpot | `HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY` | Name of a `datetime` contact property; a `date` property leaves the Google link unavailable | Empty | Optional contact property holding when that Google touch happened |
 | Admin and session | `APP_ADMIN_EMAIL` | Email address (`local@domain`), lowercased | `admin@example.com` | The single admin login that `ensure-admin` creates or updates |
 | Admin and session | `APP_ADMIN_PASSWORD_HASH` | Secret argon2 PHC string, single-quoted because it contains `$` | Empty; written by `make init` | argon2id hash of the admin password |
-| Admin and session | `SESSION_SECRET` | Secret string; `make init` writes 64 hex characters (32 random bytes) | Empty; written by `make init` | Random key that signs the session cookie |
+| Admin and session | `SESSION_SECRET` | Secret string of at least 32 characters; `make init` writes 64 hex characters (32 random bytes) | Empty; written by `make init` | Random key that signs the session cookie. The API refuses to start on a key shorter than 32 characters, of fewer than 8 distinct characters or made of a repeated run |
 
 - **Blank means unset**: a blank value takes the default.
 - **Database values travel together**: if you change any `POSTGRES_*` value, change

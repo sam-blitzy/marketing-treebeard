@@ -184,8 +184,14 @@ make migrate
 untouched. `make migrate` then runs `ads-engine migrate && ads-engine ensure-admin`, which stores
 the new hash. Sign-in reads the stored hash, so `api` needs no restart.
 
+Storing the new hash ends every existing session: every signed-in browser, and anyone holding a
+copied session cookie, gets 401 and must sign in again with the new password. Re-running
+`make migrate` with an unchanged hash keeps every session. The lost-password procedure therefore
+also locks out anyone who still holds an old session.
+
 **Change the email**: edit `APP_ADMIN_EMAIL` in `.env`, then run `make migrate`. `ensure-admin`
-creates the login under the new email and removes the old one.
+creates the login under the new email and removes the old one, which ends the old login's
+sessions with it.
 
 ## Environment and secrets
 
@@ -245,7 +251,7 @@ from `.env.example`.
 | `HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY` | HubSpot | Unset | No | `worker` | Optional `datetime` contact property holding when that Google touch happened |
 | `APP_ADMIN_EMAIL` | Admin and session | `admin@example.com` | No | `migrate` | The admin login that `ensure-admin` creates or updates |
 | `APP_ADMIN_PASSWORD_HASH` | Admin and session | Unset; written by `make init` | Yes | `migrate` | argon2id hash of the admin password, single-quoted |
-| `SESSION_SECRET` | Admin and session | Unset; written by `make init` | Yes | `api` | Key that signs session cookies. The API refuses to start without it |
+| `SESSION_SECRET` | Admin and session | Unset; written by `make init` | Yes | `api` | Key that signs session cookies. The API refuses to start without it, or with a key shorter than 32 characters, of fewer than 8 distinct characters or made of a repeated run |
 
 The CLI commands read the same variables inside the backend containers; `ads-engine --help` lists
 what each command needs.
@@ -731,6 +737,7 @@ How the freshness rows turn into item flags:
 | `migrate` exits 1 and `api` and `worker` never start | `APP_ADMIN_PASSWORD_HASH` is unset or not an argon2 hash ("APP_ADMIN_PASSWORD_HASH is not set; run `make init ADMIN_PASSWORD=…`"), or the database is unreachable | `docker compose logs migrate`; write a new hash ([Admin login](#admin-login)) |
 | `api` restarts with "APP_BASE_URL must use https:// unless it is a localhost URL" | A non-local `http://` base URL | Use `https://` with TLS in front of nginx ([Hosting beyond localhost](#hosting-beyond-localhost)), or a `localhost` URL |
 | `api` restarts with "SESSION_SECRET is not set; run make init" | `SESSION_SECRET` blank | Generate one ([Secrets](#secrets)) and recreate `api` |
+| `api` restarts with "SESSION_SECRET is too weak: use at least 32 random characters; run make init, or rotate it as docs/runbook.md describes" | A hand-set `SESSION_SECRET` that is short, has fewer than 8 distinct characters or repeats a run | Rotate it with the **Rotating `SESSION_SECRET`** block ([Secrets](#secrets)), which writes 64 random hex characters and recreates `api` |
 | Sign-in answers 429 | More than 5 attempts in a minute from one address | Wait a minute |
 | `/actions` shows "No analysis run yet" for more than 15 minutes | The first build, backfill or run failed, or the worker is restarting | `docker compose logs -f worker`; a configuration error appears as `worker_config_invalid` |
 | A source stays simulated after its credentials were added | Variables missing ("credentials not configured"), a denied token or scope (the reason names the code and endpoint), partial permissions, or the probe interval has not passed | Read the reason on `/sources`, fix the access, recreate `api` and `worker` and allow up to 30 minutes for the next probe. Partial success, such as LinkedIn ads readable while Lead Sync returns 403, changes nothing by design |
@@ -781,8 +788,11 @@ curl -fsS http://localhost:8080/api/v1/healthz
   queues the same work for the worker instead.
 - **`analyze`** takes calendar dates in `YYYY-MM-DD` form, applied to each source's native days.
   `--end` is no later than the default window end, the earlier of yesterday in the Google account's
-  time zone and yesterday UTC, and the span is 1 to `window.max_days` (default 180) days. The run is
-  `kind=custom`; open it at `/actions?run=<run_id>` with the `run_id` from its JSON summary.
+  time zone and yesterday UTC, and the span is 1 to `window.max_days` (default 180) days. `--start`
+  is no earlier than the earliest date the lookbacks `k1.baseline_days`, `crm.lead_maturity_days`
+  and `budget.max_observation_gap_hours` can reach back from (0001-04-01 as shipped); an earlier
+  start exits 2 with `start_before_earliest` and that date. The run is `kind=custom`; open it at
+  `/actions?run=<run_id>` with the `run_id` from its JSON summary.
 - **Streams**: stderr carries JSON log lines, including one `cli_error` line that explains a
   failure, and never a secret, a token or an email. stdout carries only command output: the JSON
   reports of `sync`, `analyze` and `seed-simulated` and the paths `capture-fixtures` writes, none

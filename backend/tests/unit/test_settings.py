@@ -5,6 +5,7 @@ host-exported credentials never reach a test; each test sets the fake values it 
 No test performs network or database I/O.
 """
 
+import hashlib
 import os
 import secrets
 from collections.abc import Iterator, Mapping
@@ -15,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import AliasChoices, SecretStr, ValidationError
+from pydantic_core import InitErrorDetails
 
 from ads_engine.connectors.hubspot.client import HUBSPOT_API_VERSION as HUBSPOT_CLIENT_VERSION
 from ads_engine.connectors.linkedin.client import LINKEDIN_VERSION
@@ -23,13 +25,18 @@ from ads_engine.settings import (
     HUBSPOT_API_VERSION,
     LINKEDIN_API_VERSION,
     MOCK_SCENARIOS,
+    SETTINGS_TEMPLATE_ERROR_TYPES,
+    SETTINGS_VALUE_ERROR_PREFIX,
+    SETTINGS_WITHHELD_PROBLEM,
     SOURCES,
     VALIDATOR_MESSAGES,
     ConfigurationError,
     DataMode,
     Settings,
     Source,
+    _is_weak_session_key,
     get_settings,
+    settings_error_problem,
 )
 from ads_engine.simulation import RUNTIME_SCENARIOS
 
@@ -42,7 +49,7 @@ LINKEDIN_CLIENT_SECRET = "test-linkedin-client-secret"
 LINKEDIN_REFRESH_TOKEN = "test-linkedin-refresh-token"
 LINKEDIN_ACCESS_TOKEN = "test-linkedin-token"
 HUBSPOT_TOKEN = "test-hubspot-token"
-SESSION_SECRET = "test-session-secret"
+SESSION_SECRET = "test-session-secret-for-unit-tests"
 PASSWORD_HASH = "test-argon2-password-hash"
 DEFAULT_DATABASE_URL = "postgresql+psycopg://ads:ads@db:5432/ads_engine"
 
@@ -852,8 +859,16 @@ def test_api_startup_reports_the_base_url_before_the_session_secret(
         ("http://ads.example.test", SESSION_SECRET, ("app_base_url",)),
         ("http://ads.example.test", None, ("app_base_url",)),
         ("https://ads.example.test", None, ("session_secret",)),
+        ("https://ads.example.test", "changeme", ("session_secret",)),
+        ("http://ads.example.test", "changeme", ("app_base_url",)),
     ],
-    ids=["unsafe-base-url", "both-base-url-first", "no-session-secret"],
+    ids=[
+        "unsafe-base-url",
+        "both-base-url-first",
+        "no-session-secret",
+        "weak-session-secret",
+        "weak-and-unsafe-base-url-first",
+    ],
 )
 def test_api_startup_refusal_names_the_field_at_fault(
     monkeypatch: pytest.MonkeyPatch,
@@ -870,6 +885,124 @@ def test_api_startup_refusal_names_the_field_at_fault(
         settings.check_api_startup()
 
     assert refused.value.fields == fields
+
+
+WEAK_SESSION_SECRET_MESSAGE = (
+    "SESSION_SECRET is too weak: use at least 32 random characters; run make init, "
+    "or rotate it as docs/runbook.md describes"
+)
+
+# Signing keys the API refuses: short, of fewer than 8 distinct characters, or a repeated run.
+WEAK_SESSION_SECRETS = [
+    pytest.param("a", id="one-character"),
+    pytest.param("changeme", id="changeme"),
+    pytest.param("x" * 16, id="16-x"),
+    pytest.param("x" * 32, id="32-x"),
+    pytest.param("changeme" * 4, id="changeme-4-times"),
+    pytest.param("0123456789abcdef" * 2, id="hex-digits-twice"),
+    pytest.param(secrets.token_hex(16)[:31], id="31-random-hex"),
+    pytest.param("ab" * 20, id="ab-20-times"),
+    pytest.param("abcdefg" * 4 + "gfed", id="32-characters-7-distinct"),
+    pytest.param("changeme-changeme-changeme-changeme", id="dashed-changeme-run"),
+]
+
+# Signing keys the API accepts: what make init and the runbook rotation write, a urlsafe
+# token, and conftest's TEST_SESSION_SECRET, which every API test signs cookies with.
+STRONG_SESSION_SECRETS = [
+    pytest.param(secrets.token_hex(32), id="64-random-hex"),
+    pytest.param(secrets.token_urlsafe(32), id="token-urlsafe-32"),
+    pytest.param("test-session-secret-not-for-production", id="conftest-test-value"),
+    pytest.param(SESSION_SECRET, id="unit-test-value"),
+]
+
+
+@pytest.mark.parametrize("session_secret", WEAK_SESSION_SECRETS)
+def test_api_startup_refuses_a_weak_session_secret(
+    monkeypatch: pytest.MonkeyPatch, session_secret: str
+) -> None:
+    monkeypatch.setenv("SESSION_SECRET", session_secret)
+    settings = Settings()
+
+    with pytest.raises(ConfigurationError) as refused:
+        settings.check_api_startup()
+
+    # Fixed text, the same for every key, so it quotes none of them.
+    assert str(refused.value) == WEAK_SESSION_SECRET_MESSAGE
+    assert refused.value.args == (WEAK_SESSION_SECRET_MESSAGE,)
+    assert refused.value.fields == ("session_secret",)
+
+
+def test_weak_session_secret_refusal_never_quotes_the_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    weak = "-".join(("weak", secrets.token_hex(6)))
+    monkeypatch.setenv("SESSION_SECRET", weak)
+
+    with pytest.raises(ConfigurationError) as refused:
+        Settings().check_api_startup()
+
+    rendered = f"{refused.value}\n{refused.value!r}\n{refused.value.args!r}"
+    assert weak not in rendered
+    assert weak.split("-")[1] not in rendered
+
+
+@pytest.mark.parametrize("session_secret", STRONG_SESSION_SECRETS)
+def test_api_startup_accepts_a_strong_session_secret(
+    monkeypatch: pytest.MonkeyPatch, session_secret: str
+) -> None:
+    monkeypatch.setenv("SESSION_SECRET", session_secret)
+
+    Settings().check_api_startup()
+
+
+@pytest.mark.parametrize(
+    ("candidate", "weak"),
+    [
+        pytest.param("abcdefgh" * 3 + "hgfedcba", False, id="32-characters-8-distinct"),
+        pytest.param("abcdefgh" * 3 + "hgfedcb", True, id="31-characters-8-distinct"),
+        pytest.param("abcdefg" * 4 + "gfed", True, id="32-characters-7-distinct"),
+        pytest.param("0123456789abcdef" * 2, True, id="period-16-of-32"),
+        pytest.param("0123456789abcdefg" * 2, True, id="period-17-of-34"),
+        pytest.param("0123456789abcdefg0123456789abcdef", False, id="period-17-of-33"),
+        pytest.param("abcdefgh" * 4 + "abcd", True, id="period-8-with-a-partial-tail"),
+        pytest.param("test-session-secret-not-for-production", False, id="no-repeated-run"),
+    ],
+)
+def test_weak_session_key_bounds(candidate: str, weak: bool) -> None:
+    assert _is_weak_session_key(candidate) is weak
+
+
+def _smallest_period(text: str) -> int:
+    """Return the least shift ``p`` with ``text[i] == text[i + p]`` everywhere, by brute force."""
+    return next(
+        shift
+        for shift in range(1, len(text) + 1)
+        if all(text[index] == text[index + shift] for index in range(len(text) - shift))
+    )
+
+
+def test_weak_session_key_period_matches_a_brute_force_oracle() -> None:
+    """The linear-time period agrees with the quadratic definition on scattered and built runs.
+
+    The candidates come from SHA-256 digests, so the set is the same on every run: per digest,
+    its 64 hex digits mapped onto 8 to 10 letters, and a run of 1 to 24 of those letters
+    repeated, each cut to 32 to 64 characters.
+    """
+    candidates: list[str] = []
+    for seed in range(400):
+        digest = hashlib.sha256(f"session-period-{seed}".encode()).hexdigest()
+        alphabet = "abcdefghij"[: 8 + seed % 3]
+        letters = "".join(alphabet[int(digit, 16) % len(alphabet)] for digit in digest)
+        length = 32 + seed % 33
+        candidates.append(letters[:length])
+        candidates.append((letters[: 1 + seed % 24] * 64)[:length])
+    for candidate in candidates:
+        expected = (
+            len(candidate) < 32
+            or len(set(candidate)) < 8
+            or _smallest_period(candidate) <= len(candidate) // 2
+        )
+        assert _is_weak_session_key(candidate) is expected, candidate
 
 
 # ---------------------------------------------------------------------------
@@ -1341,6 +1474,60 @@ def test_validator_messages_carry_no_quoted_value_or_placeholder() -> None:
     for message in VALIDATOR_MESSAGES:
         assert not set(message) & set("'\"{}"), message
         assert message == message.strip()
+
+
+@pytest.mark.parametrize(("values", "message"), VALIDATOR_FAILURES)
+def test_settings_error_problem_shows_each_validator_message_as_pydantic_writes_it(
+    values: Mapping[str, object], message: str
+) -> None:
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(**values)
+
+    (detail,) = excinfo.value.errors(include_input=False, include_url=False)
+    assert settings_error_problem(detail) == f"{SETTINGS_VALUE_ERROR_PREFIX}{message}"
+    assert detail["msg"] == settings_error_problem(detail)
+
+
+@pytest.mark.parametrize(
+    ("values", "error_type"),
+    [
+        pytest.param({"mock_seed": "not-a-number"}, "int_parsing", id="int-parsing"),
+        pytest.param({"backfill_days": 0}, "greater_than_equal", id="greater-than-equal"),
+        pytest.param({"data_mode": "bogus"}, "literal_error", id="literal"),
+    ],
+)
+def test_settings_error_problem_keeps_a_template_message(
+    values: Mapping[str, object], error_type: str
+) -> None:
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(**values)
+
+    (detail,) = excinfo.value.errors(include_input=False, include_url=False)
+    assert detail["type"] == error_type
+    assert error_type in SETTINGS_TEMPLATE_ERROR_TYPES
+    assert settings_error_problem(detail) == detail["msg"]
+
+
+@pytest.mark.parametrize(
+    ("error_type", "context"),
+    [
+        pytest.param("value_error", ValueError, id="unlisted-value-error"),
+        pytest.param("assertion_error", AssertionError, id="assertion-error"),
+        pytest.param("float_parsing", None, id="type-outside-the-allowlist"),
+    ],
+)
+def test_settings_error_problem_withholds_any_other_message(
+    error_type: str, context: type[Exception] | None
+) -> None:
+    sentinel = _sentinel()
+    line: dict[str, object] = {"type": error_type, "loc": ("display_timezone",), "input": sentinel}
+    if context is not None:
+        line["ctx"] = {"error": context(f"unknown zone {sentinel!r}")}
+    error = ValidationError.from_exception_data("Settings", [cast(InitErrorDetails, line)])
+
+    (detail,) = error.errors(include_input=False, include_url=False)
+    assert settings_error_problem(detail) == SETTINGS_WITHHELD_PROBLEM
+    assert sentinel not in SETTINGS_WITHHELD_PROBLEM
 
 
 def test_secret_values_lists_each_set_secret_once_in_field_order(

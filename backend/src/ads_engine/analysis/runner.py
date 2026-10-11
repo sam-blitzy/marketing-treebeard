@@ -578,8 +578,10 @@ async def custom_window(
     """Return a validated custom window (AAP 0.5.3 ``POST /runs``, ``ads-engine analyze``).
 
     Delegates to ``AnalysisWindow.custom``: the end is no later than the default window end
-    at ``now``, and the span runs from 1 day to ``window.max_days``. The caller records the
-    run as ``custom`` even when the window equals the default.
+    at ``now``, the start is no earlier than ``earliest_start`` of the configuration (the
+    first date the run's lookbacks can reach back from), and the span runs from 1 day to
+    ``window.max_days``. The caller records the run as ``custom`` even when the window
+    equals the default.
 
     Args:
         start: The first native date, inclusive.
@@ -593,8 +595,9 @@ async def custom_window(
         The custom window.
 
     Raises:
-        InvalidWindow: ``end_before_start``, ``end_after_default_end``, ``too_long`` or
-            ``too_short``; the API maps it to 422 and the CLI to exit code 2.
+        InvalidWindow: ``end_before_start``, ``end_after_default_end``,
+            ``start_before_earliest``, ``too_long`` or ``too_short``; the API maps it to 422
+            and the CLI to exit code 2.
         ConfigError: When the configuration fails to load.
         TypeError: When ``start`` or ``end`` is not a native ``date`` or ``now`` is not a
             ``datetime``.

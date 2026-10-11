@@ -22,14 +22,16 @@ Errors: a missing run is 404 ``not_found`` (:func:`~ads_engine.api.deps.not_foun
 exceptions are deliberately not caught here; ``api/app.py`` renders them:
 :class:`~ads_engine.analysis.lock.RunInProgress` as 409 ``run_in_progress`` and
 :class:`~ads_engine.analysis.window.InvalidWindow` as 422 with its own code
-(``end_before_start``, ``end_after_default_end``, ``too_long`` or ``too_short``).
+(``end_before_start``, ``end_after_default_end``, ``start_before_earliest``, ``too_long`` or
+``too_short``), raised before the run takes the lock or writes a row.
 
 Decisions taken in this module, each stated where its code lives:
 
 * **No lock and no window rules here.** :func:`ads_engine.analysis.runner.run_analysis` takes
   the shared ``analysis`` advisory lock itself, for the API, the worker and the CLI alike;
   taking it here as well would make the run fail against its own route. The window bounds
-  (end no later than the default window end, 1 day to ``window.max_days``) live once, in
+  (end no later than the default window end, start no earlier than the earliest date the
+  analysis's lookbacks allow, 1 day to ``window.max_days``) live once, in
   ``AnalysisWindow.custom``.
 * **One configuration per request.** The application's loaded thresholds
   (:data:`~ads_engine.api.deps.ThresholdsDep`) validate the window and drive the run, and the
@@ -246,11 +248,13 @@ async def create_run(
     """Compute a custom-window run synchronously from stored data and return it (201).
 
     The window is a range of calendar dates applied to each source's native days. It must
-    end no later than the default window end at the request's instant and span 1 day to
-    ``window.max_days``; ``AnalysisWindow.custom`` enforces both, and a violation is a 422
-    carrying its code. The run reads only stored data (the API never calls a platform) and
-    is recorded as ``kind=custom`` with ``trigger=manual``, even when the window equals the
-    default, so it never becomes ``/runs/latest``.
+    end no later than the default window end at the request's instant, start no earlier
+    than ``earliest_start`` of the configuration (the first date whose lookbacks the run can
+    compute; the message names it) and span 1 day to ``window.max_days``;
+    ``AnalysisWindow.custom`` enforces all three, and a violation is a 422 carrying its code,
+    answered before any run row is written. The run reads only stored data (the API never
+    calls a platform) and is recorded as ``kind=custom`` with ``trigger=manual``, even when
+    the window equals the default, so it never becomes ``/runs/latest``.
 
     The runner takes the shared ``analysis`` lock that the worker and the CLI also take,
     so only one run executes at a time whichever process starts it. While any process holds

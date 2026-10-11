@@ -34,12 +34,13 @@ test database; nothing reaches the network. The guarantees proven here:
   kept) and 422; ``/healthz``; the deadline's 503 and the catch-all 500. The middleware replaces
   any ``Cache-Control`` the application sent and leaves other ASGI scopes alone.
 * **Startup guard** (AAP 0.3.2): plain ``http://`` is accepted only on ``localhost`` and
-  ``127.0.0.1``, and the API refuses to start without ``SESSION_SECRET`` or on a ``DATABASE_URL``
-  the engine would refuse (malformed, or a driver other than psycopg 3), while an unreachable
-  database still starts it and ``/healthz`` answers 503. Each refusal, and an environment value
-  that fails validation, is logged once as ``api.startup_failed`` with the error class, the
-  fields at fault and what is wrong, never their values, before the error propagates; under
-  uvicorn the process then exits 1 with no line that is not JSON.
+  ``127.0.0.1``, and the API refuses to start without ``SESSION_SECRET``, with one too weak to
+  sign cookies, or on a ``DATABASE_URL`` the engine would refuse (malformed, or a driver other
+  than psycopg 3), while an unreachable database still starts it and ``/healthz`` answers 503.
+  Each refusal, and an environment value that fails validation, is logged once as
+  ``api.startup_failed`` with the error class, the fields at fault and what is wrong, never
+  their values, before the error propagates; under uvicorn the process then exits 1 with no
+  line that is not JSON.
 * **Every route returns its schema** (AAP 0.5.3 endpoint table), on simulated data seeded the
   way the worker seeds a first start.
 * **Feedback is idempotent per item** (AAP 0.5.3 ``POST /recommendations/{id}/feedback``,
@@ -2362,13 +2363,28 @@ def test_create_app_accepts_localhost_and_loopback(
     assert settings.secure_cookies is False
 
 
-@pytest.mark.parametrize("secret", [None, "", "   "], ids=["unset", "empty", "blank"])
+WEAK_SESSION_SECRET: Final = "test-weak-key-0451"
+"""A ``SESSION_SECRET`` under 32 characters, which the API refuses; it never reaches a log."""
+
+WEAK_SESSION_SECRET_MESSAGE: Final = (
+    "SESSION_SECRET is too weak: use at least 32 random characters; run make init, "
+    "or rotate it as docs/runbook.md describes"
+)
+"""The refusal of a weak ``SESSION_SECRET``: fixed text that quotes no part of the key."""
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [None, "", "   ", WEAK_SESSION_SECRET],
+    ids=["unset", "empty", "blank", "weak"],
+)
 def test_create_app_requires_session_secret(
     set_env: Callable[..., None], secret: str | None
 ) -> None:
     """AAP 0.3.2: without ``SESSION_SECRET`` no session can be signed, so the API will not start.
 
-    An empty or whitespace-only value counts as unset (AAP 0.3.3).
+    An empty or whitespace-only value counts as unset (AAP 0.3.3). A key short enough to be
+    guessed, with which anyone could forge a session offline, is refused as well.
     """
     set_env(SESSION_SECRET=secret)
     with pytest.raises(ConfigurationError, match="SESSION_SECRET"):
@@ -2495,12 +2511,19 @@ def startup_failures(output: str) -> list[dict[str, Any]]:
 
 
 def assert_one_startup_failure(
-    output: str, *, error_type: str, fields: list[str], message: str
+    output: str,
+    *,
+    error_type: str,
+    fields: list[str],
+    message: str,
+    errors: list[dict[str, str]] | None = None,
 ) -> None:
     """Assert ``output`` holds exactly one ``api.startup_failed`` ERROR event, as given.
 
     ``message`` is what the event tells the operator: a ``ConfigurationError``'s own text, or
-    one ``NAME: message`` per failed setting for a ``ValidationError``.
+    the summary ``invalid settings (N error[s])`` for a ``ValidationError``. ``errors`` is a
+    ``ValidationError``'s ``{variable, problem}`` list, whose length is the ``error_count``;
+    ``None`` asserts that the event carries neither key, as for a ``ConfigurationError``.
     """
     failures = startup_failures(output)
     assert len(failures) == 1, failures
@@ -2510,6 +2533,12 @@ def assert_one_startup_failure(
     assert failure["error_type"] == error_type
     assert failure["fields"] == fields
     assert failure["message"] == message
+    if errors is None:
+        assert "errors" not in failure, failure
+        assert "error_count" not in failure, failure
+    else:
+        assert failure["errors"] == errors
+        assert failure["error_count"] == len(errors)
 
 
 def test_unsafe_base_url_logs_startup_failed(
@@ -2561,6 +2590,26 @@ def test_missing_session_secret_logs_startup_failed(
     assert host not in output
 
 
+def test_weak_session_secret_logs_startup_failed(
+    set_env: Callable[..., None], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A weak ``SESSION_SECRET`` is logged once, naming its field, class and fix, never the key."""
+    set_env(SESSION_SECRET=WEAK_SESSION_SECRET)
+    capsys.readouterr()
+
+    with pytest.raises(ConfigurationError, match="SESSION_SECRET is too weak"):
+        create_app()
+
+    output = capsys.readouterr().out
+    assert_one_startup_failure(
+        output,
+        error_type="ConfigurationError",
+        fields=["session_secret"],
+        message=WEAK_SESSION_SECRET_MESSAGE,
+    )
+    assert WEAK_SESSION_SECRET not in output
+
+
 def test_session_secret_recheck_logs_startup_failed(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2586,15 +2635,18 @@ def test_session_secret_recheck_logs_startup_failed(
 INT_PARSING_MESSAGE: Final = "Input should be a valid integer, unable to parse string as an integer"
 """Pydantic's message for an integer setting whose text is not a number."""
 
+WITHHELD_PROBLEM: Final = "Invalid value; its message is withheld because it may quote the value"
+"""The problem of a settings error whose own message is outside the value-free allowlist."""
+
 
 def test_unparseable_environment_logs_startup_failed(
     set_env: Callable[..., None], capsys: pytest.CaptureFixture[str]
 ) -> None:
     """An environment value that fails validation is logged once by field name, then raised.
 
-    The message names each variable with pydantic's own message, in the order the settings
-    declare them. Neither input reaches the log, although a validation message may quote its
-    input.
+    The message is a summary; ``errors`` names each variable with pydantic's own template
+    message, in the order the settings declare them. Neither input reaches the log, although a
+    validation message may quote its input.
     """
     seed, budget = "seed-not-a-number-0451", "budget-not-a-number-0451"
     set_env(MOCK_SEED=seed, GOOGLE_DAILY_CALL_BUDGET=budget)
@@ -2608,9 +2660,11 @@ def test_unparseable_environment_logs_startup_failed(
         output,
         error_type="ValidationError",
         fields=["google_daily_call_budget", "mock_seed"],
-        message=(
-            f"MOCK_SEED: {INT_PARSING_MESSAGE}; GOOGLE_DAILY_CALL_BUDGET: {INT_PARSING_MESSAGE}"
-        ),
+        message="invalid settings (2 errors)",
+        errors=[
+            {"variable": "MOCK_SEED", "problem": INT_PARSING_MESSAGE},
+            {"variable": "GOOGLE_DAILY_CALL_BUDGET", "problem": INT_PARSING_MESSAGE},
+        ],
     )
     assert seed not in output
     assert budget not in output
@@ -2638,12 +2692,20 @@ def test_startup_failed_logs_each_validator_message_whole_and_never_the_value(
         output,
         error_type="ValidationError",
         fields=["data_mode", "display_timezone", "linkedin_ad_account_ids"],
-        message=(
-            "DISPLAY_TIMEZONE: Value error, DISPLAY_TIMEZONE must be an IANA time zone name "
-            "such as UTC or America/New_York; DATA_MODE: Input should be 'auto' or 'simulated'; "
-            "LINKEDIN_AD_ACCOUNT_IDS: Value error, LINKEDIN_AD_ACCOUNT_IDS entries must be "
-            "numeric ad account ids or urn:li:sponsoredAccount:<digits>"
-        ),
+        message="invalid settings (3 errors)",
+        errors=[
+            {
+                "variable": "DISPLAY_TIMEZONE",
+                "problem": "Value error, DISPLAY_TIMEZONE must be an IANA time zone name "
+                "such as UTC or America/New_York",
+            },
+            {"variable": "DATA_MODE", "problem": "Input should be 'auto' or 'simulated'"},
+            {
+                "variable": "LINKEDIN_AD_ACCOUNT_IDS",
+                "problem": "Value error, LINKEDIN_AD_ACCOUNT_IDS entries must be numeric ad "
+                "account ids or urn:li:sponsoredAccount:<digits>",
+            },
+        ],
     )
     for value in (zone, account, mode):
         assert value not in output
@@ -2652,11 +2714,12 @@ def test_startup_failed_logs_each_validator_message_whole_and_never_the_value(
 def test_startup_failed_withholds_the_input_a_validator_quotes(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A validator message that quotes its input keeps its text but not the quoted literal.
+    """A validator message outside the allowlist is withheld whole, so its quoted input is too.
 
     No settings validator quotes its input, so the safeguard is proven on an injected
-    ``ValidationError``: each single- or double-quoted literal of a ``value_error`` or an
-    ``assertion_error`` message becomes ``<value withheld>``.
+    ``ValidationError``: a ``value_error`` whose message is not one of the settings'
+    ``VALIDATOR_MESSAGES``, and an ``assertion_error``, each get the allowlist's withheld
+    problem in place of their own text.
     """
     sentinel = "-".join(("api", "sentinel", uuid.uuid4().hex))
     quoted = ValidationError.from_exception_data(
@@ -2692,12 +2755,47 @@ def test_startup_failed_withholds_the_input_a_validator_quotes(
         output,
         error_type="ValidationError",
         fields=["display_timezone", "linkedin_ad_account_ids"],
-        message=(
-            "LINKEDIN_AD_ACCOUNT_IDS: Value error, entries must be numeric; got "
-            "<value withheld>; DISPLAY_TIMEZONE: Assertion failed, unknown zone <value withheld>"
-        ),
+        message="invalid settings (2 errors)",
+        errors=[
+            {"variable": "LINKEDIN_AD_ACCOUNT_IDS", "problem": WITHHELD_PROBLEM},
+            {"variable": "DISPLAY_TIMEZONE", "problem": WITHHELD_PROBLEM},
+        ],
     )
     assert sentinel not in output
+
+
+def test_startup_failed_keeps_admin_email_problem_legible(
+    set_env: Callable[..., None], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An invalid ``APP_ADMIN_EMAIL`` reads as the worker logs it, with no email address.
+
+    Its problem sits in ``errors`` under its own key, so the log pipeline's rule for the value
+    of an email-named key never reads it as ``APP_ADMIN_EMAIL``'s value; only the example
+    address the validator's message names is replaced.
+    """
+    set_env(APP_ADMIN_EMAIL="notanemail")
+    capsys.readouterr()
+
+    with pytest.raises(ValidationError):
+        create_app()
+
+    output = capsys.readouterr().out
+    assert_one_startup_failure(
+        output,
+        error_type="ValidationError",
+        fields=["app_admin_email"],
+        message="invalid settings (1 error)",
+        errors=[
+            {
+                "variable": "APP_ADMIN_EMAIL",
+                "problem": "Value error, APP_ADMIN_EMAIL must be an email address such as "
+                "[REDACTED_EMAIL]",
+            }
+        ],
+    )
+    assert "Value error" in output
+    assert "@" not in output
+    assert "notanemail" not in output
 
 
 @pytest.mark.parametrize(("database_url", "message"), UNUSABLE_DATABASE_URLS)
@@ -2726,10 +2824,11 @@ def test_unusable_database_url_logs_startup_failed(
     ("variables", "error_type"),
     [
         ({"SESSION_SECRET": None}, ConfigurationError),
+        ({"SESSION_SECRET": WEAK_SESSION_SECRET}, ConfigurationError),
         ({"DATABASE_URL": "not-a-url"}, ConfigurationError),
         ({"MOCK_SEED": "seed-not-a-number-0451"}, ValidationError),
     ],
-    ids=["session-secret", "database-url", "validation-error"],
+    ids=["session-secret", "weak-session-secret", "database-url", "validation-error"],
 )
 def test_startup_refusal_is_marked_as_logged(
     set_env: Callable[..., None],
@@ -2775,10 +2874,22 @@ UVICORN_FACTORY_COMMAND: Final = (
         ),
         ({"SESSION_SECRET": None}, "ConfigurationError", ["session_secret"], None),
         (
+            {"SESSION_SECRET": WEAK_SESSION_SECRET},
+            "ConfigurationError",
+            ["session_secret"],
+            WEAK_SESSION_SECRET,
+        ),
+        (
             {"GOOGLE_DAILY_CALL_BUDGET": "budget-not-a-number-0451"},
             "ValidationError",
             ["google_daily_call_budget"],
             "budget-not-a-number-0451",
+        ),
+        (
+            {"APP_ADMIN_EMAIL": "admin-not-an-address-0451"},
+            "ValidationError",
+            ["app_admin_email"],
+            "admin-not-an-address-0451",
         ),
         ({"DATABASE_URL": "not-a-url"}, "ConfigurationError", ["database_url"], "not-a-url"),
         (
@@ -2788,7 +2899,15 @@ UVICORN_FACTORY_COMMAND: Final = (
             DATABASE_PASSWORD,
         ),
     ],
-    ids=["unsafe-base-url", "no-session-secret", "unparseable-budget", "malformed-db", "mysql-db"],
+    ids=[
+        "unsafe-base-url",
+        "no-session-secret",
+        "weak-session-secret",
+        "unparseable-budget",
+        "invalid-admin-email",
+        "malformed-db",
+        "mysql-db",
+    ],
 )
 def test_uvicorn_startup_refusal_writes_only_json_lines(
     set_env: Callable[..., None],

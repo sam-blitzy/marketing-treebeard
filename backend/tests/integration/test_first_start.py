@@ -11,7 +11,8 @@ a browser; this module proves the backend half in process:
 
 * **CLI bootstrap** (AAP 0.5.1 "Worker entry and CLI"): ``hash-password`` prints only the
   argon2id hash of stdin less its trailing newline; ``migrate`` is idempotent at revision
-  ``0001``; ``ensure-admin`` creates, then updates, the single admin login and fails clearly,
+  ``0001``; ``ensure-admin`` creates, then updates, the single admin login, ends every earlier
+  session when the password hash changes and keeps them when it does not, and fails clearly,
   naming the variable, without a hash.
 * **Environment defaults** (AAP 0.6.2; AAP 0.3.3 "A blank value is read as unset"): blank
   values take the documented defaults and blank secrets count as unset, and ``.env.example``
@@ -463,8 +464,9 @@ async def test_ensure_admin_creates_then_updates(
     """``ensure-admin`` creates the single admin, is idempotent, and updates the hash in place.
 
     The admin comes from ``APP_ADMIN_EMAIL`` and ``APP_ADMIN_PASSWORD_HASH``; another login
-    (an admin whose email was changed) is removed, a rerun keeps the one row, and a new hash
-    replaces the old one on the same row.
+    (an admin whose email was changed) is removed, a rerun keeps the one row and its session
+    generation, and a new hash replaces the old one on the same row and increments the
+    generation by exactly one, which ends every earlier session.
     """
     async with db() as session:
         session.add(AppUser(email="previous-admin@example.com", password_hash=admin_password_hash))
@@ -477,11 +479,14 @@ async def test_ensure_admin_creates_then_updates(
         ("admin@example.com", admin_password_hash)
     ]
     admin_id = users[0].id
+    generation = users[0].session_generation
 
     again = run_cli("ensure-admin")
     assert again.returncode == 0, again.stderr
     users = await _all(db, select(AppUser))
-    assert [(user.id, user.password_hash) for user in users] == [(admin_id, admin_password_hash)]
+    assert [(user.id, user.password_hash, user.session_generation) for user in users] == [
+        (admin_id, admin_password_hash, generation)
+    ]
 
     hashed = run_cli("hash-password", input="a different password\n")
     assert hashed.returncode == 0, hashed.stderr
@@ -489,10 +494,75 @@ async def test_ensure_admin_creates_then_updates(
     updated = run_cli("ensure-admin", env={"APP_ADMIN_PASSWORD_HASH": new_hash})
     assert updated.returncode == 0, updated.stderr
     users = await _all(db, select(AppUser))
-    assert [(user.id, user.email, user.password_hash) for user in users] == [
-        (admin_id, "admin@example.com", new_hash)
-    ]
+    assert [
+        (user.id, user.email, user.password_hash, user.session_generation) for user in users
+    ] == [(admin_id, "admin@example.com", new_hash, generation + 1)]
     assert PasswordHasher().verify(users[0].password_hash, "a different password")
+
+
+async def test_ensure_admin_ends_every_session_when_the_password_hash_changes(
+    db: Sessions,
+    run_cli: RunCli,
+    api_client: httpx.AsyncClient,
+    login: Login,
+    test_identity: Identity,
+) -> None:
+    """A changed password hash ends every earlier session; an unchanged one keeps them all.
+
+    Every ``docker compose up`` reruns ``ensure-admin`` with the same hash, which must sign
+    nobody out. The runbook's password change, the lost-password procedure too, reruns it
+    with a new hash: a cookie issued before, the browser's own or a saved copy, then gets 401
+    on a read and on a mutating route, the old password no longer signs in and the new one
+    does. The new hash is computed at run time by ``hash-password``, so no argon2 hash
+    literal is committed.
+    """
+    me = "/api/v1/auth/me"
+    cookie = test_identity.session_cookie
+    created = run_cli("ensure-admin")
+    assert created.returncode == 0, created.stderr
+    signed_in = await login(api_client, email=test_identity.email, password=test_identity.password)
+    assert signed_in.status_code == 200, signed_in.text
+    saved = api_client.cookies.get(cookie)
+    assert saved
+    replayed = {"Cookie": f"{cookie}={saved}"}
+    assert (await api_client.get(me)).status_code == 200
+
+    unchanged = run_cli("ensure-admin")
+    assert unchanged.returncode == 0, unchanged.stderr
+    kept = await api_client.get(me)
+    assert kept.status_code == 200, kept.text
+    assert kept.json()["email"] == test_identity.email
+
+    new_password = "the replacement admin password"
+    hashed = run_cli("hash-password", input=f"{new_password}\n")
+    assert hashed.returncode == 0, hashed.stderr
+    changed = run_cli("ensure-admin", env={"APP_ADMIN_PASSWORD_HASH": hashed.stdout.strip()})
+    assert changed.returncode == 0, changed.stderr
+
+    revoked = await api_client.get(me)
+    assert revoked.status_code == 401, revoked.text
+    assert revoked.json()["error"]["code"] == "unauthenticated"
+    assert cookie not in api_client.cookies
+    replayed_run = await api_client.post(
+        "/api/v1/runs",
+        json={"window_start": "2026-01-01", "window_end": "2026-01-07"},
+        headers={**test_identity.csrf_headers, **replayed},
+    )
+    assert replayed_run.status_code == 401, replayed_run.text
+    assert replayed_run.json()["error"]["code"] == "unauthenticated"
+    assert await _all(db, select(AnalysisRun)) == []
+
+    old_password = await api_client.post(
+        "/api/v1/auth/login",
+        json={"email": test_identity.email, "password": test_identity.password},
+        headers=dict(test_identity.csrf_headers),
+    )
+    assert old_password.status_code == 401, old_password.text
+    assert cookie not in api_client.cookies
+    new_login = await login(api_client, email=test_identity.email, password=new_password)
+    assert new_login.status_code == 200, new_login.text
+    assert (await api_client.get(me)).status_code == 200
+    assert (await api_client.get(me, headers=replayed)).status_code == 401
 
 
 @pytest.mark.parametrize("form", ["all-zero", "salt-not-base64", "memory-above-cap"])

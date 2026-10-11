@@ -9,7 +9,8 @@ Commands (``ads-engine <command> --help`` for each):
 ``migrate``            Upgrade the database to the newest Alembic revision; idempotent. Run from
                        ``backend/`` on the host, or ``/app`` in the image.
 ``ensure-admin``       Create or update the single admin login from ``APP_ADMIN_EMAIL`` and
-                       ``APP_ADMIN_PASSWORD_HASH``, removing any other login; idempotent.
+                       ``APP_ADMIN_PASSWORD_HASH``, removing any other login; idempotent for an
+                       unchanged hash, while a changed hash ends every existing session.
 ``sync --source S``    Run one source's sync jobs now, against its active dataset, and print the
                        report as JSON; exits 0 only when every job ran and succeeded.
 ``analyze``            Compute a custom-window analysis run from stored data
@@ -84,7 +85,6 @@ import httpx
 from argon2 import Parameters, PasswordHasher, extract_parameters
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from pydantic import ValidationError
-from pydantic_core import ErrorDetails
 
 from ads_engine import __version__
 from ads_engine.db.models.ops import SOURCES, AppUser
@@ -99,11 +99,11 @@ from ads_engine.logging import (
 )
 from ads_engine.settings import SOURCES as SETTINGS_SOURCES
 from ads_engine.settings import (
-    VALIDATOR_MESSAGES,
     ConfigurationError,
     Settings,
     Source,
     get_settings,
+    settings_error_problem,
 )
 
 if TYPE_CHECKING:
@@ -149,33 +149,6 @@ _ALEMBIC_INI: Final = "alembic.ini"
 _ARGON2_PREFIX: Final = "$argon2"
 _NO_ADMIN_HASH_MESSAGE: Final = (
     "APP_ADMIN_PASSWORD_HASH is not set; run `make init ADMIN_PASSWORD=…`"
-)
-
-# The problem text of a settings validation error, built only from allowlisted, value-free
-# text. These match the worker's policy for its `worker_settings_invalid` line and are kept
-# here rather than imported: the worker module loads the analysis runner, the scheduler and
-# the sync modules, which the CLI imports only inside the commands that need them.
-# The pydantic error types a Settings field produces whose message pydantic renders from its
-# own template and the field's declared constraints alone (`ge`, the allowed literals), so it
-# never carries the input; for example "Input should be greater than or equal to 1".
-_SETTINGS_TEMPLATE_ERROR_TYPES: Final[frozenset[str]] = frozenset(
-    {
-        "missing",
-        "string_type",
-        "int_type",
-        "int_parsing",
-        "int_parsing_size",
-        "int_from_float",
-        "greater_than_equal",
-        "literal_error",
-        "list_type",
-    }
-)
-# Pydantic's prefix of a `value_error` message, kept so the text reads as pydantic writes it.
-_SETTINGS_VALUE_ERROR_PREFIX: Final = "Value error, "
-# The problem of any other error: a validator's own text that may quote the value it rejects.
-_SETTINGS_WITHHELD_PROBLEM: Final = (
-    "Invalid value; its message is withheld because it may quote the value"
 )
 
 if tuple(SOURCES) != tuple(SETTINGS_SOURCES):  # pragma: no cover - guarded by the model tests
@@ -295,50 +268,19 @@ def _redacted(text: str) -> str:
     return str(redact(text))
 
 
-def _settings_problem(error: ErrorDetails) -> str:
-    """Return the value-free problem text of one settings validation error.
-
-    Only allowlisted text is returned, never an arbitrary message:
-
-    * pydantic's own message for a type in :data:`_SETTINGS_TEMPLATE_ERROR_TYPES`, rendered
-      from its template and the field's declared constraints;
-    * ``"Value error, "`` and the validator's message for a ``value_error`` whose message is
-      one of :data:`~ads_engine.settings.VALIDATOR_MESSAGES`;
-    * :data:`_SETTINGS_WITHHELD_PROBLEM` for anything else (another ``value_error``, an
-      ``assertion_error`` or a custom type), whose text may quote the value it rejects.
-
-    Example::
-
-        _settings_problem(error)  # 'Value error, GOOGLE_ADS_CUSTOMER_ID must be 10 digits'
-
-    Args:
-        error: One entry of :meth:`pydantic.ValidationError.errors`.
-
-    Returns:
-        The problem to report for ``error``.
-    """
-    error_type = error["type"]
-    if error_type in _SETTINGS_TEMPLATE_ERROR_TYPES:
-        return error["msg"]
-    if error_type == "value_error":
-        context = error.get("ctx") or {}
-        message = str(context.get("error", ""))
-        if message in VALIDATOR_MESSAGES:
-            return _SETTINGS_VALUE_ERROR_PREFIX + message
-    return _SETTINGS_WITHHELD_PROBLEM
-
-
 def _invalid_settings_message(exc: ValidationError) -> str:
     """Return the message of an invalid environment: each variable and its problem, no value.
 
     The text is ``invalid settings (<N> error[s]): <VARIABLE>: <problem>; …``, with the errors
     in pydantic's order (the fields' declaration order). Each variable is the error's ``loc``
     joined with dots and upper-cased, as the environment spells it (``SETTINGS`` for an error
-    of the whole model), and its problem comes from :func:`_settings_problem`, so the text is
-    value-free by construction. It is therefore not passed through :func:`_redacted`, whose
-    credential-assignment pass reads ``APP_ADMIN_EMAIL: Value error`` as an address key's value
-    and would garble it; only the email addresses a validator's message names as an example
-    are replaced, so stderr still carries none.
+    of the whole model), and its problem comes from
+    :func:`~ads_engine.settings.settings_error_problem`, the allowlist the worker and the API
+    report with too, so the text is value-free by construction. It is therefore not passed
+    through :func:`_redacted`, whose credential-assignment pass reads
+    ``APP_ADMIN_EMAIL: Value error`` as an address key's value and would garble it; only the
+    email addresses a validator's message names as an example are replaced, so stderr still
+    carries none.
 
     Example::
 
@@ -352,7 +294,7 @@ def _invalid_settings_message(exc: ValidationError) -> str:
     """
     problems = "; ".join(
         f"{('.'.join(str(part) for part in error['loc']) or 'settings').upper()}: "
-        f"{_settings_problem(error)}"
+        f"{settings_error_problem(error)}"
         for error in exc.errors(include_url=False, include_input=False)
     )
     count = exc.error_count()
@@ -713,14 +655,22 @@ async def _ensure_admin() -> int:
     """Upsert the admin by email and remove any other login, in one transaction.
 
     ``INSERT … ON CONFLICT (email) DO UPDATE SET password_hash = excluded.password_hash``
-    makes the command idempotent. The product has a single admin login, so rows with another
-    email (an admin whose ``APP_ADMIN_EMAIL`` was changed) are deleted in the same unit of
-    work: the replaced login can no longer sign in, and its sessions stop validating because
-    their user no longer exists (``api/deps.py``). No other table references ``app_user``.
-    The hash is validated by :func:`_admin_hash` before the transaction opens, so an invalid
-    one exits with :data:`EXIT_FAILURE` and changes nothing.
+    makes the command idempotent. A stored hash that differs from the configured one also
+    increments ``app_user.session_generation`` in the same statement, which ends every
+    existing session (every browser, and any stolen copy of a cookie), because
+    ``api/deps.py`` accepts a cookie only while its generation equals the stored one. An
+    unchanged hash leaves the generation, and so every session, as it was. The product has a
+    single admin login, so rows with another email (an admin whose ``APP_ADMIN_EMAIL`` was
+    changed) are deleted in the same unit of work: the replaced login can no longer sign in,
+    and its sessions end because their user no longer exists. No other table references
+    ``app_user``. Sign-in rehashes a stored hash whose argon2 parameters differ from
+    ``ads-engine hash-password``'s (``api/routes/auth.py``), so after a sign-in with such a
+    hand-made hash the next run, which restores the configured hash, also counts as a change
+    and ends sessions; hashes from ``hash-password`` and ``make init`` never trigger it. The
+    hash is validated by :func:`_admin_hash` before the transaction opens, so an invalid one
+    exits with :data:`EXIT_FAILURE` and changes nothing.
     """
-    from sqlalchemy import delete
+    from sqlalchemy import case, delete
     from sqlalchemy.dialects.postgresql import insert
 
     from ads_engine.db.session import session_scope
@@ -731,9 +681,18 @@ async def _ensure_admin() -> int:
         return EXIT_FAILURE
     email = settings.app_admin_email
     insert_admin = insert(AppUser).values(email=email, password_hash=password_hash)
+    # In DO UPDATE, app_user.* is the stored row and excluded.* the configured one. The bump is a
+    # SET expression rather than a conflict WHERE, which would leave RETURNING without a row.
+    password_changed = AppUser.password_hash.is_distinct_from(insert_admin.excluded.password_hash)
     upsert = insert_admin.on_conflict_do_update(
         index_elements=[AppUser.email],
-        set_={"password_hash": insert_admin.excluded.password_hash},
+        set_={
+            "password_hash": insert_admin.excluded.password_hash,
+            "session_generation": case(
+                (password_changed, AppUser.session_generation + 1),
+                else_=AppUser.session_generation,
+            ),
+        },
     ).returning(AppUser.id)
     async with session_scope() as session:
         user_id: int = (await session.execute(upsert)).scalar_one()
@@ -875,10 +834,12 @@ async def _analyze(start: date, end: date) -> int:
     """Compute and persist one custom-window run from stored data.
 
     The window is validated as ``POST /runs`` validates it (``AnalysisWindow.custom`` through
-    ``analysis.runner.custom_window``): the end no later than the default window end and a
-    span of 1 to ``window.max_days`` days, from ``Thresholds.load()``. The run is ``custom``
-    even when the window equals the default. ``run_analysis`` takes the shared ``analysis``
-    lock itself, the one lock the API, the worker and the CLI share, so it is never taken here.
+    ``analysis.runner.custom_window``): the end no later than the default window end, the
+    start no earlier than the earliest date the analysis's lookbacks allow
+    (``analysis.window.earliest_start``) and a span of 1 to ``window.max_days`` days, from
+    ``Thresholds.load()``. The run is ``custom`` even when the window equals the default.
+    ``run_analysis`` takes the shared ``analysis`` lock itself, the one lock the API, the
+    worker and the CLI share, so it is never taken here.
 
     Returns:
         :data:`EXIT_OK` with the run summary printed; :data:`EXIT_USAGE` for an invalid
@@ -3484,8 +3445,11 @@ window limits:
   START and END are calendar dates in exactly YYYY-MM-DD form, applied to each
   source's native days. END is no later than the default window end: the
   earlier of yesterday in the Google account's time zone and yesterday UTC.
-  The span, START to END inclusive, is 1 to window.max_days days (180 as
-  shipped). The run is kind custom even when it equals the default window.
+  START is no earlier than the earliest date the analysis lookbacks
+  (k1.baseline_days, crm.lead_maturity_days, budget.max_observation_gap_hours)
+  can reach back from (0001-04-01 as shipped). The span, START to END
+  inclusive, is 1 to window.max_days days (180 as shipped). The run is kind
+  custom even when it equals the default window.
 
 exit codes:
   0  the run succeeded; its summary is printed as JSON
@@ -3616,7 +3580,8 @@ def build_parser() -> argparse.ArgumentParser:
         "ensure-admin",
         help="create or update the admin login from the environment",
         description="Upsert the admin from APP_ADMIN_EMAIL and APP_ADMIN_PASSWORD_HASH and\n"
-        "remove any other login. Idempotent.",
+        "remove any other login. Idempotent for an unchanged hash; a changed password\n"
+        "hash ends every existing session.",
         epilog=_ENSURE_ADMIN_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

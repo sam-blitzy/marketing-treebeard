@@ -127,8 +127,13 @@ These definitions apply to every rule that names them.
   the observed and required days, for example "window 5 days of 7 required", or "window 1 day
   of 7 required" for a one-day window.
 - **Longest window**: `window.max_days` (default 180), LinkedIn's daily analytics retention.
-- **Custom windows** (`POST /runs`): end no later than the default window end, and span 1 to
-  `window.max_days` days.
+- **Custom windows** (`POST /runs`): end no later than the default window end, start no earlier
+  than the earliest date the analysis supports, and span 1 to `window.max_days` days. The
+  earliest start (`analysis/window.py`, `earliest_start`) is the first date whose lookbacks stay
+  inside the calendar: the longest of `k1.baseline_days` − 1 days, `crm.lead_maturity_days` days,
+  2 days and `budget.max_observation_gap_hours` + 15 hours, plus 15 hours for the widest UTC
+  offset, rounded up to whole days after 0001-01-01 (0001-04-01 with the shipped values). An
+  earlier start is a 422 `start_before_earliest` naming that date, and no run is written.
 
 ### Native days
 

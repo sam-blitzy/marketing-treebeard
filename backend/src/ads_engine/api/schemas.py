@@ -941,9 +941,10 @@ class CreateRunRequest(RequestModel):
     whitespace, unpadded or undelimited digits, and an impossible date such as
     ``"2026-02-30"`` are each a 422 ``validation_error`` naming the field.
 
-    The span (1 day to ``window.max_days``) and the end (no later than the default window
-    end) are validated by ``AnalysisWindow.custom``, whose ``InvalidWindow`` the app maps to
-    422, so those rules live in one place.
+    The span (1 day to ``window.max_days``), the end (no later than the default window end)
+    and the start (no earlier than the earliest date the analysis's lookbacks allow) are
+    validated by ``AnalysisWindow.custom``, whose ``InvalidWindow`` the app maps to 422, so
+    those rules live in one place.
 
     Attributes:
         window_start: First calendar date, inclusive, as ``YYYY-MM-DD``.

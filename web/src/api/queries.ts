@@ -1349,8 +1349,9 @@ export function useLogout() {
  * run and its page stay as they are. A failed `POST /runs` reads no page.
  *
  * Status codes: 201; 409 `run_in_progress` while any process holds the analysis lock; 422
- * `end_before_start`, `end_after_default_end`, `too_long` (over `window.max_days`),
- * `too_short` or `invalid_window` for a window outside its bounds.
+ * `end_before_start`, `end_after_default_end`, `start_before_earliest` (before the earliest
+ * date the analysis's lookbacks allow, which the message names), `too_long` (over
+ * `window.max_days`), `too_short` or `invalid_window` for a window outside its bounds.
  *
  * @returns The mutation; call `mutate({ window_start, window_end })`.
  */

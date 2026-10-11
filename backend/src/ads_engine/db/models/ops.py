@@ -386,7 +386,9 @@ class AppUser(IdPkMixin, Base):
             ``api/deps.py`` accepts a cookie only while it still equals this column.
             ``POST /auth/logout`` increments it, which revokes every session issued
             before the sign-out, on every browser and every API replica.
-            ``ensure-admin`` never writes it, so updating the password hash keeps it.
+            ``ensure-admin`` increments it when it stores a different password hash, which
+            revokes every earlier session the same way, and leaves it unchanged when the
+            configured hash equals the stored one.
     """
 
     __tablename__ = "app_user"

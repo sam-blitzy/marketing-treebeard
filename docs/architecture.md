@@ -269,9 +269,12 @@ Inside one run (`analysis/runner.py`):
 - The default window is `window.default_days` (default 28) complete days. It ends on the
   earlier of yesterday in the Google account's time zone and yesterday in UTC
   (`analysis/window.py`, `default_end`), so today, a partial day, is excluded.
-- A custom window spans 1 day to `window.max_days` (default 180, LinkedIn's daily retention) and
-  ends no later than the default window end. A window shorter than `window.trusted_min_days`
-  (default 14) carries the short-window banner and flag.
+- A custom window spans 1 day to `window.max_days` (default 180, LinkedIn's daily retention),
+  ends no later than the default window end, and starts no earlier than the earliest date the
+  lookbacks `k1.baseline_days`, `crm.lead_maturity_days` and `budget.max_observation_gap_hours`
+  can reach back from (`analysis/window.py`, `earliest_start`; 0001-04-01 as shipped). A window
+  breaking a bound is refused with 422 before any run is written. A window shorter than
+  `window.trusted_min_days` (default 14) carries the short-window banner and flag.
 
 ### Performance targets
 
@@ -863,10 +866,13 @@ Verified against `api/app.py`, `api/security.py`, `settings.py` and `web/nginx.c
   from sign-in. It is `Secure` whenever `APP_BASE_URL` is `https://…`. The cookie carries only the
   user id, email, issue time and session generation; `POST /api/v1/auth/logout` increments
   `app_user.session_generation`, which revokes every earlier cookie on every replica.
+  `ads-engine ensure-admin` increments it too whenever it stores a different password hash.
 - **Startup checks.** The API refuses to start on a plain `http://` `APP_BASE_URL` whose host is
-  not `localhost` or `127.0.0.1` (the local default is `http://localhost:8080`), and without
-  `SESSION_SECRET`. Any other deployment must terminate TLS in front of nginx
-  ([runbook](runbook.md)).
+  not `localhost` or `127.0.0.1` (the local default is `http://localhost:8080`), without
+  `SESSION_SECRET`, and with a `SESSION_SECRET` too weak to keep a session from being forged:
+  shorter than 32 characters, of fewer than 8 distinct characters or made of a repeated run
+  (`make init` writes 64 random hex characters). Any other deployment must terminate TLS in
+  front of nginx ([runbook](runbook.md)).
 - **CSRF.** Mutating requests (`POST`, `PUT`, `PATCH`, `DELETE`) must carry
   `X-Requested-With: ads-engine`; otherwise the API answers 403.
 - **Brute-force protection.** Login is limited to 5 attempts per 60 s per client IP

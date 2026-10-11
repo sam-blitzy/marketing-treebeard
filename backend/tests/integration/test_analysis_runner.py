@@ -16,7 +16,8 @@ runner itself:
   ``list_runs`` read any status;
 * ``run_analysis`` reads the context in one read-only ``REPEATABLE READ`` snapshot, writes
   every output once with the dataset ids and modes it read, stamps the requests it served,
-  and is deterministic; on the simulated default world all five sections populate;
+  and is deterministic; on the simulated default world all five sections populate, and a
+  window starting on ``earliest_start`` computes whichever side of UTC Google's day lies;
 * the typed entity keys keep only ids of stored rows, and a run whose outputs carry more
   distinct ids than PostgreSQL's 65,535 bind parameters still persists in one transaction;
 * the lock, the single-running index, crash recovery, a failing rule, a contradicting
@@ -98,7 +99,7 @@ from ads_engine.analysis.context import (
 )
 from ads_engine.analysis.lock import RunInProgress, analysis_lock
 from ads_engine.analysis.thresholds import ConfigError, Thresholds, resolve_config_dir
-from ads_engine.analysis.window import InvalidWindow
+from ads_engine.analysis.window import InvalidWindow, earliest_start
 from ads_engine.db.base import Base
 from ads_engine.db.models.accounts import AdAccount, AdGroup, Campaign, Keyword
 from ads_engine.db.models.analysis import (
@@ -1172,6 +1173,39 @@ async def test_a_180_day_custom_run_computes_well_within_30_seconds(
     (summary,) = log.named("analysis_run_summary")
     assert summary["days"] == 180
     assert summary["items_total"] == len(await _rows(Recommendation, run.id))
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("google_tz", [GOOGLE_TZ, "Pacific/Kiritimati"])
+@pytest.mark.parametrize("days", [1, 28])
+async def test_a_window_on_the_earliest_start_computes_over_the_simulated_world(
+    app_db: str, monkeypatch: pytest.MonkeyPatch, google_tz: str, days: int
+) -> None:
+    # Every rule, precedence and persistence reach back from the window by their configured
+    # lookbacks; on the floor none of them may leave the calendar, with Google's day behind
+    # UTC (New York) or 14 hours ahead of it (Kiritimati).
+    base = SCENARIOS["default"]
+    assert base.spec.google is not None
+    spec = dataclasses.replace(
+        base.spec, google=dataclasses.replace(base.spec.google, time_zone=google_tz)
+    )
+    floor = earliest_start(base.build_context(now=FIXED_NOW).thresholds)
+    scenario = dataclasses.replace(
+        base,
+        spec=spec,
+        context=ContextSpec(custom=(floor, floor + timedelta(days=days - 1)), kind="custom"),
+    )
+    ctx = scenario.build_context(now=FIXED_NOW)
+    assert (ctx.window.start, ctx.window.days) == (floor, days)
+    assert ctx.window.boundary("google") == google_tz
+    _patch_context(monkeypatch, ctx)
+
+    run = await runner.run_analysis(
+        ctx.window, "custom", "manual", thresholds=ctx.thresholds, now=ctx.now
+    )
+
+    assert run.status == "succeeded"
+    assert (run.window_start, run.window_end) == (ctx.window.start, ctx.window.end)
 
 
 # ---------------------------------------------------------------------------

@@ -77,7 +77,7 @@ from ads_engine import logging as ads_logging
 from ads_engine.analysis import runner
 from ads_engine.analysis.lock import RunInProgress
 from ads_engine.analysis.thresholds import Thresholds
-from ads_engine.analysis.window import InvalidWindow
+from ads_engine.analysis.window import InvalidWindow, earliest_start
 from ads_engine.connectors.errors import AccessDenied, QueryDefect
 from ads_engine.connectors.google_n8n.queries import (
     AD_GROUP_HI,
@@ -361,6 +361,9 @@ def test_help_states_exit_codes_environment_output_and_examples(
                 "START and END are calendar dates in exactly YYYY-MM-DD form",
                 "END is no later than the default window end: the earlier of yesterday in the "
                 "Google account's time zone and yesterday UTC",
+                "START is no earlier than the earliest date the analysis lookbacks "
+                "(k1.baseline_days, crm.lead_maturity_days, budget.max_observation_gap_hours) "
+                "can reach back from (0001-04-01 as shipped)",
                 "1 to window.max_days days (180 as shipped)",
                 "The run is kind custom even when it equals the default window",
                 "2 a date is not in YYYY-MM-DD form, or the window is out of range",
@@ -444,6 +447,12 @@ def test_help_keeps_the_epilog_line_breaks(
     monkeypatch.setenv("COLUMNS", "40")
     assert _help_text(capsys, argv).endswith(epilog)
     assert max(len(line) for line in epilog.splitlines()) <= 79
+
+
+def test_analyze_help_states_the_shipped_earliest_start() -> None:
+    # The help quotes the floor of the shipped configuration, so it moves with the lookbacks.
+    shipped = earliest_start(Thresholds.load(BACKEND.parent / "config"))
+    assert f"({shipped.isoformat()} as shipped)" in " ".join(cli._ANALYZE_EPILOG.split())
 
 
 def test_version_and_exit_codes(capsys: pytest.CaptureFixture[str]) -> None:
@@ -1513,6 +1522,15 @@ def test_ensure_admin_upserts_by_email_and_removes_other_logins(
     upsert, removal = statements
     assert upsert.startswith("INSERT INTO app_user (email, password_hash)")
     assert "ON CONFLICT (email) DO UPDATE SET password_hash = excluded.password_hash" in upsert
+    # A changed hash ends every session; an unchanged one keeps the generation. The stored row
+    # (app_user.*) is compared with the configured one (excluded.*), and there is no conflict
+    # WHERE, so RETURNING always yields the admin's id.
+    assert (
+        "session_generation = CASE WHEN (app_user.password_hash IS DISTINCT FROM "
+        "excluded.password_hash) THEN app_user.session_generation + "
+    ) in upsert
+    assert "ELSE app_user.session_generation END" in upsert
+    assert " WHERE " not in upsert
     assert "RETURNING app_user.id" in upsert
     assert removal.startswith("DELETE FROM app_user WHERE app_user.email != ")
 

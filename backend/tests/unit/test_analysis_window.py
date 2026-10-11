@@ -2,8 +2,9 @@
 
 They pin the window contract every rule and the API rely on: the default end is the earlier
 of yesterday in the Google account's time zone and yesterday UTC; the default window spans
-``window.default_days`` days ending there; custom windows end no later than the default end
-and span 1 to ``window.max_days`` days; the short-window, sustained and segment-window flags
+``window.default_days`` days ending there; custom windows end no later than the default end,
+start no earlier than ``earliest_start`` (the floor the configured lookbacks leave) and span 1
+to ``window.max_days`` days; the short-window, sustained and segment-window flags
 read the configured values; every source shares one calendar-date range while keeping its own
 boundary; and instant bounds are half-open and DST-true. Pure: no database and no network.
 """
@@ -22,6 +23,7 @@ from zoneinfo import ZoneInfo
 import pytest
 import yaml
 
+from ads_engine.analysis import metrics
 from ads_engine.analysis import window as window_module
 from ads_engine.analysis.thresholds import (
     CONFIG_FILES,
@@ -39,6 +41,7 @@ from ads_engine.analysis.window import (
     SourceDayInfo,
     SourceDays,
     default_end,
+    earliest_start,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -758,6 +761,7 @@ def test_custom_is_a_descriptor_and_not_a_dataclass_field() -> None:
         "sustained_min_days",
         "presets",
         "max_days",
+        "earliest_start",
     ]
     descriptor = AnalysisWindow.__dict__["custom"]
     with pytest.raises(TypeError, match="must be read from AnalysisWindow or a window"):
@@ -783,6 +787,223 @@ def test_invalid_window_pickles_with_both_constructor_arguments() -> None:
     assert restored.code == error.code
     assert restored.message == error.message
     assert str(restored) == str(error)
+
+
+# ---------------------------------------------------------------------------
+# earliest_start: the calendar floor the analysis's lookbacks leave
+# ---------------------------------------------------------------------------
+
+
+def _lookbacks(**overrides: int) -> Thresholds:
+    """The shipped configuration with the given dotted keys (``__`` for ``.``) replaced."""
+    return Thresholds.load(
+        CONFIG_DIR, overrides={key.replace("__", "."): value for key, value in overrides.items()}
+    )
+
+
+def _start_message(start: date, earliest: date) -> str:
+    """The ``start_before_earliest`` message for ``start`` against ``earliest``."""
+    return (
+        f"Window start {start.isoformat()} is before {earliest.isoformat()}, the earliest date "
+        "the analysis supports: its lookbacks (k1.baseline_days, crm.lead_maturity_days and "
+        "budget.max_observation_gap_hours) reach back from the window"
+    )
+
+
+def test_earliest_start_of_the_shipped_configuration(shipped: Thresholds) -> None:
+    # k1.baseline_days 90 reaches 89 days back, the longest lookback; with 15 hours of zone
+    # reach on top, the floor is 90 whole days after date.min.
+    assert (
+        shipped.int("k1.baseline_days"),
+        shipped.int("crm.lead_maturity_days"),
+        shipped.int("budget.max_observation_gap_hours"),
+    ) == (90, 14, 6)
+    assert earliest_start(shipped) == date.min + timedelta(days=90) == date(1, 4, 1)
+    assert "earliest_start" in window_module.__all__
+
+
+def test_the_zone_reach_matches_the_metrics_offset_bound() -> None:
+    assert window_module._ZONE_REACH == metrics._MAX_UTC_OFFSET == timedelta(hours=15)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "days"),
+    [
+        # 199 days of K1 baseline before the window end, plus 15 hours: 200 whole days.
+        ({"k1__baseline_days": 200}, 200),
+        # 120 days of lead maturity before the window's end instant, plus 15 hours: 121.
+        ({"crm__lead_maturity_days": 120}, 121),
+        # 15 hours plus a 2,400-hour observation gap (100 days), plus 15 hours: 102.
+        ({"budget__max_observation_gap_hours": 2400}, 102),
+        # Every lookback at its minimum: the two-day observation margin, plus 15 hours: 3.
+        (
+            {
+                "k1__baseline_days": 1,
+                "crm__lead_maturity_days": 0,
+                "budget__max_observation_gap_hours": 1,
+            },
+            3,
+        ),
+    ],
+    ids=["k1-baseline", "lead-maturity", "observation-gap", "minimum-lookbacks"],
+)
+def test_earliest_start_follows_the_longest_configured_lookback(
+    overrides: dict[str, int], days: int
+) -> None:
+    assert earliest_start(_lookbacks(**overrides)) == date.min + timedelta(days=days)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"k1__baseline_days": 4_000_000},
+        {"k1__baseline_days": 10**12},
+        {"crm__lead_maturity_days": 10**12},
+        {"budget__max_observation_gap_hours": 10**15},
+    ],
+    ids=["past-date-max", "k1-past-timedelta", "maturity-past-timedelta", "gap-past-timedelta"],
+)
+def test_earliest_start_is_date_max_when_a_lookback_outreaches_the_calendar(
+    overrides: dict[str, int],
+) -> None:
+    config = _lookbacks(**overrides)
+
+    assert earliest_start(config) == date.max
+    # No window is admissible, the default included, and nothing raises OverflowError.
+    with pytest.raises(InvalidWindow) as default_window:
+        AnalysisWindow.default(config, NY_SOURCES, now=NOW)
+    assert default_window.value.code == "start_before_earliest"
+    assert "before 9999-12-31, the earliest date" in default_window.value.message
+    with pytest.raises(InvalidWindow) as custom:
+        AnalysisWindow.custom(DEFAULT_END, DEFAULT_END, config=config, sources=NY_SOURCES, now=NOW)
+    assert custom.value.code == "start_before_earliest"
+
+
+def test_both_custom_forms_accept_the_earliest_start_and_refuse_the_day_before(
+    shipped: Thresholds,
+) -> None:
+    earliest = earliest_start(shipped)
+    configured = AnalysisWindow.default(shipped, NY_SOURCES, now=NOW)
+
+    assert configured.earliest_start == earliest
+    explicit = AnalysisWindow.custom(
+        earliest, earliest, config=shipped, sources=NY_SOURCES, now=NOW
+    )
+    bound = configured.custom(earliest, earliest)
+    assert explicit == bound
+    assert (bound.start, bound.end, bound.days, bound.earliest_start) == (
+        earliest,
+        earliest,
+        1,
+        earliest,
+    )
+
+    before = earliest - ONE_DAY
+    with pytest.raises(InvalidWindow) as explicit_error:
+        AnalysisWindow.custom(before, earliest, config=shipped, sources=NY_SOURCES, now=NOW)
+    with pytest.raises(InvalidWindow) as bound_error:
+        configured.custom(before, earliest)
+    for caught in (explicit_error, bound_error):
+        assert caught.value.code == "start_before_earliest"
+        assert caught.value.message == _start_message(before, earliest)
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [(date.min, date.min), (date.min, DEFAULT_END)],
+    ids=["first-calendar-day", "first-calendar-day-to-default-end"],
+)
+def test_a_start_on_the_first_calendar_day_is_before_the_earliest_start(
+    shipped: Thresholds, start: date, end: date
+) -> None:
+    # The start bound is checked before the span, so a window from date.min to the default
+    # end names the earliest start rather than its length.
+    earliest = earliest_start(shipped)
+    configured = AnalysisWindow.default(shipped, NY_SOURCES, now=NOW)
+
+    with pytest.raises(InvalidWindow) as explicit:
+        AnalysisWindow.custom(start, end, config=shipped, sources=NY_SOURCES, now=NOW)
+    with pytest.raises(InvalidWindow) as bound:
+        configured.custom(start, end)
+    for caught in (explicit, bound):
+        assert caught.value.code == "start_before_earliest"
+        assert caught.value.message == _start_message(start, earliest)
+
+
+def test_the_end_bounds_are_checked_before_the_earliest_start(shipped: Thresholds) -> None:
+    with pytest.raises(InvalidWindow) as reversed_window:
+        AnalysisWindow.custom(date(1, 1, 2), date.min, config=shipped, sources=NY_SOURCES, now=NOW)
+    assert reversed_window.value.code == "end_before_start"
+    with pytest.raises(InvalidWindow) as late_window:
+        AnalysisWindow.custom(
+            date.min, DEFAULT_END + ONE_DAY, config=shipped, sources=NY_SOURCES, now=NOW
+        )
+    assert late_window.value.code == "end_after_default_end"
+
+
+def test_a_configured_floor_moves_the_custom_bound() -> None:
+    config = _lookbacks(k1__baseline_days=200)
+    earliest = earliest_start(config)
+    configured = AnalysisWindow.default(config, NY_SOURCES, now=NOW)
+
+    shipped_floor = earliest_start(Thresholds.load(CONFIG_DIR))
+
+    assert earliest == date.min + timedelta(days=200)
+    assert configured.custom(earliest, earliest).start == earliest
+    # The shipped floor is now too early.
+    with pytest.raises(InvalidWindow) as caught:
+        configured.custom(shipped_floor, earliest)
+    assert caught.value.code == "start_before_earliest"
+    assert caught.value.message == _start_message(shipped_floor, earliest)
+
+
+def test_direct_construction_enforces_the_earliest_start() -> None:
+    first_day = _source_days(date.min, date.min)
+    # Without an earliest start the floor is the calendar's own first day.
+    unfloored = AnalysisWindow(
+        **_window_fields(start=date.min, end=date.min, source_days=first_day)
+    )
+    assert unfloored.earliest_start == date.min
+    assert unfloored.custom(date.min, date.min) == unfloored
+
+    floor = date(1, 4, 1)
+    floored = AnalysisWindow(
+        **_window_fields(
+            start=floor, end=floor, source_days=_source_days(floor, floor), earliest_start=floor
+        )
+    )
+    assert floored.earliest_start == floor
+    with pytest.raises(InvalidWindow) as caught:
+        AnalysisWindow(
+            **_window_fields(
+                start=date.min, end=date.min, source_days=first_day, earliest_start=floor
+            )
+        )
+    assert caught.value.code == "start_before_earliest"
+    assert caught.value.message == _start_message(date.min, floor)
+    with pytest.raises(InvalidWindow) as bound:
+        floored.custom(floor - ONE_DAY, floor)
+    assert bound.value.code == "start_before_earliest"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [datetime(1, 4, 1, tzinfo=UTC), "0001-04-01", None],
+    ids=["datetime", "text", "none"],
+)
+def test_direct_construction_rejects_an_earliest_start_that_is_not_a_date(value: object) -> None:
+    with pytest.raises(TypeError, match=re.escape("earliest_start must be a datetime.date")):
+        AnalysisWindow(**_window_fields(earliest_start=value))
+
+
+def test_the_earliest_start_is_configuration_not_evidence(shipped: Thresholds) -> None:
+    window = AnalysisWindow.default(shipped, NY_SOURCES, now=NOW)
+
+    assert window.earliest_start == earliest_start(shipped)
+    assert "earliest_start" not in window.to_json()
+    restored = pickle.loads(pickle.dumps(window))  # noqa: S301 - round-trip of our own object
+    assert restored == window
+    assert restored.earliest_start == window.earliest_start
 
 
 # ---------------------------------------------------------------------------

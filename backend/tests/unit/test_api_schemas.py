@@ -1353,6 +1353,7 @@ def test_create_run_request_windows_within_the_bounds_build_a_custom_window(
         (date(2026, 10, 2), date(2026, 10, 1), "end_before_start"),
         (DEFAULT_END - timedelta(days=180), DEFAULT_END, "too_long"),
         (date(2026, 9, 8), DEFAULT_END + timedelta(days=1), "end_after_default_end"),
+        (date.min, date.min, "start_before_earliest"),
     ],
 )
 def test_create_run_request_leaves_the_window_bounds_to_analysis_window_custom(

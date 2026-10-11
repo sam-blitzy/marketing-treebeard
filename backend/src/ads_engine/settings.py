@@ -45,7 +45,7 @@ from urllib.parse import SplitResult, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import Field, SecretStr, field_validator
-from pydantic_core import PydanticUseDefault
+from pydantic_core import ErrorDetails, PydanticUseDefault
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 __all__ = [
@@ -53,6 +53,9 @@ __all__ = [
     "HUBSPOT_API_VERSION",
     "LINKEDIN_API_VERSION",
     "MOCK_SCENARIOS",
+    "SETTINGS_TEMPLATE_ERROR_TYPES",
+    "SETTINGS_VALUE_ERROR_PREFIX",
+    "SETTINGS_WITHHELD_PROBLEM",
     "SOURCES",
     "VALIDATOR_MESSAGES",
     "ConfigurationError",
@@ -60,6 +63,7 @@ __all__ = [
     "Settings",
     "Source",
     "get_settings",
+    "settings_error_problem",
 ]
 
 Source = Literal["google", "linkedin", "hubspot"]
@@ -133,6 +137,16 @@ _UNSAFE_BASE_URL_MESSAGE: Final = (
     "terminate TLS in front of nginx (see docs/runbook.md)"
 )
 _SESSION_KEY_UNSET_MESSAGE: Final = "SESSION_SECRET is not set; run make init"
+# SESSION_SECRET is the HMAC key itsdangerous signs every session cookie with, so a short or
+# patterned key can be guessed and a session forged offline. make init and the runbook's
+# rotation write 64 hex characters (32 random bytes), which pass these bounds: fewer than 8
+# distinct digits, or a repeated run, among 64 random hex digits has a probability below 1e-18.
+_SESSION_KEY_MIN_LENGTH: Final = 32
+_SESSION_KEY_MIN_DISTINCT: Final = 8
+_SESSION_KEY_WEAK_MESSAGE: Final = (
+    f"SESSION_SECRET is too weak: use at least {_SESSION_KEY_MIN_LENGTH} random characters; "
+    "run make init, or rotate it as docs/runbook.md describes"
+)
 
 # The messages the Settings validators raise. Each is fixed text that never quotes the value
 # it rejects: a failed load is reported before the environment's secrets are known to the
@@ -195,6 +209,72 @@ Example::
     shown = message if message in VALIDATOR_MESSAGES else "message withheld"
 """
 
+SETTINGS_TEMPLATE_ERROR_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        "missing",
+        "string_type",
+        "int_type",
+        "int_parsing",
+        "int_parsing_size",
+        "int_from_float",
+        "greater_than_equal",
+        "literal_error",
+        "list_type",
+    }
+)
+"""The pydantic error types a :class:`Settings` field produces from a template alone.
+
+Pydantic renders each of their messages from its own template and the field's declared
+constraints (``ge``, the allowed literals), so the message never carries the input; for
+example "Input should be greater than or equal to 1".
+"""
+
+SETTINGS_VALUE_ERROR_PREFIX: Final = "Value error, "
+"""Pydantic's prefix of a ``value_error`` message, kept so a problem reads as pydantic writes it."""
+
+SETTINGS_WITHHELD_PROBLEM: Final = (
+    "Invalid value; its message is withheld because it may quote the value"
+)
+"""The problem of any error outside the allowlist: its own text may quote the value it rejects."""
+
+
+def settings_error_problem(error: ErrorDetails) -> str:
+    """Return the value-free ``problem`` text of one :class:`Settings` validation error.
+
+    The API's ``api.startup_failed``, the worker's ``worker_settings_invalid`` and the CLI's
+    ``invalid settings`` message all report an invalid environment with it. Only allowlisted
+    text is returned, never an arbitrary message:
+
+    * pydantic's own message for a type in :data:`SETTINGS_TEMPLATE_ERROR_TYPES`, rendered
+      from its template and the field's declared constraints;
+    * ``"Value error, "`` and the validator's message for a ``value_error`` whose message is
+      one of :data:`VALIDATOR_MESSAGES`;
+    * :data:`SETTINGS_WITHHELD_PROBLEM` for anything else (another ``value_error``, an
+      ``assertion_error`` or a custom type), whose text may quote the value it rejects.
+
+    The text may still name an example email address that a validator's message gives, such
+    as ``admin@example.com``; a caller that writes it outside the log pipeline strips those.
+
+    Example::
+
+        settings_error_problem(error)  # 'Value error, GOOGLE_ADS_CUSTOMER_ID must be 10 digits'
+
+    Args:
+        error: One entry of :meth:`pydantic.ValidationError.errors`, with its ``ctx``.
+
+    Returns:
+        The problem to report for ``error``.
+    """
+    error_type = error["type"]
+    if error_type in SETTINGS_TEMPLATE_ERROR_TYPES:
+        return error["msg"]
+    if error_type == "value_error":
+        context = error.get("ctx") or {}
+        message = str(context.get("error", ""))
+        if message in VALIDATOR_MESSAGES:
+            return SETTINGS_VALUE_ERROR_PREFIX + message
+    return SETTINGS_WITHHELD_PROBLEM
+
 
 class ConfigurationError(RuntimeError):
     """Configuration that loads but is unsafe or incomplete for the process using it.
@@ -208,7 +288,7 @@ class ConfigurationError(RuntimeError):
         try:
             settings.check_api_startup()
         except ConfigurationError as exc:
-            exc.fields  # ("session_secret",) when SESSION_SECRET is unset
+            exc.fields  # ("session_secret",) when SESSION_SECRET is unset or too weak
 
     Attributes:
         fields: The :class:`Settings` fields at fault, by name and never by value, in the
@@ -245,6 +325,47 @@ def _split_http_url(value: str) -> SplitResult | None:
     if parts.scheme not in _HTTP_SCHEMES or not parts.hostname or port == 0:
         return None
     return parts
+
+
+def _is_weak_session_key(key: str) -> bool:
+    """Return whether ``key`` is too weak to sign session cookies.
+
+    A key is weak when any of these holds:
+
+    * it is shorter than :data:`_SESSION_KEY_MIN_LENGTH` (32) characters;
+    * it holds fewer than :data:`_SESSION_KEY_MIN_DISTINCT` (8) distinct characters;
+    * it is a shorter run repeated: its smallest period ``p``, the least shift for which
+      ``key[i] == key[i + p]`` at every position, is at most half its length. For example
+      ``"changeme" * 4``, ``"0123456789abcdef" * 2`` and
+      ``"changeme-changeme-changeme-changeme"``.
+
+    The period comes from the Knuth-Morris-Pratt prefix function in linear time: it is the
+    length less that of the longest proper prefix that is also a suffix.
+
+    Example::
+
+        _is_weak_session_key("changeme")  # True
+        _is_weak_session_key(secrets.token_hex(32))  # False
+
+    Args:
+        key: The ``SESSION_SECRET`` value, exactly as it signs cookies.
+
+    Returns:
+        ``True`` when the key is short, has too few distinct characters or repeats a run.
+    """
+    length = len(key)
+    if length < _SESSION_KEY_MIN_LENGTH or len(set(key)) < _SESSION_KEY_MIN_DISTINCT:
+        return True
+    # prefix[i]: the length of the longest proper prefix of key[: i + 1] that is also its suffix.
+    prefix = [0] * length
+    matched = 0
+    for index in range(1, length):
+        while matched and key[index] != key[matched]:
+            matched = prefix[matched - 1]
+        if key[index] == key[matched]:
+            matched += 1
+        prefix[index] = matched
+    return length - prefix[-1] <= length // 2
 
 
 class Settings(BaseSettings):
@@ -696,15 +817,24 @@ class Settings(BaseSettings):
         """Check what the API needs before it serves a request.
 
         ``api/app.py:create_app()`` calls this, so ``uvicorn`` refuses to start on an
-        unsafe base URL or without a session-signing key.
+        unsafe base URL, without a session-signing key, or with one too weak to keep a
+        session from being forged (:func:`_is_weak_session_key`). Neither message carries
+        the key or any part of it.
 
         Raises:
-            ConfigurationError: When :meth:`assert_safe_base_url` fails, or
-                ``SESSION_SECRET`` is not set (``fields`` ``("session_secret",)``).
+            ConfigurationError: When :meth:`assert_safe_base_url` fails; when
+                ``SESSION_SECRET`` is not set ("SESSION_SECRET is not set; run make init");
+                or when it is shorter than 32 characters, holds fewer than 8 distinct
+                characters or repeats a shorter run ("SESSION_SECRET is too weak: …"). Both
+                ``SESSION_SECRET`` refusals have ``fields`` ``("session_secret",)``.
         """
         self.assert_safe_base_url()
         if self._missing_env_names(("session_secret",)):
             raise ConfigurationError(_SESSION_KEY_UNSET_MESSAGE, fields=("session_secret",))
+        if self.session_secret is not None and _is_weak_session_key(
+            self.session_secret.get_secret_value()
+        ):
+            raise ConfigurationError(_SESSION_KEY_WEAK_MESSAGE, fields=("session_secret",))
 
 
 @functools.lru_cache(maxsize=1)

@@ -427,9 +427,10 @@ async def require_user(request: Request, session: SessionDep, now: NowDep) -> Cu
     the absolute 12 h lifetime from sign-in, and its user still exists with the same
     email and the same session generation. Replacing the admin with ``ads-engine
     ensure-admin`` (a new row, or a changed email) therefore invalidates every earlier
-    session, and so does signing out, which increments ``app_user.session_generation``:
-    a copy of the cookie saved before the sign-out no longer matches. In each case the
-    session is cleared, so the response also expires the cookie.
+    session. So do a changed password hash stored by ``ensure-admin`` and signing out, each
+    of which increments ``app_user.session_generation``: a copy of the cookie saved before
+    either no longer matches. In each case the session is cleared, so the response also
+    expires the cookie.
 
     Every failure returns the same 401, so the response never reveals why a session was
     refused. The log records only the reason and, where known, the user id: a warning
@@ -450,7 +451,7 @@ async def require_user(request: Request, session: SessionDep, now: NowDep) -> Cu
 
     Raises:
         ApiError: 401 ``unauthenticated`` when there is no valid session, its user no
-            longer matches or it was revoked by a sign-out.
+            longer matches or it was revoked by a sign-out or a password change.
     """
     if security.session_cookie_unverified(request):
         # SessionMiddleware could not verify the cookie (tampered, forged, signed with
@@ -477,7 +478,8 @@ async def require_user(request: Request, session: SessionDep, now: NowDep) -> Cu
         )
         raise _unauthenticated()
     if user.session_generation != claims.generation:
-        # A sign-out has incremented the generation since this cookie was issued.
+        # A sign-out or a password change through ensure-admin has incremented the generation
+        # since this cookie was issued.
         security.end_session(request)
         _log.warning("auth.session_rejected", reason="session_revoked", user_id=claims.user_id)
         raise _unauthenticated()

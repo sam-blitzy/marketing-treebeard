@@ -10,8 +10,11 @@ AAP 0.5.3 (``GET /runs/latest``, ``GET /runs/{id}``, ``GET /runs?kind=custom&lim
   answers 201; ``GET /runs/{id}`` and ``GET /runs?kind=custom`` return it;
 * while another session holds the analysis lock, ``POST /runs`` answers 409
   ``run_in_progress`` and writes no run;
-* an end after the default end, an end before the start or a span above ``window.max_days``
-  is a 422 carrying ``InvalidWindow``'s code, and no run is written;
+* an end after the default end, an end before the start, a start before ``earliest_start``
+  (0001-01-01 included) or a span above ``window.max_days`` is a 422 carrying
+  ``InvalidWindow``'s code, and no run is written; a window starting on ``earliest_start``,
+  one day or ``window.max_days`` long, computes and succeeds in a Google zone behind UTC and
+  in one 14 hours ahead of it;
 * a window date sent as a UNIX timestamp or a datetime string is a 422 ``validation_error``
   naming the field, and no run is written, while the same dates as ``YYYY-MM-DD`` compute it;
 * a changed ``window.default_days`` shows in ``Run.default_days`` and in the default run;
@@ -59,7 +62,7 @@ import ads_engine.db.models  # noqa: F401 - registers every table on the metadat
 from ads_engine.analysis import runner
 from ads_engine.analysis.lock import RunInProgress, analysis_lock
 from ads_engine.analysis.thresholds import Thresholds, resolve_config_dir
-from ads_engine.analysis.window import InvalidWindow
+from ads_engine.analysis.window import InvalidWindow, earliest_start
 from ads_engine.api import app as api_app
 from ads_engine.api import deps, security
 from ads_engine.api.deps import ApiError
@@ -191,8 +194,8 @@ async def app_db(database: tuple[URL, str], monkeypatch: pytest.MonkeyPatch) -> 
         get_settings.cache_clear()
 
 
-async def _seed() -> str:
-    """Seed an active live Google dataset in New York time and the admin; return its email."""
+async def _seed(google_tz: str = GOOGLE_TZ) -> str:
+    """Seed an active live Google dataset in ``google_tz`` and the admin; return its email."""
     email = f"admin-{uuid.uuid4().hex}@example.com"
     async with session_scope() as session:
         dataset = SourceDataset(
@@ -216,7 +219,7 @@ async def _seed() -> str:
                     external_id="1234567890",
                     name="Main",
                     currency="USD",
-                    timezone=GOOGLE_TZ,
+                    timezone=google_tz,
                 ),
                 AppUser(email=email, password_hash=security.hash_password(ADMIN_PASSWORD)),
             ]
@@ -549,6 +552,7 @@ async def test_a_held_lock_answers_run_in_progress(app_db: str, thresholds: Thre
             "end_before_start",
         ),
         (_window(181), "too_long"),
+        ({"window_start": "0001-01-01", "window_end": "0001-01-01"}, "start_before_earliest"),
         ({"window_start": DEFAULT_END.isoformat()}, "validation_error"),
         ({**_window(28), "kind": "default"}, "validation_error"),
         ({"window_start": "2026-02-30", "window_end": "2026-03-01"}, "validation_error"),
@@ -562,6 +566,62 @@ async def test_window_bounds_are_unprocessable(
         await _sign_in(client, email)
         _assert_error(await client.post(f"{API}/runs", json=body, headers=CSRF), 422, code)
     assert await _run_count() == 0
+
+
+@pytest.mark.anyio
+async def test_a_start_before_the_earliest_date_is_refused_before_any_run_is_written(
+    app_db: str, thresholds: Thresholds
+) -> None:
+    earliest = earliest_start(thresholds)
+    before = earliest - timedelta(days=1)
+    email = await _seed()
+    async with await _client(thresholds) as client:
+        await _sign_in(client, email)
+        for start, end in ((date.min, date.min), (before, before), (date.min, DEFAULT_END)):
+            response = await client.post(
+                f"{API}/runs",
+                json={"window_start": start.isoformat(), "window_end": end.isoformat()},
+                headers=CSRF,
+            )
+            error = _assert_error(response, 422, "start_before_earliest")
+            assert error["message"].startswith(
+                f"Window start {start.isoformat()} is before {earliest.isoformat()}, "
+                "the earliest date the analysis supports"
+            ), error
+    assert await _run_count() == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("google_tz", [GOOGLE_TZ, "Pacific/Kiritimati"])
+async def test_the_earliest_admissible_window_computes(
+    app_db: str, thresholds: Thresholds, google_tz: str
+) -> None:
+    # The Google day runs behind UTC in New York and 14 hours ahead of it on Kiritimati, so
+    # the run's day-boundary and lookback arithmetic reaches both sides of the floor.
+    earliest = earliest_start(thresholds)
+    email = await _seed(google_tz)
+    async with await _client(thresholds) as client:
+        await _sign_in(client, email)
+        for days in (1, thresholds.max_days):
+            end = earliest + timedelta(days=days - 1)
+            created = await client.post(
+                f"{API}/runs",
+                json={"window_start": earliest.isoformat(), "window_end": end.isoformat()},
+                headers=CSRF,
+            )
+            assert created.status_code == 201, created.text
+            run = created.json()
+            assert run["status"] == "succeeded"
+            assert run["kind"] == "custom"
+            assert (run["window_start"], run["window_end"], run["days"]) == (
+                earliest.isoformat(),
+                end.isoformat(),
+                days,
+            )
+            assert {day["source"]: day["boundary"] for day in run["source_days"]} == {
+                "google": google_tz
+            }
+    assert await _run_count() == 2
 
 
 @pytest.mark.anyio
