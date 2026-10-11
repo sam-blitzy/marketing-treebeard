@@ -387,7 +387,9 @@ describe('BatchedList', () => {
       </>,
     );
     const elsewhere = screen.getByRole('button', { name: 'Elsewhere' });
-    elsewhere.focus();
+    act(() => {
+      elsewhere.focus();
+    });
 
     act(() => {
       setHash('held-90');

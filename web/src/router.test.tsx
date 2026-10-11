@@ -471,7 +471,9 @@ describe('auth guard', () => {
     // A Retry that fails again: the guard asks the API again, the button shows as loading
     // meanwhile, and the new failure screen returns focus to its own Retry.
     const retry = within(main).getByRole('button', { name: 'Retry' });
-    retry.focus();
+    act(() => {
+      retry.focus();
+    });
     fireEvent.click(retry);
     // A loading Button is inert but never natively disabled, so it keeps focus meanwhile.
     expect(retry.getAttribute('aria-busy')).toBe('true');
@@ -1445,7 +1447,9 @@ describe('sign out', () => {
     const { router } = renderApp('/settings');
     await findTitle('Settings');
     const button = screen.getByRole('button', { name: 'Sign out' });
-    button.focus();
+    act(() => {
+      button.focus();
+    });
     fireEvent.click(button);
     await waitFor(() => {
       expect(button.getAttribute('aria-busy')).toBe('true');
@@ -1457,8 +1461,10 @@ describe('sign out', () => {
     // Focus lost to <body> meanwhile, as after a click on the page background, still returns
     // to the button once the request fails.
     const main = screen.getByRole('main');
-    main.focus();
-    main.blur();
+    act(() => {
+      main.focus();
+      main.blur();
+    });
     expect(document.activeElement).toBe(document.body);
 
     held.release(LOGOUT_FAILED);
@@ -1477,13 +1483,17 @@ describe('sign out', () => {
     const { router } = renderApp('/settings');
     await findTitle('Settings');
     const button = screen.getByRole('button', { name: 'Sign out' });
-    button.focus();
+    act(() => {
+      button.focus();
+    });
     fireEvent.click(button);
     await waitFor(() => {
       expect(button.getAttribute('aria-busy')).toBe('true');
     });
     const link = within(primaryNav()).getByRole('link', { name: 'Decisions' });
-    link.focus();
+    act(() => {
+      link.focus();
+    });
 
     held.release(LOGOUT_FAILED);
 
@@ -1586,7 +1596,9 @@ describe('focus after navigation', () => {
     const { router } = renderApp('/settings');
     await findTitle('Settings');
     const button = screen.getByRole('button', { name: 'Sign out' });
-    button.focus();
+    act(() => {
+      button.focus();
+    });
     expect(document.activeElement).toBe(button);
 
     fireEvent.click(button);
@@ -1706,7 +1718,9 @@ describe('focus after navigation', () => {
       await findTitle('Settings');
       const section = await findById('settings-window');
       const button = screen.getByRole('button', { name: 'Sign out' });
-      button.focus();
+      act(() => {
+        button.focus();
+      });
 
       act(() => {
         window.history.replaceState(null, '', '#nowhere');
@@ -1750,7 +1764,9 @@ describe('focus after navigation', () => {
           link.setAttribute(name, value);
         }
         document.body.append(link);
-        button.focus();
+        act(() => {
+          button.focus();
+        });
         fireEvent.click(link, init);
         link.remove();
         return document.activeElement;

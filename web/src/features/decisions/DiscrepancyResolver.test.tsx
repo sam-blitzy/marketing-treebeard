@@ -249,7 +249,9 @@ describe('DiscrepancyResolver list', () => {
     expect(screen.queryByRole('alert')).toBeNull();
 
     const retry = buttonNamed('Retry', region);
-    retry.focus();
+    act(() => {
+      retry.focus();
+    });
     fireEvent.click(retry);
     // The failure stays in place while the read runs again: no spinner, the button is loading.
     await waitFor(() => {
@@ -1006,7 +1008,9 @@ describe('DiscrepancyResolver focus after a closing resolution', () => {
       expect(buttonNamed('Platform is correct', closing).getAttribute('aria-busy')).toBe('true');
     });
     const moved = buttonNamed('Decision is correct', other);
-    moved.focus();
+    act(() => {
+      moved.focus();
+    });
     closed = true;
     response.resolve(json(200, closedBy(first)));
 
@@ -2319,7 +2323,9 @@ describe('DiscrepancyResolution "Record intended state"', () => {
 
     const opener = buttonNamed('Record intended state');
     // A click focuses the button in a browser; fireEvent does not.
-    opener.focus();
+    act(() => {
+      opener.focus();
+    });
     const first = await openIntendedState();
     const noteText = 'Budget raised on the platform by the agency';
     fireEvent.change(within(first).getByLabelText('Daily budget'), { target: { value: '240' } });
@@ -2398,7 +2404,9 @@ describe('DiscrepancyResolution "Record intended state"', () => {
       const api = mockApi(intendedHandlers(response));
       const { onResolved } = await renderResolution(makeDiscrepancy('untracked'));
 
-      buttonNamed('Record intended state').focus();
+      act(() => {
+        buttonNamed('Record intended state').focus();
+      });
       const dialog = await openIntendedState();
       saveIntendedState(dialog);
 
@@ -2431,7 +2439,9 @@ describe('DiscrepancyResolution "Record intended state"', () => {
     await renderResolution(makeDiscrepancy('untracked'));
 
     const opener = buttonNamed('Record intended state');
-    opener.focus();
+    act(() => {
+      opener.focus();
+    });
     const dialog = await openIntendedState();
     saveIntendedState(dialog);
     await waitFor(() => {
@@ -2477,7 +2487,9 @@ describe('DiscrepancyResolution "Record intended state"', () => {
       });
       const { onResolved } = await renderResolution(makeDiscrepancy('untracked'));
 
-      buttonNamed('Record intended state').focus();
+      act(() => {
+        buttonNamed('Record intended state').focus();
+      });
       const dialog = await openIntendedState();
       saveIntendedState(dialog);
       await waitFor(() => {
@@ -2805,7 +2817,9 @@ describe('DiscrepancyResolver focus after a refresh drops the focused card', () 
       const dropped = await findCardItem('Brand Search — US');
       const next = await findCardItem('Search Partners — US');
       const control = buttonNamed('Decision is correct', dropped);
-      control.focus();
+      act(() => {
+        control.focus();
+      });
       expect(document.activeElement).toBe(control);
 
       // The worker auto-resolved it; the 30 s poll leaves it out.
@@ -2834,7 +2848,9 @@ describe('DiscrepancyResolver focus after a refresh drops the focused card', () 
     const firstItem = await findCardItem('Brand Search — US');
     const previous = await findCardItem('Search Partners — US');
     const dropped = await findCardItem('Search Shared Budget');
-    buttonNamed('Platform is correct', dropped).focus();
+    act(() => {
+      buttonNamed('Platform is correct', dropped).focus();
+    });
 
     listed = [first, second];
     await refreshList(queryClient);
@@ -2883,9 +2899,13 @@ describe('DiscrepancyResolver focus after a refresh drops the focused card', () 
     });
     const left = await findCardItem('Brand Search — US');
     const other = await findCardItem('Search Partners — US');
-    buttonNamed('Decision is correct', left).focus();
+    act(() => {
+      buttonNamed('Decision is correct', left).focus();
+    });
     const moved = buttonNamed('Platform is correct', other);
-    moved.focus();
+    act(() => {
+      moved.focus();
+    });
 
     listed = [second, third];
     await refreshList(queryClient);
@@ -2911,11 +2931,15 @@ describe('DiscrepancyResolver focus after a refresh drops the focused card', () 
       { path: '/decisions' },
     );
     const left = await findCardItem('Brand Search — US');
-    buttonNamed('Decision is correct', left).focus();
+    act(() => {
+      buttonNamed('Decision is correct', left).focus();
+    });
     // Focus moves to a control outside the list, then onto the page, as a click on it does.
     const elsewhere = buttonNamed('Elsewhere');
-    elsewhere.focus();
-    elsewhere.blur();
+    act(() => {
+      elsewhere.focus();
+      elsewhere.blur();
+    });
     expect(document.activeElement).toBe(document.body);
 
     listed = [second, third];
@@ -2939,9 +2963,13 @@ describe('DiscrepancyResolver focus after a refresh drops the focused card', () 
     });
     const left = await findCardItem('Brand Search — US');
     const control = buttonNamed('Decision is correct', left);
-    control.focus();
+    act(() => {
+      control.focus();
+    });
     // As a click on an empty part of the page does.
-    control.blur();
+    act(() => {
+      control.blur();
+    });
     expect(document.activeElement).toBe(document.body);
 
     listed = [second, third];
@@ -3008,7 +3036,9 @@ describe('DiscrepancyResolution intended-state failure closed with its dialog', 
       const { onResolved } = await renderResolution(makeDiscrepancy('untracked'));
 
       const opener = buttonNamed('Record intended state');
-      opener.focus();
+      act(() => {
+        opener.focus();
+      });
       const dialog = await openIntendedState();
       saveIntendedState(dialog);
       expect(await within(dialog).findByText(REFUSED_MESSAGE)).toBeTruthy();
@@ -3064,7 +3094,9 @@ describe('DiscrepancyResolution intended-state failure closed with its dialog', 
       const api = mockApi(intendedHandlers(response));
       await renderResolution(makeDiscrepancy('untracked'));
 
-      buttonNamed('Record intended state').focus();
+      act(() => {
+        buttonNamed('Record intended state').focus();
+      });
       const dialog = await openIntendedState();
       saveIntendedState(dialog);
       expect(await within(dialog).findByText(text)).toBeTruthy();

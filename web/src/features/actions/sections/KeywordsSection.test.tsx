@@ -1303,7 +1303,9 @@ describe('KeywordsSection: the confirmation of a card hidden on the page', () =>
     const k1 = findPageItem(makeRecommendationsPage(), FIXTURE_ITEM_IDS.k1);
     const card = await screen.findByRole('article', { name: k1.action });
     const dismiss = within(card).getByRole('button', { name: 'Dismiss' });
-    dismiss.focus();
+    act(() => {
+      dismiss.focus();
+    });
     fireEvent.click(dismiss);
 
     await waitFor(() => {

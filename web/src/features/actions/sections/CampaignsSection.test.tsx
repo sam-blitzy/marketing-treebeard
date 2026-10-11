@@ -593,7 +593,9 @@ describe('C0 discrepancy cards', () => {
     const shown = card(C0_ACTION);
     const other = card(BUDGET_C0_ACTION);
     const resolution = await within(shown).findByRole('button', { name: 'Platform is correct' });
-    resolution.focus();
+    act(() => {
+      resolution.focus();
+    });
 
     // Both discrepancies recomputed by the next run: new recommendation ids, nothing else.
     const budget = budgetC0();
@@ -688,7 +690,9 @@ describe('C0 discrepancy cards', () => {
     const line = statusLine(c0);
     // The refetched unresolved list drops it, and the resolved list holds it.
     api.use({ 'GET /discrepancies': json(200, []), [RESOLVED_KEY]: resolvedDiscrepancies() });
-    platformCorrect.focus();
+    act(() => {
+      platformCorrect.focus();
+    });
     expect(document.activeElement).toBe(platformCorrect);
     fireEvent.click(platformCorrect);
 

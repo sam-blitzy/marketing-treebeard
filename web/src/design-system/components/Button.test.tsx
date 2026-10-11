@@ -58,7 +58,9 @@ describe('Button', () => {
     render(<Button onClick={onClick}>Sync now</Button>);
 
     const button = screen.getByRole('button', { name: 'Sync now' });
-    button.focus();
+    act(() => {
+      button.focus();
+    });
     expect(document.activeElement).toBe(button);
     fireEvent.click(button);
     expect(onClick).toHaveBeenCalledTimes(1);

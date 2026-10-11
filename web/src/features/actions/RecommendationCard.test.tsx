@@ -1250,7 +1250,9 @@ describe('RecommendationCard: record decision', () => {
     await renderCard(<RecommendationCard item={item} />);
 
     const opener = within(cardOf(item)).getByRole('button', { name: RECORD_DECISION_LABEL });
-    opener.focus();
+    act(() => {
+      opener.focus();
+    });
     const dialog = await openDecisionDialog(item);
     fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
 
@@ -1388,7 +1390,9 @@ describe('RecommendationCard: record decision', () => {
 
     const opener = within(cardOf(item)).getByRole('button', { name: RECORD_DECISION_LABEL });
     // A click focuses the button in a browser; fireEvent does not.
-    opener.focus();
+    act(() => {
+      opener.focus();
+    });
     const first = await openDecisionDialog(item);
     const noteText = 'Pause until the CRM sync is fixed';
     fireEvent.change(within(first).getByRole('textbox', { name: 'Note' }), {
@@ -1488,7 +1492,9 @@ describe('RecommendationCard: record decision', () => {
       await renderCard(<RecommendationCard item={item} />);
 
       const opener = within(cardOf(item)).getByRole('button', { name: RECORD_DECISION_LABEL });
-      opener.focus();
+      act(() => {
+        opener.focus();
+      });
       const dialog = await openDecisionDialog(item);
       fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
       await waitFor(() => {
@@ -1546,7 +1552,9 @@ describe('RecommendationCard: record decision', () => {
     );
 
     const opener = within(cardOf(item)).getByRole('button', { name: RECORD_DECISION_LABEL });
-    opener.focus();
+    act(() => {
+      opener.focus();
+    });
     const dialog = await openDecisionDialog(item);
     fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
     await waitFor(() => {
@@ -1554,7 +1562,9 @@ describe('RecommendationCard: record decision', () => {
     });
     fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
     const elsewhere = screen.getByRole('button', { name: 'Elsewhere' });
-    elsewhere.focus();
+    act(() => {
+      elsewhere.focus();
+    });
 
     release(json(201, genericCrmDecision({ id: 811, origin: 'user', status: 'paused' })));
 
@@ -1613,7 +1623,9 @@ describe('RecommendationActions: a newer run of the same recommendation', () => 
     const item = makeItem({ id: 61 });
     const show = await renderReplaceableCard(item);
     const dismiss = within(cardOf(item)).getByRole('button', { name: FEEDBACK_LABELS.dismiss });
-    dismiss.focus();
+    act(() => {
+      dismiss.focus();
+    });
 
     const next = newerRun(item);
     show(next);
@@ -1924,7 +1936,9 @@ describe('RecommendationActions: a newer run of the same recommendation', () => 
     api.use({ 'GET /decisions': json(200, [genericCrmDecision()]) });
     const item = c1Item();
     const show = await renderReplaceableCard(item);
-    within(cardOf(item)).getByRole('button', { name: RECORD_DECISION_LABEL }).focus();
+    act(() => {
+      within(cardOf(item)).getByRole('button', { name: RECORD_DECISION_LABEL }).focus();
+    });
     await openDecisionDialog(item);
 
     const next = { ...newerRun(item), decision_subject: null };
@@ -2180,7 +2194,9 @@ async function renderLiveCards(ids: readonly number[]): Promise<Item[]> {
 /** Presses a card's action as a keyboard user does: focus first, then activate. */
 function press(item: Item, label: string): void {
   const button = within(cardOf(item)).getByRole('button', { name: label });
-  button.focus();
+  act(() => {
+    button.focus();
+  });
   fireEvent.click(button);
 }
 
@@ -2339,7 +2355,9 @@ describe('RecommendationActions: outcome announcement and focus after feedback',
       expect(posts(api)).toHaveLength(1);
     });
     const elsewhere = screen.getByRole('button', { name: 'Elsewhere' });
-    elsewhere.focus();
+    act(() => {
+      elsewhere.focus();
+    });
     release(json(201, makeFeedback('dismiss', { recommendation_id: first.id })));
 
     await waitFor(() => {
@@ -2429,7 +2447,9 @@ async function markDoneOutcome(item: Item): Promise<HTMLElement> {
   // The only card, found by role alone because a blank action leaves it without a name.
   const card = screen.getByRole('article');
   const button = within(card).getByRole('button', { name: FEEDBACK_LABELS.done });
-  button.focus();
+  act(() => {
+    button.focus();
+  });
   fireEvent.click(button);
   await within(card).findByText(FEEDBACK_STATUS_MESSAGES.done);
   return outcomeRegion();

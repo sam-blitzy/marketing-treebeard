@@ -736,7 +736,9 @@ describe('ActionsPage', () => {
       }
 
       const dismiss = within(pauseCard).getByRole('button', { name: 'Dismiss' });
-      dismiss.focus();
+      act(() => {
+        dismiss.focus();
+      });
       fireEvent.click(dismiss);
 
       // SectionFrame drops the hidden item; the region above the sections keeps its outcome.
@@ -1071,7 +1073,9 @@ describe('ActionsPage', () => {
       // A Retry that fails again: the button is busy meanwhile, then gets focus back.
       const first = gated();
       api.use({ 'GET /recommendations': first.handler });
-      retry.focus();
+      act(() => {
+        retry.focus();
+      });
       fireEvent.click(retry);
       await waitFor(() => {
         expect(first.gate.release).toBeDefined();
@@ -1087,8 +1091,10 @@ describe('ActionsPage', () => {
       // still goes back to Retry once the read settles.
       const title = screen.getByRole('heading', { level: 1, name: 'Actions' });
       title.tabIndex = -1;
-      title.focus();
-      title.blur();
+      act(() => {
+        title.focus();
+        title.blur();
+      });
       expect(document.activeElement).toBe(document.body);
       first.gate.release?.(apiError(500, 'internal_error', 'Database still unavailable'));
 
@@ -1120,7 +1126,9 @@ describe('ActionsPage', () => {
 
       const pending = gated();
       api.use({ 'GET /recommendations': pending.handler });
-      retry.focus();
+      act(() => {
+        retry.focus();
+      });
       fireEvent.click(retry);
       await waitFor(() => {
         expect(pending.gate.release).toBeDefined();
@@ -1128,7 +1136,9 @@ describe('ActionsPage', () => {
       // Meanwhile the user moves focus elsewhere: here, to the page title, made focusable.
       const heading = screen.getByRole('heading', { level: 1, name: 'Actions' });
       heading.tabIndex = -1;
-      heading.focus();
+      act(() => {
+        heading.focus();
+      });
       pending.gate.release?.(apiError(500, 'internal_error', 'Still unavailable'));
 
       await screen.findByText('Still unavailable');
@@ -1617,7 +1627,9 @@ describe('ActionsPage: the confirmation where a card stood', () => {
     }
 
     const snooze = within(pauseCard).getByRole('button', { name: 'Snooze for 7 days' });
-    snooze.focus();
+    act(() => {
+      snooze.focus();
+    });
     fireEvent.click(snooze);
 
     const text = feedbackConfirmationText('snooze', pause);

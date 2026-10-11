@@ -2331,7 +2331,9 @@ describe('card keys across runs', () => {
     const show = renderReplaceable(items, cardList);
     const card = screen.getByRole('article', { name: 'Add "crm trial" as exact-match negative' });
     const action = within(card).getByRole('button');
-    action.focus();
+    act(() => {
+      action.focus();
+    });
     expect(document.activeElement).toBe(action);
 
     show(items.map(nextRun));
@@ -2368,7 +2370,9 @@ describe('card keys across runs', () => {
     const action = within(
       screen.getByRole('article', { name: 'Add "crm demo" as exact-match negative' }),
     ).getByRole('button');
-    action.focus();
+    act(() => {
+      action.focus();
+    });
 
     show(items.map(nextRun));
 
@@ -2691,7 +2695,9 @@ describe('confirmations of items hidden on the page', () => {
     render(<Host />);
     const card = screen.getByRole('article', { name: 'First' });
     const action = within(card).getByRole('button');
-    action.focus();
+    act(() => {
+      action.focus();
+    });
     const consoleError = vi.spyOn(console, 'error');
 
     act(() => {

@@ -359,8 +359,10 @@ function dropFocusToBody(): void {
   const holder = document.createElement('span');
   holder.tabIndex = -1;
   document.body.append(holder);
-  holder.focus();
-  holder.remove();
+  act(() => {
+    holder.focus();
+    holder.remove();
+  });
   expect(document.activeElement).toBe(document.body);
 }
 
@@ -951,7 +953,9 @@ describe('WindowPicker', () => {
       await presetsShown();
 
       const preset = button('56 days');
-      preset.focus();
+      act(() => {
+        preset.focus();
+      });
       fireEvent.click(preset);
       // The focused preset is disabled while the run computes, but keeps focus: it is inert and
       // aria-disabled until focus leaves it, while the other presets are natively disabled.
@@ -1060,7 +1064,9 @@ describe('WindowPicker', () => {
       api.use({ 'GET /runs/latest': latest.handler });
       const retry = button('Retry reading the latest default run');
       expect(retry.textContent).toBe('Retry');
-      retry.focus();
+      act(() => {
+        retry.focus();
+      });
       fireEvent.click(retry);
 
       await waitFor(() => {
@@ -1778,7 +1784,9 @@ describe('WindowPicker', () => {
       await presetsShown();
 
       const toggle = button('Recent custom windows');
-      toggle.focus();
+      act(() => {
+        toggle.focus();
+      });
       fireEvent.click(toggle);
 
       expect(toggle.getAttribute('aria-expanded')).toBe('true');
@@ -1861,7 +1869,9 @@ describe('WindowPicker', () => {
       expect(screen.queryByRole('combobox')).toBeNull();
       expect(customRunReads(api)).toHaveLength(1);
 
-      again.focus();
+      act(() => {
+        again.focus();
+      });
       fireEvent.click(again);
 
       expect(again.getAttribute('aria-expanded')).toBe('true');

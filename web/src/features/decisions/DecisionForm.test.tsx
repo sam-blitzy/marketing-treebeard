@@ -2399,16 +2399,24 @@ describe('DecisionForm: the retired lock outlasts every later read (AAP 0.5.5)',
     try {
       const onRetired = vi.fn<() => void>();
       const onFailed = vi.fn<(message: string, error: unknown) => void>();
-      const api = mockApi({ [logKey(OWN_BUDGET)]: retiredError() });
-      await renderForm({
-        subject: OWN_BUDGET,
-        prefill: { status: 'paused' },
-        recommendationId: FIXTURE_ITEM_IDS.c1,
-        onRetired,
-        onFailed,
-      });
+      // The refusal is held until the form has mounted, then answered while the test waits for
+      // its banner, so the lock it sets, and reports to onRetired, settles inside that wait.
+      const read = deferredResponse();
+      const api = mockApi({ [logKey(OWN_BUDGET)]: () => read.promise });
+      await renderWithProviders(
+        <DecisionForm
+          subject={OWN_BUDGET}
+          prefill={{ status: 'paused' }}
+          recommendationId={FIXTURE_ITEM_IDS.c1}
+          onRetired={onRetired}
+          onFailed={onFailed}
+        />,
+        { path: '/decisions' },
+      );
+      expect(screen.getByRole('status').textContent).toBe('Loading decision');
 
-      expect(screen.getByText(RETIRED)).toBeDefined();
+      read.resolve(retiredError());
+      expect(await screen.findByText(RETIRED)).toBeDefined();
       expect(screen.queryByText(NO_STATE)).toBeNull();
       // The API's own wording, which names internals, is never shown.
       expect(screen.queryByText(/does not belong to an active dataset/)).toBeNull();

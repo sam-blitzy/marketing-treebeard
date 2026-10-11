@@ -567,7 +567,9 @@ describe('Dialog keyboard focus trap', () => {
 
   it('wraps Shift+Tab from the first stop to the last', () => {
     const { close, save } = renderForm();
-    close.focus();
+    act(() => {
+      close.focus();
+    });
 
     expect(pressTab(true)).toBe(false);
     expect(document.activeElement).toBe(save);
@@ -598,12 +600,16 @@ describe('Dialog keyboard focus trap', () => {
 
   it('leaves Tab between two inner stops to the browser', () => {
     const { close, note } = renderForm();
-    close.focus();
+    act(() => {
+      close.focus();
+    });
 
     expect(pressTab()).toBe(true);
     expect(document.activeElement).toBe(close);
 
-    note.focus();
+    act(() => {
+      note.focus();
+    });
     expect(pressTab()).toBe(true);
     expect(pressTab(true)).toBe(true);
     expect(document.activeElement).toBe(note);
@@ -640,7 +646,9 @@ describe('Dialog keyboard focus trap', () => {
     // Modifier shortcuts on the first stop, where a plain Shift+Tab would wrap: never
     // sequential navigation.
     const close = screen.getByRole('button', { name: 'Close' });
-    close.focus();
+    act(() => {
+      close.focus();
+    });
     for (const modifiers of [{ altKey: true }, { ctrlKey: true }, { metaKey: true }]) {
       expect(pressTab(true, modifiers)).toBe(true);
       expect(document.activeElement).toBe(close);
@@ -848,7 +856,9 @@ describe('Dialog keyboard focus trap', () => {
       );
       const close = screen.getByRole('button', { name: 'Close' });
       const date = result.getByLabelText('Effective date');
-      close.focus();
+      act(() => {
+        close.focus();
+      });
       return { close, date };
     }
 
@@ -891,7 +901,9 @@ describe('Dialog keyboard focus trap', () => {
       expect(pressTab(true)).toBe(true);
       expect(setTimer).toHaveBeenCalledTimes(1);
       const first = setTimer.mock.results[0]?.value as unknown;
-      close.focus();
+      act(() => {
+        close.focus();
+      });
       expect(pressTab(true)).toBe(true);
 
       // The first fallback is cancelled before the second is scheduled.
@@ -915,7 +927,9 @@ describe('Dialog keyboard focus trap', () => {
             <input aria-label="Effective date" type="date" />
           </Dialog>,
         );
-        screen.getByRole('button', { name: 'Close' }).focus();
+        act(() => {
+          screen.getByRole('button', { name: 'Close' }).focus();
+        });
         const setTimer = vi.spyOn(window, 'setTimeout');
         const clearTimer = vi.spyOn(window, 'clearTimeout');
         expect(pressTab(true)).toBe(true);

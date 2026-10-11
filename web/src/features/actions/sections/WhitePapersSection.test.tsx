@@ -2588,7 +2588,9 @@ describe('WhitePapersSection rendered again', () => {
       name: 'Show details for The 2026 B2B Pipeline Report (EUR)',
     });
     fireEvent.click(toggle);
-    toggle.focus();
+    act(() => {
+      toggle.focus();
+    });
     expect(toggle.getAttribute('aria-expanded')).toBe('true');
     const markDone = screen.getByRole('button', { name: 'Mark done' });
 

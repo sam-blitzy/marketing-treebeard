@@ -1129,7 +1129,9 @@ describe('CreativeSection: the confirmation of a card hidden on the page', () =>
       const card = await screen.findByRole('article', { name: cr3.action });
       const label = { dismiss: 'Dismiss', snooze: 'Snooze for 7 days', done: 'Mark done' }[kind];
       const button = within(card).getByRole('button', { name: label });
-      button.focus();
+      act(() => {
+        button.focus();
+      });
       fireEvent.click(button);
 
       await waitFor(() => {

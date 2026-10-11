@@ -900,7 +900,9 @@ describe('DateRangePicker', () => {
       );
 
       const applyButton = screen.getByRole('button', { name: 'Apply' });
-      applyButton.focus();
+      act(() => {
+        applyButton.focus();
+      });
       expect(document.activeElement).toBe(applyButton);
       apply();
 
