@@ -18,7 +18,7 @@
  *    recommendation reads "Recommendation".
  * 3. **Decided by**: the user, or "System" for rows the product wrote itself.
  * 4. **Patch applied**: the fields the submission itself carried, in the fixed order status,
- *    daily budget, total budget ("status: paused; daily budget: €120.00").
+ *    daily budget, total budget ("status: Paused; daily budget: EUR 120.00").
  * 5. **Resulting expected state**: the complete materialised state the row holds, rendered by
  *    its decision shape (`own_budget`, `shared_member`, `budget`; AAP 0.5.2).
  * 6. **Note**.
@@ -399,10 +399,11 @@ function patchValue(patch: unknown, field: keyof DecisionPatchView): string | nu
 
 /**
  * The "Patch applied" cell: the fields the submission carried, in the fixed order status,
- * daily budget, total budget, joined with "; ", for example "status: paused; daily budget:
- * €120.00". The status shows its stored value and amounts are formatted in the subject's
- * currency. An empty patch reads "Platform state at first sync" on a baseline row and an em dash
- * on any other row.
+ * daily budget, total budget, joined with "; ", for example "status: Paused; daily budget:
+ * EUR 120.00". The status shows its label ({@link statusLabel}), as every other status on
+ * `/decisions` and `/actions` reads, and amounts are formatted in the subject's currency. An
+ * empty patch reads "Platform state at first sync" on a baseline row and an em dash on any
+ * other row.
  *
  * A shared member's budget assignment is not a patch field: it changes only through a
  * discrepancy resolution, whose patch is empty (AAP 0.5.2), and `DecisionPatchView` defines no
@@ -416,7 +417,7 @@ function describePatch(decision: Decision): string {
     if (value === null) {
       continue;
     }
-    const shown = field === 'status' ? value : formatMoney(value, currency);
+    const shown = field === 'status' ? statusLabel(value) : formatMoney(value, currency);
     parts.push(`${FIELD_LABELS[field]}: ${shown}`);
   }
   if (parts.length > 0) {
@@ -425,7 +426,7 @@ function describePatch(decision: Decision): string {
   return decision.origin === 'baseline' ? BASELINE_PATCH_TEXT : EM_DASH;
 }
 
-/** The row's amounts that are set, as "daily budget $500.00", in the subject's currency. */
+/** The row's amounts that are set, as "daily budget USD 500.00", in the subject's currency. */
 function amountParts(decision: Decision): string[] {
   const parts: string[] = [];
   for (const field of AMOUNT_FIELDS) {
@@ -464,7 +465,7 @@ const NO_BUDGET_NAMES: ReadonlyMap<number, string> = new Map<number, string>();
  *
  * @example
  * ```ts
- * describeExpectedState(savedDecision); // "Active · daily budget $160.00"
+ * describeExpectedState(savedDecision); // "Active · daily budget USD 160.00"
  * ```
  */
 export function describeExpectedState(
@@ -966,7 +967,7 @@ export function DecisionLog() {
         Stack gap alone; Stack takes the region out of the column while it is empty.
       */}
       <Stack gap={5}>
-        {log === undefined && failure === null ? <Spinner label={LOADING_LABEL} /> : null}
+        {log === undefined && failure === null ? <Spinner label={LOADING_LABEL} showLabel /> : null}
         <div role="status">{notices.length === 0 ? null : <Stack gap={3}>{notices}</Stack>}</div>
         {content}
       </Stack>

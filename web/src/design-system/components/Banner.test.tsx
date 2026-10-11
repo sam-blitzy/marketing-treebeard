@@ -167,4 +167,37 @@ describe('Banner', () => {
 
     expect(bannerOf('No id').hasAttribute('id')).toBe(false);
   });
+
+  it('breaks long identifiers of a string title and content at their underscores only', () => {
+    const title =
+      'No CRM link for Google campaigns: HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY not configured';
+    const content = 'Set HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY, then sync HubSpot.';
+    const { container } = render(<Banner title={title}>{content}</Banner>);
+
+    const titleNode = container.querySelector('.ds-banner__title');
+    const contentNode = container.querySelector('.ds-banner__content');
+    // The text, and so the banner's accessible text, is exactly the API's.
+    expect(titleNode?.textContent).toBe(title);
+    expect(contentNode?.textContent).toBe(content);
+    expect(titleNode?.querySelectorAll('wbr')).toHaveLength(3);
+    expect(contentNode?.querySelectorAll('wbr')).toHaveLength(4);
+    for (const wbr of container.querySelectorAll('wbr')) {
+      expect(wbr.previousSibling?.textContent?.endsWith('_')).toBe(true);
+    }
+  });
+
+  it('leaves a title without a long identifier, and element content, as given', () => {
+    const { container } = render(
+      <Banner title="Simulated data: Google (DATA_MODE=simulated)">
+        <em>HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY</em>
+      </Banner>,
+    );
+
+    expect(container.querySelector('.ds-banner__title')?.innerHTML).toBe(
+      'Simulated data: Google (DATA_MODE=simulated)',
+    );
+    expect(container.querySelector('.ds-banner__content')?.innerHTML).toBe(
+      '<em>HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY</em>',
+    );
+  });
 });

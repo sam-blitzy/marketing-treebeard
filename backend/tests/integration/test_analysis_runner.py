@@ -923,7 +923,7 @@ async def test_stored_c0_cards_lead_with_the_recommendations_they_hold(
         # Both campaigns were chosen because items depend on them, so each holds some.
         assert held[discrepancy_id] > 0, discrepancy_id
         # The action and reason still state the platform and decided values.
-        assert card.action == "Resolve: platform shows paused, last decided active"
+        assert card.action == "Resolve: platform shows Paused, last decided Active"
 
 
 @pytest.mark.anyio

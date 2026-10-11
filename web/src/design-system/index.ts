@@ -25,8 +25,8 @@
  * `shared.css` where it uses it), so importing a component brings its styles, and `tokens.css`
  * is imported once, by `src/main.tsx`.
  *
- * Exports follow the component order of AAP 0.4.2, one group per component, with the token
- * constants last.
+ * Exports follow the component order of AAP 0.4.2, one group per component, then the
+ * identifier-break text helper, with the token constants last.
  *
  * GAP: bind to Blitzy OS on source arrival.
  *
@@ -124,6 +124,10 @@ export type { EmptyStateProps } from './components/EmptyState';
 // Sub-list switch (Block / Expand / Review). GAP: bind to Blitzy OS on source arrival.
 export { Tabs } from './components/Tabs';
 export type { TabItem, TabsProps } from './components/Tabs';
+
+// Line-break opportunities after the underscores of long identifiers in API text, which Banner
+// and Badge apply themselves. GAP: keep applying it in the Blitzy OS bindings (see GAPS.md).
+export { withIdentifierBreaks } from './components/identifierBreaks';
 
 // Semantic token names, tones and spacing steps. GAP: bind to Blitzy OS on source arrival.
 // cssVar is not re-exported: tokens.ts reserves it for the wrappers, and feature code styles

@@ -23,7 +23,8 @@
  *    budget, as the API marks it, AAP 0.5.4.1) and a one-line summary of the spending days and
  *    the rule's predicate days (B4: weekend days, then weekdays, with spend) against what the
  *    evidence requires, and whose "Efficiency" cell holds cost per outcome against the account
- *    baseline. The grid stacks to one column below its breakpoint (design system).
+ *    baseline. Each cell title carries its definition as `Tooltip` help (AAP 0.4.2). The grid
+ *    stacks to one column below its breakpoint (design system).
  * 2. **Budget days**: a captioned table of every day count against its requirement, in the
  *    order of AAP 0.5.4.1 Evidence whatever the API's metric order: known-budget (or
  *    budget-active) days, spending days, the predicate days (capped, high-utilization or
@@ -56,10 +57,11 @@
 import type { ReactElement, ReactNode } from 'react';
 
 import type { Item, Metric } from '../../../api/types';
-import { DataTable, Grid, Stack } from '../../../design-system';
+import { DataTable, Grid, Stack, Tooltip } from '../../../design-system';
 import type { DataTableColumn } from '../../../design-system';
 import {
   EM_DASH,
+  FIGURE_SEPARATOR,
   NOT_APPLICABLE,
   UNAVAILABLE,
   formatCount,
@@ -67,6 +69,7 @@ import {
   formatMoney,
   isDecimalString,
 } from '../../../lib/format';
+import { evidenceRatioDigits } from '../EvidenceTable';
 import { RecommendationCard } from '../RecommendationCard';
 import {
   allocations,
@@ -81,6 +84,7 @@ import {
   unallocatedAmount,
 } from '../evidenceExtra';
 import type { Allocation, DayCount, Funding, SharedMember } from '../evidenceExtra';
+import { metricHelp } from '../metricHelp';
 import { FieldList, SectionFrame, groupRepeatsSectionTitle } from './SectionFrame';
 import type { FieldItem, SectionComponentProps } from './SectionFrame';
 
@@ -140,20 +144,27 @@ const SHARED_BUDGET_FLAG = 'shared_budget';
  * The window utilization as display text: the ratio as a percentage, or "n/a" when the API marks
  * the measure as not applying (a lifetime or custom-period budget, or no known-budget active day;
  * AAP 0.5.4.1). The API's "n/a" is passed through `formatMetric` verbatim and normalised to
- * {@link NOT_APPLICABLE}, so every not-applicable utilization reads the same.
+ * {@link NOT_APPLICABLE}, so every not-applicable utilization reads the same. The percentage
+ * takes the evidence table's precision (`ratioDigits`, {@link evidenceRatioDigits}), so it
+ * reads exactly as the same metric's row in the card's evidence.
  */
-function utilizationText(metric: Metric | null): string {
+function utilizationText(metric: Metric | null, ratioDigits: number): string {
   if (metric === null) {
     return UNAVAILABLE;
   }
-  const text = formatMetric(metric);
+  const text = formatMetric(metric, { ratioDigits });
   return text.trim().toLowerCase() === NOT_APPLICABLE ? NOT_APPLICABLE : text;
 }
 
-/** A day count's figure against its requirement: `"26 / 5"`, or `"20 / —"` when none applies. */
+/**
+ * A day count's figure against its requirement: `"26 / 5"`, or `"20 / —"` when none applies,
+ * joined by the shared {@link FIGURE_SEPARATOR}: a slash between two no-break spaces (U+00A0),
+ * so a line wraps between the words of a label or between parts, never inside an
+ * "observed / required" figure such as "0 / —".
+ */
 function dayRatio(count: DayCount): string {
   const required = count.required === null ? EM_DASH : formatCount(count.required);
-  return `${formatCount(count.observed)} / ${required}`;
+  return `${formatCount(count.observed)}${FIGURE_SEPARATOR}${required}`;
 }
 
 /**
@@ -203,7 +214,7 @@ function utilizationFields(item: Item, counts: readonly DayCount[]): FieldItem[]
     {
       key: KEYS.utilization,
       label: utilization?.label ?? 'Window utilization',
-      value: utilizationText(utilization),
+      value: utilizationText(utilization, evidenceRatioDigits(item.evidence)),
     },
   ];
   const summary = daySummary(counts);
@@ -243,8 +254,11 @@ function efficiencyFields(item: Item): FieldItem[] {
 /**
  * Utilization beside efficiency (AAP 0.5.5: "utilization and efficiency in adjacent columns").
  * Two `Stack` cells in one two-column `Grid`, each named and titled, so a screen reader announces
- * "Utilization" and "Efficiency" as groups and a sighted reader sees the same titles. Rendered
- * only when the evidence carries a utilization or a cost-per-outcome metric.
+ * "Utilization" and "Efficiency" as groups and a sighted reader sees the same titles. Each title
+ * carries its definition as `Tooltip` help, from {@link metricHelp}: window utilization for
+ * "Utilization" and cost per outcome against the account baseline for "Efficiency"
+ * (AAP 0.5.4.1). Rendered only when the evidence carries a utilization or a cost-per-outcome
+ * metric.
  */
 function UtilizationEfficiency({
   item,
@@ -263,14 +277,20 @@ function UtilizationEfficiency({
       {/*
         BLITZY [DESIGN_SYSTEM_GAP]: the design system has no text or label primitive, and feature
         code carries no CSS (AAP 0.4.4). Each cell's title is therefore a <span> in a Stack; the
-        Stack's accessible name repeats it so the cell is announced as a named group.
+        Stack's accessible name repeats it so the cell is announced as a named group. The title
+        carries its measure's help text in a Tooltip (AAP 0.4.2), inside the <span> so the
+        trigger keeps the title's own width rather than the Stack's full column.
       */}
       <Stack gap={1} aria-label="Utilization">
-        <span>Utilization</span>
+        <span>
+          <Tooltip content={metricHelp(KEYS.utilization)}>Utilization</Tooltip>
+        </span>
         <FieldList fields={utilizationFields(item, counts)} />
       </Stack>
       <Stack gap={1} aria-label="Efficiency">
-        <span>Efficiency</span>
+        <span>
+          <Tooltip content={metricHelp(KEYS.costPerOutcome)}>Efficiency</Tooltip>
+        </span>
         <FieldList fields={efficiencyFields(item)} />
       </Stack>
     </Grid>

@@ -6,7 +6,7 @@
  *
  * | Path         | Screen           | Guard and search                                        |
  * |--------------|------------------|---------------------------------------------------------|
- * | `/login`     | `LoginPage`      | none; `?redirect=` is kept only as a same-origin path   |
+ * | `/login`     | `LoginPage`      | signed out; `?redirect=` only as a same-origin path     |
  * | `/`          | none             | redirects to `/actions`                                 |
  * | `/actions`   | `ActionsPage`    | signed in; `?run=<id>` addresses one run                |
  * | `/decisions` | `DecisionsPage`  | signed in                                               |
@@ -14,26 +14,43 @@
  * | `/settings`  | `SettingsPage`   | signed in (read-only)                                   |
  * | any other    | "Page not found" | signed in, so it renders inside the app shell           |
  *
- * `LoginPage` and `ActionsPage` are imported statically; the `/decisions`, `/sources` and
- * `/settings` screens are code-split (see "Code splitting" below).
+ * `/login` serves signed-out visitors only: one already signed in is sent on, replacing the
+ * entry, to the `redirect` path (search and hash included) or to `/actions`, the default page
+ * after login (see `loginRoute`). Every visit to `/login` revalidates the session, through the
+ * cached user or one `GET /auth/me`, so a tab still holding a 401 from before a sign-in in
+ * another tab of the same browser is sent on too. The one exception is the arrival of the auth
+ * guard's own 401 redirect, which the guard marks in its history state (`authGuardSignedOut`):
+ * the guard has just asked, so `/login` takes that answer once for that history entry and asks
+ * nothing (see {@link isGuardSignedOutArrival}).
+ *
+ * `LoginPage` and `ActionsPage`, with its presentational failure state `ActionsLoadFailure`, are
+ * imported statically; the `/decisions`, `/sources` and `/settings` screens are code-split (see
+ * "Code splitting" below).
  *
  * The four signed-in screens sit under one pathless layout route, `authenticated`. Its
  * `beforeLoad` reads `GET /auth/me` through the TanStack Query cache
  * (`ensureQueryData(meQueryOptions())`), so navigation between screens re-asks nothing while the
- * cached user is present. A 401 redirects to `/login?redirect=<the requested href>`; any other
- * failure (for example 503 `database_unavailable`) is rethrown and shown by {@link RootError}
- * with a Retry button, never mistaken for a signed-out session.
+ * cached user is present. A 401 redirects to `/login?redirect=<the requested href>`, marked as
+ * the guard's redirect in its history state; any other failure (for example 503
+ * `database_unavailable`, or a 502 while the API is down) is rethrown and shown by the layout's
+ * own error screen ({@link SignedInError}) with a Retry button, never mistaken for a signed-out
+ * session. On `/actions` that screen is the page's own failure state, "Actions could not be
+ * loaded" (`ActionsLoadFailure`); on every other path it is "Something went wrong".
  *
- * The layout ({@link AppLayout}) renders the one `PageShell` of every signed-in screen: the
- * `TopBar` with the signed-in email and "Sign out", the primary `SideNav` (Actions, Decisions,
- * Sources, Settings) and the routed page in `<main>`. Each page renders its own
- * `PageShell.Title` and sections, and `LoginPage` renders its own `PageShell`, so every screen
- * has exactly one `<main>` landmark.
+ * The layout ({@link AppLayout}) renders the one `PageShell` of every signed-in screen through
+ * {@link SignedInShell}: the `TopBar` with the signed-in email and "Sign out", the primary
+ * `SideNav` (Actions, Decisions, Sources, Settings) and the routed page in `<main>`. The
+ * layout's own error and pending screens ({@link SignedInError}, {@link SignedInPending}) use
+ * the same shell without the email, because no session has been confirmed, and render no page.
+ * Each page renders its own `PageShell.Title` and sections, and `LoginPage` renders its own
+ * `PageShell`, so every screen has exactly one `<main>` landmark.
  *
- * Error, not-found and pending screens render through {@link RouteFrame}: inside the layout
- * they fill `<main>` beside the navigation, and outside it (the layout's own guard failed or is
- * still pending, the login screen failed, or a `notFound()` was raised outside the layout) they
- * bring a `PageShell` of their own, so each keeps exactly one `<main>`. The error and not-found
+ * Error, not-found and pending screens render through {@link RouteFrame}: inside a signed-in
+ * shell they fill `<main>` beside the primary navigation, and outside it (the login screen
+ * failed or is still pending, the root route failed, or a `notFound()` was raised outside the
+ * layout) they bring a {@link SignInShell}: a `PageShell` with the product's `TopBar` and the
+ * one-link "Sign in" `SideNav` that `LoginPage` shows, so every screen has a `PageShell`, a
+ * `TopBar` and a `SideNav` (AAP 0.5.5) and exactly one `<main>`. The error and not-found
  * screens render a `PageShell.Title`, the page's one `<h1>`; the pending screen renders only its
  * labelled `Spinner`, with no heading.
  *
@@ -107,7 +124,7 @@ import {
   useRouter,
   useRouterState,
 } from '@tanstack/react-router';
-import type { ErrorComponentProps, RouterHistory } from '@tanstack/react-router';
+import type { ErrorComponentProps, ParsedLocation, RouterHistory } from '@tanstack/react-router';
 import { createContext, useContext, useEffect, useId, useRef, useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 
@@ -126,7 +143,7 @@ import {
   TopBar,
 } from './design-system';
 import type { SideNavItem, SideNavLinkProps } from './design-system';
-import { ActionsPage } from './features/actions/ActionsPage';
+import { ActionsLoadFailure, ActionsPage } from './features/actions/ActionsPage';
 import { LoginPage } from './features/auth/LoginPage';
 import { focusElement, idFromHash } from './lib/focus';
 
@@ -142,6 +159,15 @@ const DEFAULT_AFTER_LOGIN = '/actions';
 
 /** Accessible name of the primary navigation landmark. */
 const PRIMARY_NAV_LABEL = 'Primary';
+
+/**
+ * The sign-in screen's path: the one destination of the navigation a screen outside the
+ * authenticated layout shows ({@link SignInShell}).
+ */
+const SIGN_IN_PATH = '/login';
+
+/** Text of that navigation's one link, the sign-in screen's own title. */
+const SIGN_IN_NAV_LABEL = 'Sign in';
 
 /** Text of the top bar's sign-out button. */
 const SIGN_OUT_LABEL = 'Sign out';
@@ -382,8 +408,9 @@ function screenImporter<TModule>(importer: () => Promise<TModule>): () => Promis
 // ---------------------------------------------------------------------------------------------
 
 /**
- * `true` inside {@link AppLayout}, whose `PageShell` already provides the top bar, the navigation
- * and `<main>`. {@link RouteFrame} reads it to decide whether to bring a `PageShell` of its own.
+ * `true` inside {@link SignedInShell}, whose `PageShell` already provides the top bar, the
+ * navigation and `<main>`: the authenticated layout and its own error and pending screens.
+ * {@link RouteFrame} reads it to decide whether to bring a `PageShell` of its own.
  */
 const InsideAppLayoutContext = createContext(false);
 
@@ -400,11 +427,12 @@ interface RouteFrameProps {
  * The frame of a screen the router renders on its own: an error, a not-found path or a pending
  * route.
  *
- * Inside the authenticated layout the content fills that layout's `<main>`, next to the primary
- * navigation. Outside it (the layout's guard itself failed or is still pending, the login screen
- * failed, or a `notFound()` was raised outside the layout) the content gets a `PageShell` with
- * the product's `TopBar`, so the screen still has exactly one `<main>` and a skip link. Either
- * way the content is one `Stack`, spaced like the pages.
+ * Inside a {@link SignedInShell} (the authenticated layout, or its own error and pending
+ * screens) the content fills that shell's `<main>`, next to the primary navigation. Outside it
+ * (the login screen failed or is still pending, the root route failed, or a `notFound()` was
+ * raised outside the layout) the content gets a {@link SignInShell}, so the screen still has a
+ * `TopBar`, a `SideNav`, exactly one `<main>` and a skip link. Either way the content is one
+ * `Stack`, spaced like the pages.
  */
 function RouteFrame({ children }: RouteFrameProps): ReactElement {
   const insideAppLayout = useContext(InsideAppLayoutContext);
@@ -412,7 +440,71 @@ function RouteFrame({ children }: RouteFrameProps): ReactElement {
   if (insideAppLayout) {
     return content;
   }
-  return <PageShell topBar={<TopBar productName={PRODUCT_NAME} />}>{content}</PageShell>;
+  return <SignInShell>{content}</SignInShell>;
+}
+
+/**
+ * `SideNav`'s `renderLink` for the sign-in navigation of {@link SignInShell}: a TanStack `Link`
+ * to `/login` carrying the class contract and `aria-current` that `SideNav` built, as
+ * `LoginPage` renders its own. On `/login` itself (its item is current) it keeps the current
+ * search, so activating it never drops the `redirect` a sign-in returns to; from any other path
+ * it opens `/login` without a search. It judges "active" as {@link isCurrentPath} does, so
+ * `Link` never adds an `aria-current` of its own that the item does not carry.
+ *
+ * @param item - The item being rendered; its destination is also `linkProps.href`.
+ * @param linkProps - The props `SideNav` built for the link.
+ * @returns The link element.
+ */
+function renderSignInLink(item: SideNavItem, linkProps: SideNavLinkProps): ReactNode {
+  return (
+    <Link
+      to={SIGN_IN_PATH}
+      search={item.current === true ? true : {}}
+      className={linkProps.className}
+      aria-current={linkProps['aria-current']}
+      activeProps={NO_LINK_STATE_PROPS}
+      activeOptions={PRIMARY_LINK_ACTIVE_OPTIONS}
+    >
+      {linkProps.children}
+    </Link>
+  );
+}
+
+/** Props of {@link SignInShell}. */
+interface SignInShellProps {
+  /** What `<main>` holds: the content of an error, not-found or pending screen. */
+  children: ReactNode;
+}
+
+/**
+ * The `PageShell` of a screen the router renders outside the authenticated layout: the login
+ * route's error and pending screens, the root route's error screen, and a `notFound()` raised
+ * outside the layout.
+ *
+ * Every screen uses `PageShell`, `TopBar` and `SideNav` (AAP 0.5.5), so it brings all three: the
+ * `TopBar` with the product name only, and the "Primary" `SideNav` that `LoginPage` shows,
+ * holding one link, "Sign in", to `/login`, marked current only on `/login`. Nothing here knows
+ * whether the visitor is signed in, so the navigation never lists the signed-in screens, as
+ * `LoginPage`'s never does.
+ */
+function SignInShell({ children }: SignInShellProps): ReactElement {
+  const pathname = useRouterState({ select: (state) => state.location.pathname });
+  const items: SideNavItem[] = [
+    {
+      key: 'login',
+      label: SIGN_IN_NAV_LABEL,
+      href: SIGN_IN_PATH,
+      current: isCurrentPath(pathname, SIGN_IN_PATH),
+    },
+  ];
+  return (
+    <PageShell
+      topBar={<TopBar productName={PRODUCT_NAME} />}
+      sideNav={<SideNav label={PRIMARY_NAV_LABEL} items={items} renderLink={renderSignInLink} />}
+    >
+      {children}
+    </PageShell>
+  );
 }
 
 /**
@@ -591,7 +683,9 @@ function RootComponent(): ReactElement {
 
 /**
  * The error screen of every route: the root route's `errorComponent` and the router's
- * `defaultErrorComponent`.
+ * `defaultErrorComponent`, and the content of the authenticated layout's own error screen
+ * ({@link SignedInError}) on every path but `/actions`, which it renders inside a
+ * {@link SignedInShell}.
  *
  * It shows the "Something went wrong" title, then a critical `Banner` whose title is the
  * failure's message: the {@link ApiError} message, which the API client guarantees is safe to
@@ -670,7 +764,7 @@ function NotFound(): ReactElement {
 function RoutePending(): ReactElement {
   return (
     <RouteFrame>
-      <Spinner label={PENDING_LABEL} />
+      <Spinner label={PENDING_LABEL} showLabel />
     </RouteFrame>
   );
 }
@@ -691,17 +785,18 @@ function isPrimaryPath(href: string): href is PrimaryPath {
 }
 
 /**
- * Whether the primary destination `to` is the screen at `pathname`.
+ * Whether the navigation destination `to` is the screen at `pathname`.
  *
- * The match is exact, ignoring one trailing slash: the four screens have no sub-pages, so a path
+ * The match is exact, ignoring one trailing slash: the screens have no sub-pages, so a path
  * below one (`/actions/nope`) is the not-found screen and marks no link as the current page. The
- * search is ignored, so `/actions?run=202`, a custom run, still marks Actions.
+ * search is ignored, so `/actions?run=202`, a custom run, still marks Actions, and
+ * `/login?redirect=…` still marks "Sign in".
  *
  * @param pathname - The router's current pathname.
- * @param to - A primary destination.
+ * @param to - A primary destination, or the sign-in screen of {@link SignInShell}.
  * @returns `true` when the navigation should mark `to` as the current page.
  */
-function isCurrentPath(pathname: string, to: PrimaryPath): boolean {
+function isCurrentPath(pathname: string, to: PrimaryPath | typeof SIGN_IN_PATH): boolean {
   const normalised =
     pathname.length > 1 && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
   return normalised === to;
@@ -751,14 +846,24 @@ function isSessionGone(error: ApiError): boolean {
   return error.status === 401;
 }
 
+/** Props of {@link SignedInShell}. */
+interface SignedInShellProps {
+  /**
+   * The signed-in email the top bar shows. Omitted on the authenticated layout's own error and
+   * pending screens, where no session has been confirmed; an empty email is not shown either.
+   */
+  email?: string;
+  /** What `<main>` holds: the routed page, or the layout's error or pending content. */
+  children: ReactNode;
+}
+
 /**
- * The authenticated layout: the one `PageShell` of every signed-in screen.
+ * The one `PageShell` of every signed-in screen, and of the authenticated layout's own error and
+ * pending screens. It provides `InsideAppLayoutContext`, so a {@link RouteFrame} inside it fills
+ * its `<main>` instead of bringing a shell of its own.
  *
- * - **Top bar**: the product name, the signed-in email (plain text, not a heading) and a quiet
- *   "Sign out" button. The email is the user the auth guard read from `GET /auth/me` and put in
- *   the route context. It is read from there rather than through a `useMe()` observer: sign-out
- *   clears the query cache before the screen leaves, and an observer would then re-fetch
- *   `GET /auth/me` only to receive the 401 of the session just ended.
+ * - **Top bar**: the product name, the signed-in email when `email` is given (plain text, not a
+ *   heading) and a quiet "Sign out" button.
  * - **Sign out** posts `/auth/logout`. Once it succeeds, or fails with 401 because the session
  *   had already ended, the query cache is cleared and the screen moves to `/login`, where
  *   {@link useFocusRecoveryAfterNavigation} places focus. Any other failure keeps the user signed
@@ -779,10 +884,14 @@ function isSessionGone(error: ApiError): boolean {
  *     another control during the request stays where it is.
  * - **Primary navigation**: Actions, Decisions, Sources and Settings, in that order. The current
  *   screen's link carries `aria-current="page"`, set by `SideNav` from the router's pathname.
- * - **Main**: the routed page, or "Page not found" for a path no screen matches.
+ * - **Main**: `children`.
+ *
+ * It reads no server state: the mutation behind "Sign out" sends nothing until it is used.
+ *
+ * @param props - See {@link SignedInShellProps}.
+ * @returns The shell around `children`.
  */
-function AppLayout(): ReactElement {
-  const email = authenticatedRoute.useRouteContext({ select: (context) => context.me.email });
+function SignedInShell({ email, children }: SignedInShellProps): ReactElement {
   const logout = useLogout();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
@@ -833,7 +942,7 @@ function AppLayout(): ReactElement {
       <PageShell
         topBar={
           <TopBar productName={PRODUCT_NAME}>
-            {email !== '' && <span>{email}</span>}
+            {email !== undefined && email !== '' && <span>{email}</span>}
             <div role="status" aria-live="polite" aria-atomic="false">
               <Inline gap={3} justify="end">
                 {signOutFailed && <span id={signOutErrorId}>{SIGN_OUT_FAILED_MESSAGE}</span>}
@@ -852,9 +961,150 @@ function AppLayout(): ReactElement {
         }
         sideNav={<SideNav label={PRIMARY_NAV_LABEL} items={items} renderLink={renderPrimaryLink} />}
       >
-        <Outlet />
+        {children}
       </PageShell>
     </InsideAppLayoutContext.Provider>
+  );
+}
+
+/**
+ * The authenticated layout: the {@link SignedInShell} of every signed-in screen, with the
+ * signed-in email, around the routed page, or "Page not found" for a path no screen matches.
+ *
+ * The email is the user the auth guard read from `GET /auth/me` and put in the route context. It
+ * is read from there rather than through a `useMe()` observer: sign-out clears the query cache
+ * before the screen leaves, and an observer would then re-fetch `GET /auth/me` only to receive
+ * the 401 of the session just ended.
+ */
+function AppLayout(): ReactElement {
+  const email = authenticatedRoute.useRouteContext({ select: (context) => context.me.email });
+  return (
+    <SignedInShell email={email}>
+      <Outlet />
+    </SignedInShell>
+  );
+}
+
+/**
+ * The routers whose `/actions` guard-failure screen ({@link ActionsGuardError}) saw its Retry
+ * fail again, until the screen that shows the new failure has read the mark.
+ *
+ * Re-running the guard replaces the screen: the router shows the layout's pending screen while
+ * `GET /auth/me` runs, and the error boundary then mounts a new error screen, so the screen that
+ * started the Retry cannot return focus to the button of the one that follows it. Keyed weakly
+ * by router, so a discarded router (each test builds one) is not retained.
+ */
+const actionsRetriesFailedAgain = new WeakSet<object>();
+
+/**
+ * The authenticated layout's error screen on `/actions` ({@link SignedInError}): the page's own
+ * failure state, {@link ActionsLoadFailure}, with the `<h1>` "Actions", "Actions could not be
+ * loaded", the error's safe reason and "Retry". It reads no server state and renders no page, so
+ * no protected read starts before the guard has confirmed the session.
+ *
+ * "Retry" re-runs the guard: it shows the button as loading, invalidates the router, which reads
+ * `GET /auth/me` again (a failed query holds no data), and once that load has settled resets
+ * the error boundary, as {@link RootError} does. When the guard passes, the routed page renders
+ * in the layout. When it fails again, the new screen returns focus to its Retry button if focus
+ * fell to `<body>` (or to `<main>`, where {@link useFocusRecoveryAfterNavigation} places focus
+ * that fell), so keyboard users can retry at once (WCAG 2.2 SC 2.4.3); focus the user moved to
+ * another control is left alone.
+ *
+ * @param props - The router's error props: the guard's error and the boundary's `reset`.
+ * @returns The `/actions` failure state, filling the signed-in shell's `<main>`.
+ */
+function ActionsGuardError({ error, reset }: ErrorComponentProps): ReactElement {
+  const router = useRouter();
+  const [retrying, setRetrying] = useState(false);
+  const retryButtonRef = useRef<HTMLButtonElement>(null);
+
+  // Mounted for a Retry that failed again: focus goes back to this screen's Retry button.
+  useEffect(() => {
+    if (!actionsRetriesFailedAgain.delete(router)) {
+      return;
+    }
+    const focused = document.activeElement;
+    if (focused === null || focused === document.body || focused.tagName === 'MAIN') {
+      retryButtonRef.current?.focus();
+    }
+  }, [router]);
+
+  const retry = async (): Promise<void> => {
+    setRetrying(true);
+    try {
+      await router.invalidate();
+    } finally {
+      setRetrying(false);
+      // Marked before the reset, so the screen the reset mounts for a renewed failure reads it.
+      const failedAgain =
+        isCurrentPath(router.state.location.pathname, '/actions') &&
+        router.state.matches.some(
+          (match) => match.routeId === authenticatedRoute.id && match.status === 'error',
+        );
+      if (failedAgain) {
+        actionsRetriesFailedAgain.add(router);
+      }
+      reset();
+    }
+  };
+
+  return (
+    <ActionsLoadFailure
+      error={error}
+      onRetry={() => {
+        void retry();
+      }}
+      retrying={retrying}
+      retryButtonRef={retryButtonRef}
+    />
+  );
+}
+
+/**
+ * The authenticated layout's `errorComponent`: the error screen of a failure the layout itself
+ * hit, chiefly its auth guard's `GET /auth/me` failing with anything but a 401 (a 502 or 503
+ * while the API is down, or no network). Its content fills the `<main>` of a
+ * {@link SignedInShell}, beside the primary navigation and below "Sign out", as on every
+ * signed-in screen:
+ *
+ * - on `/actions` (one trailing slash and any search allowed, as {@link isCurrentPath} judges
+ *   it), the page's own failure state, {@link ActionsGuardError}, so a reload during an outage
+ *   shows "Actions could not be loaded" where the page would be;
+ * - on every other path, and for a {@link ScreenChunkError}, {@link RootError}'s "Something went
+ *   wrong", safe message and Retry.
+ *
+ * It stays fail-closed: no session was confirmed, so the top bar shows no email, and no page
+ * renders or reads data, because the routed screens sit only under {@link AppLayout}. Either
+ * Retry re-runs the guard. A 401 never reaches it: the guard turns it into the redirect to
+ * `/login`.
+ *
+ * @param props - The router's error props, passed on to the screen it renders.
+ * @returns The error screen inside the signed-in shell.
+ */
+function SignedInError(props: ErrorComponentProps): ReactElement {
+  const pathname = useRouterState({ select: (state) => state.location.pathname });
+  const onActions =
+    isCurrentPath(pathname, '/actions') && !(props.error instanceof ScreenChunkError);
+  return (
+    <SignedInShell>
+      {onActions ? <ActionsGuardError {...props} /> : <RootError {...props} />}
+    </SignedInShell>
+  );
+}
+
+/**
+ * The authenticated layout's `pendingComponent`: while its auth guard waits for `GET /auth/me`
+ * longer than the router's pending threshold, {@link RoutePending}'s spinner fills the `<main>`
+ * of a {@link SignedInShell} without an email, so the screen is framed as it will be once the
+ * guard passes. No page renders or reads data before it has.
+ *
+ * @returns The pending screen inside the signed-in shell.
+ */
+function SignedInPending(): ReactElement {
+  return (
+    <SignedInShell>
+      <RoutePending />
+    </SignedInShell>
   );
 }
 
@@ -879,17 +1129,124 @@ const rootRoute = createRootRouteWithContext<RouterContext>()({
 });
 
 /**
- * `/login`, outside the authenticated layout. A rejected `redirect` is removed from the URL
- * (see {@link carriesRejectedValue}).
+ * The `/login` history entries, per query client and by their `__TSR_key`, whose session check
+ * the auth guard's 401 has already stood in for once (see {@link isGuardSignedOutArrival}).
+ */
+const guardAnsweredEntries = new WeakMap<QueryClient, Set<string>>();
+
+/**
+ * Whether this `/login` load is the arrival of the auth guard's own 401 redirect, so the
+ * guard's answer stands in for the session check and the API is not asked twice in a row.
+ *
+ * All three must hold:
+ * - The entry carries `state.authGuardSignedOut`, which only that redirect writes (see
+ *   {@link authenticatedRoute}).
+ * - The `queryKeys.me` entry still holds a 401, the answer the guard redirected on, so nothing
+ *   has confirmed a session since.
+ * - This history entry has not been answered this way before. The marker stays on its entry,
+ *   so any later load of it (Back or Forward to it, Retry on its error screen) asks the API, as
+ *   every other visit does: by then the visitor may have signed in in another tab, which shares
+ *   this tab's session cookie. A reload starts with an empty cache, so it asks too.
+ *
+ * The test is deterministic: it reads the history entry and the cache, never the clock.
+ *
+ * @param queryClient - The app's query client, from the route context.
+ * @param state - The history state of the `/login` location being loaded.
+ * @returns `true` at most once per marked entry, and only while the guard's 401 is cached.
+ */
+function isGuardSignedOutArrival(
+  queryClient: QueryClient,
+  state: ParsedLocation['state'],
+): boolean {
+  const entry = state.__TSR_key;
+  if (state.authGuardSignedOut !== true || entry === undefined) {
+    return false;
+  }
+  const cached = queryClient.getQueryState(meQueryOptions().queryKey);
+  if (cached?.status !== 'error' || !isApiError(cached.error) || cached.error.status !== 401) {
+    return false;
+  }
+  const answered = guardAnsweredEntries.get(queryClient) ?? new Set<string>();
+  if (answered.has(entry)) {
+    return false;
+  }
+  answered.add(entry);
+  guardAnsweredEntries.set(queryClient, answered);
+  return true;
+}
+
+/**
+ * Whether the visitor opening `/login` already holds a valid session, read through the
+ * `queryKeys.me` entry the auth guard reads (`meQueryOptions()`).
+ *
+ * - The auth guard's own 401 redirect arriving ({@link isGuardSignedOutArrival}): `false`, with
+ *   no new request. The guard has just read `GET /auth/me` and the API answered 401.
+ * - Every other visit: `ensureQueryData` answers, from the cache when it holds the user (seeded
+ *   by sign-in or read by the guard), else with one `GET /auth/me`, which never retries. A
+ *   cached 401 holds no user, so the "Sign in" links, an in-app navigation to `/login`, and
+ *   Back or Forward to a `/login` entry all ask the API again, and find a session started in
+ *   another tab. Sign-out and an expired session clear the cache before they open `/login`, and
+ *   a reload starts with an empty one, so those ask as well.
+ *   - 200 `{email}`: `true`.
+ *   - Any failure (a 401, a 5xx, no response at all): `false`. No session can be confirmed, so
+ *     the sign-in form shows, and the form reports an outage itself when the visitor submits.
+ *
+ * @param queryClient - The app's query client, from the route context.
+ * @param state - The history state of the `/login` location being loaded.
+ * @returns `true` when the API confirmed the session, or the cache holds the signed-in user.
+ */
+async function hasSession(
+  queryClient: QueryClient,
+  state: ParsedLocation['state'],
+): Promise<boolean> {
+  if (isGuardSignedOutArrival(queryClient, state)) {
+    return false;
+  }
+  try {
+    await queryClient.ensureQueryData(meQueryOptions());
+    return true;
+  } catch {
+    // Whatever the failure, nothing confirmed a session: the sign-in form is the screen to show.
+    return false;
+  }
+}
+
+/**
+ * `/login`, outside the authenticated layout, for signed-out visitors. Its `beforeLoad`:
+ *
+ * 1. Removes a rejected `redirect` from the URL (see {@link carriesRejectedValue}).
+ * 2. Stops there on a preload (a hovered or focused "Sign in" link, `defaultPreload: 'intent'`),
+ *    so intent alone never sends a request.
+ * 3. Sends a visitor already signed in ({@link hasSession}) on to the sanitised `redirect`, as an
+ *    `href`, so its search and hash survive (`/actions?run=202`), or to `/actions`, the default
+ *    page after login. The redirect replaces `/login` in the history, so Back does not return to
+ *    it. Every other visitor gets the sign-in form.
+ *
+ * Every visit revalidates the session, so a tab still holding a 401 from before a sign-in in
+ * another tab finds that session the next time `/login` opens. The one load that asks nothing is
+ * the arrival of the auth guard's own 401 redirect, recognised by the `authGuardSignedOut` mark
+ * the guard puts in its history state, because the guard has just asked
+ * ({@link isGuardSignedOutArrival}).
+ *
+ * The redirect is thrown after {@link hasSession} has settled, outside its `try`, so no catch
+ * can swallow it. It cannot loop: `src/main.tsx` leaves the `queryKeys.me` read's 401 to the
+ * routes and clears the cache before it opens `/login` for any other 401, so the check asks
+ * the API again, which answers 401. A `redirect` that is itself a `/login` URL is followed the
+ * same way, from the cached user, and each hop drops one level of nesting, so the chain ends at
+ * the innermost target, or at `/actions` when that has none.
  */
 const loginRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/login',
   validateSearch: validateLoginSearch,
-  beforeLoad: ({ location, search }): void => {
+  beforeLoad: async ({ context, location, preload, search }): Promise<void> => {
     if (carriesRejectedValue(location.search, 'redirect', search.redirect)) {
       throw redirect({ to: '/login', search: {}, replace: true });
     }
+    if (preload || !(await hasSession(context.queryClient, location.state))) {
+      return;
+    }
+    throw redirect({ href: search.redirect ?? DEFAULT_AFTER_LOGIN, replace: true });
   },
   component: LoginRouteComponent,
 });
@@ -922,8 +1279,12 @@ interface AuthenticatedContext {
  * sign-in, or read once by an earlier navigation) and otherwise calls `GET /auth/me`, which never
  * retries. The user is returned as route context (`me`), which the layout's top bar shows. A 401
  * becomes a redirect to `/login` carrying the requested href (path, search and hash) as
- * `redirect`, so sign-in returns there. Every other failure is rethrown, so the error screen
- * shows it with Retry instead of sending a signed-in user to the login form.
+ * `redirect`, so sign-in returns there, and the `authGuardSignedOut` mark in its history state,
+ * so `/login` takes that fresh 401 as its own check instead of asking again
+ * ({@link isGuardSignedOutArrival}). Every other failure is rethrown, so the layout's own
+ * error screen ({@link SignedInError}) shows it with Retry, inside the signed-in shell, instead
+ * of sending a signed-in user to the login form. While the guard waits longer than the router's
+ * pending threshold, {@link SignedInPending} shows the spinner in the same shell.
  */
 const authenticatedRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -934,12 +1295,18 @@ const authenticatedRoute = createRoute({
       return { me };
     } catch (error) {
       if (isApiError(error) && error.status === 401) {
-        throw redirect({ to: '/login', search: { redirect: location.href } });
+        throw redirect({
+          to: '/login',
+          search: { redirect: location.href },
+          state: { authGuardSignedOut: true },
+        });
       }
       throw error;
     }
   },
   component: AppLayout,
+  errorComponent: SignedInError,
+  pendingComponent: SignedInPending,
 });
 
 /**
@@ -1111,10 +1478,21 @@ export function createAppRouter(
 
 /**
  * Registers the app's router with TanStack Router, so features type `Link to="/actions"
- * search={{ run }}` and `useNavigate()` against this tree without importing this module.
+ * search={{ run }}` and `useNavigate()` against this tree without importing this module, and
+ * types the app's own key in the history state that `redirect`, `Link` and `navigate` write.
  */
 declare module '@tanstack/react-router' {
   interface Register {
     router: AppRouter;
+  }
+
+  interface HistoryState {
+    /**
+     * `true` only on the `/login` entry the auth guard's 401 redirect writes
+     * ({@link authenticatedRoute}); absent everywhere else. The guard has just read
+     * `GET /auth/me` and the API answered 401, so that entry's first load takes the answer as
+     * its session check ({@link isGuardSignedOutArrival}).
+     */
+    authGuardSignedOut?: true;
   }
 }

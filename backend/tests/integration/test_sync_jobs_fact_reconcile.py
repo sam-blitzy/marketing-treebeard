@@ -48,6 +48,7 @@ from ads_engine.connectors.google_n8n.partition import (
     REASON_FINEST_PARTITION,
     FetchOutcome,
     PartitionedFetcher,
+    RowSink,
     interruption_reason,
 )
 from ads_engine.connectors.linkedin.client import LinkedInClient, Listing
@@ -869,11 +870,21 @@ async def _inject_google(world: World) -> dict[str, set[tuple[Any, ...]]]:
 
 
 def _patch_fetch(monkeypatch: pytest.MonkeyPatch, edit: FetchEdit) -> None:
-    """Pass every Google partitioned fetch through ``edit(query_id, scope, outcome)``."""
+    """Pass every Google partitioned fetch through ``edit(query_id, scope, outcome)``.
+
+    The fetch is read without the job's sink, so the edit sees its rows; the edited rows are
+    then handed to the sink, as a streaming fetch hands over what it accepted.
+    """
     original = PartitionedFetcher.partitioned_fetch
 
-    async def edited(self: PartitionedFetcher, query_id: str, scope: Any = None) -> FetchOutcome:
-        return edit(query_id, scope, await original(self, query_id, scope))
+    async def edited(
+        self: PartitionedFetcher, query_id: str, scope: Any = None, *, sink: RowSink | None = None
+    ) -> FetchOutcome:
+        outcome = edit(query_id, scope, await original(self, query_id, scope))
+        if sink is None or not outcome.rows:
+            return outcome
+        await sink(outcome.rows)
+        return replace(outcome, rows=(), streamed=outcome.streamed + len(outcome.rows))
 
     monkeypatch.setattr(PartitionedFetcher, "partitioned_fetch", edited)
 

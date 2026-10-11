@@ -313,7 +313,9 @@ the worker queues a fresh default-window run. Every rule and threshold key is ex
 - **Brute force**: sign-in is limited to 5 attempts per minute per client IP.
 - **Personal data**: lead emails are persisted only as SHA-256 hashes, and free-text form answers
   are not stored.
-- **Logs**: structured JSON with the n8n secret header and `Authorization` values redacted.
+- **Logs**: structured JSON with the n8n secret header and `Authorization` values redacted. The
+  nginx access log drops query strings, Basic-auth users and emails
+  ([Log redaction](docs/architecture.md#security)).
 - **Least privilege**: LinkedIn and HubSpot access uses read-only scopes.
 
 ## Development and CI

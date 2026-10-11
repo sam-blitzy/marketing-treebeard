@@ -63,11 +63,19 @@ Decisions taken in this module, each stated where its code lives:
   active dataset at all) has never succeeded, so it is both stale and incomplete, never
   silently fresh: on its cards, in ``stale_datasets`` and ``incomplete_datasets``, and in
   both banners ("no successful sync", "no freshness record").
+* **Sources with no active dataset**: a source left with no active primary dataset (a probe
+  defect at first start, which never falls back to simulated data, AAP 0.3.3) has every one
+  of its datasets listed stale and incomplete whether or not an item on the page requires
+  it, since the sections reading it are empty. Both banners name its datasets together, once:
+  "google.entities, google.metrics_daily, google.search_terms (no active Google dataset)",
+  and the stale banner adds the source's ``source_connection`` status and reason when the
+  status is not ``ok`` and a reason is recorded ("…; Google status error: <reason>").
 * **Page aggregates**: the page-level lists and banners aggregate the same checks the cards
-  show plus every current freshness row (judged over the run's window). A dataset is listed
-  stale or incomplete when any of those checks is, so one item's complete check never masks
-  another item's wider range; the banners name every distinct reason of each dataset in a
-  fixed order and count distinct dataset names.
+  show plus every current freshness row (judged over the run's window) and every dataset of
+  a source with no active dataset. A dataset is listed stale or incomplete when any of those
+  checks is, so one item's complete check never masks another item's wider range; the
+  banners name every distinct reason of each dataset in a fixed order and count distinct
+  dataset names.
 
 Performance: one query per table for the whole page, never one per item (AAP 0.1.1: the five
 sections render in under 2 s). :func:`overlay` issues at most eight statements whatever the
@@ -96,7 +104,7 @@ Example::
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from types import MappingProxyType
@@ -288,15 +296,16 @@ class OverlayView:
             primary dataset, ``None`` for a source with no active dataset.
         stale_datasets: Names of the datasets that are stale now (last success older than
             ``sources.stale_after_hours``, never succeeded, or coverage short of the run's
-            window end), in ``DATASETS`` order: every current freshness row and every
-            dataset an item on the page requires, including one with no freshness row or
-            whose source has no current dataset.
+            window end), in ``DATASETS`` order: every current freshness row, every dataset an
+            item on the page requires, including one with no freshness row or whose source
+            has no current dataset, and every dataset of a source with no active dataset.
         incomplete_datasets: Names of the datasets that are not ``complete`` over a required
             range, in ``DATASETS`` order: an item's range is the run's window, widened for a
             K1 item's ``google.metrics_daily`` to its frozen baseline start, and a freshness
             row no item requires is judged over the run's window. ``complete`` rows whose
             coverage starts after the range start or ends before the window end count. A
-            dataset is listed when any card's check or its current row's check is incomplete.
+            dataset is listed when any card's check or its current row's check is incomplete,
+            and every dataset of a source with no active dataset is listed.
         computed_at: The read time the overlay was computed for.
 
     Raises:
@@ -775,7 +784,7 @@ class _LiveState:
 
     Attributes:
         datasets: The current datasets.
-        connections: ``source -> (mode, reason)`` from ``source_connection``.
+        connections: ``source -> (mode, status, reason)`` from ``source_connection``.
         discrepant: Subjects with an unresolved discrepancy in an active dataset.
         open_discrepancies: How many unresolved discrepancies the active datasets hold.
         freshness: ``dataset_freshness`` rows of the current datasets, keyed
@@ -785,7 +794,7 @@ class _LiveState:
     """
 
     datasets: _CurrentDatasets
-    connections: Mapping[str, tuple[str, str | None]]
+    connections: Mapping[str, tuple[str, str, str | None]]
     discrepant: frozenset[SubjectRef]
     open_discrepancies: int
     freshness: Mapping[tuple[int, str], Freshness]
@@ -801,12 +810,17 @@ def _completeness(value: str) -> Completeness:
     return "unknown"
 
 
-async def _load_connections(session: AsyncSession) -> dict[str, tuple[str, str | None]]:
-    """Read every ``source_connection`` row as ``source -> (mode, reason)``."""
+async def _load_connections(session: AsyncSession) -> dict[str, tuple[str, str, str | None]]:
+    """Read every ``source_connection`` row as ``source -> (mode, status, reason)``."""
     result = await session.execute(
-        select(SourceConnection.source, SourceConnection.mode, SourceConnection.reason)
+        select(
+            SourceConnection.source,
+            SourceConnection.mode,
+            SourceConnection.status,
+            SourceConnection.reason,
+        )
     )
-    return {source: (mode, reason) for source, mode, reason in result}
+    return {source: (mode, status, reason) for source, mode, status, reason in result}
 
 
 async def _load_discrepancies(
@@ -1485,7 +1499,7 @@ def _simulated_banner(live: _LiveState) -> BannerView | None:
             continue
         connection = live.connections.get(source)
         connection_reason = (
-            connection[1] if connection is not None and connection[0] == DATA_SIMULATED else None
+            connection[2] if connection is not None and connection[0] == DATA_SIMULATED else None
         )
         reason = next(
             (
@@ -1501,13 +1515,62 @@ def _simulated_banner(live: _LiveState) -> BannerView | None:
     return _banner(BANNER_SIMULATED_SOURCES, f"Simulated data: {'; '.join(parts)}", len(parts))
 
 
-def _stale_banner(checks: Sequence[_DatasetCheck], *, display_timezone: str) -> BannerView | None:
-    """The datasets that are stale now, each with its last success in ``display_timezone``."""
+def _dataset_parts(
+    names: Sequence[str],
+    live: _LiveState,
+    part: Callable[[str], str],
+    *,
+    with_status: bool,
+) -> list[str]:
+    """The banner parts naming ``names``: one per dataset, or one per source with no dataset.
+
+    The datasets of a source with no active primary dataset (a probe defect at first start
+    never falls back to simulated data, AAP 0.3.3) have nothing of their own to report, so
+    they are named together, once, as "{names} (no active {Source} dataset)". With
+    ``with_status`` the part also gives the source's ``source_connection`` status and reason
+    when the status is not ``ok`` and a reason is recorded, for example "google.entities,
+    google.metrics_daily, google.search_terms (no active Google dataset; Google status error:
+    QueryError in Q-G1)". Every other dataset gets ``part(name)``. ``names`` is in
+    ``DATASETS`` order, which keeps each source's datasets together.
+    """
+    missing = {source for source in SOURCES if source not in live.datasets.primaries}
+    parts: list[str] = []
+    grouped: set[str] = set()
+    for name in names:
+        source = _dataset_source(name)
+        if source not in missing:
+            parts.append(part(name))
+            continue
+        if source in grouped:
+            continue
+        grouped.add(source)
+        label = _SOURCE_LABELS[source]
+        detail = f"no active {label} dataset"
+        connection = live.connections.get(source)
+        if with_status and connection is not None:
+            _, status, reason = connection
+            if status != "ok" and reason:
+                detail = f"{detail}; {label} status {status}: {reason}"
+        members = [other for other in names if _dataset_source(other) == source]
+        parts.append(f"{', '.join(members)} ({detail})")
+    return parts
+
+
+def _stale_banner(
+    checks: Sequence[_DatasetCheck], live: _LiveState, *, display_timezone: str
+) -> BannerView | None:
+    """The datasets that are stale now, each with its last success in ``display_timezone``.
+
+    The datasets of a source with no active dataset are named together with the source's
+    status and reason (:func:`_dataset_parts`); the count is the number of distinct dataset
+    names.
+    """
     names = _ordered_names(check.name for check in checks)
     if not names:
         return None
-    parts: list[str] = []
-    for name in names:
+
+    def part(name: str) -> str:
+        """One dataset with its oldest last success, or "no successful sync"."""
         group = [check.row for check in checks if check.name == name]
         successes = [
             row.last_success_at
@@ -1515,33 +1578,38 @@ def _stale_banner(checks: Sequence[_DatasetCheck], *, display_timezone: str) -> 
             if row is not None and row.last_success_at is not None
         ]
         if len(successes) < len(group):
-            parts.append(f"{name} (no successful sync)")
-        else:
-            last_success = format_instant(min(successes), display_timezone)
-            parts.append(f"{name} (last success {last_success})")
+            return f"{name} (no successful sync)"
+        last_success = format_instant(min(successes), display_timezone)
+        return f"{name} (last success {last_success})"
+
+    parts = _dataset_parts(names, live, part, with_status=True)
     return _banner(BANNER_STALE_DATASETS, f"Stale data: {', '.join(parts)}", len(names))
 
 
-def _incomplete_banner(checks: Sequence[_DatasetCheck]) -> BannerView | None:
+def _incomplete_banner(checks: Sequence[_DatasetCheck], live: _LiveState) -> BannerView | None:
     """The datasets that are not complete over a required range, each with every reason.
 
     ``checks`` holds every incomplete check on the page, in :func:`_check_order`; each
     distinct reason of a dataset is named once, in that order (an end shortfall that several
     items share appears once beside a K1 item's baseline-start shortfall), and the count is
-    the number of distinct dataset names.
+    the number of distinct dataset names. The datasets of a source with no active dataset
+    are named together as having none (:func:`_dataset_parts`).
     """
     names = _ordered_names(check.name for check in checks)
     if not names:
         return None
-    parts: list[str] = []
-    for name in names:
+
+    def part(name: str) -> str:
+        """One dataset with every distinct reason it is incomplete."""
         reasons = dict.fromkeys(
             reason
             for check in checks
             if check.name == name
             for reason in _incomplete_reasons(check)
         )
-        parts.append(f"{name} ({'; '.join(reasons)})")
+        return f"{name} ({'; '.join(reasons)})"
+
+    parts = _dataset_parts(names, live, part, with_status=False)
     return _banner(BANNER_INCOMPLETE_DATASETS, f"Incomplete data: {', '.join(parts)}", len(names))
 
 
@@ -1568,8 +1636,8 @@ def _banners(
         _discrepancy_banner(live.open_discrepancies),
         _tracking_banner(run, findings),
         _simulated_banner(live),
-        _stale_banner(stale_checks, display_timezone=display_timezone),
-        _incomplete_banner(incomplete_checks),
+        _stale_banner(stale_checks, live, display_timezone=display_timezone),
+        _incomplete_banner(incomplete_checks, live),
         _short_window_banner(run),
     )
     built = {banner.code: banner for banner in candidates if banner is not None}
@@ -1664,9 +1732,10 @@ async def overlay(
 
     # The page aggregates the very checks its cards show (including required datasets with no
     # freshness row or no current dataset, and those of historical items), plus every current
-    # freshness row judged over the run's window. A dataset is listed stale or incomplete when
-    # ANY of those checks is, so one item's complete check never masks another item's wider
-    # required range (a K1 baseline) on the same dataset.
+    # freshness row judged over the run's window, plus every dataset of a source with no
+    # active dataset. A dataset is listed stale or incomplete when ANY of those checks is, so
+    # one item's complete check never masks another item's wider required range (a K1
+    # baseline) on the same dataset.
     views: dict[int, ItemOverlayView] = {}
     assessments: dict[_DatasetCheck, None] = {}
     for item in items:
@@ -1686,6 +1755,13 @@ async def overlay(
     for (dataset_id, name), row in live.freshness.items():
         check = _judge(name, dataset_id, row, now=now, stale_after=stale_after, required=run_window)
         assessments[check] = None
+    # A source with no active dataset (a probe defect never falls back, AAP 0.3.3) leaves
+    # every section reading it empty; each of its datasets has never succeeded in use, so it
+    # is listed stale and incomplete and both banners name the source, whatever the items.
+    for name in DATASETS:
+        if _dataset_source(name) not in datasets.primaries:
+            check = _judge(name, None, None, now=now, stale_after=stale_after, required=run_window)
+            assessments[check] = None
     page_checks = sorted(assessments, key=_check_order)
     stale_checks = [check for check in page_checks if check.stale]
     incomplete_checks = [check for check in page_checks if check.incomplete]

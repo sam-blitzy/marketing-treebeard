@@ -137,6 +137,20 @@ Rule modules are pure functions of an `AnalysisContext` and perform no I/O.
   requests (`analysis_request`).
 - **The SPA talks only to `/api/v1` through nginx.** Every request is same-origin, so the API
   installs no CORS middleware.
+- **Every `/api/` error has the API's shape.** An error nginx makes itself under `/api/` is sent
+  as `application/json` in the API's `{"error": {"code", "message"}}` envelope, with its
+  original status (`web/nginx.conf`): 400 `bad_request` (a malformed request) or
+  `request_header_too_large` (headers or cookies over nginx's buffers), 405 `method_not_allowed`
+  (the `TRACE` method, or any method other than `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`
+  and `OPTIONS`, which nginx refuses itself, with the body the API sends for a method a route
+  does not declare; uvicorn would otherwise answer a method its parser does not know with a
+  plain-text 400), 413 `payload_too_large` (a body over 1 MB), 500 `internal_error`, 501
+  `not_implemented` (a `Transfer-Encoding` other than `chunked`), 502 or 503
+  `upstream_unavailable` (the API down: refusing connections or its name not resolvable) and 504
+  `upstream_timeout` (no connection within 5 s or no answer within 120 s). The API's own errors
+  pass through unchanged. Any other path gets nginx's own pages, and so does a request line
+  nginx rejects before it reads a path: one too malformed to carry a path (400), too long (414)
+  or naming an HTTP version nginx does not serve (505).
 - **Nothing writes to a platform.** Every connector issues reads only.
 
 ```mermaid
@@ -264,6 +278,10 @@ Inside one run (`analysis/runner.py`):
 - `POST /api/v1/runs` computes synchronously. The API cancels any request after its own 45 s
   deadline (503 `request_timeout`), and nginx waits up to 120 s (`proxy_read_timeout`), so a
   slow request still ends in the API's error envelope.
+- nginx gives up connecting to the API after 5 s (`proxy_connect_timeout`; a connect on the
+  Compose network takes well under a millisecond). Once `api` stops, a request ends within 5 s
+  in 504 `upstream_timeout`, and from the moment nginx's resolver drops the name (within 10 s)
+  in an immediate 502 `upstream_unavailable`, never in a 60 s hang.
 
 ## Schedule and continuous analysis
 
@@ -365,7 +383,10 @@ frozen evidence; it only adds holds, flags and hidden state:
 - **Open discrepancies** are read live, so a discrepancy detected after the run holds every
   dependent item at once, and the banner count is always current.
 - **Source modes, active datasets and dataset freshness** are read live, so simulation labels
-  and stale or incomplete flags stay current.
+  and stale or incomplete flags stay current. A source with no active dataset, after a probe
+  defect at first start for example, has every one of its datasets listed in
+  `overlay.stale_datasets` and `overlay.incomplete_datasets`, and both banners name it, the
+  stale banner with its connection status and reason.
 - **Feedback** (dismiss, snooze, done) is read live, as `current.hidden_by`.
 
 ### Historical-only items
@@ -622,6 +643,8 @@ derive each item's flags from those datasets only:
   only those days.
 - A required dataset with no freshness row has never succeeded, so it is both stale and
   incomplete.
+- A section that stores no item gets one `incomplete_dataset` finding for each dataset its
+  rules read that is not complete over the window, so its empty state gives the reason.
 - A successful sync of one dataset never hides a failed refresh of another, because every write
   touches exactly one row.
 
@@ -852,11 +875,34 @@ Verified against `api/app.py`, `api/security.py`, `settings.py` and `web/nginx.c
   `Referrer-Policy: same-origin`. Because of that policy, Swagger UI and ReDoc are disabled; the
   OpenAPI document is served at `/api/v1/openapi.json` to a signed-in session only. Every `/api/`
   response carries exactly one `Cache-Control: no-store`, set by the API on every answer and
-  enforced by nginx on `/api/`, its own 502, 504 and 413 included, so no browser or shared cache
+  enforced by nginx on `/api/`, its own JSON error answers included, so no browser or shared cache
   keeps an API body after sign-out.
+  The SPA document (`/index.html`, which every client-side route serves) carries exactly one
+  `Cache-Control: no-store` as well, which keeps a signed-in screen out of the browser's
+  back/forward cache. A browser that restores a page from that cache anyway gets an empty page
+  and a reload (`web/src/main.tsx`), so Back after sign-out lands on `/login` and never shows
+  the ended session's data.
 - **Log redaction.** structlog JSON logs redact the `Authorization` header, the n8n secret header,
   every configured secret value, database URL passwords and email addresses
-  (`[REDACTED_EMAIL]`) before rendering (`logging.py`).
+  (`[REDACTED_EMAIL]`) before rendering (`logging.py`). The `web` (nginx) access log uses the
+  `redacted` format in `web/nginx.conf`: the combined fields, with every query string dropped
+  whole and logged as `?[REDACTED]` (nginx cannot redact per key; the API's log line for the
+  same request redacts each sensitive value), the remote user always `-`, the referer without
+  its query or fragment, and a path, referer or user agent holding an at sign, raw or
+  percent-encoded, logged as `[REDACTED_EMAIL]`. nginx's error log has no configurable format,
+  and every line it writes about a request names the raw request line read so far and the
+  referer, so `web` writes no error-log line for any request or connection, at any level. Its
+  one server in `web/nginx.conf` declares `error_log /dev/null`, the log the listening socket
+  and every request use, before nginx picks a location and after, and no `location` declares
+  one of its own, so each inherits it. That holds whatever went wrong: a malformed, oversized
+  or unsupported request (400, 414, 494, 505), a body over 1 MB, the API refusing, closing,
+  unresolved or timing out, a web-root directory nginx may not search, a full disk under a
+  temporary file, a failed memory allocation or access-log write. Each request's record is its
+  redacted access line and status. The image's main-level error log (`notice`, on stderr)
+  still carries startup, reload and worker-process messages ("worker_connections are not
+  enough, reusing connections" among them) and resolver errors, none of which names a request.
+  The cost: the alerts nginx writes when it cannot accept a connection ("worker_connections are
+  not enough" with none left to reuse, `accept4()` out of file descriptors) are not logged.
 - **Secret scanning.** CI runs `make secret-scan`, the same target as a local scan. It runs the
   pinned `zricethezav/gitleaks:v8.30.1` image as published, pulling it only when it is not
   present locally and never rebuilding or patching it, and checks that its gitleaks reports
@@ -892,6 +938,14 @@ Monitoring is structured JSON logs and one health endpoint; nothing else is ship
   classification and mode change with its reason, Google call-budget usage, each analysis run's
   summary with its `config_hash`, scheduler lock events and authentication failures. Logs never
   contain emails, secrets, tokens, the webhook URL or the n8n header value.
+- `web` (nginx) writes one combined-style access line per request to stdout
+  (`docker compose logs web`), except for `/assets/` and `/favicon.ico`, in the `redacted`
+  format: no query string, remote user or email ([Security](#security), Log redaction). It
+  writes no error-log line for any request or connection: a request nginx rejects, cannot serve
+  or cannot pass to the API (for example 400, 413, 500, 502 or 504) shows only as its access
+  line's status, with no reason text. Its stderr holds only nginx's startup, reload,
+  worker-process and resolver messages, which name no request; the alerts nginx writes when it
+  cannot accept a connection are not logged.
 - `GET /api/v1/healthz` answers `{"status": "ok"}` after a database round trip. It backs the
   `api` container's healthcheck.
 - The worker exposes no health endpoint. Its state is visible on `/sources` (mode, status,

@@ -30,6 +30,19 @@
  * 4. **The render**: `StrictMode`, then `QueryClientProvider`, then `RouterProvider`. The router
  *    must sit inside the provider of the same client, because the layout's hooks read the
  *    provider while the auth guard reads the route context.
+ * 5. **Back/forward cache restores.** A browser may restore a page from its back/forward cache
+ *    exactly as the user left it, for example on Back across a full page load after "Sign out":
+ *    the ended session's email, source chips and cards would show again, and nothing would ask
+ *    the API until a poll got a 401. nginx serves the document `Cache-Control: no-store`, which
+ *    keeps it out of that cache in most browsers, but a browser may restore such a page anyway.
+ *    The session cookie is HttpOnly, so only the API can tell whether the session still holds.
+ *    - On a `pagehide` event whose `persisted` is `true`, the page may enter that cache:
+ *      {@link clearPageEnteringBackForwardCache} removes the rendered app and clears the query
+ *      cache, so the frozen page holds nothing a restore could paint before its own scripts run.
+ *    - On a `pageshow` event whose `persisted` is `true`, the page was restored:
+ *      {@link reloadPageRestoredFromBackForwardCache} clears it the same way, in case it was
+ *      not emptied on the way in, then reloads it, and the new document's auth guard asks
+ *      `GET /auth/me` again: `/login` on a 401, the screen afresh while the session holds.
  *
  * The bundle carries no configuration and loads nothing external: no environment values, no
  * devtools, no service worker and no analytics, so nginx's `default-src 'self'` policy holds
@@ -234,10 +247,66 @@ if (container === null) {
   throw new Error(`Root element #${ROOT_ELEMENT_ID} not found`);
 }
 
-createRoot(container).render(
+/** The React root the app renders into, kept so the back/forward cache handlers can unmount it. */
+const root = createRoot(container);
+
+root.render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
       <RouterProvider router={router} />
     </QueryClientProvider>
   </StrictMode>,
 );
+
+// ---------------------------------------------------------------------------------------------
+// Back/forward cache
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Removes everything the app shows and holds: unmounts {@link root}, which empties the page at
+ * once, and clears {@link queryClient}. Unmounting an already unmounted root does nothing, so a
+ * second call is harmless.
+ */
+function clearRenderedApp(): void {
+  root.unmount();
+  queryClient.clear();
+}
+
+/**
+ * The window's `pagehide` listener: empties a page the browser may keep in its back/forward
+ * cache (`persisted` true), so the frozen page holds no screen and no data that a restore could
+ * show before {@link reloadPageRestoredFromBackForwardCache} runs. A page that is not kept is
+ * left alone: it is about to be discarded.
+ *
+ * @param event - The `pagehide` event; `persisted` is `true` when the page may be cached.
+ */
+function clearPageEnteringBackForwardCache(event: PageTransitionEvent): void {
+  if (event.persisted) {
+    clearRenderedApp();
+  }
+}
+
+/**
+ * The window's `pageshow` listener: reloads a page the browser restored from its back/forward
+ * cache, so a session that ended while the page sat there never shows its data again. A normal
+ * load also fires `pageshow`, with `persisted` false, and is left alone.
+ *
+ * In order:
+ * 1. It removes the rendered app and the cached data ({@link clearRenderedApp}), in case the
+ *    page entered the cache without {@link clearPageEnteringBackForwardCache} emptying it.
+ * 2. It reloads the page. The new document's auth guard reads `GET /auth/me` through the API
+ *    layer: a 401 opens `/login`, and a session that still holds renders the screen afresh. This
+ *    function fetches nothing itself.
+ *
+ * @param event - The `pageshow` event; `persisted` is `true` for a back/forward cache restore.
+ */
+function reloadPageRestoredFromBackForwardCache(event: PageTransitionEvent): void {
+  if (!event.persisted) {
+    return;
+  }
+  clearRenderedApp();
+  window.location.reload();
+}
+
+window.addEventListener('pagehide', clearPageEnteringBackForwardCache);
+window.addEventListener('pageshow', reloadPageRestoredFromBackForwardCache);

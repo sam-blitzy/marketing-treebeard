@@ -12,7 +12,9 @@
  *
  * Plain global CSS with the ds- prefix and BEM elements, like every stylesheet in this folder.
  * Every value is a token from ../tokens.css, so binding Blitzy OS touches tokens.css alone. The
- * class names are a contract with TopBar.tsx; keep them exactly as written.
+ * class names are a contract with TopBar.tsx, and with the static loading screen in
+ * web/index.html, which writes the bar and product name out by hand (see PageShell.css); keep
+ * them exactly as written.
  */
 
 /*

@@ -957,7 +957,7 @@ export function SettingsPage(): ReactElement {
       {data !== undefined ? (
         <SettingsContent config={data} />
       ) : (
-        isPending && <Spinner label={LOADING_LABEL} />
+        isPending && <Spinner label={LOADING_LABEL} showLabel />
       )}
     </Stack>
   );

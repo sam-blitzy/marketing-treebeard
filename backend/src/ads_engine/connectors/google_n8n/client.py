@@ -27,10 +27,18 @@ What this module does, and what it leaves to others:
 * **Paging** (:meth:`GoogleAdsWebhookClient.run_query`, :meth:`GoogleAdsWebhookClient.search`):
   renders one template of :data:`~ads_engine.connectors.google_n8n.queries.QUERIES` and follows
   a ``nextPageToken`` at once when one is returned, because page tokens expire after a few
-  hours. The specified n8n response carries no token, and nothing here depends on one.
+  hours. The specified n8n response carries no token, and nothing here depends on one. A relay
+  may also return a token it does not honour: the live n8n workflow answers a follow-up call
+  with page 1 again and a fresh token. Pages of one ``googleAds:search`` result are disjoint and
+  every Q-G* row is unique, so a follow-up page that repeats a row of page 1 or of the page
+  before it, or that carries a token but no row, proves the token did not advance. That page is
+  discarded, the token is abandoned and the result reported capped, so ``partition.py`` narrows
+  the query by date and id ranges instead. The client then remembers that this relay ignores
+  tokens (:attr:`GoogleAdsWebhookClient.page_tokens_ignored`) and stops following them for the
+  rest of its life, saving one call per capped partition.
 * **Completeness** is ``partition.py``'s job. A last page of exactly
-  :data:`~ads_engine.connectors.google_n8n.queries.PAGE_SIZE` (10,000) rows with no token may be
-  truncated; :attr:`QueryResult.capped` reports it and
+  :data:`~ads_engine.connectors.google_n8n.queries.PAGE_SIZE` (10,000) rows with no token, or an
+  abandoned token, means the result may be truncated; :attr:`QueryResult.capped` reports it and
   ``partition.PartitionedFetcher.partitioned_fetch`` narrows the query until no partition is
   capped.
 * **Call budget**: every POST attempt (first pages, next pages, partition calls and retries)
@@ -47,7 +55,8 @@ text without a readable ``SELECT`` list).
 The product holds only the webhook URL, the header name and the secret. Google's own client
 credentials stay in n8n's credential store, the connector never writes to Google Ads, and no
 streaming search variant is used. Logs never carry the secret, the header value, the webhook URL
-or its path, the customer id, the GAQL text or an ``IN`` id list (only its length).
+or its path, the customer id, the GAQL text, a page token or an ``IN`` id list (only its
+length).
 
 Example:
     ``sync`` owns the HTTP client and the budget, and reads one query to its last page::
@@ -62,9 +71,19 @@ Example:
                 ...
 """
 
+import hashlib
 import json
 import re
-from collections.abc import AsyncGenerator, AsyncIterator, Collection, Iterable, Mapping
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from contextlib import aclosing
 from dataclasses import dataclass
 from typing import Final, Protocol, Self, runtime_checkable
@@ -151,6 +170,9 @@ _MASK_PATHS_SHOWN: Final = 5
 # any query the product issues (partition.py keeps every partition below one page). It stops a
 # misbehaving relay that keeps returning fresh tokens, even under the unmetered budget.
 _MAX_PAGES_PER_QUERY: Final = 1_000
+# Bytes of a row fingerprint (BLAKE2b): 128 bits, so two different rows of one query never
+# share one in practice, at 16 bytes a row held for page 1 and the previous page only.
+_FINGERPRINT_BYTES: Final = 16
 
 
 # ---------------------------------------------------------------------------------------------
@@ -238,18 +260,26 @@ class SearchPage:
 
 @dataclass(frozen=True, slots=True)
 class QueryResult:
-    """Every page of one GAQL query, read to its last page.
+    """Every page of one GAQL query, read to its last page or to an abandoned page token.
 
     Attributes:
         query_id: The template id, such as ``"Q-G2"``.
-        rows: The rows of every page, in page order and, within a page, in the order returned.
-        pages: Pages read, the first included; at least 1.
-        calls: POST attempts made for this query: one per page plus every retry. Each was
-            counted against the call budget.
-        capped: Whether the last page held exactly ``PAGE_SIZE`` (10,000) rows and carried no
-            page token. Such a response may be truncated, and the caller must partition the
-            query (``partition.PartitionedFetcher.partitioned_fetch``) instead of trusting it as
+        rows: The rows of every page kept, in page order and, within a page, in the order
+            returned; empty when the pages were handed to ``run_query``'s ``on_page`` instead.
+        pages: Pages kept, the first included; at least 1. A follow-up page discarded because
+            its token did not advance is not counted; its call is in :attr:`calls`.
+        calls: POST attempts made for this query: one per page plus every retry, a discarded
+            page included. Each was counted against the call budget.
+        capped: Whether the result may be truncated: the last page held exactly ``PAGE_SIZE``
+            (10,000) rows and carried no page token, or a page token was abandoned
+            (:attr:`token_abandoned`). The caller must then partition the query
+            (``partition.PartitionedFetcher.partitioned_fetch``) instead of trusting it as
             complete.
+        token_abandoned: Whether a returned ``nextPageToken`` was not followed to its end: a
+            follow-up page proved that the relay ignored the token (it repeated a row of page 1
+            or of the page before it, or carried a token but no row), or the client had already
+            learned that it does (:attr:`GoogleAdsWebhookClient.page_tokens_ignored`). The rows
+            beyond the last page kept were never read.
     """
 
     query_id: str
@@ -257,6 +287,7 @@ class QueryResult:
     pages: int
     calls: int
     capped: bool
+    token_abandoned: bool = False
 
 
 @dataclass(slots=True)
@@ -276,6 +307,8 @@ class _CallContext:
             list exactly.
         ids_count: Length of the scope's ``IN`` id list, logged instead of the ids themselves.
         attempts: POST attempts made so far for this query, retries included.
+        abandoned: Whether the paging loop stopped before a returned ``nextPageToken`` was
+            followed to its end (:attr:`QueryResult.token_abandoned`).
     """
 
     query_id: str
@@ -283,6 +316,7 @@ class _CallContext:
     selected: frozenset[str]
     ids_count: int | None = None
     attempts: int = 0
+    abandoned: bool = False
 
 
 # ---------------------------------------------------------------------------------------------
@@ -293,8 +327,9 @@ class _CallContext:
 class GoogleAdsWebhookClient:
     """Reads Google Ads through the n8n webhook: one POST per GAQL query page.
 
-    The client is stateless apart from its lifetime call count, so one instance may serve
-    concurrent queries. It never opens or closes its ``httpx.AsyncClient``: the caller builds it
+    The client is stateless apart from its lifetime call count and what it learned about the
+    relay's page tokens (:attr:`page_tokens_ignored`), so one instance may serve concurrent
+    queries. It never opens or closes its ``httpx.AsyncClient``: the caller builds it
     with ``connectors.http.build_client("google", transport)`` (no base URL, the 120 s per-call
     deadline, redacting logging hooks) and owns its lifecycle. The transport is the only thing
     that differs between live and simulated runs.
@@ -318,6 +353,7 @@ class GoogleAdsWebhookClient:
         "_calls_made",
         "_customer_id",
         "_http",
+        "_page_tokens_ignored",
         "_retry",
         "_secret",
         "_secret_header",
@@ -367,6 +403,7 @@ class GoogleAdsWebhookClient:
         self._customer_id: str = _checked_customer_id(customer_id)
         self._retry: RetryPolicy = retry
         self._calls_made: int = 0
+        self._page_tokens_ignored: bool = False
 
     @classmethod
     def from_settings(
@@ -432,6 +469,19 @@ class GoogleAdsWebhookClient:
         difference before and after it.
         """
         return self._calls_made
+
+    @property
+    def page_tokens_ignored(self) -> bool:
+        """Whether this client has seen the relay ignore a ``page_token``; read-only.
+
+        Set once a follow-up page proved that its token did not advance (it repeated a row of
+        page 1 or of the page before it, or carried a token but no row). From then on, for the
+        rest of the client's life (one job or one build), a page that carries a
+        ``nextPageToken`` is kept but its token is not followed: the result is reported capped
+        (:attr:`QueryResult.token_abandoned`), so ``partition.py`` narrows the query at once
+        instead of spending a call on a page that would be discarded.
+        """
+        return self._page_tokens_ignored
 
     def __repr__(self) -> str:
         """Return the class name and the call count; never the URL, secret or customer id."""
@@ -591,15 +641,23 @@ class GoogleAdsWebhookClient:
     # -- paging -------------------------------------------------------------------------------
 
     async def run_query(
-        self, query_id: str, scope: Mapping[str, object] | None = None
+        self,
+        query_id: str,
+        scope: Mapping[str, object] | None = None,
+        *,
+        on_page: Callable[[SearchPage], Awaitable[None]] | None = None,
     ) -> QueryResult:
-        """Read one GAQL query to its last page.
+        """Read one GAQL query to its last page, or until its page token proves ignored.
 
         Renders ``QUERIES[query_id].render(**scope)``, sends the first page with
         ``page_token=None`` and, while a page returns a ``nextPageToken``, sends it back at once.
-        The rows of a query that fails are discarded: the caller re-reads the whole query,
-        because page tokens expire. Completeness of a capped result is the caller's to
-        establish, through ``partition.PartitionedFetcher.partitioned_fetch``.
+        A follow-up page that repeats a row of page 1 or of the page before it, or that carries
+        a token but no row, shows the relay ignored the token: that page is discarded, the
+        token abandoned and the result reported capped, and the client learns that this relay
+        ignores tokens (:attr:`page_tokens_ignored`), after which a returned token is not
+        followed at all. The rows of a query that fails are discarded by the caller, who
+        re-reads the whole query, because page tokens expire. Completeness of a capped result
+        is the caller's to establish, through ``partition.PartitionedFetcher.partitioned_fetch``.
 
         Args:
             query_id: A key of :data:`~ads_engine.connectors.google_n8n.queries.QUERIES`, such
@@ -607,10 +665,15 @@ class GoogleAdsWebhookClient:
             scope: Narrowing values for the template's ``render``, keyed by the scope-key
                 constants of ``queries.py`` (``last_id``, ``ids``, ``start``, ``end``, id
                 ranges); ``None`` for none.
+            on_page: When given, each kept page (validated, and for a follow-up page proven to
+                advance) is awaited into it as soon as it is read, in page order, instead of
+                being accumulated, so a long query never holds more than one page; the result's
+                ``rows`` is then empty. An error it raises propagates unchanged and stops the
+                query.
 
         Returns:
-            Every row in page order, the page count, the POST attempts made and whether the
-            last page was capped.
+            Every row kept in page order (none with ``on_page``), the pages kept, the POST
+            attempts made and whether the result may be truncated.
 
         Raises:
             AccessDenied: As :meth:`search_page`, unchanged.
@@ -624,18 +687,22 @@ class GoogleAdsWebhookClient:
         query, context = _prepare(query_id, scope)
         rows: list[GoogleAdsRow] = []
         pages = 0
-        capped = False
+        last_capped = False
         async with aclosing(self._pages(query, context)) as stream:
             async for page in stream:
-                rows.extend(page.rows)
                 pages += 1
-                capped = page.capped
+                last_capped = page.capped
+                if on_page is None:
+                    rows.extend(page.rows)
+                else:
+                    await on_page(page)
         return QueryResult(
             query_id=context.query_id,
             rows=tuple(rows),
             pages=pages,
             calls=context.attempts,
-            capped=capped,
+            capped=last_capped or context.abandoned,
+            token_abandoned=context.abandoned,
         )
 
     async def search(
@@ -644,7 +711,9 @@ class GoogleAdsWebhookClient:
         """Stream the rows of one GAQL query, page by page.
 
         The same paging loop as :meth:`run_query`, yielding each page's rows as soon as the page
-        is validated. It does not partition and reports no completeness;
+        is validated. It does not partition and reports no completeness: when a page token is
+        abandoned because the relay ignores it, the stream ends quietly after the last page
+        kept, and rows beyond it are never read.
         ``partition.PartitionedFetcher.partitioned_fetch`` is the completeness-aware entry point
         that ``sync`` uses. Validation and the first call happen on the first iteration.
 
@@ -669,14 +738,23 @@ class GoogleAdsWebhookClient:
                     yield row
 
     async def _pages(self, query: str, context: _CallContext) -> AsyncGenerator[SearchPage]:
-        """Yield every page of ``query``, following each returned token at once.
+        """Yield every page of ``query``, following each returned token while it advances.
 
         A page's token is checked before the page is yielded, so a relay that repeats a token
-        fails the query before any row of the looping page is handed out.
+        fails the query before any row of the looping page is handed out; the 1,000-page cap
+        and that check come first. A follow-up page (one requested with a token) then has to
+        advance: pages of one ``googleAds:search`` result are disjoint and every Q-G* row is
+        unique, so a follow-up page holding a row of page 1 or of the page before it, or one
+        that carries a token but no row, shows the relay re-ran the query instead of resuming
+        it. Such a page is discarded (never yielded), the loop stops with the query marked
+        abandoned, and the client learns that the relay ignores tokens. While it knows that, a
+        page that carries a token is yielded but its token is not followed. Only the row
+        fingerprints of page 1 and of the previous page are kept, so the check is bounded.
 
         Args:
             query: The rendered GAQL text.
-            context: The query's bookkeeping; ``page`` is set to each page's ordinal.
+            context: The query's bookkeeping; ``page`` is set to each page's ordinal and
+                ``abandoned`` once a returned token is not followed to its end.
 
         Yields:
             Each validated page, the first included.
@@ -688,6 +766,8 @@ class GoogleAdsWebhookClient:
         seen_tokens: set[str] = set()
         page_token: str | None = None
         page_number = 0
+        first_prints: frozenset[bytes] = frozenset()
+        previous_prints: frozenset[bytes] = frozenset()
         while True:
             if page_number >= _MAX_PAGES_PER_QUERY:
                 raise _defect(
@@ -705,10 +785,53 @@ class GoogleAdsWebhookClient:
                         "page token repeated", query_id=context.query_id, http_status=None
                     )
                 seen_tokens.add(next_token)
+            if page_token is None:
+                # Page 1: its fingerprints are needed only when its token will be followed.
+                if next_token is not None and not self._page_tokens_ignored:
+                    first_prints = previous_prints = frozenset(_fingerprints(page.rows))
+            else:
+                prints = _fingerprints(page.rows)
+                repeated = sum(
+                    1 for digest in prints if digest in first_prints or digest in previous_prints
+                )
+                if repeated or (next_token is not None and not page.rows):
+                    self._abandon_ignored_token(context, rows=len(page.rows), repeated=repeated)
+                    return
+                previous_prints = frozenset(prints)
             yield page
             if next_token is None:
                 return
+            if self._page_tokens_ignored:
+                context.abandoned = True
+                log.info(
+                    "google.page_token_not_followed",
+                    source=_SOURCE,
+                    query_id=context.query_id,
+                    page=page_number,
+                    rows=len(page.rows),
+                    calls_made=self._calls_made,
+                )
+                return
             page_token = next_token
+
+    def _abandon_ignored_token(self, context: _CallContext, *, rows: int, repeated: int) -> None:
+        """Record a follow-up page whose token did not advance, and learn it for the client.
+
+        Logs ``google.page_token_ignored`` at warning level with the source, the query id, the
+        discarded page's ordinal and row count, how many of its rows repeated an earlier page,
+        and the client's call count; never the token, which is a credential-like cursor.
+        """
+        context.abandoned = True
+        self._page_tokens_ignored = True
+        log.warning(
+            "google.page_token_ignored",
+            source=_SOURCE,
+            query_id=context.query_id,
+            page=context.page,
+            rows=rows,
+            repeated=repeated,
+            calls_made=self._calls_made,
+        )
 
 
 # ---------------------------------------------------------------------------------------------
@@ -780,6 +903,24 @@ def _selected_in_text(query: str) -> frozenset[str]:
             "query's SELECT list must name GAQL fields, dot-separated lowercase snake_case "
             "segments separated by commas"
         ) from None
+
+
+def _fingerprints(rows: Sequence[GoogleAdsRow]) -> list[bytes]:
+    """Return a 16-byte BLAKE2b fingerprint of each row, in order.
+
+    A row is serialised canonically (keys sorted, no whitespace, non-ASCII kept), so two rows
+    share a fingerprint exactly when they hold the same values. Decimal numbers, which the
+    JSON decoder returns for every non-integer value, are serialised as their text.
+    """
+    return [
+        hashlib.blake2b(
+            json.dumps(
+                row, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str
+            ).encode("utf-8"),
+            digest_size=_FINGERPRINT_BYTES,
+        ).digest()
+        for row in rows
+    ]
 
 
 def _ids_count(scope: Mapping[str, object]) -> int | None:

@@ -691,6 +691,22 @@ describe('apiFetch error responses', () => {
     expect(error.message).toBe(MESSAGES.unavailable);
   });
 
+  it('keeps upstream_unavailable and the "temporarily unavailable" text of nginx\'s JSON 502', async () => {
+    // The exact body web/nginx.conf sends from @api_upstream_unavailable while the API is down.
+    const body =
+      '{"error":{"code":"upstream_unavailable","message":"The server is temporarily unavailable. Try again shortly."}}';
+    stubFetch(() => text(body, 502, JSON_CONTENT_TYPE));
+    const error = await apiErrorOf(apiFetch('/runs/latest'));
+    expect(fields(error)).toEqual({
+      name: 'ApiError',
+      status: 502,
+      code: 'upstream_unavailable',
+      message: MESSAGES.unavailable,
+      retryAfter: undefined,
+    });
+    expect(error.message).toMatch(/temporarily unavailable/);
+  });
+
   it('passes an envelope code the client does not know through unchanged', async () => {
     stubFetch(() => json(envelope('brand_new_code', 'Something new.'), 422));
     const error = await apiErrorOf(apiFetch('/x'));

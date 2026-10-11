@@ -11,13 +11,16 @@
  *    The run notice is the {@link CustomRunBanner} for a custom-window run ("Custom window
  *    {start} – {end}" with "Back to default"), or the {@link OlderDefaultRunBanner} for a
  *    default run opened by id that is no longer the latest default run;
- * 4. the {@link SectionNav}: anchor links with item counts for the five sections;
- * 5. the polite region of the {@link ActionOutcomeProvider}, empty (and taking no space) until a
+ * 4. the page's refresh region, a polite status region empty (and taking no space) until a read
+ *    the page shows fails to refresh, when it holds "Actions could not be refreshed" (see
+ *    "States" below);
+ * 5. the {@link SectionNav}: anchor links with item counts for the five sections;
+ * 6. the polite region of the {@link ActionOutcomeProvider}, empty (and taking no space) until a
  *    card confirms an outcome there, such as "Dismissed: Pause (Generic CRM — US)": it outlives
  *    the card a recorded feedback removes and announces the outcome. The visible confirmation
  *    of a feedback stands where the card stood, inside its section, so the user sees it where
  *    they acted;
- * 6. the five sections in the user's order ({@link SECTION_ORDER}): Keywords to adjust,
+ * 7. the five sections in the user's order ({@link SECTION_ORDER}): Keywords to adjust,
  *    Campaigns to pause or launch, Budget changes, Copy/creative changes, White papers, each
  *    rendered by its own component from {@link SECTION_COMPONENTS}.
  *
@@ -38,14 +41,24 @@
  *
  * - **Data**: the page above. A background refetch that fails keeps the last page on screen,
  *   because TanStack Query keeps `data` when a refetch errors; the hook's own polling recovers by
- *   itself once the API answers again.
+ *   itself once the API answers again. Meanwhile a warning "Actions could not be refreshed",
+ *   with the failure's reason and "Showing the last loaded state.", sits in the page's refresh
+ *   region, after the global banners and before the section navigation, so the
+ *   open-discrepancies banner stays above everything (AAP 0.5.5) and the warning still precedes
+ *   the cards it qualifies. It covers a failed refresh of the page itself, of the source chips,
+ *   of the unresolved discrepancy list and of the configuration, and clears once each of them
+ *   has been read again.
  * - **Loading** (no data yet): the title and a `Spinner` labelled "Loading actions".
  * - **No analysis run yet** (default run only, 404 `not_found` or 409 `run_not_ready`): the first
  *   start, while the worker backfills and computes the first default run (AAP 0.11.2). The hook
  *   keeps polling every `FIRST_RUN_POLL_MS`, so the page fills in by itself; `first-start.spec.ts`
  *   waits on this state.
  * - **Run not found** (a `runId` the API does not know): a "Back to default" link.
- * - **Any other failure**: the API's message and a "Retry" button that refetches.
+ * - **Any other failure**: the API's message and a "Retry" button that refetches, rendered by
+ *   {@link ActionsLoadFailure}. `src/router.tsx` renders the same failure state, with a Retry
+ *   that re-runs the auth guard, when that guard's `GET /auth/me` fails with anything but a 401
+ *   on `/actions` (a reload during an outage), so the page's own failure state appears inside
+ *   the signed-in shell before any page read has started.
  *
  * A failure screen stays mounted while its read runs again, by poll or by Retry, so it never
  * flickers back to the spinner and keyboard focus is kept; each failure message is announced
@@ -59,18 +72,20 @@
  *   API, and no window length or threshold is written here (AAP 0.5.4.1).
  * - **No alert**: nothing here carries `role="alert"`; AAP 0.5.5 reserves it for the
  *   open-discrepancies banner, which `GlobalBanners` owns.
- * - **No router import**: `src/router.tsx` imports this page, so `Link` comes straight from
- *   `@tanstack/react-router` and is typed by the router's `Register` augmentation.
+ * - **No router import**: `src/router.tsx` imports this page and {@link ActionsLoadFailure}, so
+ *   `Link` comes straight from `@tanstack/react-router` and is typed by the router's `Register`
+ *   augmentation.
  *
  * @packageDocumentation
  */
 import { Link } from '@tanstack/react-router';
 import { memo, useEffect, useRef, useState } from 'react';
-import type { ComponentType, ReactElement, ReactNode } from 'react';
+import type { ComponentType, ReactElement, ReactNode, Ref } from 'react';
 
 import {
   isApiError,
   isAwaitingFirstRun,
+  useActionsRefreshFailure,
   useDefaultRun,
   usePrefetchActionsReads,
   useRecommendations,
@@ -78,7 +93,7 @@ import {
 import type { ApiError } from '../../api/queries';
 import { SECTION_ORDER } from '../../api/types';
 import type { RecommendationsPage, Run, RunId, Section, SectionKey } from '../../api/types';
-import { Button, EmptyState, PageShell, Spinner, Stack } from '../../design-system';
+import { Banner, Button, EmptyState, PageShell, Spinner, Stack } from '../../design-system';
 import {
   CustomRunBanner,
   OlderDefaultRunBanner,
@@ -134,6 +149,12 @@ const GENERIC_ERROR_MESSAGE = 'The recommendations could not be read. Try again.
 
 /** Label of the button that repeats the failed `GET /recommendations`. */
 const RETRY_LABEL = 'Retry';
+
+/** Title of the notice shown while the loaded page's reads can no longer be refreshed. */
+const REFRESH_ERROR_TITLE = 'Actions could not be refreshed';
+
+/** What follows the failure's reason in that notice: the page keeps its last data. */
+const REFRESH_ERROR_SUFFIX = 'Showing the last loaded state.';
 
 // ---------------------------------------------------------------------------------------------
 // Public API
@@ -382,8 +403,10 @@ function useSettledFailure(
 /** Props of {@link ActionsFrame}. */
 interface ActionsFrameProps {
   /**
-   * A state message to announce, such as the "No analysis run yet" or failure `EmptyState`.
-   * It is rendered inside the frame's polite status region; omitted, the region stays empty.
+   * A state message to announce, such as the "No analysis run yet" or failure `EmptyState`. It
+   * is rendered inside the frame's polite status region; omitted, the region stays empty, as it
+   * does on the loaded page, which announces a failed refresh in a region of its own below the
+   * global banners ({@link ActionsContent}).
    */
   notice?: ReactNode;
   /** What the page shows below the title and the notice. */
@@ -412,10 +435,86 @@ function ActionsFrame({ notice, children }: ActionsFrameProps): ReactElement {
   );
 }
 
+/** Props of {@link ActionsLoadFailure}. */
+export interface ActionsLoadFailureProps {
+  /**
+   * The failure to explain. The reason shown is its `ApiError` message, trimmed, which the API
+   * client guarantees is safe to show, or a generic sentence for a blank message or any other
+   * error, so a stack trace or internal error text never reaches the screen.
+   */
+  error: unknown;
+  /** Runs the failed read again; called each time the user activates "Retry". */
+  onRetry: () => void;
+  /**
+   * Whether a Retry the user started is still running: the button then shows as loading, which
+   * makes it inert (`aria-disabled`) while it keeps focus. Defaults to `false`.
+   */
+  retrying?: boolean;
+  /**
+   * The "Retry" button's ref, through which the caller returns focus to the button once a Retry
+   * has failed again and focus fell to the page body (WCAG 2.2 SC 2.4.3).
+   */
+  retryButtonRef?: Ref<HTMLButtonElement>;
+}
+
+/**
+ * The `/actions` failure state: the page's `<h1>` "Actions" and, in its polite status region,
+ * an `EmptyState` "Actions could not be loaded" with the failure's reason and a "Retry" `Button`.
+ *
+ * It is presentational and reads no server state, so it renders the same screen for both
+ * callers: {@link ActionsPage}, when `GET /recommendations` fails without data, and the
+ * authenticated layout's error screen in `src/router.tsx`, when the auth guard's
+ * `GET /auth/me` fails with anything but a 401 on `/actions` (a 502 or 503 during an outage).
+ * There no session has been confirmed, so no page read may start; `onRetry` re-runs the guard.
+ * The notice is announced politely, never as an alert, which AAP 0.5.5 reserves for
+ * discrepancies.
+ *
+ * @param props - see {@link ActionsLoadFailureProps}
+ * @returns the failure state, rendered inside the app's `PageShell`
+ *
+ * @example
+ * ```tsx
+ * <ActionsLoadFailure
+ *   error={failure}
+ *   onRetry={() => void retry()}
+ *   retrying={retrying}
+ *   retryButtonRef={retryButtonRef}
+ * />
+ * ```
+ */
+export function ActionsLoadFailure({
+  error,
+  onRetry,
+  retrying = false,
+  retryButtonRef,
+}: ActionsLoadFailureProps): ReactElement {
+  return (
+    <ActionsFrame
+      notice={
+        <EmptyState
+          title={LOAD_ERROR_TITLE}
+          action={
+            <Button ref={retryButtonRef} loading={retrying} onClick={onRetry}>
+              {RETRY_LABEL}
+            </Button>
+          }
+        >
+          {failureReason(error)}
+        </EmptyState>
+      }
+    />
+  );
+}
+
 /** Props of {@link ActionsContent}. */
 interface ActionsContentProps {
   /** One `GET /recommendations` response: the run, its overlay, banners and sections. */
   page: RecommendationsPage;
+  /**
+   * The failed refresh of a read the page shows, from `useActionsRefreshFailure`, or `null`
+   * while every one of them is current.
+   */
+  refreshFailure: ApiError | null;
   /**
    * Whether `/actions?run=<id>` addressed the run. Without an id the page is the latest default
    * run by definition, so it is never marked as an older one.
@@ -464,13 +563,28 @@ function runNoticeFor(
  * that hold it, and inside one {@link B1CardsProvider}, through which each C2 "Scale" card links
  * the B1 card that carries its amount.
  *
- * Memoized on `page` and `runAddressed`: the page re-renders whenever its read's fetch status
- * changes, at the start and the end of every poll, and this content renders again only for a
- * newly delivered page, or for a new latest default run, which it reads for the run notice.
- * Each section then renders again only when its own inputs changed ({@link SECTION_RENDERERS}).
+ * While `refreshFailure` is set, a polite status region right after the global banners and
+ * before the section navigation holds a warning `Banner` "Actions could not be refreshed" with
+ * the failure's reason and "Showing the last loaded state.", so a failed poll of the page, the
+ * source chips, the discrepancy list or the configuration never leaves the cards looking
+ * current. It sits below the global banners, so the open-discrepancies banner, and the fixed
+ * order of the banners after it, stay above it (AAP 0.5.5: the discrepancy banner sits above
+ * everything), and above the sections and their cards. The region mounts with this content, so
+ * a failure that arrives later lands in a region assistive technology already watches and is
+ * announced politely (WCAG 2.2 SC 4.1.3), never as an alert, which AAP 0.5.5 reserves for
+ * discrepancies; without a failure it is empty, and `Stack` takes it out of the column, so it
+ * adds no space.
+ *
+ * Memoized on `page`, `refreshFailure` and `runAddressed`: the page re-renders whenever its
+ * read's fetch status changes, at the start and the end of every poll, and this content renders
+ * again only for a newly delivered page, a change of the reported failure, whose `ApiError`
+ * stays the same object until it does, or a new latest default run, which it reads for the run
+ * notice. Each section then renders again only when its own inputs changed
+ * ({@link SECTION_RENDERERS}).
  */
 const ActionsContent = memo(function ActionsContent({
   page,
+  refreshFailure,
   runAddressed,
 }: ActionsContentProps): ReactElement {
   const { run, overlay, banners, sections } = page;
@@ -487,6 +601,15 @@ const ActionsContent = memo(function ActionsContent({
         overlay={overlay}
         runNotice={runNoticeFor(run, runAddressed, latestDefaultRun)}
       />
+      {/* After the global banners, so the open-discrepancies banner stays above it (AAP 0.5.5),
+          and mounted with the page, so a later failed refresh is announced. */}
+      <div role="status">
+        {refreshFailure !== null && (
+          <Banner tone="warning" title={REFRESH_ERROR_TITLE}>
+            {`${failureReason(refreshFailure)} ${REFRESH_ERROR_SUFFIX}`}
+          </Banner>
+        )}
+      </div>
       <SectionNav sections={sections} />
       <ActionOutcomeProvider>
         {/* Held cards link the discrepancies that hold them: the run's C0 cards or /decisions. */}
@@ -519,7 +642,12 @@ const ActionsContent = memo(function ActionsContent({
  * and, for an addressed run only, `GET /runs/latest`), so they do not wait for the page to
  * arrive. It renders, in precedence order:
  *
- * - the loaded page whenever data exists, including after a failed background refetch;
+ * - the loaded page whenever data exists, including after a failed background refetch, which
+ *   `useActionsRefreshFailure(runId)` reports: while the page's own read, the source chips'
+ *   `GET /sources`, the unresolved discrepancy list or `GET /config` last failed to refresh,
+ *   a warning `Banner` "Actions could not be refreshed", below the global banners and above the
+ *   section navigation, gives the reason and "Showing the last loaded state.", until the next
+ *   successful read clears it;
  * - `PageShell.Title` "Actions" with a `Spinner` labelled "Loading actions" until the first
  *   response settles;
  * - without `runId`, an `EmptyState` "No analysis run yet" with "The first analysis is still
@@ -528,8 +656,8 @@ const ActionsContent = memo(function ActionsContent({
  *   run arrives, and the page then shows it by itself;
  * - with `runId`, an `EmptyState` "Run not found" with a "Back to default" link to `/actions`
  *   when the API does not know the run (404, or 422 for an id that cannot name a run);
- * - otherwise an `EmptyState` "Actions could not be loaded" with the API's message and a
- *   "Retry" `Button` that reads the page again.
+ * - otherwise {@link ActionsLoadFailure}: an `EmptyState` "Actions could not be loaded" with the
+ *   API's message and a "Retry" `Button` that reads the page again.
  *
  * A failure screen stays in place while its read runs again, by poll or by Retry
  * ({@link useSettledFailure}), so it never flickers to the spinner. A Retry the user starts
@@ -554,6 +682,8 @@ export function ActionsPage({ runId }: ActionsPageProps): ReactElement {
   const query = useRecommendations(runId);
   // The status bar's reads start here, beside the page's own, rather than once the page has data.
   usePrefetchActionsReads(runId);
+  // A failed poll of a read the loaded page shows; those reads keep their last data meanwhile.
+  const refreshFailure = useActionsRefreshFailure(runId);
   const failure = useSettledFailure(
     runId,
     query.error,
@@ -599,13 +729,19 @@ export function ActionsPage({ runId }: ActionsPageProps): ReactElement {
   };
 
   if (query.data !== undefined) {
-    return <ActionsContent page={query.data} runAddressed={runId !== undefined} />;
+    return (
+      <ActionsContent
+        page={query.data}
+        refreshFailure={refreshFailure}
+        runAddressed={runId !== undefined}
+      />
+    );
   }
 
   if (failure === null) {
     return (
       <ActionsFrame>
-        <Spinner label={LOADING_LABEL} />
+        <Spinner label={LOADING_LABEL} showLabel />
       </ActionsFrame>
     );
   }
@@ -613,6 +749,8 @@ export function ActionsPage({ runId }: ActionsPageProps): ReactElement {
   if (runId === undefined && isAwaitingFirstRun(failure)) {
     return (
       <ActionsFrame notice={<EmptyState title={FIRST_RUN_TITLE}>{FIRST_RUN_REASON}</EmptyState>}>
+        {/* The EmptyState above already says on screen that the first run is computing, so this
+            ring keeps its label for assistive technology only rather than repeating it. */}
         <Spinner label={FIRST_RUN_WAITING_LABEL} />
       </ActionsFrame>
     );
@@ -639,25 +777,13 @@ export function ActionsPage({ runId }: ActionsPageProps): ReactElement {
   }
 
   return (
-    <ActionsFrame
-      notice={
-        <EmptyState
-          title={LOAD_ERROR_TITLE}
-          action={
-            <Button
-              ref={retryButtonRef}
-              loading={retrying}
-              onClick={() => {
-                void retry();
-              }}
-            >
-              {RETRY_LABEL}
-            </Button>
-          }
-        >
-          {failureReason(failure)}
-        </EmptyState>
-      }
+    <ActionsLoadFailure
+      error={failure}
+      onRetry={() => {
+        void retry();
+      }}
+      retrying={retrying}
+      retryButtonRef={retryButtonRef}
     />
   );
 }

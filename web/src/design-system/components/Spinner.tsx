@@ -1,19 +1,28 @@
 /**
  * `Spinner`: the product's loading indicator (AAP 0.4.2, "Loading and empty states").
  *
- * It renders a decorative rotating ring plus a visually hidden text label inside a
- * `role="status"` element. `role="status"` is a polite live region (implicit
- * `aria-live="polite"` and `aria-atomic="true"`): assistive technology reads the label as a
- * status message without moving focus or interrupting what the user is doing, and the ring
- * itself stays out of the accessibility tree (WCAG 2.2 SC 4.1.3 Status Messages).
+ * It renders a decorative rotating ring plus a text label inside a `role="status"` element. The
+ * label is visually hidden by default, or shown beside the ring with `showLabel`. `role="status"`
+ * is a polite live region (implicit `aria-live="polite"` and `aria-atomic="true"`): assistive
+ * technology reads the label as a status message without moving focus or interrupting what the
+ * user is doing, and the ring itself stays out of the accessibility tree (WCAG 2.2 SC 4.1.3
+ * Status Messages). Shown or hidden, the label is the same single text node, so it is announced
+ * once.
  *
  * The styling lives in `Spinner.css`, and the hidden-text utility in `shared.css`. Their class
  * names are the contract this component renders:
  *
  * - `ds-spinner`: the inline wrapper carrying `role="status"`;
+ * - `ds-spinner--labelled`: added to the wrapper with `showLabel`, spacing the label from the ring;
  * - `ds-spinner__circle`: the ring, `aria-hidden="true"`; it stops turning under
  *   `prefers-reduced-motion: reduce` and stays visible in forced-colours mode;
- * - `ds-visually-hidden`: the label, read by assistive technology but not shown on screen.
+ * - `ds-visually-hidden`: the label by default, read by assistive technology but not shown on
+ *   screen;
+ * - `ds-spinner__label`: the label with `showLabel`, shown beside the ring.
+ *
+ * `web/index.html` writes the `showLabel` markup out by hand in its static loading screen, which
+ * the browser paints before the bundle runs; keep the two in step (`PageShell.test.tsx` compares
+ * them).
  *
  * Inside `Button`, the Spinner sits in a slot that `Button` hides from the accessibility tree:
  * the button conveys its loading state with `aria-busy="true"`, so the button's accessible name
@@ -22,8 +31,8 @@
  * The Blitzy OS source is not available, so this is a product wrapper at the last
  * graceful-degradation step: it renders semantic HTML styled by semantic tokens, except for the
  * ring's `1s linear` rotation and the label's visually hidden `1px` box and `inset(50%)` clip
- * that `../GAPS.md` lists, and binding Blitzy OS later changes only this file and `Spinner.css`
- * (AAP 0.4.5, `../GAPS.md`).
+ * that `../GAPS.md` lists, and binding Blitzy OS later changes only this file and `Spinner.css`,
+ * plus the static copy of its markup in `web/index.html` (AAP 0.4.5, `../GAPS.md`).
  *
  * GAP: bind to Blitzy OS on source arrival.
  *
@@ -45,37 +54,50 @@ import './Spinner.css';
  */
 export interface SpinnerProps {
   /**
-   * The accessible text announced by the live region and never shown on screen, for example
-   * `"Loading recommendations"`. It is required and should name what is loading in a short,
-   * non-empty phrase: the ring is decorative, so this label is the Spinner's only content for
-   * assistive technology.
+   * The text announced by the live region, for example `"Loading recommendations"`, and shown
+   * beside the ring when {@link SpinnerProps.showLabel} is set. It is required and should name
+   * what is loading in a short, non-empty phrase: the ring is decorative, so this label is the
+   * Spinner's only content for assistive technology.
    */
   label: string;
+  /**
+   * Whether the label is also shown on screen, beside the ring. Defaults to `false`: the label is
+   * then visually hidden and only assistive technology reads it.
+   *
+   * Set it where the Spinner stands in for a whole page or page section that is still loading,
+   * so sighted users see what they are waiting for rather than a bare ring. Leave it off where
+   * visible text nearby already says so, or where the Spinner sits inside a control, such as
+   * `Button`'s loading state, whose own label names the action.
+   */
+  showLabel?: boolean;
 }
 
 /**
- * Loading indicator: a decorative ring with a visually hidden label inside a polite
- * `role="status"` live region.
+ * Loading indicator: a decorative ring with a label inside a polite `role="status"` live region.
+ * The label is visually hidden unless `showLabel` is set.
  *
  * Render it in place of content that is still loading, and remove it once the content arrives.
  * Whether a screen reader speaks a live region the moment it is mounted varies between screen
  * readers, but the label is always reachable as the status element's text. The component holds
- * no state and has no effects; its output depends only on `label`.
+ * no state and has no effects; its output depends only on `label` and `showLabel`.
  *
  * GAP: bind to Blitzy OS on source arrival.
  *
  * @example
  * ```tsx
+ * // A page still loading: the label shows beside the ring.
  * if (recommendations.isPending) {
- *   return <Spinner label="Loading recommendations" />;
+ *   return <Spinner label="Loading recommendations" showLabel />;
  * }
+ * // Inline, beside text that already explains the wait: the label stays visually hidden.
+ * <Spinner label="Waiting for the first analysis run" />
  * ```
  */
-export function Spinner({ label }: SpinnerProps) {
+export function Spinner({ label, showLabel = false }: SpinnerProps) {
   return (
-    <span role="status" className="ds-spinner">
+    <span role="status" className={showLabel ? 'ds-spinner ds-spinner--labelled' : 'ds-spinner'}>
       <span className="ds-spinner__circle" aria-hidden="true" />
-      <span className="ds-visually-hidden">{label}</span>
+      <span className={showLabel ? 'ds-spinner__label' : 'ds-visually-hidden'}>{label}</span>
     </span>
   );
 }

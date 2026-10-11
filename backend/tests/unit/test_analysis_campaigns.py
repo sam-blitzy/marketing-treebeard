@@ -559,7 +559,16 @@ def test_c1_pauses_a_steady_spender_with_no_output() -> None:
         "outcomes": 0,
         "expected_outcomes": Decimal("3.000000"),
     }
-    assert item.evidence.baselines[0].key == "baseline_cost_per_outcome"
+    # No cost-per-outcome metric pairs with the baseline, so it carries its own unit and the
+    # account currency and is shown in that currency (AAP 0.5.5 "with currency").
+    (baseline,) = item.evidence.baselines
+    assert (baseline.key, baseline.unit, baseline.currency) == (
+        "baseline_cost_per_outcome",
+        "currency",
+        "USD",
+    )
+    rendered = item.evidence.to_json()["baselines"][0]
+    assert (rendered["unit"], rendered["currency"]) == ("currency", "USD")
     assert item.evidence.sample is not None
     assert (item.evidence.sample.observed, item.evidence.sample.required) == (
         Decimal(3),
@@ -788,11 +797,16 @@ def test_c1b_pauses_a_campaign_whose_matured_leads_reach_no_pipeline() -> None:
         "leads",
     )
     assert expected.value == Decimal("20.000000")
-    assert [(entry.key, entry.label, entry.value) for entry in item.evidence.baselines] == [
+    assert [
+        (entry.key, entry.label, entry.value, entry.unit, entry.currency)
+        for entry in item.evidence.baselines
+    ] == [
         (
             "baseline_cost_per_outcome",
             "Account cost per lead (same source and objective)",
             Decimal("135.800000"),
+            "currency",
+            "USD",
         )
     ]
     assert item.reason == (
@@ -834,7 +848,14 @@ def test_c1b_still_pauses_without_a_finite_account_baseline(
     (entry,) = item.evidence.baselines
     assert (entry.key, entry.value) == ("baseline_cost_per_outcome", baseline)
     rendered = item.evidence.to_json()
-    assert rendered["baselines"][0]["value"] == baseline
+    # A "—" or unavailable baseline is still a money baseline in the account currency.
+    assert rendered["baselines"][0] == {
+        "key": "baseline_cost_per_outcome",
+        "label": "Account cost per lead (same source and objective)",
+        "value": baseline,
+        "unit": "currency",
+        "currency": "USD",
+    }
     shown = {m["key"]: m for m in rendered["metrics"]}
     assert shown["expected_outcomes"]["value"] is None
     assert shown["expected_outcomes"]["unavailable"] is True
@@ -1065,9 +1086,11 @@ def test_c2_scale_links_its_b1_item_and_declares_its_g1_targets() -> None:
     assert set(item.evidence.thresholds) == {*C2_THRESHOLD_KEYS, *VETO_THRESHOLD_KEYS}
     assert item.evidence.sample is not None
     assert item.evidence.sample.unit == "known-budget days"
-    assert [baseline.key for baseline in item.evidence.baselines] == [
-        "baseline_cost_per_outcome",
-        "max_cost_per_outcome",
+    assert [
+        (baseline.key, baseline.unit, baseline.currency) for baseline in item.evidence.baselines
+    ] == [
+        ("baseline_cost_per_outcome", "currency", "USD"),
+        ("max_cost_per_outcome", "currency", "USD"),
     ]
     assert item.rank_key == (Decimal("129.333333"),)
     assert item.reason == (

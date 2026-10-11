@@ -30,14 +30,26 @@
  * - "Too many attempts. Try again in N seconds": 429 `rate_limited`, from the 6th attempt within
  *   a minute per IP (AAP 0.5.3), with N from the response's `Retry-After`; without a usable
  *   wait, "Too many attempts. Try again shortly."
- * - Any other API failure shows the API's own message (for example "Database unavailable"), and
- *   a failure without an API error shows "Sign-in failed. Try again."
+ * - An outage, in which the API never judged the credentials: the request did not reach the
+ *   server (status 0 `network_error`: "The server could not be reached. Check your connection
+ *   and try again.") or the server failed on its own side (any 5xx: the API's own message, such
+ *   as "Database unavailable", or "The server is temporarily unavailable. Try again shortly." for
+ *   an error page without the API's envelope, such as nginx's 502 while the API restarts).
+ * - Any other API failure shows the API's own message, and a failure without an API error shows
+ *   "Sign-in failed. Try again."
  *
- * After any other API failure (401, 429, any other status, or no response at all) the password
- * field is cleared and focused, so a screen reader reads the message through the field's
- * `aria-describedby`. The message also heads the form in a
- * critical `Banner`. Neither carries `role="alert"`: AAP 0.5.5 reserves it for the
- * open-discrepancies banner.
+ * Where a failed attempt's message shows:
+ * - **An outage**: only at the head of the form, in a critical `Banner`. No field is marked
+ *   invalid and nothing typed is cleared, because the credentials were not refused. The banner
+ *   sits in a polite `role="status"` region mounted with the page, so the message is announced
+ *   when it appears (WCAG 2.2 SC 4.1.3). When focus has fallen to `<body>` during the request,
+ *   it returns to the "Sign in" button, where Enter retries; focus in a field stays there.
+ * - **Every other failure** (401, 429, a 422 naming neither field, any other status, or a
+ *   failure without an API error): at the head of the form in a critical `Banner`, and under the
+ *   password field, which is cleared and focused, so a screen reader reads the message through
+ *   the field's `aria-describedby`.
+ *
+ * No message carries `role="alert"`: AAP 0.5.5 reserves it for the open-discrepancies banner.
  *
  * Rules this file keeps:
  * - **Server state only through `../../api/queries`** (AAP 0.11.1). The CSRF header
@@ -46,7 +58,8 @@
  * - **Design system only** (AAP 0.4.4): `PageShell`, `TopBar`, `SideNav`, `TextField`,
  *   `Button`, `Banner`, and layout through `Stack` and `Inline`; no raw interactive or heading
  *   elements, no styles and no stylesheet of its own. The `<form>` element is plain HTML because
- *   the design system has no form wrapper and a form carries no visual styling.
+ *   the design system has no form wrapper and a form carries no visual styling; so is the
+ *   outage message's `role="status"` region, an unstyled `<div>` that `Stack` spaces.
  * - **Sign-in navigation**: every screen uses `PageShell`, `TopBar` and `SideNav` (AAP 0.5.5),
  *   and `/login` sits outside the authenticated layout that renders the signed-in screens'
  *   navigation, so the page renders its own "Primary" `SideNav`. It holds one link, "Sign in",
@@ -56,7 +69,7 @@
  *   `POST /api/v1/auth/login` and no other request carries it. It is measured and sent exactly
  *   as typed (never trimmed), never rendered outside its masked field, logged or echoed in a
  *   message, and cleared after an attempt the API refused for any reason but a field validation
- *   error.
+ *   error. An outage refused nothing, so it leaves the password as typed.
  * - **No router import**: `src/router.tsx` imports this page, so `useNavigate` and `Link` come
  *   straight from `@tanstack/react-router`.
  * - **Fixed strings**: the e2e specs (`web/tests/e2e/auth.setup.ts`, `first-start.spec.ts`)
@@ -403,7 +416,8 @@ function serverFieldErrors(error: unknown): FieldErrors | undefined {
  * The message never contains the submitted password.
  *
  * @param error - The mutation's error.
- * @returns The text shown in the banner and under the password field.
+ * @returns The text shown in the banner and, unless {@link isOutage} holds, under the password
+ *   field.
  */
 function loginErrorMessage(error: unknown): string {
   if (!isApiError(error)) {
@@ -420,6 +434,25 @@ function loginErrorMessage(error: unknown): string {
     return `Too many attempts. Try again in ${seconds} ${seconds === 1 ? 'second' : 'seconds'}`;
   }
   return error.message.trim() === '' ? GENERIC_FAILURE_MESSAGE : error.message;
+}
+
+/**
+ * Whether a failed `POST /auth/login` was an outage that left the credentials unjudged: the
+ * request never reached the API (status 0 `network_error`), or the server failed on its own side
+ * (any 5xx, such as nginx's 502 while the API restarts or 503 `database_unavailable`). It says
+ * nothing about the email or the password, so the page marks no field invalid and clears
+ * nothing typed.
+ *
+ * @param error - The mutation's error.
+ * @returns `true` for an outage; `false` for an answer that refused the attempt (401, 422, 429
+ *   and every other status below 500), a status-0 failure other than `network_error`, and a
+ *   failure that is not an `ApiError`.
+ */
+function isOutage(error: unknown): boolean {
+  return (
+    isApiError(error) &&
+    ((error.status === 0 && error.code === 'network_error') || error.status >= 500)
+  );
 }
 
 /**
@@ -495,6 +528,10 @@ export interface LoginPageProps {
  *   falls back to `/actions`.
  * - On a 422 `validation_error` naming the email or the password, the API's message for each
  *   named field sits under that field and focus moves to the first one; nothing is cleared.
+ * - On an outage (no response, or a 5xx; see {@link isOutage}) the message heads the form and
+ *   nowhere else: no field is marked invalid and nothing is cleared. It renders inside a polite
+ *   `role="status"` region that exists from the first render, so it is announced. Once the
+ *   request has settled, focus that fell to `<body>` returns to the button, so Enter retries.
  * - On any other failure the message heads the form and sits under the password field, the
  *   password is cleared, and focus moves to the password field once the message has rendered.
  *
@@ -516,10 +553,32 @@ export function LoginPage({ redirectTo }: LoginPageProps) {
   const [emailError, setEmailError] = useState<string | undefined>(undefined);
   const [passwordError, setPasswordError] = useState<string | undefined>(undefined);
   const [formError, setFormError] = useState<string | undefined>(undefined);
+  const [outageError, setOutageError] = useState<string | undefined>(undefined);
+  // The number of attempts an outage has ended. Every one changes it, so the effect below runs
+  // once per outage, after the render that re-enables the button has committed.
+  const [outages, setOutages] = useState(0);
   const [focusRequest, setFocusRequest] = useState<FocusRequest | undefined>(undefined);
 
   const emailRef = useRef<HTMLInputElement>(null);
   const passwordRef = useRef<HTMLInputElement>(null);
+  const submitRef = useRef<HTMLButtonElement>(null);
+
+  // After an outage, focus returns to "Sign in" when it fell to <body> (or nowhere) during the
+  // request, so Enter retries. Focus in a field, as after Enter pressed there, stays where it
+  // is; the polite region announces the message either way.
+  useEffect(() => {
+    if (outages === 0) {
+      return;
+    }
+    const button = submitRef.current;
+    if (button === null) {
+      return;
+    }
+    const focused = button.ownerDocument.activeElement;
+    if (focused === null || focused === button.ownerDocument.body) {
+      button.focus();
+    }
+  }, [outages]);
 
   // Focus moves after the render that shows the message has committed, so the field already
   // carries aria-invalid and the message in aria-describedby when a screen reader announces it.
@@ -565,6 +624,7 @@ export function LoginPage({ redirectTo }: LoginPageProps) {
     setEmailError(nextEmailError);
     setPasswordError(nextPasswordError);
     setFormError(undefined);
+    setOutageError(undefined);
     if (nextEmailError !== undefined) {
       requestFocus('email');
       return;
@@ -589,6 +649,12 @@ export function LoginPage({ redirectTo }: LoginPageProps) {
           requestFocus(fieldErrors.email !== undefined ? 'email' : 'password');
           return;
         }
+        // An outage refused nothing: the message heads the form only, and what was typed stays.
+        if (isOutage(error)) {
+          setOutageError(loginErrorMessage(error));
+          setOutages((count) => count + 1);
+          return;
+        }
         setFormError(loginErrorMessage(error));
         setPassword('');
         requestFocus('password');
@@ -604,6 +670,11 @@ export function LoginPage({ redirectTo }: LoginPageProps) {
       <PageShell.Title>{PAGE_TITLE}</PageShell.Title>
       <form noValidate onSubmit={handleSubmit}>
         <Stack gap={4}>
+          {/* Polite, never role="alert", and present before its first message so the message
+              is announced; while empty, Stack.css takes it out of the column. */}
+          <div role="status">
+            {outageError !== undefined ? <Banner tone="critical" title={outageError} /> : null}
+          </div>
           {formError !== undefined ? <Banner tone="critical" title={formError} /> : null}
           <TextField
             label={EMAIL_LABEL}
@@ -629,7 +700,7 @@ export function LoginPage({ redirectTo }: LoginPageProps) {
           />
           {/* The action row keeps the button at its own width instead of the column's. */}
           <Inline>
-            <Button type="submit" variant="primary" loading={login.isPending}>
+            <Button type="submit" variant="primary" loading={login.isPending} ref={submitRef}>
               {SUBMIT_LABEL}
             </Button>
           </Inline>

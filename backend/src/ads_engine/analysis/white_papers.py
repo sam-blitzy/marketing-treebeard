@@ -84,6 +84,7 @@ from ads_engine.analysis.context import (
 )
 from ads_engine.analysis.metrics import G1_THRESHOLD_KEYS, spend_increase_blocked
 from ads_engine.analysis.thresholds import Thresholds
+from ads_engine.decisions import minor_unit_exponent, round_to_minor_unit
 
 __all__ = [
     "ACTION_DOUBLE_DOWN_PREFIX",
@@ -92,6 +93,7 @@ __all__ = [
     "ACTION_RETIRE",
     "METRIC_KEYS",
     "REQUIRED_DATASETS",
+    "SECTION_DATASETS",
     "THRESHOLD_KEYS",
     "W1_ALL_BLOCKED_REASON",
     "evaluate",
@@ -129,6 +131,14 @@ REQUIRED_DATASETS: Final[tuple[str, ...]] = (
 That is the effective CRM dataset of the LinkedIn dataset in use: the companion while LinkedIn
 is simulated, HubSpot's active primary otherwise (AAP 0.3.3), so an item's ``stale`` and
 ``incomplete`` flags derive from the CRM data its counts were actually read from.
+"""
+
+SECTION_DATASETS: Final[tuple[str, ...]] = REQUIRED_DATASETS
+"""Every dataset the White papers section reads: exactly :data:`REQUIRED_DATASETS`.
+
+Precedence judges these over the run's window when the section stores no item, so an empty
+section says which of its datasets do not cover the window (AAP 0.5.5 "Each section shows an
+EmptyState with the reason").
 """
 
 THRESHOLD_KEYS: Final[tuple[str, ...]] = (
@@ -171,9 +181,6 @@ METRIC_KEYS: Final[tuple[str, ...]] = (
 
 _CRM_SCOPE: Final = "linkedin"
 """LinkedIn-attributed evidence reads the effective CRM dataset (AAP 0.3.3)."""
-
-_CENT: Final = Decimal("0.01")
-"""Display precision of money in reason sentences."""
 
 _RATIO_PLACES: Final = Decimal("0.0001")
 """Precision of a displayed ratio or multiple; trailing zeros are dropped (``10``, ``2.5``)."""
@@ -242,11 +249,6 @@ def _bounded(value: Decimal) -> Decimal:
     return bounded_decimal(value)
 
 
-def _fixed(amount: Decimal) -> str:
-    """Render an amount to two decimals: ``Decimal("24")`` -> ``"24.00"``."""
-    return format(amount.quantize(_CENT, rounding=ROUND_HALF_EVEN), "f")
-
-
 def _plain(value: Decimal) -> str:
     """Render a ratio or multiple without trailing zeros: ``0.80`` -> ``"0.8"``."""
     return format(_plain_decimal(value), "f")
@@ -268,8 +270,24 @@ def _percent(share: Decimal) -> str:
 
 
 def _money(amount: Decimal, currency: str) -> str:
-    """Render an amount with its currency: ``USD 30.00``."""
-    return f"{currency} {_fixed(amount)}"
+    """Render an amount with its currency at the currency's minor unit: ``USD 2,766.00``.
+
+    The places are the ISO 4217 minor unit of :func:`ads_engine.decisions.minor_unit_exponent`,
+    the unit decided amounts are validated to. The amount is rounded by
+    :func:`ads_engine.decisions.round_to_minor_unit` (half up: a tie rounds away from zero) and
+    grouped in thousands, as the campaign and budget reason texts render money and as the web
+    client's ``formatMoney`` renders the same stored value in the table cell, so a white-paper
+    reason and its cell read alike: a cost of ``89.225`` is ``USD 89.23`` in both.
+
+    Example:
+        >>> [_money(Decimal("30"), code) for code in ("USD", "JPY", "KWD", "IQD", "AFN")]
+        ['USD 30.00', 'JPY 30', 'KWD 30.000', 'IQD 30.000', 'AFN 30.00']
+        >>> _money(Decimal("2766"), "USD"), _money(Decimal("89.225"), "USD")
+        ('USD 2,766.00', 'USD 89.23')
+    """
+    places = minor_unit_exponent(currency)
+    rendered = format(round_to_minor_unit(amount, currency), f",.{places}f")
+    return f"{currency} {rendered}"
 
 
 def _cost_text(cost: CostValue, currency: str) -> str:

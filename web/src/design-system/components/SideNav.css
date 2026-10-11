@@ -2,8 +2,10 @@
 
 /*
  * Navigation list with optional item counts: the app's primary navigation in the router layout
- * and the /actions section navigation (anchor links with item counts). SideNav.tsx renders, and
- * router links built through its renderLink prop must keep, this class contract:
+ * and the /actions section navigation (anchor links with item counts). SideNav.tsx renders,
+ * router links built through its renderLink prop must keep, and the static loading screen in
+ * web/index.html writes out by hand for its one "Sign in" link (see PageShell.css), this class
+ * contract:
  *
  *   <nav class="ds-sidenav" aria-label="…">
  *     <ul class="ds-sidenav__list">

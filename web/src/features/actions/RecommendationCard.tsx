@@ -87,7 +87,7 @@ import { DecisionForm } from '../decisions/DecisionForm';
 import { describeExpectedState } from '../decisions/DecisionLog';
 import { useActionOutcome, useRecordFeedbackConfirmation } from './ActionOutcomes';
 import { BlockingDiscrepancyLinks } from './BlockingDiscrepancies';
-import { EvidenceTable } from './EvidenceTable';
+import { EvidenceTable, evidenceRatioDigits } from './EvidenceTable';
 import { decisionContextFor, headlineMetric, type DecisionContext } from './evidenceExtra';
 import { FlagList } from './FlagList';
 import { isHeld, itemIdentity } from './sections/SectionFrame';
@@ -131,7 +131,7 @@ export const RECORD_DECISION_LABEL = 'Record decision';
 /**
  * The status a card shows after its decision form saved a decision. The card's line follows it
  * with the expected state the decision recorded, "Decision recorded: Active · daily budget
- * $160.00" ({@link decisionRecordedLine}).
+ * USD 160.00" ({@link decisionRecordedLine}).
  */
 export const DECISION_RECORDED_MESSAGE = 'Decision recorded';
 
@@ -261,14 +261,20 @@ function entityLine(entity: EntityView): string | undefined {
  * The header's headline number (AAP 0.1.2): the metric the item's rule selected in its frozen
  * evidence ({@link headlineMetric}), labelled with the API's own metric label and formatted by
  * `formatMetric` with its unit and currency, so an unavailable value reads "unavailable", never
- * `0`, and a floor keeps its "≥" or "≤" mark.
+ * `0`, and a floor keeps its "≥" or "≤" mark. A percentage takes the evidence table's precision
+ * ({@link evidenceRatioDigits}), so the figure reads exactly as the metric's row below it: a CR1
+ * lead rate of 0.000722 reads "0.072%" in both, never "0.1%".
  *
  * @param item - the recommendation
  * @returns the figure, or `undefined` when the evidence selects no headline metric
  */
 function headlineFigure(item: Item): CardHeaderProps['figure'] {
   const metric = headlineMetric(item);
-  return metric === null ? undefined : { label: metric.label, value: formatMetric(metric) };
+  if (metric === null) {
+    return undefined;
+  }
+  const ratioDigits = evidenceRatioDigits(item.evidence);
+  return { label: metric.label, value: formatMetric(metric, { ratioDigits }) };
 }
 
 /**
@@ -357,7 +363,7 @@ function outcomeMessage(status: string, item: Item): string {
  * where the state is what the decision recorded, the complete expected state the server
  * materialised from the patch, worded as the decision log's "Resulting expected state" cell
  * ({@link describeExpectedState}): for example "Decision recorded: Active · daily budget
- * $160.00" after Active and 160 were recorded on a C1 card, never the recommendation's own
+ * USD 160.00" after Active and 160 were recorded on a C1 card, never the recommendation's own
  * action. Amounts are in the subject's currency.
  *
  * @param decision - the saved decision, the `POST /decisions` response the form reported, or
@@ -373,7 +379,7 @@ function decisionRecordedLine(decision: Decision | null): string {
 /**
  * The confirmation a saved decision announces: its {@link decisionRecordedLine} naming the
  * card's entity, because the card may be scrolled away when it is read, for example "Decision
- * recorded: Active · daily budget $160.00 (Competitor - Conquest)". The entity is left out when
+ * recorded: Active · daily budget USD 160.00 (Competitor - Conquest)". The entity is left out when
  * the item carries no name. Unlike {@link outcomeMessage}'s action, the state line never states
  * the entity's name, so the name follows it whenever the item carries one.
  *
@@ -652,7 +658,7 @@ function closeDialogSession(current: DialogSession): DialogSession {
  *   closed the card's status line reads "Saving decision". Every success, also one that ends
  *   after its dialog was closed, is reported by the status line "Decision recorded: {state}",
  *   the expected state the saved decision holds as the decision log words it, for example
- *   "Decision recorded: Active · daily budget $160.00"; a failure shows in the warning
+ *   "Decision recorded: Active · daily budget USD 160.00"; a failure shows in the warning
  *   `Banner`. The closed dialog returns focus to "Record decision", which stays focusable while
  *   it loads; once the save settles, focus that has been lost goes back to it when nothing else
  *   has taken it.

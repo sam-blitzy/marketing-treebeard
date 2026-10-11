@@ -55,7 +55,7 @@
  * default page's C1, C0 and historical CR1 cards, or `makeItem` for a single variant.
  */
 import { apiError, html, json, mockApi, type ApiMock, type MockResponse } from '../../test/mockApi';
-import { renderWithProviders } from '../../test/render';
+import { KEEP_SPACES, renderWithProviders } from '../../test/render';
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { useState, type ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -148,7 +148,7 @@ function genericCrmDecision(overrides: Partial<Decision> = {}): Decision {
  * daily budget kept at USD 200.00: what the saved decision recorded, as the decision log words
  * it, never the recommendation's action.
  */
-const PAUSED_RECORDED_LINE = `${DECISION_RECORDED_MESSAGE}: Paused · daily budget $200.00`;
+const PAUSED_RECORDED_LINE = `${DECISION_RECORDED_MESSAGE}: Paused · daily budget USD\u00a0200.00`;
 
 /** Any recorded-decision status line, whatever state it names. */
 const RECORDED_LINE_PATTERN = new RegExp(`^${DECISION_RECORDED_MESSAGE}`, 'u');
@@ -539,7 +539,7 @@ describe('RecommendationCard: headline number', () => {
       throw new Error('The headline figure was not rendered');
     }
 
-    expect(figure.textContent).toBe('Wasted spend $515.34');
+    expect(figure.textContent).toBe('Wasted spend USD\u00a0515.34');
     expect(heading.contains(figure)).toBe(false);
     const entity = within(header).getByText('crm demo · Google');
     expect(heading.compareDocumentPosition(figure)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
@@ -556,7 +556,7 @@ describe('RecommendationCard: headline number', () => {
     const header = headerOf(item);
     expect(header.querySelector('.ds-card__figure')).toBeNull();
     expect(within(header).queryByText('Wasted spend')).toBeNull();
-    expect(within(header).queryByText('$515.34')).toBeNull();
+    expect(within(header).queryByText('USD 515.34')).toBeNull();
   });
 
   it('shows no headline number, and never another metric, when the key names none', async () => {
@@ -565,7 +565,7 @@ describe('RecommendationCard: headline number', () => {
 
     const header = headerOf(item);
     expect(header.querySelector('.ds-card__figure')).toBeNull();
-    expect(within(header).queryByText('$515.34')).toBeNull();
+    expect(within(header).queryByText('USD 515.34')).toBeNull();
   });
 
   it('renders an unavailable headline value as "unavailable", never 0', async () => {
@@ -575,6 +575,76 @@ describe('RecommendationCard: headline number', () => {
     const figure = within(headerOf(item)).getByText('Wasted spend').parentElement;
     expect(figure?.textContent).toBe('Wasted spend unavailable');
     expect(figure?.textContent).not.toMatch(/\d/);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Headline number: percentages at the evidence table's precision
+// ---------------------------------------------------------------------------------------------
+
+describe('RecommendationCard: headline percentage precision', () => {
+  /** A ratio metric as `analysis.context.Metric.to_json` renders it. */
+  function ratioMetric(key: string, label: string, value: string): Metric {
+    return { key, label, value, unit: 'ratio', currency: null, floor: null, unavailable: null };
+  }
+
+  /** The headline figure text of the card of `item`, label and value. */
+  function figureText(item: Item, label: string): string | null {
+    const header = cardOf(item).querySelector('.ds-card__header');
+    if (!(header instanceof HTMLElement)) {
+      throw new Error('The card header was not rendered');
+    }
+    return within(header).getByText(label).parentElement?.textContent ?? null;
+  }
+
+  /** The Value cell text of the evidence row headed `label` on the card of `item`. */
+  function evidenceValue(item: Item, label: string): string | null {
+    const table = within(cardOf(item)).getByRole('table', { name: 'Evidence' });
+    const row = within(table).getByRole('rowheader', { name: label }).closest('tr');
+    return row?.querySelector('td')?.textContent ?? null;
+  }
+
+  it('shows a CR1 lead rate as its evidence row does, "0.072%" rather than "0.1%"', async () => {
+    const item = makeItem({
+      rule_id: 'CR1',
+      action: 'Variant A vs Variant B: Variant A ahead, not yet distinguishable',
+      evidence: makeEvidence({
+        metrics: [
+          ratioMetric('rate_a', 'Variant A lead rate', '0.000722'),
+          ratioMetric('rate_b', 'Variant B lead rate', '0.000698'),
+        ],
+        extra: { headline_metric: 'rate_a' },
+      }),
+    });
+    await renderCard(<RecommendationCard item={item} />);
+
+    expect(figureText(item, 'Variant A lead rate')).toBe('Variant A lead rate 0.072%');
+    expect(evidenceValue(item, 'Variant A lead rate')).toBe('0.072%');
+    expect(evidenceValue(item, 'Variant B lead rate')).toBe('0.070%');
+  });
+
+  it('shows a CR3 stage rate at the precision that keeps it apart from its baseline', async () => {
+    const item = makeItem({
+      rule_id: 'CR3',
+      action: 'Next test: change only headline',
+      evidence: makeEvidence({
+        metrics: [
+          ratioMetric('click_rate', 'Click rate', '0.007501'),
+          ratioMetric('click_rate_ci_low', 'Click rate interval low', '0.007000'),
+          ratioMetric('click_rate_ci_high', 'Click rate interval high', '0.008030'),
+        ],
+        baselines: [
+          { key: 'click_rate_baseline', label: 'Account click rate baseline', value: '0.008120' },
+        ],
+        extra: { headline_metric: 'click_rate' },
+      }),
+    });
+    await renderCard(<RecommendationCard item={item} />);
+
+    expect(figureText(item, 'Click rate')).toBe('Click rate 0.75%');
+    expect(evidenceValue(item, 'Click rate')).toBe('0.75%');
+    expect(evidenceValue(item, 'Click rate interval low')).toBe('0.70%');
+    expect(evidenceValue(item, 'Click rate interval high')).toBe('0.80%');
   });
 });
 
@@ -1087,7 +1157,7 @@ describe('RecommendationCard: record decision', () => {
     const dialog = await openDecisionDialog(item);
     fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
 
-    expect(await within(cardOf(item)).findByText(PAUSED_RECORDED_LINE)).toBeDefined();
+    expect(await within(cardOf(item)).findByText(PAUSED_RECORDED_LINE, KEEP_SPACES)).toBeDefined();
     expect(screen.queryByRole('dialog')).toBeNull();
     const [post] = posts(api);
     expect(posts(api)).toHaveLength(1);
@@ -1276,7 +1346,7 @@ describe('RecommendationCard: record decision', () => {
     const dialog = await openDecisionDialog(item);
     fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
 
-    const line = await within(cardOf(item)).findByText(PAUSED_RECORDED_LINE);
+    const line = await within(cardOf(item)).findByText(PAUSED_RECORDED_LINE, KEEP_SPACES);
     // Inside a provider the card's own line is visible but no second live region.
     expect(line.getAttribute('role')).toBeNull();
     expect(outcomeRegion().textContent).toBe(
@@ -1345,7 +1415,7 @@ describe('RecommendationCard: record decision', () => {
     release(json(201, saved));
 
     // The late save is reported on the card and in the provider's region...
-    expect(await within(cardOf(item)).findByText(PAUSED_RECORDED_LINE)).toBeDefined();
+    expect(await within(cardOf(item)).findByText(PAUSED_RECORDED_LINE, KEEP_SPACES)).toBeDefined();
     expect(within(cardOf(item)).queryByText(DECISION_SAVING_MESSAGE)).toBeNull();
     expect(outcomeRegion().textContent).toBe(
       `${PAUSED_RECORDED_LINE} (Generic CRM — US)`,
@@ -1485,7 +1555,7 @@ describe('RecommendationCard: record decision', () => {
 
     release(json(201, genericCrmDecision({ id: 811, origin: 'user', status: 'paused' })));
 
-    expect(await within(cardOf(item)).findByText(PAUSED_RECORDED_LINE)).toBeDefined();
+    expect(await within(cardOf(item)).findByText(PAUSED_RECORDED_LINE, KEEP_SPACES)).toBeDefined();
     await waitFor(() => {
       expect(opener).toHaveProperty('disabled', false);
     });
@@ -1795,7 +1865,7 @@ describe('RecommendationActions: a newer run of the same recommendation', () => 
     expect(within(cardOf(next)).queryByText(HISTORICAL_LABEL)).toBeNull();
     fireEvent.click(within(reopened).getByRole('button', { name: 'Save decision' }));
 
-    expect(await within(cardOf(next)).findByText(PAUSED_RECORDED_LINE)).toBeDefined();
+    expect(await within(cardOf(next)).findByText(PAUSED_RECORDED_LINE, KEEP_SPACES)).toBeDefined();
     expect(screen.queryByRole('dialog')).toBeNull();
     expect(posts(api).map((call) => call.body)).toEqual([
       { ...decisionBody, recommendation_id: item.id },
@@ -1834,7 +1904,7 @@ describe('RecommendationActions: a newer run of the same recommendation', () => 
 
     fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
 
-    expect(await within(cardOf(next)).findByText(PAUSED_RECORDED_LINE)).toBeDefined();
+    expect(await within(cardOf(next)).findByText(PAUSED_RECORDED_LINE, KEEP_SPACES)).toBeDefined();
     expect(screen.queryByRole('dialog')).toBeNull();
     // The form posts the recommendation it was opened for, whose subject is the same.
     expect(posts(api).map((call) => call.body)).toEqual([
@@ -2368,7 +2438,7 @@ describe('RecommendationActions: the confirmation names the entity once', () => 
     const dialog = await openDecisionDialog(item);
     fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
 
-    expect(await within(cardOf(item)).findByText(PAUSED_RECORDED_LINE)).toBeDefined();
+    expect(await within(cardOf(item)).findByText(PAUSED_RECORDED_LINE, KEEP_SPACES)).toBeDefined();
     // The state names no entity, so the name still follows it.
     expect(outcomeRegion().textContent).toBe(`${PAUSED_RECORDED_LINE} (Generic CRM — US)`);
   });
@@ -2583,11 +2653,12 @@ describe("RecommendationActions: the recorded decision's state", () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
 
     const line = await within(cardOf(item)).findByText(
-      'Decision recorded: Active · daily budget $160.00',
+      'Decision recorded: Active · daily budget USD\u00a0160.00',
+      KEEP_SPACES,
     );
     expect(line.getAttribute('role')).toBeNull();
     expect(outcomeRegion().textContent).toBe(
-      'Decision recorded: Active · daily budget $160.00 (Generic CRM — US)',
+      'Decision recorded: Active · daily budget USD\u00a0160.00 (Generic CRM — US)',
     );
     expect(outcomeRegion().textContent).not.toContain(item.action);
     expect(posts(api).map((call) => call.body)).toEqual([
@@ -2620,7 +2691,10 @@ describe("RecommendationActions: the recorded decision's state", () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Save decision' }));
 
     // Outside a provider the card's own line is the polite region.
-    const line = await within(cardOf(item)).findByText('Decision recorded: daily budget $600.00');
+    const line = await within(cardOf(item)).findByText(
+      'Decision recorded: daily budget USD\u00a0600.00',
+      KEEP_SPACES,
+    );
     expect(line.getAttribute('role')).toBe('status');
   });
 

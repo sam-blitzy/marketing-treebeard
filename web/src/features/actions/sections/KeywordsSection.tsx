@@ -12,9 +12,15 @@
  *    ones, those computed from replaced data and the held ones collapsed behind their "Held
  *    until discrepancies are resolved" disclosure; only items hidden by feedback are left out.
  *    That is the rule the section's navigation count follows, so the tab counts add up to it.
- *    Every tab the API returns is shown, an empty one included, whose panel says "No items",
- *    unless it holds the confirmation of a card a feedback recorded on this page has hidden,
- *    which stays in the card's place.
+ *    Every tab the API returns is shown, an empty one included. A tab that holds the
+ *    confirmation of a card a feedback recorded on this page has hidden keeps it in the card's
+ *    place; any other empty tab's panel is an `EmptyState` titled with the reason its rule has
+ *    no card: the cards feedback hides now, else the reason of the leading withheld line of the
+ *    group's rule (for example "No search term met the K1 minimum of 70 clicks", with the
+ *    minimum read from the recorded sample), else, when the section reports suppression counts,
+ *    "No {rule} action to show; not shown in this section: {count} {label}" (for example "No K3
+ *    action to show; not shown in this section: 2 dismissed"; the counts are the section's,
+ *    never the rule's), else "{rule} did not fire for this window".
  * 2. **Keyword cards.** Each item is a {@link RecommendationCard} whose body reads, in order:
  *    - **The six fields.** The "Keyword details" list holds exactly six fields, in the keyword
  *      field set's order (AAP 0.5.5 "Keywords: term, campaign and ad group, spend, conversions,
@@ -53,20 +59,29 @@
 import { useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 
-import type { Item, Metric } from '../../../api/types';
+import type { Item, Metric, Withheld } from '../../../api/types';
 import { EmptyState, Stack, Tabs } from '../../../design-system';
 import type { TabItem } from '../../../design-system';
 import {
   EM_DASH,
+  FIGURE_SEPARATOR,
   UNAVAILABLE,
   formatCount,
   formatMetric,
   isDecimalString,
 } from '../../../lib/format';
 import { RecommendationCard } from '../RecommendationCard';
+import { withheldReason } from '../WithheldList';
 import { ADJACENT_TERMS_MAX, adjacentTerms, keywordFields, reviewHalves } from '../evidenceExtra';
 import type { AdjacentTerm, KeywordFields } from '../evidenceExtra';
-import { FieldList, SectionFrame } from './SectionFrame';
+import {
+  FieldList,
+  NO_RULE_FIRED_REASON,
+  SectionFrame,
+  notShownReason,
+  reportedSuppressions,
+  suppressionLine,
+} from './SectionFrame';
 import type { FieldItem, GroupParts, SectionComponentProps } from './SectionFrame';
 
 // ---------------------------------------------------------------------------------------------
@@ -92,20 +107,32 @@ export const ADJACENT_TERMS_TITLE = 'Adjacent terms from your search-term report
 /** The accessible name of a K3 card's quality-score and by-half field list. */
 export const REVIEW_EVIDENCE_LABEL = 'Review evidence';
 
-/** The title of the empty state a tab shows when its group has no card to show. */
-export const EMPTY_GROUP_TITLE = 'No items';
-
 /** The label of a keyword card's second field: the term's campaign and ad group. */
 const CAMPAIGN_AND_AD_GROUP_LABEL = 'Campaign and ad group';
 
 /** The separator between the campaign and ad group names: "Core CRM — US · CRM Software". */
 const CAMPAIGN_SEPARATOR = ' · ';
 
+/** The rule that produces block / negative-keyword candidates. */
+const BLOCK_RULE_ID = 'K1';
+
 /** The rule that produces expansion candidates, whose cards list adjacent terms. */
 const EXPANSION_RULE_ID = 'K2';
 
 /** The rule that produces keyword reviews, whose cards show quality score and CPC by half. */
 const REVIEW_RULE_ID = 'K3';
+
+/**
+ * The rule behind each Keywords group key the API returns (AAP 0.5.4.3): `block` holds the K1
+ * block / negative-keyword candidates, `expand` the K2 expansion candidates and `review` the K3
+ * keyword reviews. An empty tab reads its reason from the withheld lines of its group's rule; a
+ * group key not listed here has no known rule.
+ */
+const GROUP_RULES: Readonly<Record<string, string>> = Object.freeze({
+  block: BLOCK_RULE_ID,
+  expand: EXPANSION_RULE_ID,
+  review: REVIEW_RULE_ID,
+});
 
 // ---------------------------------------------------------------------------------------------
 // Value helpers
@@ -127,6 +154,14 @@ function textOr(text: unknown, fallback: string): string {
  */
 function metricText(metric: Metric | null): string {
   return metric === null ? UNAVAILABLE : formatMetric(metric);
+}
+
+/**
+ * A first-half against second-half pair, each as {@link metricText}, joined by
+ * {@link FIGURE_SEPARATOR}: "USD 2.10 / USD 2.52", which never wraps inside the pair.
+ */
+function halvesText(firstHalf: Metric | null, secondHalf: Metric | null): string {
+  return `${metricText(firstHalf)}${FIGURE_SEPARATOR}${metricText(secondHalf)}`;
 }
 
 /**
@@ -234,8 +269,8 @@ function adjacentTermText(term: AdjacentTerm): string {
 
 /**
  * The K3 review fields (AAP 0.5.5 "review cards add QS and CPC by half"): the quality score of
- * the first span → the last span, then CPC and cost/conversion as first half / second half.
- * A value the evidence lacks reads "unavailable".
+ * the first span → the last span, then CPC and cost/conversion as first half / second half
+ * ({@link halvesText}). A value the evidence lacks reads "unavailable".
  *
  * @param item - the K3 item
  * @returns the fields, in display order
@@ -251,12 +286,12 @@ function reviewEvidenceFields(item: Item): FieldItem[] {
     {
       key: 'cpc_by_half',
       label: 'CPC by half',
-      value: `${metricText(halves.cpcFirstHalf)} / ${metricText(halves.cpcSecondHalf)}`,
+      value: halvesText(halves.cpcFirstHalf, halves.cpcSecondHalf),
     },
     {
       key: 'cost_per_conversion_by_half',
       label: 'Cost/conversion by half',
-      value: `${metricText(halves.cpaFirstHalf)} / ${metricText(halves.cpaSecondHalf)}`,
+      value: halvesText(halves.cpaFirstHalf, halves.cpaSecondHalf),
     },
   ];
 }
@@ -366,8 +401,8 @@ function shownItemCount(parts: GroupParts): number {
 /**
  * Whether a group has something to show: at least one visible, historical or held item (a
  * {@link shownItemCount} above 0), or the confirmation of an item a feedback recorded on this
- * page has hidden, which the tab shows in place of its "No items" state while the run still
- * lists the item.
+ * page has hidden, which the tab shows in place of its empty state ({@link emptyTabReason})
+ * while the run still lists the item.
  */
 function hasShownItems(parts: GroupParts): boolean {
   return shownItemCount(parts) > 0 || parts.placed.confirmed > 0;
@@ -382,7 +417,7 @@ function hasShownItems(parts: GroupParts): boolean {
  *
  * The design-system `Tabs` would otherwise always open on the first tab. Opening on the first
  * sub-list with something to act on keeps a section whose Block list is empty from greeting
- * the user with "No items" while Expand or Review holds actions; the tab order, labels and
+ * the user with an empty state while Expand or Review holds actions; the tab order, labels and
  * counts stay exactly as the API returned them.
  *
  * @param parts - every group of the section, as the frame prepared them
@@ -398,12 +433,72 @@ function defaultTabKey(parts: readonly GroupParts[]): string | undefined {
 }
 
 /**
+ * The rule behind a group key ({@link GROUP_RULES}), or `null` for a key it does not list. Only
+ * the map's own keys match, so a key such as `constructor` is not read from the prototype.
+ */
+function groupRule(key: string): string | null {
+  return Object.hasOwn(GROUP_RULES, key) ? (GROUP_RULES[key] ?? null) : null;
+}
+
+/**
+ * The one-sentence reason of a tab whose group has no card and no confirmation to show
+ * ({@link hasShownItems}), the first that applies:
+ *
+ * 1. "No actions to show: {n} hidden by feedback since this run (dismissed, snoozed or done)"
+ *    when feedback given since the run hides the group's cards now ({@link notShownReason});
+ * 2. the reason of the leading withheld line of the group's rule ({@link withheldReason}), for
+ *    example "No search term met the K1 minimum of 70 clicks" or "K3 withheld: window 7 days of
+ *    14 required", every number the recorded sample's;
+ * 3. "No {rule} action to show; not shown in this section: {count} {label}; …" when the section
+ *    reports suppression counts ({@link reportedSuppressions}), one part per count as the
+ *    frame's "Not shown" list writes it ({@link suppressionLine}), for example "No K3 action to
+ *    show; not shown in this section: 2 dismissed". The run records those counts per section,
+ *    never per rule, so the sentence names them as the section's and never claims they are the
+ *    tab's; it only keeps the tab from saying its rule did not fire when the rule may have fired
+ *    and had its items suppressed, by feedback for example;
+ * 4. "{rule} did not fire for this window" for a group of a known rule with nothing withheld and
+ *    nothing suppressed in the section;
+ * 5. "No rule fired for this window" ({@link NO_RULE_FIRED_REASON}) for a group key with no
+ *    known rule, once nothing is hidden now.
+ *
+ * @param parts - the group, as the frame prepared it
+ * @param withheld - the section's withheld patterns, in API order
+ * @param suppressions - the section's suppression counts ({@link reportedSuppressions})
+ * @returns the reason
+ */
+function emptyTabReason(
+  parts: GroupParts,
+  withheld: readonly Withheld[],
+  suppressions: readonly (readonly [string, number])[],
+): string {
+  const notShown = notShownReason(parts.hiddenCount);
+  if (notShown !== null) {
+    return notShown;
+  }
+  const rule = groupRule(parts.group.key);
+  if (rule === null) {
+    return NO_RULE_FIRED_REASON;
+  }
+  const ruleLines = withheld.filter((w) => textOr(w.rule_id, '') === rule);
+  const withheldText = withheldReason(ruleLines);
+  if (withheldText !== null) {
+    return withheldText;
+  }
+  if (suppressions.length > 0) {
+    const counts = suppressions.map(([reason, count]) => suppressionLine(reason, count));
+    return `No ${rule} action to show; not shown in this section: ${counts.join('; ')}`;
+  }
+  return `${rule} did not fire for this window`;
+}
+
+/**
  * One group as a tab: the API's key and title, the count of every card its panel holds
  * ({@link shownItemCount}: visible, computed from replaced data and held, so a group whose
  * items are all held counts them rather than reading 0), and as its panel either the frame's
  * default body (visible cards, the cards computed from replaced data, then the held disclosure,
  * collapsed, each card a feedback recorded on this page has hidden leaving its confirmation in
- * its place) or, for a group with nothing to show, an empty state that says so. The count
+ * its place) or, for a group with nothing to show ({@link hasShownItems}: no card and no
+ * confirmation), an `EmptyState` titled with the reason ({@link emptyTabReason}). The count
  * never includes a confirmation: the hidden item is counted as hidden.
  *
  * The group's anchor id is the id of the tab's panel element, which `Tabs` always renders, so
@@ -411,14 +506,21 @@ function defaultTabKey(parts: readonly GroupParts[]): string | undefined {
  * selected has not yet mounted its content.
  *
  * @param parts - the group, as the frame prepared it
+ * @param withheld - the section's withheld patterns, in API order, for an empty tab's reason
+ * @param suppressions - the section's suppression counts ({@link reportedSuppressions}), for an
+ *   empty tab's reason
  * @returns the tab
  */
-function groupTab(parts: GroupParts): TabItem {
+function groupTab(
+  parts: GroupParts,
+  withheld: readonly Withheld[],
+  suppressions: readonly (readonly [string, number])[],
+): TabItem {
   const title = textOr(parts.group.title, parts.group.key);
   const content = hasShownItems(parts) ? (
     <Stack>{parts.body}</Stack>
   ) : (
-    <EmptyState title={EMPTY_GROUP_TITLE}>{`No ${title} actions in this window`}</EmptyState>
+    <EmptyState title={emptyTabReason(parts, withheld, suppressions)} />
   );
   return {
     key: parts.group.key,
@@ -435,10 +537,12 @@ function groupTab(parts: GroupParts): TabItem {
  * item. See the module overview for the card's fields.
  *
  * The frame renders the section's findings, including the `search_term_coverage` finding,
- * above the tabs, and its own empty state, withheld list and suppression counts. The tab list
- * is the design-system `Tabs`, so the arrow keys, Home and End move between tabs and Tab moves
- * into the visible panel. The component keeps only which tab the user selected; it fetches
- * nothing.
+ * above the tabs, and its own empty state, withheld list and suppression counts. An empty tab's
+ * panel states why its rule has no card ({@link emptyTabReason}), from the section's withheld
+ * lines and suppression counts, unless it holds the confirmation of a card a feedback recorded
+ * on this page has hidden, which stays in the card's place. The tab list is the design-system
+ * `Tabs`, so the arrow keys, Home and End move between tabs and Tab moves into the visible
+ * panel. The component keeps only which tab the user selected; it fetches nothing.
  *
  * @param props - see {@link SectionComponentProps}; only `section` is read
  * @returns the section region
@@ -455,10 +559,11 @@ export function KeywordsSection({ section }: SectionComponentProps): ReactElemen
     // A choice whose group the latest response no longer returns falls back to the default.
     const chosenExists = parts.some((part) => part.group.key === chosenKey);
     const selectedKey = chosenExists ? chosenKey : defaultTabKey(parts);
+    const suppressions = reportedSuppressions(section);
     return (
       <Tabs
         label={KEYWORD_TABS_LABEL}
-        tabs={parts.map(groupTab)}
+        tabs={parts.map((part) => groupTab(part, section.withheld, suppressions))}
         selectedKey={selectedKey}
         onChange={setChosenKey}
       />

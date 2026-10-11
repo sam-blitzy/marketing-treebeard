@@ -19,8 +19,11 @@
  * - labelled fields, suppression labels and finding tones;
  * - the frame itself: the section region and its `<h2>`, findings first as banners that are never
  *   alerts, groups in API order as anchored `<h3>` regions, the `renderGroup`, `renderGroups` and
- *   `renderEmptyGroup` hooks, the empty state and its reason lines, the withheld list and the
- *   "Not shown" counts;
+ *   `renderEmptyGroup` hooks, the empty state's one-sentence reason (hidden and suppressed
+ *   cards, else the leading withheld line, else the data-gap sentence of the section's
+ *   `incomplete_dataset` findings, else the first finding that explains the absence, else
+ *   "No rule fired for this window", with no list repeated inside it and long identifiers
+ *   wrapping at their underscores), the withheld list and the "Not shown" counts;
  * - the confirmations of items a feedback recorded on the page has hidden: placed in the hidden
  *   card's own position in API order (also in an emptied replaced-data or held block), never a
  *   batched entry, a live region or a Tab stop, keeping a group whose every item was hidden on
@@ -36,7 +39,15 @@ import { useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { FindingCode, Group, Item, ItemOverlay, Section } from '../../../api/types';
+import type {
+  Finding,
+  FindingCode,
+  Group,
+  Item,
+  ItemOverlay,
+  Section,
+  SectionKey,
+} from '../../../api/types';
 import { Button } from '../../../design-system';
 import {
   makeEvidence,
@@ -59,12 +70,14 @@ import {
   FieldList,
   HeldDisclosure,
   HistoricalItems,
+  NO_RULE_FIRED_REASON,
   REPLACED_DATA_LABEL,
   SUPPRESSION_LABELS,
   SectionFrame,
   findingTone,
   groupAnchorId,
   groupRepeatsSectionTitle,
+  incompleteDataReason,
   isConfirmed,
   isHeld,
   isHidden,
@@ -72,6 +85,7 @@ import {
   itemAnchorId,
   itemIdentity,
   itemKeys,
+  notShownReason,
   partitionGroup,
   placeConfirmations,
   sectionAnchorId,
@@ -134,6 +148,33 @@ function hiddenItem(id: number, action: string, held = false): Item {
   });
 }
 
+/**
+ * An `incomplete_dataset` finding as the run's P4 step records it: the message names the dataset
+ * and its causes, and the evidence carries the dataset, its completeness row and `reasons`.
+ */
+function incompleteFinding(
+  dataset: string,
+  reasons: readonly string[],
+  section: SectionKey = 'keywords',
+): Finding {
+  return makeFinding({
+    code: 'incomplete_dataset',
+    section,
+    entity: null,
+    message: `${dataset} is not complete over the window: ${reasons.join('; ')}`,
+    evidence: {
+      dataset,
+      dataset_id: 7,
+      completeness: 'incomplete',
+      covered_from: '2026-04-13',
+      covered_through: '2026-10-09',
+      reason: null,
+      reasons: [...reasons],
+      items: 0,
+    },
+  });
+}
+
 /** The `renderItem` every frame test passes: a plain line naming the group and the action. */
 function renderLine(item: Item, group: Group): ReactNode {
   return <div data-testid={`item-${String(item.id)}`}>{`${group.key}: ${item.action}`}</div>;
@@ -150,6 +191,25 @@ function listLines(name: string): string[] {
   return within(list)
     .getAllByRole('listitem')
     .map((entry) => entry.textContent);
+}
+
+/** The frame's empty state (the design-system `EmptyState` root), or `null` when it has none. */
+function emptyState(): Element | null {
+  return document.querySelector('.ds-emptystate');
+}
+
+/** The text of the empty state's title, the frame's one-sentence reason. */
+function emptyTitle(): string | null | undefined {
+  return emptyState()?.querySelector('.ds-emptystate__title')?.textContent;
+}
+
+/**
+ * `text` as Testing Library's text queries match a rendered node: the no-break spaces (U+00A0)
+ * that join every "observed / required" figure collapsed to plain spaces. `textContent` keeps
+ * them, so exact assertions on it compare `text` itself.
+ */
+function asQueriedText(text: string): string {
+  return text.replaceAll('\u00A0', ' ');
 }
 
 /** Whether `later` comes after `earlier` in document order. */
@@ -691,14 +751,14 @@ describe('FieldList', () => {
         label="Keyword details"
         fields={[
           { key: 'term', label: 'Term', value: 'crm software' },
-          { key: 'spend', label: 'Spend', value: '$412.30' },
+          { key: 'spend', label: 'Spend', value: 'USD 412.30' },
           { key: 'conversions', label: 'Conversions', value: 0 },
         ]}
       />,
     );
     expect(listLines('Keyword details')).toEqual([
       'Term: crm software',
-      'Spend: $412.30',
+      'Spend: USD 412.30',
       'Conversions: 0',
     ]);
   });
@@ -729,8 +789,8 @@ describe('FieldList', () => {
     render(
       <FieldList
         fields={[
-          { key: 'spend', label: 'Spend', value: '$1.00' },
-          { key: 'spend', label: 'Spend', value: '$2.00' },
+          { key: 'spend', label: 'Spend', value: 'USD 1.00' },
+          { key: 'spend', label: 'Spend', value: 'USD 2.00' },
         ]}
       />,
     );
@@ -740,7 +800,7 @@ describe('FieldList', () => {
       within(list)
         .getAllByRole('listitem')
         .map((entry) => entry.textContent),
-    ).toEqual(['Spend: $1.00', 'Spend: $2.00']);
+    ).toEqual(['Spend: USD 1.00', 'Spend: USD 2.00']);
   });
 
   it('renders nothing without fields', () => {
@@ -772,6 +832,137 @@ describe('suppression labels', () => {
     expect(suppressionLabel('toString')).toBe('toString');
   });
 });
+
+describe('notShownReason', () => {
+  it('names the cards hidden by feedback, then each suppression count, in one sentence', () => {
+    expect(notShownReason(1)).toBe(
+      'No actions to show: 1 hidden by feedback since this run (dismissed, snoozed or done)',
+    );
+    expect(
+      notShownReason(1_200, [
+        ['feedback_dismiss', 2],
+        ['g1_blocked', 1],
+        ['p9_future_reason', 3],
+      ]),
+    ).toBe(
+      'No actions to show: 1,200 hidden by feedback since this run (dismissed, snoozed or done); ' +
+        '2 dismissed; 1 spend increase blocked by the high-utilization guard; 3 p9_future_reason',
+    );
+    expect(notShownReason(0, [['g1_blocked', 3]])).toBe(
+      'No actions to show: 3 spend increases blocked by the high-utilization guard',
+    );
+  });
+
+  it('is null when nothing is hidden or suppressed, and ignores a count that is not positive', () => {
+    expect(notShownReason(0)).toBeNull();
+    expect(notShownReason(-1, [])).toBeNull();
+    expect(notShownReason(Number.NaN)).toBeNull();
+  });
+});
+
+describe('incompleteDataReason', () => {
+  const NO_GOOGLE = 'no active Google dataset';
+  const FROM_13 = 'covers from 2026-04-13, after the window start 2026-01-01';
+  const FROM_14 = 'covers from 2026-04-14, after the window start 2026-01-01';
+
+  it('summarises the datasets that share a cause in one sentence, in API order', () => {
+    expect(
+      incompleteDataReason([
+        incompleteFinding('google.entities', [NO_GOOGLE]),
+        incompleteFinding('google.metrics_daily', [NO_GOOGLE]),
+        incompleteFinding('google.search_terms', [NO_GOOGLE]),
+      ]),
+    ).toBe(
+      'Data does not fully cover this window: google.entities, google.metrics_daily, ' +
+        'google.search_terms (no active Google dataset)',
+    );
+  });
+
+  it('groups datasets by cause in first-seen order and names each dataset once', () => {
+    expect(
+      incompleteDataReason([
+        incompleteFinding('hubspot.associations', [FROM_13], 'white_papers'),
+        incompleteFinding('linkedin.analytics_daily', [FROM_14], 'white_papers'),
+        incompleteFinding('hubspot.contacts', [FROM_13], 'white_papers'),
+        incompleteFinding('hubspot.associations', [FROM_13], 'white_papers'),
+        // Another code is not a data gap, whatever its evidence names.
+        makeFinding({
+          code: 'skipped_stage',
+          section: 'white_papers',
+          evidence: { dataset: 'hubspot.deal_search', reasons: [FROM_13] },
+        }),
+        incompleteFinding('linkedin.leads', [FROM_13], 'white_papers'),
+      ]),
+    ).toBe(
+      'Data does not fully cover this window: hubspot.associations, hubspot.contacts, ' +
+        `linkedin.leads (${FROM_13}); linkedin.analytics_daily (${FROM_14})`,
+    );
+  });
+
+  it('joins a dataset\'s causes with "; ", trimmed, and ignores entries that are not text', () => {
+    expect(
+      incompleteDataReason([
+        makeFinding({
+          code: 'incomplete_dataset',
+          evidence: {
+            dataset: '  google.metrics_daily ',
+            reasons: [' partition deferred ', 3, null, '', 'call budget exhausted'],
+          },
+        }),
+        incompleteFinding('google.search_terms', ['partition deferred', 'call budget exhausted']),
+      ]),
+    ).toBe(
+      'Data does not fully cover this window: google.metrics_daily, google.search_terms ' +
+        '(partition deferred; call budget exhausted)',
+    );
+  });
+
+  it('names a dataset without a cause when its finding records none', () => {
+    expect(
+      incompleteDataReason([
+        incompleteFinding('linkedin.leads', []),
+        makeFinding({ code: 'incomplete_dataset', evidence: { dataset: 'linkedin.segments' } }),
+        makeFinding({
+          code: 'incomplete_dataset',
+          evidence: { dataset: 'linkedin.analytics_daily', reasons: [7, ' ', null] },
+        }),
+        incompleteFinding('hubspot.contacts', [FROM_13]),
+        // A `reasons` that is not an array records no cause.
+        makeFinding({
+          code: 'incomplete_dataset',
+          evidence: { dataset: 'hubspot.deal_search', reasons: FROM_13 },
+        }),
+      ]),
+    ).toBe(
+      'Data does not fully cover this window: linkedin.leads, linkedin.segments, ' +
+        `linkedin.analytics_daily, hubspot.deal_search; hubspot.contacts (${FROM_13})`,
+    );
+  });
+
+  it('skips a finding whose evidence names no dataset, and is null when none does', () => {
+    const malformed: Finding[] = [
+      makeFinding({ code: 'incomplete_dataset', evidence: { dataset: 42, reasons: [NO_GOOGLE] } }),
+      makeFinding({ code: 'incomplete_dataset', evidence: { dataset: '  ', reasons: [NO_GOOGLE] } }),
+      makeFinding({ code: 'incomplete_dataset', evidence: { reasons: [NO_GOOGLE] } }),
+      // Payloads that bypassed the contract, as an older or newer API could send them.
+      { ...makeFinding({ code: 'incomplete_dataset' }), evidence: null } as unknown as Finding,
+      {
+        ...makeFinding({ code: 'incomplete_dataset' }),
+        evidence: ['google.entities'],
+      } as unknown as Finding,
+      makeFinding({
+        code: 'pipeline_unavailable',
+        evidence: { dataset: 'hubspot.contacts', reasons: [FROM_13] },
+      }),
+    ];
+    expect(incompleteDataReason(malformed)).toBeNull();
+    expect(incompleteDataReason([])).toBeNull();
+    expect(
+      incompleteDataReason([...malformed, incompleteFinding('google.entities', [NO_GOOGLE])]),
+    ).toBe('Data does not fully cover this window: google.entities (no active Google dataset)');
+  });
+});
+
 
 describe('findingTone', () => {
   it.each<FindingCode>([
@@ -1148,7 +1339,7 @@ describe('SectionFrame', () => {
       screen.queryByRole('button', { name: /^Held until discrepancies are resolved/u }),
     ).toBeNull();
     expect(document.getElementById('group-budget-changes-held')).toBeNull();
-    expect(screen.queryByText('No actions in this section')).toBeNull();
+    expect(emptyState()).toBeNull();
   });
 
   it('keeps a group whose only items are held, and shows no empty state', () => {
@@ -1161,7 +1352,7 @@ describe('SectionFrame', () => {
     expect(
       screen.getByRole('button', { name: 'Held until discrepancies are resolved (1)' }),
     ).toBeTruthy();
-    expect(screen.queryByText('No actions in this section')).toBeNull();
+    expect(emptyState()).toBeNull();
   });
 
   it('leaves out a group whose items are all hidden by feedback, and counts them', () => {
@@ -1189,7 +1380,7 @@ describe('SectionFrame', () => {
     expect(screen.queryByTestId('item-7')).toBeNull();
     expect(screen.queryByText('launch: Snoozed since the run')).toBeNull();
     expect(listLines('Not shown')).toEqual(['1 hidden since this run']);
-    expect(screen.queryByText('No actions in this section')).toBeNull();
+    expect(emptyState()).toBeNull();
   });
 
   it('lists the run suppression counts under "Not shown" beside the shown cards', () => {
@@ -1209,7 +1400,7 @@ describe('SectionFrame', () => {
       '4 unknown_reason',
     ]);
     expect(screen.getByTestId('item-1').textContent).toBe('changes: B1');
-    expect(screen.queryByText('No actions in this section')).toBeNull();
+    expect(emptyState()).toBeNull();
   });
 
   it('lets renderGroup replace the body of each group with shown items, with its parts', () => {
@@ -1305,7 +1496,7 @@ describe('SectionFrame', () => {
     // The frame renders no group region of its own and ignores renderGroup.
     expect(screen.queryAllByRole('heading', { level: 3 })).toHaveLength(0);
     expect(renderGroup).not.toHaveBeenCalled();
-    expect(screen.queryByText('No actions in this section')).toBeNull();
+    expect(emptyState()).toBeNull();
   });
 
   it('calls renderGroups, with no empty state, when the only shown item is computed from replaced data', () => {
@@ -1319,7 +1510,7 @@ describe('SectionFrame', () => {
 
     expect(renderGroups).toHaveBeenCalledTimes(1);
     expect(screen.getByTestId('tabs')).toBeTruthy();
-    expect(screen.queryByText('No actions in this section')).toBeNull();
+    expect(emptyState()).toBeNull();
   });
 
   it('does not call renderGroups when nothing is shown, and shows the empty state instead', () => {
@@ -1333,10 +1524,9 @@ describe('SectionFrame', () => {
 
     expect(renderGroups).not.toHaveBeenCalled();
     expect(screen.queryByTestId('tabs')).toBeNull();
-    expect(screen.getByText('No actions in this section')).toBeTruthy();
-    expect(
-      screen.getByText('1 hidden by feedback since this run (dismissed, snoozed or done)'),
-    ).toBeTruthy();
+    expect(emptyTitle()).toBe(
+      'No actions to show: 1 hidden by feedback since this run (dismissed, snoozed or done)',
+    );
   });
 
   it('keeps an empty group region, with its anchor, when renderEmptyGroup returns content', () => {
@@ -1387,16 +1577,43 @@ describe('SectionFrame', () => {
       const region = screen.getByRole('region', { name: 'Copy/creative changes' });
       const empty = region.querySelector('.ds-emptystate');
       expect(empty?.querySelector('.ds-emptystate__title')?.textContent).toBe(
-        'No actions in this section',
+        NO_RULE_FIRED_REASON,
       );
-      expect(empty?.querySelector('.ds-emptystate__reason')?.textContent).toBe(
-        'No rule fired for this window',
-      );
+      expect(NO_RULE_FIRED_REASON).toBe('No rule fired for this window');
+      // One sentence, as the title, and no reason body.
+      expect(empty?.querySelector('.ds-emptystate__reason')).toBeNull();
       expect(screen.queryByRole('list', { name: 'Not shown' })).toBeNull();
       expect(screen.queryByText('Withheld for sample size')).toBeNull();
     });
 
-    it('quotes the withheld line as its reason, and the full withheld list follows', () => {
+    it('wraps long identifiers of a finding at their underscores, in its banner and the empty-state sentence', () => {
+      const message =
+        'No CRM link for Google campaigns: HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY and ' +
+        'HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY not configured.';
+      renderFrame({
+        section: makeSection('campaigns', {
+          findings: [makeFinding({ code: 'no_crm_link', section: 'campaigns', message })],
+          groups: [makeGroup({ key: 'pause', title: 'Pause', items: [] })],
+        }),
+      });
+
+      const region = screen.getByRole('region', { name: 'Campaigns to pause or launch' });
+      const banner = region.querySelector('.ds-banner__title');
+      // The only finding is the empty state's one sentence, its title, with no reason body.
+      const sentence = region.querySelector('.ds-emptystate__title');
+      expect(region.querySelector('.ds-emptystate__reason')).toBeNull();
+      for (const node of [banner, sentence]) {
+        // The text is the API's, unchanged; only <wbr> break opportunities are added.
+        expect(node?.textContent).toBe(message);
+        const breaks = node?.querySelectorAll('wbr') ?? [];
+        expect(breaks).toHaveLength(7);
+        for (const wbr of breaks) {
+          expect(wbr.previousSibling?.textContent?.endsWith('_')).toBe(true);
+        }
+      }
+    });
+
+    it('states the leading withheld line\'s minimum as its reason, and the full withheld list follows it', () => {
       const withheld = makeWithheld();
       renderFrame({
         section: makeSection('keywords', {
@@ -1405,15 +1622,14 @@ describe('SectionFrame', () => {
         }),
       });
 
-      const empty = document.querySelector('.ds-emptystate');
+      const empty = emptyState();
       expect(empty).not.toBeNull();
-      expect(empty?.querySelector('.ds-emptystate__title')?.textContent).toBe(
-        'No actions in this section',
-      );
-      expect(empty?.querySelector('.ds-emptystate__reason')?.textContent).toBe(
-        withheldLine(withheld),
-      );
-      expect(screen.queryByText('No rule fired for this window')).toBeNull();
+      // AAP 0.5.5's example sentence, its minimum the recorded sample.required (37 clicks).
+      expect(emptyTitle()).toBe('No search term met the K1 minimum of 37 clicks');
+      expect(empty?.querySelector('.ds-emptystate__reason')).toBeNull();
+      // The withheld line is the list's alone: the empty state does not repeat it.
+      expect(empty?.textContent).not.toContain(withheldLine(withheld));
+      expect(screen.getAllByText(asQueriedText(withheldLine(withheld)))).toHaveLength(1);
 
       // The WithheldList still renders in full, below the empty state.
       const list = screen.getByRole('list', { name: 'Withheld for sample size' });
@@ -1424,7 +1640,179 @@ describe('SectionFrame', () => {
       expect(screen.queryByRole('list', { name: 'Not shown' })).toBeNull();
     });
 
-    it('states why: hidden cards, suppressions, three withheld lines, findings', () => {
+    it('states an account-wide withheld line\'s reason before any finding', () => {
+      renderFrame({
+        section: makeSection('keywords', {
+          groups: [makeGroup({ items: [] })],
+          findings: [
+            makeFinding({
+              code: 'k1_no_baseline',
+              message: 'Block candidates withheld account-wide: too few baseline conversions.',
+            }),
+          ],
+          withheld: [
+            makeWithheld({
+              entity: null,
+              reason: 'baseline 9 conversions of 10 required',
+              sample: { observed: 9, required: 10, unit: 'conversions' },
+            }),
+          ],
+        }),
+      });
+
+      expect(emptyTitle()).toBe('K1 withheld: baseline 9 conversions of 10 required');
+      // The finding stays a banner above, once.
+      expect(
+        screen.getAllByText('Block candidates withheld account-wide: too few baseline conversions.'),
+      ).toHaveLength(1);
+    });
+
+    it('states the data-gap sentence of its incomplete datasets, never one finding\'s banner', () => {
+      const findings = [
+        incompleteFinding('google.entities', ['no active Google dataset']),
+        incompleteFinding('google.metrics_daily', ['no active Google dataset']),
+        incompleteFinding('google.search_terms', ['no active Google dataset']),
+      ];
+      renderFrame({
+        section: makeSection('keywords', {
+          groups: [
+            makeGroup({ key: 'block', title: 'Block', items: [] }),
+            makeGroup({ key: 'review', title: 'Review', items: [] }),
+          ],
+          findings,
+        }),
+      });
+
+      expect(emptyTitle()).toBe(
+        'Data does not fully cover this window: google.entities, google.metrics_daily, ' +
+          'google.search_terms (no active Google dataset)',
+      );
+      expect(emptyState()?.querySelector('.ds-emptystate__reason')).toBeNull();
+      // Each finding stays one banner above, and the empty state's title is none of them.
+      const region = screen.getByRole('region', { name: 'Keywords to adjust' });
+      const banners = [...region.querySelectorAll('.ds-banner__title')].map(
+        (node) => node.textContent,
+      );
+      expect(banners).toEqual(findings.map((finding) => finding.message));
+      expect(banners).not.toContain(emptyTitle());
+      for (const finding of findings) {
+        expect(emptyState()?.textContent).not.toContain(finding.message);
+        expect(screen.getAllByText(finding.message)).toHaveLength(1);
+      }
+    });
+
+    it('puts the data-gap sentence before a finding that comes first in API order', () => {
+      const from13 = 'covers from 2026-04-13, after the window start 2026-01-01';
+      renderFrame({
+        section: makeSection('budget', {
+          groups: [makeGroup({ key: 'changes', title: 'Budget changes', items: [] })],
+          findings: [
+            makeFinding({ code: 'pipeline_unavailable', message: 'Pipeline unavailable.' }),
+            incompleteFinding('google.metrics_daily', [from13], 'budget'),
+            incompleteFinding('linkedin.analytics_daily', [from13], 'budget'),
+          ],
+        }),
+      });
+
+      expect(emptyTitle()).toBe(
+        'Data does not fully cover this window: google.metrics_daily, ' +
+          `linkedin.analytics_daily (${from13})`,
+      );
+      expect(screen.getAllByText('Pipeline unavailable.')).toHaveLength(1);
+    });
+
+    it('lets the leading withheld line lead over the data-gap sentence', () => {
+      renderFrame({
+        section: makeSection('keywords', {
+          groups: [makeGroup({ items: [] })],
+          findings: [incompleteFinding('google.search_terms', ['partition deferred'])],
+          withheld: [makeWithheld()],
+        }),
+      });
+
+      expect(emptyTitle()).toBe('No search term met the K1 minimum of 37 clicks');
+    });
+
+    it('falls back to the first finding when no incomplete-dataset evidence names a dataset', () => {
+      const unnamed =
+        'google.search_terms is not complete over the window: no active Google dataset';
+      renderFrame({
+        section: makeSection('keywords', {
+          groups: [makeGroup({ items: [] })],
+          findings: [
+            makeFinding({
+              code: 'incomplete_dataset',
+              message: unnamed,
+              evidence: { dataset: 7, reasons: 'no active Google dataset' },
+            }),
+            makeFinding({ code: 'k1_no_baseline', message: 'K1 has no usable baseline.' }),
+          ],
+        }),
+      });
+
+      expect(emptyTitle()).toBe(unnamed);
+    });
+
+    it('states the first finding that explains the absence when nothing is withheld', () => {
+      const incomplete =
+        'google.metrics_daily is not complete over the window: covers from 2026-04-13, after ' +
+        'the window start 2026-01-01';
+      // Evidence that names no dataset, so no data-gap sentence applies and the first finding
+      // that explains the absence is the reason.
+      const unnamed = { completeness: 'incomplete' };
+      renderFrame({
+        section: makeSection('budget', {
+          groups: [makeGroup({ key: 'changes', title: 'Budget changes', items: [] })],
+          findings: [
+            makeFinding({ code: 'no_crm_link', message: 'No CRM link for Google campaigns.' }),
+            makeFinding({ code: 'incomplete_dataset', message: '   ', evidence: unnamed }),
+            makeFinding({ code: 'incomplete_dataset', message: incomplete, evidence: unnamed }),
+            makeFinding({ code: 'pipeline_unavailable', message: 'Pipeline unavailable.' }),
+          ],
+        }),
+      });
+
+      // An informational finding comes first in API order, but the incomplete dataset explains
+      // the empty section; a blank message is skipped.
+      expect(emptyTitle()).toBe(incomplete);
+      expect(emptyState()?.querySelector('.ds-emptystate__reason')).toBeNull();
+      // Every finding with a message is still a banner, and the others are not repeated below.
+      const region = screen.getByRole('region', { name: 'Budget changes' });
+      expect(emptyState()?.textContent).not.toContain('No CRM link for Google campaigns.');
+      expect(emptyState()?.textContent).not.toContain('Pipeline unavailable.');
+      expect(within(region).getByText('No CRM link for Google campaigns.')).toBeTruthy();
+      expect(within(region).getByText('Pipeline unavailable.')).toBeTruthy();
+    });
+
+    it('falls back to an informational finding when it is the only one with a message', () => {
+      renderFrame({
+        section: makeSection('white_papers', {
+          findings: [
+            makeFinding({ code: 'pipeline_unavailable', message: '' }),
+            makeFinding({
+              code: 'skipped_stage',
+              message: 'Qualified Lead: 2 contacts skipped this stage (not counted)',
+            }),
+          ],
+        }),
+      });
+
+      expect(emptyTitle()).toBe('Qualified Lead: 2 contacts skipped this stage (not counted)');
+    });
+
+    it('names the suppression counts alone when nothing is hidden by feedback', () => {
+      renderFrame({
+        section: makeSection('budget', {
+          groups: [makeGroup({ key: 'changes', title: 'Budget changes', items: [] })],
+          withheld: [makeWithheld({ rule_id: 'B2' })],
+          suppressed: { feedback_dismiss: 2, g1_blocked: 0 },
+        }),
+      });
+
+      expect(emptyTitle()).toBe('No actions to show: 2 dismissed');
+    });
+
+    it('states why in one sentence: hidden cards and suppressions first, no list repeated', () => {
       const withheld = [
         makeWithheld(),
         makeWithheld({
@@ -1467,25 +1855,32 @@ describe('SectionFrame', () => {
         }),
       });
 
-      const reason = document.querySelector('.ds-emptystate__reason');
-      expect([...(reason?.querySelectorAll('span') ?? [])].map((line) => line.textContent)).toEqual(
-        [
-          '3 hidden by feedback since this run (dismissed, snoozed or done)',
-          '2 snoozed',
-          '1 spend increase blocked by the high-utilization guard',
-          '4 unknown_reason',
-          'K1 · crm pricing comparison: clicks 30 of 37 required — 30 / 37 clicks',
-          'K3 · crm software: quality-score days 3 of 5 required — 3 / 5 days',
-          'K1 · Account-wide: fewer than 10 baseline conversions — 9 / 10 conversions',
-          'K1 is withheld account-wide: the baseline has too few conversions.',
-        ],
+      expect(emptyTitle()).toBe(
+        'No actions to show: 3 hidden by feedback since this run (dismissed, snoozed or done); ' +
+          '2 snoozed; 1 spend increase blocked by the high-utilization guard; 4 unknown_reason',
       );
+      const empty = emptyState();
+      expect(empty?.querySelector('.ds-emptystate__reason')).toBeNull();
+      // Neither the withheld lines nor the finding are repeated inside the empty state: the
+      // finding is a banner above it, and the withheld lines are listed below it, once each.
+      for (const w of withheld) {
+        expect(empty?.textContent).not.toContain(withheldLine(w));
+        expect(screen.getAllByText(asQueriedText(withheldLine(w)))).toHaveLength(1);
+      }
+      expect(empty?.textContent).not.toContain(finding.message);
+      expect(screen.getAllByText(finding.message)).toHaveLength(1);
       // Groups without a shown item are left out.
       expect(screen.queryAllByRole('heading', { level: 3 })).toHaveLength(0);
 
-      // The full withheld list follows under the default title, all four lines.
+      // The full withheld list follows under the default title, all four lines, each figure
+      // joined by no-break spaces (U+00A0).
       expect(screen.getByText('Withheld for sample size')).toBeTruthy();
-      expect(listLines('Withheld for sample size')).toHaveLength(4);
+      expect(listLines('Withheld for sample size')).toEqual([
+        'K1 · crm pricing comparison: clicks 30 of 37 required — 30\u00A0/\u00A037 clicks',
+        'K3 · crm software: quality-score days 3 of 5 required — 3\u00A0/\u00A05 days',
+        'K1 · Account-wide: fewer than 10 baseline conversions — 9\u00A0/\u00A010 conversions',
+        'K2 · fourth term: conversions 2 of 3 required — 2\u00A0/\u00A03 conversions',
+      ]);
 
       expect(listLines('Not shown')).toEqual([
         '2 snoozed',
@@ -1525,7 +1920,7 @@ describe('SectionFrame', () => {
     });
 
     expect(listLines('Patterns withheld for sample size')).toEqual([
-      'B4 · Generic CRM — US: 3 weekend days of 4 required — 3 / 4 weekend days',
+      'B4 · Generic CRM — US: 3 weekend days of 4 required — 3\u00A0/\u00A04 weekend days',
     ]);
     expect(screen.queryByText('Withheld for sample size')).toBeNull();
     expect(
@@ -2382,7 +2777,7 @@ describe('confirmations of items hidden on the page', () => {
         ],
       }),
     );
-    expect(screen.queryByText('No actions in this section')).toBeNull();
+    expect(emptyState()).toBeNull();
     expect(
       within(screen.getByRole('region', { name: 'Launch ideas' })).getByText(dismissal(launch)),
     ).toBeTruthy();
@@ -2400,7 +2795,9 @@ describe('confirmations of items hidden on the page', () => {
 
     expect(screen.queryByRole('region', { name: 'Pause' })).toBeNull();
     expect(screen.queryByText(dismissal(c1))).toBeNull();
-    expect(screen.getByText('No actions in this section')).toBeTruthy();
+    expect(emptyTitle()).toBe(
+      'No actions to show: 1 hidden by feedback since this run (dismissed, snoozed or done)',
+    );
   });
 
   it('shows the confirmation in place of a replaced-data block or held disclosure the feedback emptied', () => {

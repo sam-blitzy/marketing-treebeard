@@ -39,15 +39,18 @@ Conversions are decimals throughout: data-driven attribution makes them fraction
 Displayed gate values never contradict the comparison they report. A reason cites a gate that
 scales a baseline by a configured multiple other than 1 at the scaled value stored in evidence
 (K1's ``min_spend`` floor, K2's ``max_cost_per_conversion``), never as that multiple of a
-rounded baseline, and money rounds half-even, monotonically, on both sides of the comparison.
+rounded baseline, and money rounds half up, monotonically, on both sides of the comparison.
 Search-term coverage shows ``keywords.min_search_term_coverage`` exactly as configured, and the
 share (four places) and percentage (one place) gain places only where fewer would put them on
 the other side of it. Counts take a singular noun only at exactly 1 ("1 click", "1 day").
 
 Purity: no database, network, settings or logging access. The module imports only the rule
-contract (``context``), pure helpers of ``metrics``, the text primitives of ``text`` and the
-``Thresholds`` type; it never imports ``precedence`` or ``runner``. Every threshold is read
-from ``ctx.thresholds`` and copied into ``evidence.thresholds``.
+contract (``context``), pure helpers of ``metrics``, the text primitives of ``text``, the
+``Thresholds`` type and the pure ISO 4217 money helpers of ``ads_engine.decisions``
+(``minor_unit_exponent``, the unit decisions are validated to and every rule renders money at,
+and ``round_to_minor_unit``, the half-up rounding every rule renders money with); it never
+imports ``precedence`` or ``runner``. Every threshold is read from ``ctx.thresholds``
+and copied into ``evidence.thresholds``.
 
 Example:
     >>> from decimal import Decimal
@@ -63,7 +66,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from decimal import ROUND_HALF_EVEN, Context, Decimal
+from decimal import ROUND_05UP, ROUND_HALF_EVEN, Context, Decimal
 from fractions import Fraction
 from typing import Any, Final, Literal
 
@@ -107,6 +110,7 @@ from ads_engine.analysis.context import (
 from ads_engine.analysis.metrics import Totals, window_totals
 from ads_engine.analysis.text import adjacent_terms, tokenize
 from ads_engine.analysis.thresholds import Thresholds
+from ads_engine.decisions import minor_unit_exponent, round_to_minor_unit
 
 __all__ = [
     "ADJACENT_TERMS_LABEL",
@@ -122,6 +126,7 @@ __all__ = [
     "K3_DATASETS",
     "K3_THRESHOLD_KEYS",
     "MIN_CLICKS_LABEL",
+    "SECTION_DATASETS",
     "evaluate",
     "k1_min_clicks",
 ]
@@ -173,6 +178,16 @@ K3_DATASETS: Final[tuple[str, ...]] = (
 """The datasets K3 reads: keyword daily facts, the Q-G7 keyword snapshots, and search-term
 spend for the account's search-term coverage."""
 
+SECTION_DATASETS: Final[tuple[str, ...]] = tuple(
+    dict.fromkeys((*K1_DATASETS, *K2_DATASETS, *K3_DATASETS))
+)
+"""Every dataset the Keywords section reads: the union of K1's, K2's and K3's, first-seen order.
+
+Precedence judges these over the run's window when the section stores no item, so an empty
+section says which of its datasets do not cover the window (AAP 0.5.5 "Each section shows an
+EmptyState with the reason").
+"""
+
 COVERAGE_THRESHOLD_KEY: Final = "keywords.min_search_term_coverage"
 """The share of keyword spend below which every keyword item carries ``search_term_coverage``."""
 
@@ -219,6 +234,11 @@ _WIDE: Final = Context(prec=60, rounding=ROUND_HALF_EVEN)
 """Wide enough that converting and quantizing any stored amount or ratio is exact or correctly
 rounded, independent of the caller's decimal context."""
 
+_STICKY: Final = Context(prec=60, rounding=ROUND_05UP)
+"""Converts a money ``Fraction`` for :func:`ads_engine.decisions.round_to_minor_unit` without
+losing a digit that rounding reads: an inexact quotient keeps a last digit other than 0 and 5
+(``ROUND_05UP``), so it never reads as a tie or as an exact amount it is not."""
+
 _RATIO_PLACES: Final = 4
 """Decimal places of a displayed ratio (CPC ratio, cost/conversion ratio, coverage share)."""
 
@@ -234,46 +254,6 @@ _PERCENT_PLACES: Final = 1
 _DASH: Final = "—"
 """A cost/conversion whose known conversion count is 0 (AAP 0.5.4.3, 0.5.5): a zero denominator,
 never a finite value and never "unavailable", which is reserved for unreported conversions."""
-
-# ISO 4217 minor units, mirrored from ``ads_engine.decisions`` (outside this module's
-# dependency set) so evidence and reasons show money at the precision the account bills in.
-_ZERO_DECIMAL_CURRENCIES: Final[frozenset[str]] = frozenset(
-    {
-        "BIF",
-        "CLP",
-        "DJF",
-        "GNF",
-        "ISK",
-        "JPY",
-        "KMF",
-        "KRW",
-        "PYG",
-        "RWF",
-        "UGX",
-        "UYI",
-        "VND",
-        "VUV",
-        "XAF",
-        "XOF",
-        "XPF",
-    }
-)
-"""ISO 4217 currencies with no minor unit."""
-
-_THREE_DECIMAL_CURRENCIES: Final[frozenset[str]] = frozenset(
-    {"BHD", "IQD", "JOD", "KWD", "LYD", "OMR", "TND"}
-)
-"""ISO 4217 currencies whose minor unit is a thousandth."""
-
-
-def _minor_unit(currency: str) -> int:
-    """Return the ISO 4217 minor-unit exponent of ``currency`` (2 for most currencies)."""
-    code = currency.strip().upper()
-    if code in _ZERO_DECIMAL_CURRENCIES:
-        return 0
-    if code in _THREE_DECIMAL_CURRENCIES:
-        return 3
-    return 2
 
 
 def _exact(value: Decimal | int) -> Fraction:
@@ -302,8 +282,37 @@ def _round(value: Fraction | Decimal | int, places: int) -> Decimal:
 
 
 def _money(value: Fraction | Decimal | int, currency: str) -> Decimal:
-    """Return a money value at the currency's minor unit: ``Decimal("61")`` → ``61.00`` (USD)."""
-    return _round(value, _minor_unit(currency))
+    """Return a money value at the currency's minor unit: ``Decimal("61")`` → ``61.00`` (USD).
+
+    The minor unit is ISO 4217's, from :func:`ads_engine.decisions.minor_unit_exponent`, and
+    the rounding is :func:`ads_engine.decisions.round_to_minor_unit`'s, half up (a tie rounds
+    away from zero): the one rule decisions are validated to and every rule and the web client
+    render money with, so an amount reads alike on a keyword card and on every other card.
+    Ratios, means, rates and shares keep their half-even rounding (:func:`_round`).
+
+    The tie is decided on the exact amount. A ``Decimal`` or ``int`` is passed as it is. A
+    ``Fraction`` is first divided out to one place past the minor unit under :data:`_STICKY`:
+    exact when the quotient ends there, and otherwise off every tie and every exact amount, so
+    a quotient just below a tie still rounds down.
+
+    Example:
+        >>> _money(Decimal("89.225"), "USD"), _money(Fraction(-1, 8), "USD")
+        (Decimal('89.23'), Decimal('-0.13'))
+        >>> _money(Fraction(89_225, 1_000) - Fraction(1, 10**70), "USD")
+        Decimal('89.22')
+        >>> _money(Fraction(5, 2), "JPY"), _money(Fraction(2, 3), "KWD")
+        (Decimal('3'), Decimal('0.667'))
+
+    Raises:
+        decimal.InvalidOperation: When the amount does not fit 60 significant digits at one
+            place past its minor unit (a ``Fraction``) or at its minor unit (otherwise).
+        ValueError: When a ``Decimal`` amount is not finite.
+    """
+    if isinstance(value, Fraction):
+        quantum = Decimal(1).scaleb(-(minor_unit_exponent(currency) + 1))
+        quotient = _STICKY.divide(Decimal(value.numerator), Decimal(value.denominator))
+        return round_to_minor_unit(quotient.quantize(quantum, context=_STICKY), currency)
+    return round_to_minor_unit(Decimal(value), currency)
 
 
 def _ratio(value: Fraction) -> Decimal:
@@ -364,7 +373,7 @@ def _money_text(value: Decimal, currency: str | None) -> str:
     """Render money as ``"USD 1,234.50"``; the value is already at the minor unit."""
     if currency is None:
         return format(value, ",f")
-    places = _minor_unit(currency)
+    places = minor_unit_exponent(currency)
     return f"{currency} {value:,.{places}f}"
 
 
@@ -1149,7 +1158,7 @@ def _k1_reason(evidence: Evidence) -> str:
     any other multiple it cites the ``min_spend`` baseline, "at or above the spend floor of
     {floor} ({multiple}x the account cost/conversion)", because a multiple of the displayed
     cost/conversion can exceed the displayed spend that cleared the exact floor. Spend, the
-    floor and the cost/conversion are each rounded half-even at the minor unit, and rounding is
+    floor and the cost/conversion are each rounded half up at the minor unit, and rounding is
     monotone, so the displayed spend is never below the displayed value it is said to reach.
 
     An ``ADDED`` term always names its matched keyword criterion and warns that an exact-match
@@ -1264,10 +1273,10 @@ def _k1_candidate(
             f"Account cost/conversion ({currency})",
             _money(account_cpa, currency),
         ),
-        # The floor the spend was compared with, rounded half-even like the spend and never
-        # up: spend is stored at micros, so a spend of 20.002 clears an exact floor of 20.0015
-        # yet would show 20.00 against a rounded-up 20.01. Rounding is monotone, so a spend at
-        # or above the floor never shows below it.
+        # The floor the spend was compared with, rounded to the nearest minor unit like the
+        # spend and never up to the next one: spend is stored at micros, so a spend of 20.002
+        # clears an exact floor of 20.0015 yet would show 20.00 against a rounded-up 20.01.
+        # Rounding is monotone, so a spend at or above the floor never shows below it.
         Baseline(
             "min_spend",
             f"Spend floor ({currency})",
@@ -1609,7 +1618,7 @@ def _k2_reason(evidence: Evidence) -> str:
     with any other ratio it cites the ``max_cost_per_conversion`` baseline, "at or below the
     highest qualifying cost/conversion of {max} ({ratio}x the campaign's cost/conversion)",
     because a multiple of the displayed campaign cost/conversion can fall below the displayed
-    term cost/conversion that met the exact maximum. Each value is rounded half-even at the
+    term cost/conversion that met the exact maximum. Each value is rounded half up at the
     minor unit, and rounding is monotone, so the displayed term cost/conversion never exceeds
     the displayed value it is said to stay within.
     """

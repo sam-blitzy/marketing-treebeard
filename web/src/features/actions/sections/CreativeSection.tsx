@@ -46,7 +46,13 @@ import type { ReactElement } from 'react';
 import type { Group, Item } from '../../../api/types';
 import { DataTable, Stack } from '../../../design-system';
 import type { DataTableColumn } from '../../../design-system';
-import { NOT_APPLICABLE, UNAVAILABLE, formatCount, formatPercent } from '../../../lib/format';
+import {
+  NOT_APPLICABLE,
+  UNAVAILABLE,
+  formatCount,
+  formatPercent,
+  percentDigits,
+} from '../../../lib/format';
 import { RecommendationCard } from '../RecommendationCard';
 import { BatchControl, BatchEntryAnchor, ROW_BATCH_SIZE, useBatches } from '../batches';
 import type { BatchNoun } from '../batches';
@@ -60,10 +66,14 @@ import type { GroupParts, SectionComponentProps } from './SectionFrame';
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Fraction digits of a stage rate in the variants table. LinkedIn click and open rates sit well
- * below 1% (for example 0.44% against 0.40%), so the one digit of `formatPercent`'s default
- * would show two different variants as the same "0.4%". Two digits keep sibling variants
- * apart, as the backend's own reason text does when it renders these rates.
+ * The fewest fraction digits of a stage rate in the variants table. Each rate column shows one
+ * fixed precision, trailing zeros included, so its figures line up and compare ("0.80%" beside
+ * "0.58%", never "0.8%" beside "0.58%"). LinkedIn click and open rates sit well below 1% (for
+ * example 0.44% against 0.40%), so the one digit of `formatPercent`'s default would show two
+ * different variants as the same "0.4%"; two digits at least, as the backend's own reason text
+ * renders these rates. A column takes more, up to the four the backend records, when two of
+ * its different rates would still read alike, or a rate would show fewer than two significant
+ * digits (`percentDigits`): 0.007994 and 0.008014 read "0.799%" and "0.801%".
  */
 export const VARIANT_RATE_DIGITS = 2;
 
@@ -81,8 +91,9 @@ export const NOT_ESTIMABLE = 'not estimable';
  * 1. a stage that does not apply (`applies` is `false`: the open and completion rates of a
  *    campaign outside lead generation, which uses only click rate) renders
  *    {@link NOT_APPLICABLE} (`"n/a"`);
- * 2. a rate renders as a percentage at {@link VARIANT_RATE_DIGITS} fraction digits
- *    (`"0.004377"` → `"0.44%"`);
+ * 2. a rate renders as a percentage at exactly `digits` fraction digits, trailing zeros
+ *    included: its column's precision, at least {@link VARIANT_RATE_DIGITS}
+ *    (`"0.004377"` → `"0.44%"`, `"0.008"` → `"0.80%"`; at 3, `"0.007994"` → `"0.799%"`);
  * 3. a missing rate whose denominator is a known zero (zero exposure) renders
  *    {@link NOT_ESTIMABLE} (`"not estimable"`);
  * 4. any other missing rate (unreported or inconsistent counts) renders `"unavailable"`.
@@ -94,11 +105,15 @@ export const NOT_ESTIMABLE = 'not estimable';
  * @param applies - Whether the stage applies to the variant's campaign; `null` when unknown.
  * @param denominator - The stage's own denominator (impressions for click and open rate, form
  *   opens for completion rate); `null` when unreported.
+ * @param digits - The fixed fraction digits of the rate's column. Defaults to
+ *   {@link VARIANT_RATE_DIGITS}.
  * @returns The formatted percentage, `"n/a"`, `"not estimable"` or `"unavailable"`.
  *
  * @example
  * ```ts
  * formatVariantRate('0.395062', true, 162); // "39.51%"
+ * formatVariantRate('0.01', true, 4000); // "1.00%"
+ * formatVariantRate('0.007994', true, 13250, 3); // "0.799%"
  * formatVariantRate(null, false, null); // "n/a"
  * formatVariantRate(null, true, 0); // "not estimable"
  * formatVariantRate(null, null, null); // "unavailable"
@@ -108,14 +123,41 @@ export function formatVariantRate(
   rate: string | null,
   applies: boolean | null,
   denominator: number | null,
+  digits: number = VARIANT_RATE_DIGITS,
 ): string {
   if (applies === false) {
     return NOT_APPLICABLE;
   }
   if (rate !== null) {
-    return formatPercent(rate, VARIANT_RATE_DIGITS);
+    return formatPercent(rate, digits, { fixed: true });
   }
   return denominator === 0 ? NOT_ESTIMABLE : UNAVAILABLE;
+}
+
+/** The fixed fraction digits of each rate column of one variants table. */
+interface VariantRateDigits {
+  /** The Click rate column's digits. */
+  readonly click: number;
+  /** The Open rate column's digits. */
+  readonly open: number;
+  /** The Completion rate column's digits. */
+  readonly completion: number;
+}
+
+/**
+ * The digits of each rate column, from the column's own rates over every variant of the
+ * table, shown or not yet revealed, so a "Show more" never changes a column's precision: the
+ * rates the column renders as percentages (open and completion rates only where the stage
+ * applies), at least {@link VARIANT_RATE_DIGITS} (`percentDigits`).
+ */
+function variantRateDigits(rows: readonly VariantRow[]): VariantRateDigits {
+  const options = { min: VARIANT_RATE_DIGITS };
+  const leadGenRows = rows.filter((row) => row.leadGen !== false);
+  return {
+    click: percentDigits(rows.map((row) => row.clickRate), options),
+    open: percentDigits(leadGenRows.map((row) => row.openRate), options),
+    completion: percentDigits(leadGenRows.map((row) => row.completionRate), options),
+  };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -169,7 +211,10 @@ interface KeyedVariant {
   readonly variant: VariantRow;
 }
 
-/** One shown variants-table row: a {@link KeyedVariant} and its row header's focus target. */
+/**
+ * One shown variants-table row: a {@link KeyedVariant}, its row header's focus target and its
+ * table's rate-column digits.
+ */
 interface VariantTableRow extends KeyedVariant {
   /**
    * The id of the row header's focus target while the table shows rows in batches
@@ -177,6 +222,8 @@ interface VariantTableRow extends KeyedVariant {
    * the table is not batched.
    */
   readonly focusId: string | null;
+  /** The fixed digits of each rate column ({@link variantRateDigits}), the same on every row. */
+  readonly digits: VariantRateDigits;
 }
 
 /** What a variants table counts in its batch control: "Showing 50 of 64 variants". */
@@ -208,7 +255,8 @@ function keyedVariants(rows: readonly VariantRow[]): KeyedVariant[] {
  * objective, over impressions; open rate, over impressions, and completion rate, over form
  * opens, apply as the variant's `leadGen` says. So a stage the campaign does not use renders
  * "n/a", a missing rate over zero impressions or form opens "not estimable", and any other
- * missing rate "unavailable".
+ * missing rate "unavailable". Each rate column renders at its own fixed digits
+ * ({@link variantRateDigits}).
  */
 const VARIANT_COLUMNS: readonly DataTableColumn<VariantTableRow>[] = [
   {
@@ -227,21 +275,32 @@ const VARIANT_COLUMNS: readonly DataTableColumn<VariantTableRow>[] = [
     key: 'click_rate',
     header: 'Click rate',
     align: 'end',
-    render: (row) => formatVariantRate(row.variant.clickRate, true, row.variant.impressions),
+    render: (row) =>
+      formatVariantRate(row.variant.clickRate, true, row.variant.impressions, row.digits.click),
   },
   {
     key: 'open_rate',
     header: 'Open rate',
     align: 'end',
     render: (row) =>
-      formatVariantRate(row.variant.openRate, row.variant.leadGen, row.variant.impressions),
+      formatVariantRate(
+        row.variant.openRate,
+        row.variant.leadGen,
+        row.variant.impressions,
+        row.digits.open,
+      ),
   },
   {
     key: 'completion_rate',
     header: 'Completion rate',
     align: 'end',
     render: (row) =>
-      formatVariantRate(row.variant.completionRate, row.variant.leadGen, row.variant.formOpens),
+      formatVariantRate(
+        row.variant.completionRate,
+        row.variant.leadGen,
+        row.variant.formOpens,
+        row.digits.completion,
+      ),
   },
   {
     key: 'leads',
@@ -269,15 +328,17 @@ export interface VariantsTableProps {
  * "n/a" (AAP 0.5.4.6: non-lead-gen campaigns use only click rate); a missing rate of a stage
  * that applies, or whose applicability the evidence does not state, renders "not estimable"
  * over a zero denominator and "unavailable" otherwise (AAP 0.11.1), never "n/a" or "0%"; an
- * absent count renders "unavailable". The table states numbers only: which variant leads, and
- * whether that lead is distinguishable, is said by the API's CR1 cards (AAP 0.5.4.2 P7).
+ * absent count renders "unavailable". Each rate column reads at one fixed precision, at least
+ * {@link VARIANT_RATE_DIGITS} places, chosen over all the campaign's variants so its different
+ * rates read apart. The table states numbers only: which variant leads, and whether that lead is
+ * distinguishable, is said by the API's CR1 cards (AAP 0.5.4.2 P7).
  *
  * The table shows `ROW_BATCH_SIZE` rows at a time, in stored order, followed by a "Show {n}
  * more variants" control when the campaign has more (`../batches`).
  *
- * Memoized on its props, with the keyed rows derived once per `rows` array: given the same
- * campaign name and the same rows, a block that renders again keeps the table, and the rows it
- * has revealed, as they are.
+ * Memoized on its props, with the keyed rows and the column digits derived once per `rows`
+ * array: given the same campaign name and the same rows, a block that renders again keeps the
+ * table, and the rows it has revealed, as they are.
  *
  * @param props - see {@link VariantsTableProps}
  * @returns the table, or `null` when there are no variants
@@ -293,6 +354,8 @@ export const VariantsTable = memo(function VariantsTable({
 }: VariantsTableProps): ReactElement | null {
   // Keys are assigned over every variant, so a shown row keeps the key it has in the full table.
   const keyed = useMemo(() => keyedVariants(rows), [rows]);
+  // Digits come from every variant, so revealing more rows never changes a column's precision.
+  const digits = useMemo(() => variantRateDigits(rows), [rows]);
   const batches = useBatches(keyed, { batchSize: ROW_BATCH_SIZE });
   if (keyed.length === 0) {
     return null;
@@ -300,6 +363,7 @@ export const VariantsTable = memo(function VariantsTable({
   const shown: VariantTableRow[] = batches.shown.map((row, index) => ({
     ...row,
     focusId: batches.batched ? batches.entryId(index) : null,
+    digits,
   }));
   return (
     <>

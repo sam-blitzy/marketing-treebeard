@@ -140,6 +140,7 @@ __all__ = [
     "CONTRACT_UNKNOWN_REASON",
     "FRACTIONAL_REASON",
     "NO_EXPOSURE_REASON",
+    "SECTION_DATASETS",
     "WEIGHTED_REASON",
     "BudgetCrm",
     "budget_crm",
@@ -651,6 +652,19 @@ def _ad_datasets(source: Source) -> tuple[str, str]:
 
 def _required(*groups: Iterable[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(name for group in groups for name in group))
+
+
+SECTION_DATASETS: Final[tuple[str, ...]] = _required(
+    _ad_datasets("google"), _ad_datasets("linkedin")
+)
+"""Every dataset the Budget section's rules gate on: each ad source's entities and daily metrics.
+
+B1-B4 read the budget history from entity snapshots and spend and outcomes from daily metrics.
+The CRM Qualified Lead counts a card shows where linked are not gating, so their datasets are
+left out. Precedence judges these over the run's window when the section stores no item, so
+an empty section says which of its datasets do not cover the window (AAP 0.5.5 "Each section
+shows an EmptyState with the reason").
+"""
 
 
 def _shared_flag(member_count: int) -> Flag:

@@ -9,10 +9,14 @@
  *   hidden by feedback), so the tab counts add up to the section's navigation count. A held
  *   card stays collapsed behind "Held until discrepancies are resolved". The section opens on
  *   the first sub-list with a visible card, else one with a card computed from replaced data,
- *   else one with a held card; an empty sub-list says "No items"; a chosen tab survives a
+ *   else one with a held card; an empty sub-list states why its rule has no card (cards hidden
+ *   by feedback, else its rule's leading withheld line, such as "No search term met the K1
+ *   minimum of 70 clicks", else the section's suppression counts as the frame writes them, such
+ *   as "No K3 action to show; not shown in this section: 2 dismissed", else "{rule} did not fire
+ *   for this window"); a chosen tab survives a
  *   refetch and falls back to the default when its group disappears. A section with no card to
- *   show renders the frame's empty state with its reasons (feedback, findings, a withheld K1
- *   term) and no tabs.
+ *   show renders the frame's empty state with its one-sentence reason (the cards feedback hides,
+ *   a withheld K1 term's minimum) and no tabs.
  * - **The coverage finding.** The `search_term_coverage` finding (search-term spend ÷ keyword
  *   spend, below 80%) sits above the tabs as a banner, never an alert, and every keyword card
  *   carries the low-coverage flag.
@@ -28,7 +32,7 @@
  *   before the evidence table.
  *
  * - **A card hidden on the page.** Dismissing a sub-list's only card leaves its confirmation in
- *   the tab's panel, not "No items", and the tab stays selected with its count of 0.
+ *   the tab's panel, not an empty state, and the tab stays selected with its count of 0.
  *
  * The section fetches nothing, so every test stubs the API with no handler: any request fails
  * the test. The feedback-flow test alone renders the section from a stubbed
@@ -61,7 +65,6 @@ import { renderWithProviders } from '../../../test/render';
 import { visibleItemCount } from '../SectionNav';
 import {
   ADJACENT_TERMS_TITLE,
-  EMPTY_GROUP_TITLE,
   KEYWORD_DETAILS_LABEL,
   KEYWORD_TABS_LABEL,
   KeywordsSection,
@@ -100,6 +103,15 @@ function pageItem(id: number): Item {
 /** A Keywords section holding exactly `groups`, with no finding or withheld line. */
 function keywordsWith(...groups: Group[]): Section {
   return makeSection('keywords', { groups });
+}
+
+/** A K1 search term withheld at `observed` clicks of `required`, as the backend records it. */
+function k1Withheld(name: string, observed: number, required: number) {
+  return makeWithheld({
+    entity: { source: 'google', type: 'search_term', id: `61000201|7700112|${name}`, name },
+    reason: `clicks ${String(observed)} of ${String(required)} required`,
+    sample: { observed, required, unit: 'clicks' },
+  });
 }
 
 /** One evidence metric, as the backend serialises it. */
@@ -213,6 +225,17 @@ function keywordDetails(action: string): string[] {
   return within(within(card).getByRole('list', { name: KEYWORD_DETAILS_LABEL }))
     .getAllByRole('listitem')
     .map((entry) => entry.textContent ?? '');
+}
+
+/**
+ * The title of the one empty state inside `container`, its one-sentence reason; it fails the
+ * test when `container` holds none or several, or when the empty state has a reason body.
+ */
+function emptyStateTitle(container: HTMLElement): string | null | undefined {
+  const empties = container.querySelectorAll('.ds-emptystate');
+  expect(empties).toHaveLength(1);
+  expect(empties[0]?.querySelector('.ds-emptystate__reason')).toBeNull();
+  return empties[0]?.querySelector('.ds-emptystate__title')?.textContent;
 }
 
 /** How many times `text` occurs in the text of `container`. */
@@ -409,7 +432,7 @@ describe('KeywordsSection', () => {
       expect(keywordDetails('Add as exact-match negative')).toEqual([
         'Term: free crm template',
         CORE_CRM_ENTRY,
-        'Spend: $186.40',
+        'Spend: USD\u00a0186.40',
         'Conversions: 0',
         'Cost/conversion: —',
         // The reason sentence, the specific reason it is flagged, is the API's, shown verbatim.
@@ -428,7 +451,7 @@ describe('KeywordsSection', () => {
       // A block candidate shows its wasted spend (AAP 0.5.4.3 K1) in the card's evidence.
       const evidence = within(card).getByRole('table', { name: 'Evidence' });
       expect(within(evidence).getByText('Wasted spend').closest('tr')?.textContent).toContain(
-        '$186.40',
+        'USD\u00a0186.40',
       );
       // Every keyword card of a low-coverage account carries the coverage flag.
       expect(within(card).getByText('Low search-term coverage: 74% of keyword spend')).toBeTruthy();
@@ -448,9 +471,9 @@ describe('KeywordsSection', () => {
       expect(keywordDetails(action)).toEqual([
         'Term: crm for small business',
         CORE_CRM_ENTRY,
-        'Spend: $240.00',
+        'Spend: USD\u00a0240.00',
         'Conversions: 4',
-        'Cost/conversion: $60.00',
+        'Cost/conversion: USD\u00a060.00',
         `Reason: ${reason}`,
       ]);
       const card = within(visiblePanel()).getByRole('article', { name: action });
@@ -492,9 +515,9 @@ describe('KeywordsSection', () => {
       expect(keywordDetails(action)).toEqual([
         'Term: crm software',
         CORE_CRM_ENTRY,
-        'Spend: $1,205.40',
+        'Spend: USD\u00a01,205.40',
         'Conversions: 14',
-        'Cost/conversion: $86.10',
+        'Cost/conversion: USD\u00a086.10',
         `Reason: ${reason}`,
       ]);
       const card = within(visiblePanel()).getByRole('article', { name: action });
@@ -514,23 +537,36 @@ describe('KeywordsSection', () => {
       );
       expect(listEntries(card, REVIEW_EVIDENCE_LABEL)).toEqual([
         'Quality score: 7 → 5.8',
-        'CPC by half: $2.10 / $2.52',
-        'Cost/conversion by half: $75.00 / $97.20',
+        'CPC by half: USD\u00a02.10\u00A0/\u00A0USD\u00a02.52',
+        'Cost/conversion by half: USD\u00a075.00\u00A0/\u00A0USD\u00a097.20',
       ]);
       expect(within(card).queryByRole('list', { name: ADJACENT_TERMS_TITLE })).toBeNull();
     });
 
-    it('opens on the first sub-list with a visible card and says "No items" in an empty one', async () => {
+    it('opens on the first sub-list with a visible card and states the K1 minimum in an empty Block tab', async () => {
+      // The run-8 shape: K1 terms withheld at 70 clicks required, then a K2 term.
+      const withheld = [
+        k1Withheld('free attribution software download', 44, 70),
+        k1Withheld('attribution modeling', 28, 70),
+        makeWithheld({
+          rule_id: 'K2',
+          reason: 'conversions 1 of 3 required',
+          sample: { observed: 1, required: 3, unit: 'conversions' },
+        }),
+      ];
       await renderKeywords(
-        keywordsWith(
-          makeGroup({ key: 'block', title: 'Block / negative-keyword candidates', items: [] }),
-          makeGroup({
-            key: 'expand',
-            title: 'Expansion candidates',
-            items: [pageItem(FIXTURE_ITEM_IDS.k2)],
-          }),
-          makeGroup({ key: 'review', title: 'Review', items: [pageItem(FIXTURE_ITEM_IDS.k3)] }),
-        ),
+        makeSection('keywords', {
+          groups: [
+            makeGroup({ key: 'block', title: 'Block / negative-keyword candidates', items: [] }),
+            makeGroup({
+              key: 'expand',
+              title: 'Expansion candidates',
+              items: [pageItem(FIXTURE_ITEM_IDS.k2)],
+            }),
+            makeGroup({ key: 'review', title: 'Review', items: [pageItem(FIXTURE_ITEM_IDS.k3)] }),
+          ],
+          withheld,
+        }),
       );
 
       expect(tabNames()).toEqual([
@@ -548,29 +584,65 @@ describe('KeywordsSection', () => {
       fireEvent.click(screen.getByRole('tab', { name: 'Block / negative-keyword candidates 0' }));
 
       const panel = visiblePanel();
-      expect(within(panel).getByText(EMPTY_GROUP_TITLE)).toBeTruthy();
-      expect(
-        within(panel).getByText('No Block / negative-keyword candidates actions in this window'),
-      ).toBeTruthy();
+      // AAP 0.5.5's sentence, its minimum the K1 lines' recorded sample.required.
+      expect(emptyStateTitle(panel)).toBe('No search term met the K1 minimum of 70 clicks');
       expect(within(panel).queryByRole('article')).toBeNull();
       expect(panel.id).toBe('group-keywords-block');
+      // The withheld lines are listed once, below the tabs, and not repeated in the panel.
+      expect(listEntries(document.body, 'Withheld for sample size')).toHaveLength(3);
+      expect(panel.textContent).not.toContain('attribution modeling');
     });
 
-    it('counts each sub-list\'s visible cards (2, 1, 0) in API order and says "No items" on an empty Review tab', async () => {
+    it('states an account-wide K3 line in an empty Review tab, and "No rule fired" for a group with no known rule', async () => {
       await renderKeywords(
-        keywordsWith(
-          makeGroup({
-            key: 'block',
-            title: 'Block / negative-keyword candidates',
-            items: [k1With(51, [], null), k1With(52, [], null)],
-          }),
-          makeGroup({
-            key: 'expand',
-            title: 'Expansion candidates',
-            items: [pageItem(FIXTURE_ITEM_IDS.k2)],
-          }),
-          makeGroup({ key: 'review', title: 'Review', items: [] }),
-        ),
+        makeSection('keywords', {
+          groups: [
+            makeGroup({
+              key: 'block',
+              title: 'Block / negative-keyword candidates',
+              items: [pageItem(FIXTURE_ITEM_IDS.k1)],
+            }),
+            makeGroup({ key: 'review', title: 'Review', items: [] }),
+            makeGroup({ key: 'future', title: 'Future rule', items: [] }),
+          ],
+          withheld: [
+            k1Withheld('attribution modeling', 28, 70),
+            makeWithheld({
+              rule_id: 'K3',
+              entity: null,
+              reason: 'window 7 days of 14 required',
+              sample: { observed: 7, required: 14, unit: 'days' },
+            }),
+          ],
+        }),
+      );
+
+      fireEvent.click(screen.getByRole('tab', { name: 'Review 0' }));
+      expect(emptyStateTitle(visiblePanel())).toBe('K3 withheld: window 7 days of 14 required');
+
+      fireEvent.click(screen.getByRole('tab', { name: 'Future rule 0' }));
+      expect(emptyStateTitle(visiblePanel())).toBe('No rule fired for this window');
+    });
+
+    it('counts each sub-list\'s visible cards (2, 1, 0) in API order and says K3 did not fire on an empty Review tab', async () => {
+      await renderKeywords(
+        makeSection('keywords', {
+          groups: [
+            makeGroup({
+              key: 'block',
+              title: 'Block / negative-keyword candidates',
+              items: [k1With(51, [], null), k1With(52, [], null)],
+            }),
+            makeGroup({
+              key: 'expand',
+              title: 'Expansion candidates',
+              items: [pageItem(FIXTURE_ITEM_IDS.k2)],
+            }),
+            makeGroup({ key: 'review', title: 'Review', items: [] }),
+          ],
+          // Only another rule's line is withheld, which the Review tab never quotes.
+          withheld: [k1Withheld('attribution modeling', 28, 70)],
+        }),
       );
 
       // One tab per API group, in API order, each its API title followed by its card count.
@@ -588,10 +660,163 @@ describe('KeywordsSection', () => {
 
       expect(selectedTabName()).toBe('Review 0');
       const panel = visiblePanel();
-      expect(within(panel).getByText(EMPTY_GROUP_TITLE)).toBeTruthy();
-      expect(within(panel).getByText('No Review actions in this window')).toBeTruthy();
+      expect(emptyStateTitle(panel)).toBe('K3 did not fire for this window');
       expect(within(panel).queryByRole('article')).toBeNull();
       expect(panel.id).toBe('group-keywords-review');
+    });
+
+    it('names the section\'s suppression counts, never "did not fire", on an empty tab whose rule has no withheld line', async () => {
+      // The default run after both K3 cards were dismissed: the rerun has no K3 item and no K3
+      // withheld line, and the section reports the 2 dismissals (per section, never per rule).
+      await renderKeywords(
+        makeSection('keywords', {
+          groups: [
+            makeGroup({
+              key: 'block',
+              title: 'Block / negative-keyword candidates',
+              items: [pageItem(FIXTURE_ITEM_IDS.k1)],
+            }),
+            makeGroup({
+              key: 'expand',
+              title: 'Expansion candidates',
+              items: [pageItem(FIXTURE_ITEM_IDS.k2)],
+            }),
+            makeGroup({ key: 'review', title: 'Review', items: [] }),
+          ],
+          // Only another rule's line is withheld, which the Review tab never quotes.
+          withheld: [k1Withheld('attribution modeling', 28, 70)],
+          suppressed: { feedback_dismiss: 2 },
+        }),
+      );
+
+      fireEvent.click(screen.getByRole('tab', { name: 'Review 0' }));
+      const panel = visiblePanel();
+      expect(emptyStateTitle(panel)).toBe(
+        'No K3 action to show; not shown in this section: 2 dismissed',
+      );
+      expect(panel.textContent).not.toContain('did not fire');
+      // The frame's "Not shown" list writes the same count the same way.
+      expect(listEntries(document.body, 'Not shown')).toEqual(['2 dismissed']);
+    });
+
+    it('writes every reported suppression count as the frame does, with g1_blocked singular at 1, and skips zero and non-finite counts', async () => {
+      const control: SectionControl = {};
+      const section = (suppressed: Section['suppressed']): Section =>
+        makeSection('keywords', {
+          groups: [
+            makeGroup({ key: 'block', title: 'Block / negative-keyword candidates', items: [] }),
+            makeGroup({
+              key: 'expand',
+              title: 'Expansion candidates',
+              items: [pageItem(FIXTURE_ITEM_IDS.k2)],
+            }),
+            makeGroup({ key: 'future', title: 'Future rule', items: [] }),
+          ],
+          suppressed,
+        });
+      await renderWithProviders(
+        <Harness
+          initial={section({
+            g1_blocked: 1,
+            feedback_snooze: 0,
+            feedback_done: 3,
+            tracking_absent: Number.NaN,
+            feedback_dismiss: 1,
+          })}
+          control={control}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole('tab', { name: 'Block / negative-keyword candidates 0' }));
+      expect(emptyStateTitle(visiblePanel())).toBe(
+        'No K1 action to show; not shown in this section: 1 spend increase blocked by the ' +
+          'high-utilization guard; 3 marked done; 1 dismissed',
+      );
+      expect(listEntries(document.body, 'Not shown')).toEqual([
+        '1 spend increase blocked by the high-utilization guard',
+        '3 marked done',
+        '1 dismissed',
+      ]);
+      // A group key with no known rule keeps the frame's sentence.
+      fireEvent.click(screen.getByRole('tab', { name: 'Future rule 0' }));
+      expect(emptyStateTitle(visiblePanel())).toBe('No rule fired for this window');
+
+      // Plural labels above 1, and the other labels as the frame writes them.
+      act(() => {
+        control.replace?.(
+          section({ g1_blocked: 2, feedback_snooze: 4, tracking_absent: 5, unknown_reason: 6 }),
+        );
+      });
+      fireEvent.click(screen.getByRole('tab', { name: 'Block / negative-keyword candidates 0' }));
+      expect(emptyStateTitle(visiblePanel())).toBe(
+        'No K1 action to show; not shown in this section: 2 spend increases blocked by the ' +
+          'high-utilization guard; 4 snoozed; 5 suppressed until tracking is verified; ' +
+          '6 unknown_reason',
+      );
+
+      // Only zero and non-finite counts: nothing is reported, so the rule did not fire.
+      act(() => {
+        control.replace?.(
+          section({ feedback_dismiss: 0, g1_blocked: Number.POSITIVE_INFINITY, feedback_done: -1 }),
+        );
+      });
+      expect(emptyStateTitle(visiblePanel())).toBe('K1 did not fire for this window');
+      expect(screen.queryByRole('list', { name: 'Not shown' })).toBeNull();
+    });
+
+    it('keeps the rule\'s withheld line ahead of the section\'s suppression counts', async () => {
+      await renderKeywords(
+        makeSection('keywords', {
+          groups: [
+            makeGroup({ key: 'block', title: 'Block / negative-keyword candidates', items: [] }),
+            makeGroup({ key: 'review', title: 'Review', items: [pageItem(FIXTURE_ITEM_IDS.k3)] }),
+          ],
+          withheld: [k1Withheld('free attribution software download', 44, 70)],
+          suppressed: { feedback_dismiss: 2 },
+        }),
+      );
+
+      fireEvent.click(screen.getByRole('tab', { name: 'Block / negative-keyword candidates 0' }));
+      expect(emptyStateTitle(visiblePanel())).toBe(
+        'No search term met the K1 minimum of 70 clicks',
+      );
+    });
+
+    it('keeps the cards feedback hides now ahead of the withheld line and the suppression counts', async () => {
+      const hiddenK3 = {
+        ...pageItem(FIXTURE_ITEM_IDS.k3),
+        current: makeItemOverlay({ hidden_by: 'dismiss' }),
+      };
+      await renderKeywords(
+        makeSection('keywords', {
+          groups: [
+            makeGroup({
+              key: 'block',
+              title: 'Block / negative-keyword candidates',
+              items: [pageItem(FIXTURE_ITEM_IDS.k1)],
+            }),
+            makeGroup({ key: 'review', title: 'Review', items: [hiddenK3] }),
+          ],
+          withheld: [
+            makeWithheld({
+              rule_id: 'K3',
+              entity: null,
+              reason: 'window 7 days of 14 required',
+              sample: { observed: 7, required: 14, unit: 'days' },
+            }),
+          ],
+          suppressed: { feedback_dismiss: 2 },
+        }),
+      );
+
+      fireEvent.click(screen.getByRole('tab', { name: 'Review 0' }));
+      expect(emptyStateTitle(visiblePanel())).toBe(
+        'No actions to show: 1 hidden by feedback since this run (dismissed, snoozed or done)',
+      );
+      expect(listEntries(document.body, 'Not shown')).toEqual([
+        '2 dismissed',
+        '1 hidden since this run',
+      ]);
     });
 
     it('opens on a sub-list with only a held card, which the tab counts, and leaves a hidden card out of its count', async () => {
@@ -627,17 +852,23 @@ describe('KeywordsSection', () => {
       expect(keywordDetails(heldAction)).toEqual([
         'Term: crm for small business',
         CORE_CRM_ENTRY,
-        'Spend: $240.00',
+        'Spend: USD\u00a0240.00',
         'Conversions: 4',
-        'Cost/conversion: $60.00',
+        'Cost/conversion: USD\u00a060.00',
         `Reason: ${heldK2.reason}`,
       ]);
       expect(occurrences(heldCard, heldK2.reason)).toBe(1);
       expectOneDetailsList(heldCard);
       // The snoozed K3 is counted under "Not shown", never rendered.
       expect(listEntries(document.body, 'Not shown')).toEqual(['1 hidden since this run']);
+      // The Review tab's only card is snoozed, so its reason names the hidden card.
       fireEvent.click(screen.getByRole('tab', { name: 'Review 0' }));
-      expect(within(visiblePanel()).getByText(EMPTY_GROUP_TITLE)).toBeTruthy();
+      expect(emptyStateTitle(visiblePanel())).toBe(
+        'No actions to show: 1 hidden by feedback since this run (dismissed, snoozed or done)',
+      );
+      // The Block tab, empty with nothing withheld, says its rule did not fire.
+      fireEvent.click(screen.getByRole('tab', { name: 'Block / negative-keyword candidates 0' }));
+      expect(emptyStateTitle(visiblePanel())).toBe('K1 did not fire for this window');
     });
 
     it('counts a card computed from replaced data in its tab, shows it openly and opens on it before a held-only tab', async () => {
@@ -681,9 +912,9 @@ describe('KeywordsSection', () => {
       expect(listEntries(card, KEYWORD_DETAILS_LABEL)).toEqual([
         'Term: crm software',
         CORE_CRM_ENTRY,
-        'Spend: $1,205.40',
+        'Spend: USD\u00a01,205.40',
         'Conversions: 14',
-        'Cost/conversion: $86.10',
+        'Cost/conversion: USD\u00a086.10',
         `Reason: ${historicalK3.reason}`,
       ]);
       expect(occurrences(card, historicalK3.reason)).toBe(1);
@@ -729,7 +960,7 @@ describe('KeywordsSection', () => {
         fireEvent.click(screen.getByRole('tab', { name: tab }));
         const panel = visiblePanel();
         // The counted cards stay collapsed behind the held disclosure until it is expanded.
-        expect(within(panel).queryByText(EMPTY_GROUP_TITLE)).toBeNull();
+        expect(panel.querySelector('.ds-emptystate')).toBeNull();
         expect(within(panel).queryAllByRole('article')).toHaveLength(0);
         const toggle = within(panel).getByRole('button', {
           name: `Held until discrepancies are resolved (${String(count)})`,
@@ -776,7 +1007,8 @@ describe('KeywordsSection', () => {
 
       expect(tabNames()).toEqual(['block 1', 'expand 0']);
       fireEvent.click(screen.getByRole('tab', { name: 'expand 0' }));
-      expect(within(visiblePanel()).getByText('No expand actions in this window')).toBeTruthy();
+      // The reason is the rule's, whatever the tab's label.
+      expect(emptyStateTitle(visiblePanel())).toBe('K2 did not fire for this window');
     });
 
     it('shows the frame empty state with its reasons, and no tabs, when no card can be shown', async () => {
@@ -794,12 +1026,12 @@ describe('KeywordsSection', () => {
       );
 
       expect(screen.queryByRole('tablist')).toBeNull();
-      expect(screen.getByText('No actions in this section')).toBeTruthy();
-      expect(
-        screen.getByText('1 hidden by feedback since this run (dismissed, snoozed or done)'),
-      ).toBeTruthy();
-      // The coverage finding is both the banner above and a reason line of the empty state.
-      expect(screen.getAllByText(/^Search terms cover 74% of keyword spend/u)).toHaveLength(2);
+      expect(emptyStateTitle(document.body)).toBe(
+        'No actions to show: 1 hidden by feedback since this run (dismissed, snoozed or done)',
+      );
+      // The coverage finding is the banner above, and only that: the empty state names the
+      // hidden card instead of repeating it.
+      expect(screen.getAllByText(/^Search terms cover 74% of keyword spend/u)).toHaveLength(1);
     });
 
     it('gives a withheld K1 term as the empty state\'s reason, with no tabs, when no group has an item', async () => {
@@ -818,19 +1050,21 @@ describe('KeywordsSection', () => {
       expect(screen.queryByRole('tablist')).toBeNull();
       expect(screen.queryByRole('tab')).toBeNull();
 
+      // The reason is the leading K1 line's recorded minimum (the fixture's 37 clicks), in
+      // AAP 0.5.5's words.
+      expect(emptyStateTitle(document.body)).toBe(
+        'No search term met the K1 minimum of 37 clicks',
+      );
       // The withheld line, "{rule} · {term}: {reason} — {observed} / {required} {unit}", with the
-      // recorded sample of the fixture (30 clicks of the 37 required).
+      // recorded sample of the fixture (30 clicks of the 37 required), is listed once, below the
+      // empty state, and not repeated inside it. Its figure is joined by no-break spaces
+      // (U+00A0): getByText matches the rendered text with them collapsed, and the list entry's
+      // exact text keeps them.
       const line = 'K1 · crm pricing comparison: clicks 30 of 37 required — 30 / 37 clicks';
-      const emptyState = screen.getByText('No actions in this section').parentElement;
-      if (emptyState === null) {
-        throw new Error('the empty-state title has no container');
-      }
-      expect(within(emptyState).getByText(line)).toBeTruthy();
-      // A section with a withheld pattern has a reason, so the no-reason fallback is not shown.
-      expect(within(emptyState).queryByText('No rule fired for this window')).toBeNull();
-      // The full withheld list follows the empty state, with the same line.
-      expect(listEntries(document.body, 'Withheld for sample size')).toEqual([line]);
-      expect(screen.getAllByText(line)).toHaveLength(2);
+      const exactLine =
+        'K1 · crm pricing comparison: clicks 30 of 37 required — 30\u00A0/\u00A037 clicks';
+      expect(listEntries(document.body, 'Withheld for sample size')).toEqual([exactLine]);
+      expect(screen.getAllByText(line)).toHaveLength(1);
     });
   });
 
@@ -917,9 +1151,9 @@ describe('KeywordsSection', () => {
         'Cost/conversion: —',
         'Cost/conversion: —',
         'Cost/conversion: —',
-        'Cost/conversion: $100.00',
-        'Cost/conversion: $100.00',
-        'Cost/conversion: $100.00',
+        'Cost/conversion: USD\u00a0100.00',
+        'Cost/conversion: USD\u00a0100.00',
+        'Cost/conversion: USD\u00a0100.00',
       ]);
       // A fractional conversion is shown as returned, never rounded to 0.
       expect(within(visiblePanel()).getByText('Conversions: 0.3')).toBeTruthy();
@@ -1050,8 +1284,8 @@ describe('KeywordsSection', () => {
       const card = within(visiblePanel()).getByRole('article', { name: 'Review keyword 41' });
       expect(listEntries(card, REVIEW_EVIDENCE_LABEL)).toEqual([
         'Quality score: unavailable → 6.5',
-        'CPC by half: $1.80 / unavailable',
-        'Cost/conversion by half: unavailable / unavailable',
+        'CPC by half: USD\u00a01.80\u00A0/\u00A0unavailable',
+        'Cost/conversion by half: unavailable\u00A0/\u00A0unavailable',
       ]);
     });
   });
@@ -1078,10 +1312,11 @@ describe('KeywordsSection: the confirmation of a card hidden on the page', () =>
     expect(block.getAttribute('aria-selected')).toBe('true');
     expect(screen.getByRole('tab', { name: 'Expansion candidates 1' })).toBeDefined();
     expect(screen.getByRole('tab', { name: 'Review 1' })).toBeDefined();
-    // Its panel shows the confirmation where the card stood, not "No items".
+    // Its panel shows the confirmation where the card stood, not an empty state.
     const panel = screen.getByRole('tabpanel');
     expect(within(panel).getByText(feedbackConfirmationText('dismiss', k1))).toBeDefined();
-    expect(within(panel).queryByText(EMPTY_GROUP_TITLE)).toBeNull();
+    expect(panel.querySelector('.ds-emptystate')).toBeNull();
+    expect(panel.textContent).not.toContain('No actions to show');
     // The other sub-lists' cards sit in hidden panels, so focus goes to the section heading.
     const region = screen.getByRole('region', { name: 'Keywords to adjust' });
     await waitFor(() => {

@@ -1874,7 +1874,10 @@ def test_p4_an_incomplete_required_dataset_flags_exactly_the_items_that_read_it(
     ``p4.incomplete`` marks ``google.search_terms`` incomplete ("result limit reached at
     finest partition"): K1, which reads it, carries ``incomplete`` naming the dataset and its
     reason, and Keywords records an ``incomplete_dataset`` finding; B3, which does not read
-    it, carries none. The twin with the dataset complete flags nothing incomplete.
+    it, carries none. The twin with the dataset complete flags nothing incomplete, and only a
+    section it leaves with no item records ``incomplete_dataset`` findings (``items`` 0): those
+    name the datasets of that section that do not cover the window (AAP 0.5.5), never the
+    now-complete one.
     """
     scenario = _scenario("p4.incomplete.case")
     dataset = str(scenario.expect.values["incomplete_dataset"])
@@ -1896,11 +1899,13 @@ def test_p4_an_incomplete_required_dataset_flags_exactly_the_items_that_read_it(
     out = _precede(make_context(complete))
     assert _candidates(out, KEYWORDS, K1)
     assert not any(c.has_flag(FLAG_INCOMPLETE) for c in _candidates(out))
-    assert all(
-        f.code != FINDING_INCOMPLETE_DATASET
-        for section in SECTION_ORDER
-        for f in out.findings[section]
-    )
+    for section in SECTION_ORDER:
+        for finding in out.findings[section]:
+            if finding.code != FINDING_INCOMPLETE_DATASET:
+                continue
+            assert not out.items[section], finding.message
+            assert finding.evidence["items"] == 0
+            assert finding.evidence["dataset"] != dataset
 
 
 def test_p4_a_live_item_reading_a_stale_dataset_has_data_status_stale(

@@ -63,7 +63,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ads_engine.analysis.shortfall import shortfall_spans, shortfall_within
 from ads_engine.analysis.thresholds import ContentAsset, CrmBindings, Thresholds
-from ads_engine.analysis.window import AnalysisWindow
+from ads_engine.analysis.window import UTC_BOUNDARY, AnalysisWindow
 from ads_engine.db.models.analysis import DATA_STATUSES, FEEDBACK_KINDS, RECOMMENDATION_SECTIONS
 from ads_engine.db.models.ops import DATASETS, SOURCES
 
@@ -1375,29 +1375,63 @@ class Metric:
 class Baseline:
     """A value an item's metrics were compared against (AAP 0.5.3 ``Evidence.baselines``).
 
+    A baseline that no metric of its item shares a unit with carries its own ``unit`` and, for
+    money, ``currency``, so it is shown in the account currency like the metrics (AAP 0.5.5:
+    the evidence lists the metrics against their baselines "with currency"). C1's account cost
+    per outcome is such a baseline: the pause card has no cost-per-outcome metric beside it.
+    Both keys are optional additions to the AAP 0.5.3 ``{key, label, value}`` shape: a
+    baseline without them, including every baseline frozen before they existed, keeps exactly
+    that shape.
+
     Attributes:
         key: Stable machine key, for example ``account_cost_per_outcome``.
         label: Display label.
         value: The baseline value; ``None`` when unavailable.
+        unit: The unit, as :attr:`Metric.unit` names it (for example ``currency`` or
+            ``ratio``); ``None`` for a baseline shown in the unit of the metric it pairs with,
+            or a unitless one such as K1's conversions per click.
+        currency: ISO currency code for a money value; set only together with ``unit``.
 
     Raises:
-        ValueError: On construction, for a blank key or label.
+        ValueError: On construction, for a blank key, label, unit or currency, or a currency
+            without a unit.
         TypeError: On construction, for a ``float`` or ``bool`` value.
     """
 
     key: str
     label: str
     value: Decimal | int | str | None
+    unit: str | None = None
+    currency: str | None = None
 
     def __post_init__(self) -> None:
         """Validate the fields."""
         _require_text(self.key, "Baseline.key")
         _require_text(self.label, "Baseline.label")
         _require_metric_value(self.value, f"Baseline {self.key!r} value")
+        if self.unit is not None:
+            _require_text(self.unit, "Baseline.unit")
+        if self.currency is not None:
+            _require_text(self.currency, "Baseline.currency")
+            if self.unit is None:
+                raise ValueError(f"Baseline {self.key!r} has a currency but no unit")
 
     def to_json(self) -> dict[str, Any]:
-        """Return ``{key, label, value}``."""
-        return {"key": self.key, "label": self.label, "value": json_value(self.value)}
+        """Return ``{key, label, value, unit?, currency?}``.
+
+        ``unit`` and ``currency`` appear only when set, so a baseline without them renders the
+        same JSON as one frozen before the keys existed.
+        """
+        rendered: dict[str, Any] = {
+            "key": self.key,
+            "label": self.label,
+            "value": json_value(self.value),
+        }
+        if self.unit is not None:
+            rendered["unit"] = self.unit
+        if self.currency is not None:
+            rendered["currency"] = self.currency
+        return rendered
 
 
 @dataclass(frozen=True, slots=True)
@@ -1588,34 +1622,60 @@ class ProvenanceEntry:
 class DatasetStatus:
     """A dataset an item read, with its completeness and coverage at compute time.
 
+    A dataset with a coverage date also records the day boundary that date is in, so the date
+    is shown labelled with its source's day boundary (AAP 0.5.5) whatever the source: the
+    window's ``source_days`` names the boundary of the day sources only, and HubSpot, which
+    holds instants, has none there although its coverage dates are UTC dates.
+    :meth:`AnalysisContext.make_evidence` sets it. ``boundary`` is an optional addition to the
+    AAP 0.5.3 ``{dataset, completeness, covered_through}`` shape: a status without it,
+    including every status frozen before it existed, keeps exactly that shape.
+
     Attributes:
         dataset: The dataset name, one of ``db.models.ops.DATASETS``.
         completeness: ``complete``, ``incomplete`` or ``unknown``; ``unknown`` when no
             freshness row exists.
         covered_through: The last native date the dataset covers; ``None`` when unknown.
+        boundary: The IANA zone whose midnight ends ``covered_through``, for example
+            ``America/New_York`` for Google or ``UTC`` for LinkedIn and HubSpot; set only
+            together with ``covered_through``. ``None`` when the boundary is unknown.
 
     Raises:
-        ValueError: On construction, for an unknown dataset or completeness.
+        ValueError: On construction, for an unknown dataset or completeness, a blank
+            ``boundary``, or a ``boundary`` without ``covered_through``.
         TypeError: On construction, when ``covered_through`` is not a native date.
     """
 
     dataset: str
     completeness: Completeness
     covered_through: date | None = None
+    boundary: str | None = None
 
     def __post_init__(self) -> None:
         """Validate the fields."""
         _require_in(self.dataset, DATASETS, "DatasetStatus.dataset")
         _require_in(self.completeness, _COMPLETENESS_VALUES, "DatasetStatus.completeness")
         _require_native_date(self.covered_through, "DatasetStatus.covered_through", optional=True)
+        if self.boundary is not None:
+            _require_text(self.boundary, "DatasetStatus.boundary")
+            if self.covered_through is None:
+                raise ValueError(
+                    f"DatasetStatus {self.dataset!r} has a boundary but no covered_through"
+                )
 
     def to_json(self) -> dict[str, Any]:
-        """Return ``{dataset, completeness, covered_through}``."""
-        return {
+        """Return ``{dataset, completeness, covered_through, boundary?}``.
+
+        ``boundary`` appears only when set, so a status without it renders the same JSON as
+        one frozen before the key existed.
+        """
+        rendered: dict[str, Any] = {
             "dataset": self.dataset,
             "completeness": self.completeness,
             "covered_through": json_value(self.covered_through),
         }
+        if self.boundary is not None:
+            rendered["boundary"] = self.boundary
+        return rendered
 
 
 def _tuple_of[T](value: object, kind: type[T], what: str) -> tuple[T, ...]:
@@ -1821,7 +1881,8 @@ class Evidence:
         sample: The sample size against its minimum, when the rule is sample-gated.
         test: The statistical test, when one was used.
         thresholds: ``{dotted key: configured value}`` for every threshold applied; read-only.
-        datasets: The datasets read, with completeness and coverage.
+        datasets: The datasets read, with completeness and coverage, each coverage date with
+            its day boundary.
         provenance: One entry per distinct dataset read, frozen at compute time.
         extra: Rule-specific detail, for example white-paper ``rows``, expansion
             ``adjacent_terms``, B1/B3 allocation text, ``depends_on`` or
@@ -2527,9 +2588,24 @@ class Freshness:
             return shortfall_within(self.reason, start=window_start, end=window_end)
         return self.reason or self.completeness
 
-    def status(self) -> DatasetStatus:
-        """Return the dataset's frozen :class:`DatasetStatus` for evidence."""
-        return DatasetStatus(self.dataset, self.completeness, self.covered_through)
+    def status(self, *, boundary: str | None = None) -> DatasetStatus:
+        """Return the dataset's frozen :class:`DatasetStatus` for evidence.
+
+        Args:
+            boundary: The IANA zone whose midnight ends the dataset's coverage dates
+                (:meth:`AnalysisContext.make_evidence` passes its source's). It is recorded
+                only with a ``covered_through``: a row without one, such as a full-state entity
+                dataset, has no date to label.
+
+        Raises:
+            ValueError: When ``boundary`` is blank.
+        """
+        return DatasetStatus(
+            self.dataset,
+            self.completeness,
+            self.covered_through,
+            boundary if self.covered_through is not None else None,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3810,6 +3886,29 @@ class AnalysisContext:
             return None
         return self.freshness.get((dataset_id, dataset_name))
 
+    def _coverage_boundary(self, dataset_name: str) -> str | None:
+        """Return the IANA zone whose midnight ends ``dataset_name``'s coverage dates.
+
+        ``google.*`` and ``linkedin.*`` dates are their source's native days, so their boundary
+        is the one the window records for the source in ``source_days`` (Google's account time
+        zone, LinkedIn's UTC); ``None`` when the window lists no such source. ``hubspot.*``
+        dates are UTC dates (:data:`UTC_BOUNDARY`).
+
+        Raises:
+            ValueError: For a name outside ``db.models.ops.DATASETS``.
+        """
+        _require_in(dataset_name, DATASETS, "dataset name")
+        source = _DATASET_SOURCE_PREFIXES[dataset_name.split(".", 1)[0]]
+        if source == "hubspot":
+            # HubSpot holds instants and has no native day, but its sync jobs record coverage
+            # as UTC dates: the CRM job's state range, deal search and Google-touch discovery
+            # each take astimezone(UTC).date(), as the /sources screen labels them.
+            return UTC_BOUNDARY
+        for item in self.window.source_days:
+            if item.source == source:
+                return item.boundary
+        return None
+
     @property
     def stale_after(self) -> timedelta:
         """``sources.stale_after_hours`` as a duration (P4).
@@ -3880,7 +3979,9 @@ class AnalysisContext:
           values the rule applied.
         * ``datasets`` has one :class:`DatasetStatus` per required dataset (repeats dropped),
           from its freshness row; ``unknown`` with no coverage when the row or the dataset is
-          missing.
+          missing. A status with a ``covered_through`` records the day boundary of that date:
+          the window's for a Google or LinkedIn dataset, UTC for a HubSpot one (AAP 0.5.5,
+          "Daily dates are shown as stored, labelled with their source's day boundary").
         * ``provenance`` has one :class:`ProvenanceEntry` per distinct dataset read, frozen at
           compute time and never replaced by the current status (AAP 0.3.2).
         * ``extra.headline_metric`` (:data:`EXTRA_HEADLINE_METRIC`) is ``headline``: the key
@@ -3927,7 +4028,11 @@ class AnalysisContext:
         for name in dict.fromkeys(required_datasets):
             ref = self.dataset_ref_for(name, crm_scope=crm_scope)
             row = None if ref is None else self.freshness_for(name, ref.dataset_id)
-            statuses.append(row.status() if row is not None else DatasetStatus(name, "unknown"))
+            statuses.append(
+                row.status(boundary=self._coverage_boundary(name))
+                if row is not None
+                else DatasetStatus(name, "unknown")
+            )
             if ref is not None and ref.dataset_id not in provenance:
                 provenance[ref.dataset_id] = ref.provenance()
         evidence = Evidence(

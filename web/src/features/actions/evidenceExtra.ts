@@ -411,10 +411,11 @@ export interface DiscrepancyRef {
 /**
  * Reads a C0 item's discrepancy (`discrepancy._candidate`): `extra.discrepancy_id`, `kind`,
  * `shape`, `state`, `detected_at` and `resolutions`. The display texts come from the `platform`
- * and `decided` metrics, which hold `render_value`'s strings ("paused", "USD 50.00", "shared
- * budget 123", "not returned", "no decision"); `extra.decided` and `extra.platform` hold the raw
- * state objects and are read only when they are already strings. A missing text renders
- * "unavailable".
+ * and `decided` metrics, which hold `render_value`'s strings ("Paused", "daily budget USD
+ * 50.00", "Active · shared budget 123", "not returned by the platform", "no decision
+ * recorded"), worded as the `/decisions` resolver words the same discrepancy; `extra.decided`
+ * and `extra.platform` hold the raw state objects and are read only when they are already
+ * strings. A missing text renders "unavailable".
  *
  * @param source - The C0 item or its evidence.
  * @returns The reference, or `null` when `extra.discrepancy_id` is missing or not an id.

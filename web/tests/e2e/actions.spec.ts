@@ -15,7 +15,7 @@
  *    source's day boundary) and one badge per flag, "Simulated data" included. Every
  *    white-paper row of every currency cohort shows its cells, and its expanded details their
  *    per-creative rows, evidence, chip and flags. Rules that bypass the shared formatter check
- *    the floor markers, "unavailable", currency symbols and the sample's observed / required,
+ *    the floor markers, "unavailable", currency codes and the sample's observed / required,
  *    and a routed copy of the page (`page.route`; `page.request` reads are never routed) adds
  *    floors, unavailable counts, zero-denominator costs and an "unknown creative" row.
  * 3. The window picker offers exactly the configured presets with the configured default marked;
@@ -120,10 +120,13 @@ import {
   formatDecimal,
   formatMetric,
   formatSample,
+  formatSourceDate,
   formatTestLine,
   formatWindowChip,
   isDecimalString,
+  ratioMetricDigits,
 } from '../../src/lib/format';
+import type { MetricInput } from '../../src/lib/format';
 
 // ---------------------------------------------------------------------------------------------
 // API paths and timing
@@ -256,7 +259,7 @@ const DATASETS_LABEL = 'Data used';
 const UNNAMED_TEST = 'Statistical test';
 const EMPTY_THRESHOLD_LIST = 'none';
 
-/** Fraction digits of a baseline no metric gives a unit to (`RECORDED_DIGITS`). */
+/** Fraction digits of an unpaired baseline with no unit or currency (`RECORDED_DIGITS`). */
 const RECORDED_DIGITS = 6;
 
 /** Fraction digits of a numeric threshold (`THRESHOLD_DIGITS`). */
@@ -354,6 +357,12 @@ const SOURCE_LABELS: Readonly<Record<SourceName, string>> = {
 };
 
 const COUNT_FORMAT = new Intl.NumberFormat('en');
+
+/**
+ * The no-break space (U+00A0) the UI joins a currency code and its figure with, so a wrapped
+ * line never ends with a bare code.
+ */
+const NO_BREAK_SPACE = '\u00a0';
 
 // ---------------------------------------------------------------------------------------------
 // API helpers
@@ -840,7 +849,9 @@ const SNAPSHOT_LABELS: SnapshotLabels = {
  * Reads, inside the page, what each element shows, so a section of any size is compared in
  * one round trip: a card's evidence blocks, window chips and flag lists, or a table's caption,
  * headers and body rows, each with its expanded white-paper detail (per-creative table,
- * evidence, chip, flags and "Notes on {asset}" list). Texts are `textContent`, trimmed. It runs
+ * evidence, chip, flags and "Notes on {asset}" list). Texts are `textContent`, trimmed, without
+ * the text of any `role="tooltip"` bubble: a metric label's `Tooltip` keeps its help text in
+ * the DOM while closed, and the row header shows, and is named by, the label alone. It runs
  * through `evaluateAll`, so it reads only its arguments and the DOM.
  *
  * @param roots - the `article` cards or `table` elements to read
@@ -850,7 +861,18 @@ const SNAPSHOT_LABELS: SnapshotLabels = {
 function snapshotRendered(roots: Element[], labels: SnapshotLabels): RenderedRoot[] {
   const chipPattern = new RegExp(labels.chipPattern, 'u');
   const flagsSelector = `ul[aria-label="${labels.flagsLabel}"]`;
-  const text = (node: Element | null | undefined): string => node?.textContent?.trim() ?? '';
+  const text = (node: Element | null | undefined): string => {
+    if (node === null || node === undefined) {
+      return '';
+    }
+    const copy = node.cloneNode(true);
+    if (copy instanceof Element) {
+      for (const bubble of Array.from(copy.querySelectorAll('[role="tooltip"]'))) {
+        bubble.remove();
+      }
+    }
+    return copy.textContent?.trim() ?? '';
+  };
 
   const readBlock = (table: HTMLTableElement): EvidenceBlock => {
     const rows: EvidenceRow[] = [];
@@ -1042,10 +1064,40 @@ function pairBaselines(
 }
 
 /**
- * An unpaired baseline's value: a number at six places, else unitless
- * (`formatUnpairedBaseline`).
+ * A paired baseline as `formatMetric` formats it (`pairedBaselineInput`): its value in its
+ * metric's unit and currency, without the metric's floor or unavailable markers.
  */
-function unpairedBaselineText(value: MetricValue): string {
+function pairedBaselineInput(baseline: Baseline, metric: Metric): MetricInput {
+  return { value: baseline.value, unit: metric.unit, currency: metric.currency };
+}
+
+/**
+ * The one fixed fraction-digit count of every percentage in an evidence table, as
+ * `evidenceRatioDigits` in `EvidenceTable.tsx` picks it (`tableRatioDigits`):
+ * `ratioMetricDigits` over every metric and every baseline paired with one, each as the table
+ * formats it. CR1 lead rates of 0.000722 and 0.000698 therefore read "0.072%" and "0.070%",
+ * never "0.1%" twice.
+ */
+function tableRatioDigits(
+  metrics: readonly Metric[],
+  pairing: { readonly byMetric: readonly (readonly Baseline[])[] },
+): number {
+  const paired = metrics.flatMap((metric, index) =>
+    (pairing.byMetric[index] ?? []).map((baseline) => pairedBaselineInput(baseline, metric)),
+  );
+  return ratioMetricDigits([...metrics, ...paired]);
+}
+
+/**
+ * An unpaired baseline's value (`formatUnpairedBaseline`): in its own unit and currency when it
+ * records either, as C1's account cost per outcome does; else a number at six places, else
+ * unitless. Blank unit or currency text counts as none.
+ */
+function unpairedBaselineText(baseline: Baseline): string {
+  const { value, unit, currency } = baseline;
+  if ((unit ?? '').trim() !== '' || (currency ?? '').trim() !== '') {
+    return formatMetric({ value, unit, currency });
+  }
   if (typeof value === 'number' || (typeof value === 'string' && isDecimalString(value))) {
     return formatDecimal(value, RECORDED_DIGITS);
   }
@@ -1087,19 +1139,41 @@ function thresholdText(value: unknown): string {
   return UNAVAILABLE;
 }
 
-/** One "Data used" entry: "{dataset}: {completeness}, covered through {date}". */
-function datasetText(entry: DatasetCoverage): string {
-  const through =
-    entry.covered_through === null || entry.covered_through.trim() === ''
-      ? UNAVAILABLE
-      : entry.covered_through;
-  return `${entry.dataset}: ${entry.completeness}, covered through ${through}`;
+/** The sources a dataset name's prefix can name, as in `google.metrics_daily`. */
+const DATASET_SOURCES: readonly SourceName[] = ['google', 'linkedin', 'hubspot'];
+
+/**
+ * One "Data used" entry. With a recorded date: "{dataset}: {completeness}, covered through
+ * {date}", the date as stored and labelled with its source's day boundary: the entry's own
+ * `boundary` when it is not blank ("2026-10-05 (HubSpot day, UTC)"), else the one the window's
+ * `source_days` records for the source ("2026-10-05 (Google day, America/New_York)"), the
+ * source's day alone when neither does (evidence frozen before entries recorded a boundary
+ * reads "(HubSpot day)"), and no label when the name's prefix is no known source. Without one:
+ * "{dataset}: {completeness}".
+ */
+function datasetText(entry: DatasetCoverage, sourceDays: EvidenceWindow['source_days']): string {
+  const head = `${entry.dataset}: ${entry.completeness}`;
+  const through = entry.covered_through?.trim() ?? '';
+  if (through === '') {
+    return head;
+  }
+  const dot = entry.dataset.indexOf('.');
+  const prefix = dot > 0 ? entry.dataset.slice(0, dot) : '';
+  const source = DATASET_SOURCES.find((name) => name === prefix);
+  if (source === undefined) {
+    return `${head}, covered through ${through}`;
+  }
+  const own = entry.boundary?.trim() ?? '';
+  const boundary =
+    own === '' ? (sourceDays.find((day) => day.source === source)?.boundary ?? null) : own;
+  return `${head}, covered through ${formatSourceDate(through, source, boundary)}`;
 }
 
 /**
  * The evidence block an item's frozen evidence renders as (AAP 0.5.4.8; `EvidenceTable.tsx`):
- * one row per metric with its value and paired baselines, the unpaired baselines, the
- * thresholds applied and the datasets used, then the sample and test lines.
+ * one row per metric with its value and paired baselines, every percentage among them at the
+ * table's one precision ({@link tableRatioDigits}), the unpaired baselines, the thresholds
+ * applied and the datasets used, then the sample and test lines.
  *
  * @param evidence - the item's `evidence`, as the API returned it
  * @param caption - the table's caption: "Evidence" on a card, "Evidence for {asset}" on a row
@@ -1108,20 +1182,17 @@ function datasetText(entry: DatasetCoverage): string {
 function expectedEvidenceBlock(evidence: Evidence, caption: string): EvidenceBlock {
   const { metrics, baselines, sample, test: statTest, thresholds, datasets } = evidence;
   const pairing = pairBaselines(metrics, baselines);
+  const ratioDigits = tableRatioDigits(metrics, pairing);
   const rows = metrics.map((metric, index): EvidenceRow => {
     const paired = pairing.byMetric[index] ?? [];
     return {
       header: metricLabel(metric).trim(),
-      value: formatMetric(metric).trim(),
+      value: formatMetric(metric, { ratioDigits }).trim(),
       baselines:
         paired.length === 0
           ? [EM_DASH]
           : paired.map((baseline) => {
-              const value = formatMetric({
-                value: baseline.value,
-                unit: metric.unit,
-                currency: metric.currency,
-              });
+              const value = formatMetric(pairedBaselineInput(baseline, metric), { ratioDigits });
               return `${baselineLabel(baseline)}: ${value}`.trim();
             }),
     };
@@ -1133,7 +1204,7 @@ function expectedEvidenceBlock(evidence: Evidence, caption: string): EvidenceBlo
       ? OTHER_BASELINES_LABEL
       : BASELINES_LABEL;
     const entries = pairing.unpaired.map((baseline) =>
-      `${baselineLabel(baseline)}: ${unpairedBaselineText(baseline.value)}`.trim(),
+      `${baselineLabel(baseline)}: ${unpairedBaselineText(baseline)}`.trim(),
     );
     lists.push({ heading: label, label, entries });
   }
@@ -1145,7 +1216,9 @@ function expectedEvidenceBlock(evidence: Evidence, caption: string): EvidenceBlo
     lists.push({ heading: THRESHOLDS_LABEL, label: THRESHOLDS_LABEL, entries });
   }
   if (datasets.length > 0) {
-    const entries = datasets.map((entry) => datasetText(entry).trim());
+    const entries = datasets.map((entry) =>
+      datasetText(entry, evidence.window.source_days).trim(),
+    );
     lists.push({ heading: DATASETS_LABEL, label: DATASETS_LABEL, entries });
   }
 
@@ -1165,15 +1238,21 @@ function expectedEvidenceBlock(evidence: Evidence, caption: string): EvidenceBlo
 // Rendering rules checked without the shared formatter
 // ---------------------------------------------------------------------------------------------
 
-/** A currency's sign as `Intl` prints it ("$", "€", "XYZ"); `null` for a code it refuses. */
-function currencySymbol(code: string): string | null {
+/**
+ * A currency's code as `Intl` prints it with `currencyDisplay: 'code'` ("USD", "EUR", "XYZ"),
+ * the one money style the UI shares with the backend's reason texts; `null` for a code it
+ * refuses.
+ */
+function currencyCode(code: string): string | null {
   try {
-    const parts = new Intl.NumberFormat('en', { style: 'currency', currency: code }).formatToParts(
-      1,
-    );
+    const parts = new Intl.NumberFormat('en', {
+      style: 'currency',
+      currency: code,
+      currencyDisplay: 'code',
+    }).formatToParts(1);
     return parts.find((part) => part.type === 'currency')?.value ?? null;
   } catch {
-    // Intl throws RangeError for a malformed code; the value then renders with no symbol.
+    // Intl throws RangeError for a malformed code; the value then renders with no code prefix.
     return null;
   }
 }
@@ -1193,7 +1272,7 @@ function wholeCount(value: MetricValue): string | null {
  * Checks one rendered metric value against AAP 0.5.5 and 0.11.1 directly, so a regression in
  * `formatMetric` itself fails too: an unavailable value is exactly "unavailable", never 0; text
  * renders verbatim; a numeric value is never "unavailable"; a floored count starts "≥ " and a
- * floored amount "≤ "; an amount shows its currency's sign.
+ * floored amount "≤ "; an amount shows its currency's ISO code.
  *
  * @param rendered - the cell's text
  * @param metric - the metric, as the API returned it
@@ -1226,9 +1305,12 @@ function expectMetricRendering(rendered: string, metric: Metric, where: string):
       `${cell} is an attribution floor, so it reads "${marker}…", not "${rendered}"`,
     ).toBe(true);
   }
-  const symbol = currency === '' ? null : currencySymbol(currency);
-  if (symbol !== null) {
-    expect(rendered, `${cell} is an amount in ${currency}`).toContain(symbol);
+  const code = currency === '' ? null : currencyCode(currency);
+  if (code !== null) {
+    expect(
+      rendered,
+      `${cell} is an amount in ${currency}, its code kept with its figure`,
+    ).toContain(`${code}${NO_BREAK_SPACE}`);
   }
 }
 
@@ -1248,8 +1330,9 @@ function expectSampleAndTest(lines: readonly string[], evidence: Evidence, where
     const observed = wholeCount(sample.observed);
     const required = wholeCount(sample.required);
     if (observed !== null && required !== null) {
+      // The figure is joined by no-break spaces (U+00A0), so it never wraps inside the figure.
       expect(samples[0], `${where}: the sample line reads observed / required`).toContain(
-        `${observed} / ${required}`,
+        `${observed}\u00A0/\u00A0${required}`,
       );
     }
     const unit = (sample.unit ?? '').trim();
@@ -2031,9 +2114,18 @@ function withRenderingEdgeCases(source: RecommendationsPage): EdgeCasePage {
   return { page, card: edited, assetItemId: asset?.id ?? null };
 }
 
-/** An amount as `Intl` prints it in `currency`, independently of `src/lib/format.ts`. */
+/**
+ * An amount as `Intl` prints it in `currency` after its ISO code ("USD 75.00"), code and figure
+ * joined by {@link NO_BREAK_SPACE} whichever space ICU emits there, independently of
+ * `src/lib/format.ts`.
+ */
 function plainMoney(amount: number, currency: string): string {
-  return new Intl.NumberFormat('en', { style: 'currency', currency }).format(amount);
+  return new Intl.NumberFormat('en', { style: 'currency', currency, currencyDisplay: 'code' })
+    .formatToParts(amount)
+    .map((part) =>
+      part.type === 'literal' && /^\s+$/u.test(part.value) ? NO_BREAK_SPACE : part.value,
+    )
+    .join('');
 }
 
 /** Checks, literally, how the card {@link withRenderingEdgeCases} edited renders its additions. */
@@ -2269,7 +2361,10 @@ function campaignState(status: 'active' | 'paused', daily: string): DiscrepancyV
   };
 }
 
-/** The boundary discrepancy `index`, with sides fitting its kind (`render_value` texts too). */
+/**
+ * The boundary discrepancy `index`, with sides fitting its kind, and the texts the backend's
+ * `render_value` renders for them, which the `/decisions` resolver words alike.
+ */
 function boundaryDiscrepancy(index: number): {
   discrepancy: Discrepancy;
   decided: string;
@@ -2284,22 +2379,22 @@ function boundaryDiscrepancy(index: number): {
     status: {
       decided: { status: 'active' },
       platform: { status: 'paused' },
-      texts: ['active', 'paused'],
+      texts: ['Active', 'Paused'],
     },
     budget: {
       decided: campaignState('active', '50.00'),
       platform: campaignState('active', '75.00'),
-      texts: ['USD 50.00', 'USD 75.00'],
+      texts: ['daily budget USD 50.00', 'daily budget USD 75.00'],
     },
     untracked: {
       decided: null,
       platform: campaignState('active', '50.00'),
-      texts: ['no decision', 'active, USD 50.00'],
+      texts: ['no decision recorded', 'Active · daily budget USD 50.00'],
     },
     missing: {
       decided: campaignState('active', '50.00'),
       platform: null,
-      texts: ['active, USD 50.00', 'not returned'],
+      texts: ['Active · daily budget USD 50.00', 'not returned by the platform'],
     },
   };
   const side = sides[kind];

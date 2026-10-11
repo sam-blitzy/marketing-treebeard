@@ -312,10 +312,15 @@ class Seam:
     reached: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
 
     def patch(self, monkeypatch: pytest.MonkeyPatch, owner: type, method: str) -> None:
-        """Route every call of ``owner.method`` through :attr:`edits`."""
+        """Route every call of ``owner.method`` through :attr:`edits`.
+
+        A streaming Google fetch is read without the job's ``sink``, so the edit sees its rows;
+        the edited rows are then handed to the sink, as the fetch hands over what it accepted.
+        """
         original: Callable[..., Awaitable[Any]] = getattr(owner, method)
 
         async def edited(client: Any, *args: Any, **kwargs: Any) -> Any:
+            sink = kwargs.pop("sink", None)
             self.calls += 1
             edit = self.edits.get(self.calls)
             if edit == "raise":
@@ -324,7 +329,11 @@ class Seam:
                 self.reached.set()
                 await asyncio.get_running_loop().create_future()
             answer = await original(client, *args, **kwargs)
-            return answer if edit is None or isinstance(edit, str) else edit(answer, args)
+            answer = answer if edit is None or isinstance(edit, str) else edit(answer, args)
+            if sink is None or not answer.rows:
+                return answer
+            await sink(answer.rows)
+            return dataclasses.replace(answer, rows=(), streamed=answer.streamed + len(answer.rows))
 
         monkeypatch.setattr(owner, method, edited)
 

@@ -463,8 +463,8 @@ describe('discrepancyRef', () => {
       kind: 'status',
       shape: 'own_budget',
       state: 'open',
-      decided: 'active',
-      platform: 'paused',
+      decided: 'Active',
+      platform: 'Paused',
       resolutions: [...FIXTURE_RESOLUTIONS.status],
       detectedAt: '2026-10-06T03:00:41Z',
     });

@@ -424,12 +424,32 @@ function baseline(key: string, label: string, value: MetricValue): Baseline {
   return { key, label, value } satisfies Baseline;
 }
 
-/** One complete dataset per name, covered through the window end, as of compute time. */
+/**
+ * The day boundary the backend freezes with a dataset's coverage date: the one
+ * {@link FIXTURE_SOURCE_DAYS} names for a Google or LinkedIn dataset, and UTC for a HubSpot one,
+ * whose sync jobs record UTC dates; `null` for a name whose prefix is no day source.
+ */
+function coverageBoundary(dataset: string): string | null {
+  const prefix = dataset.slice(0, Math.max(dataset.indexOf('.'), 0));
+  if (prefix === 'hubspot') {
+    return 'UTC';
+  }
+  return FIXTURE_SOURCE_DAYS.find((day) => day.source === prefix)?.boundary ?? null;
+}
+
+/**
+ * One complete dataset per name, covered through the window end, as of compute time, with the
+ * day boundary of that date ({@link coverageBoundary}).
+ */
 function coverage(...names: readonly string[]): DatasetCoverage[] {
   return names.map(
     (dataset) =>
-      ({ dataset, completeness: 'complete', covered_through: FIXTURE_WINDOW.end }) satisfies
-        DatasetCoverage,
+      ({
+        dataset,
+        completeness: 'complete',
+        covered_through: FIXTURE_WINDOW.end,
+        boundary: coverageBoundary(dataset),
+      }) satisfies DatasetCoverage,
   );
 }
 
@@ -1992,13 +2012,13 @@ function campaignsSection(): Section {
     id: FIXTURE_ITEM_IDS.c0,
     rank: 1,
     rule_id: 'C0',
-    action: 'Resolve: platform shows paused, last decided active',
+    action: 'Resolve: platform shows Paused, last decided Active',
     reason: 'Platform status differs from the last decided status.',
     entity: entity('google', 'campaign', '21000301', 'Brand Search — US'),
     evidence: makeEvidence({
       metrics: [
-        metric('platform', 'Platform', 'paused', 'status'),
-        metric('decided', 'Last decided', 'active', 'status'),
+        metric('platform', 'Platform', 'Paused', 'status'),
+        metric('decided', 'Last decided', 'Active', 'status'),
       ],
       // C0 records no threshold of its own; precedence still freezes the policy keys, because
       // the discrepancy reads google.entities.

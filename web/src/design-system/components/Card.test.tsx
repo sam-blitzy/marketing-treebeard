@@ -3,12 +3,13 @@
  * (AAP 0.4.2; `../GAPS.md`, binding procedure step 6).
  *
  * They hold the wrapper to the contract in its TSDoc: the card is an `<article>` named by the
- * heading `Card.Header` renders (`<h3>` by default, `<h4>` on request); the rank reads as
- * "Rank {rank}" through a visually hidden prefix; the headline figure reads "{label} {value}"
- * between the heading and the entity line, outside the heading, so the card's name stays the
- * action; the rank, figure and entity line are skipped for values React renders as nothing
- * (`undefined`, `null`, booleans, `''`) but kept for `0`; a header outside a card still gets an id
- * of its own; and the body and footer hold their children.
+ * heading `Card.Header` renders (`<h3>` by default, `<h4>` on request, with the class and
+ * sibling order `Card.css` uses to set an `<h4>` headline and its figure a step smaller); the
+ * rank reads as "Rank {rank}" through a visually hidden prefix; the headline figure reads
+ * "{label} {value}" between the heading and the entity line, outside the heading, so the card's
+ * name stays the action; the rank, figure and entity line are skipped for values React renders
+ * as nothing (`undefined`, `null`, booleans, `''`) but kept for `0`; a header outside a card
+ * still gets an id of its own; and the body and footer hold their children.
  */
 import { render, screen, within } from '@testing-library/react';
 import type { ReactNode } from 'react';
@@ -57,6 +58,39 @@ describe('Card', () => {
     const article = screen.getByRole('article', { name: 'Scale' });
     expect(within(article).getByRole('heading', { level: 4, name: 'Scale' })).toBeDefined();
     expect(within(article).queryByRole('heading', { level: 3 })).toBeNull();
+  });
+
+  it('gives an h4 headline the title class and its figure the selector Card.css steps down', () => {
+    const { container } = render(
+      <>
+        <Card>
+          <Card.Header
+            rank={1}
+            title="Scale"
+            headingLevel={4}
+            figure={{ label: 'Spend', value: 'USD 1,240.00' }}
+          />
+          <Card.Body>Body</Card.Body>
+        </Card>
+        <Card>
+          <Card.Header title="Pause" figure={{ label: 'Spend', value: 'USD 90.00' }} />
+          <Card.Body>Body</Card.Body>
+        </Card>
+      </>,
+    );
+
+    const h4 = screen.getByRole('heading', { level: 4, name: 'Scale' });
+    expect(h4.className).toBe('ds-card__title');
+    expect(h4.matches('h4.ds-card__title')).toBe(true);
+    // Card.css steps an h4 headline's figure value down with it through this selector, and only
+    // an h4 headline's figure matches it.
+    const stepped = container.querySelectorAll(
+      'h4.ds-card__title ~ .ds-card__figure .ds-card__figure-value',
+    );
+    expect(Array.from(stepped).map((value) => value.textContent)).toEqual(['USD 1,240.00']);
+    const h3 = screen.getByRole('heading', { level: 3, name: 'Pause' });
+    expect(h3.className).toBe('ds-card__title');
+    expect(h3.matches('h4.ds-card__title')).toBe(false);
   });
 
   it('labels each card by its own heading', () => {
@@ -121,7 +155,7 @@ describe('Card', () => {
         <Card.Header
           rank={1}
           title="Add as exact-match negative"
-          figure={{ label: 'Wasted spend', value: '$186.40' }}
+          figure={{ label: 'Wasted spend', value: 'USD 186.40' }}
           meta="free crm template · Google"
         />
         <Card.Body>Body</Card.Body>
@@ -135,9 +169,9 @@ describe('Card', () => {
     });
     const figure = container.querySelector('.ds-card__figure');
     expect(figure?.tagName).toBe('P');
-    expect(figure?.textContent).toBe('Wasted spend $186.40');
+    expect(figure?.textContent).toBe('Wasted spend USD 186.40');
     expect(figure?.querySelector('.ds-card__figure-label')?.textContent).toBe('Wasted spend');
-    expect(figure?.querySelector('.ds-card__figure-value')?.textContent).toBe('$186.40');
+    expect(figure?.querySelector('.ds-card__figure-value')?.textContent).toBe('USD 186.40');
     expect(heading.contains(figure ?? null)).toBe(false);
     expect(figure?.previousElementSibling).toBe(heading);
     expect(figure?.nextElementSibling?.className).toBe('ds-card__meta');
@@ -168,7 +202,7 @@ describe('Card', () => {
     const { container } = render(
       <>
         <Card>
-          <Card.Header title="Pause" figure={{ label: slot, value: '$10.00' }} />
+          <Card.Header title="Pause" figure={{ label: slot, value: 'USD 10.00' }} />
           <Card.Body>Body</Card.Body>
         </Card>
         <Card>
@@ -179,7 +213,7 @@ describe('Card', () => {
     );
 
     expect(container.querySelector('.ds-card__figure')).toBeNull();
-    expect(screen.queryByText('$10.00')).toBeNull();
+    expect(screen.queryByText('USD 10.00')).toBeNull();
     expect(screen.queryByText('Spend')).toBeNull();
   });
 

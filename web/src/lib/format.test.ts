@@ -9,11 +9,16 @@
  * contract are asserted verbatim.
  *
  * Fixtures are typed against `../api/types` with `satisfies`, so a schema change fails the
- * typecheck. The suite mocks nothing and reads no clock, locale or `TZ`, and no test measures
- * elapsed time: the runner's per-test timeout is the only timing any test meets. It passes
- * unchanged under `TZ=Pacific/Auckland` and `TZ=America/Los_Angeles`.
+ * typecheck. The suite mocks nothing but `Intl.NumberFormat.prototype.formatToParts`, in the one
+ * money test that stands in for ICU builds emitting another space beside the currency code. The
+ * one file it reads is the backend's `decisions.py`, whose ISO 4217 minor-unit table the money
+ * functions must mirror. It reads no clock, locale or `TZ`, and no test measures elapsed time:
+ * the runner's per-test timeout is the only timing any test meets. It passes unchanged under
+ * `TZ=Pacific/Auckland` and `TZ=America/Los_Angeles`.
  */
-import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+
+import { describe, expect, it, vi } from 'vitest';
 
 import type {
   EvidenceWindow,
@@ -27,7 +32,9 @@ import * as format from './format';
 import {
   DAY_UNITS,
   EM_DASH,
+  FIGURE_SEPARATOR,
   LOCALE,
+  MONEY_SEPARATOR,
   MONEY_UNITS,
   MULTIPLE_UNITS,
   NOT_APPLICABLE,
@@ -46,6 +53,7 @@ import {
   formatDateRange,
   formatDays,
   formatDecimal,
+  formatExactMoney,
   formatFloor,
   formatInstant,
   formatMetric,
@@ -58,6 +66,8 @@ import {
   formatTestLine,
   formatWindowChip,
   isDecimalString,
+  percentDigits,
+  ratioMetricDigits,
   sourceLabel,
 } from './format';
 
@@ -75,8 +85,55 @@ function metric(value: Metric['value'], overrides: Partial<Metric> = {}): Metric
   };
 }
 
-/** The spaces format.ts must never leave in its output. */
+/**
+ * The spaces ICU may emit inside `Intl` output, which format.ts replaces with plain spaces. The
+ * only no-break spaces it emits on purpose are those of `FIGURE_SEPARATOR`, inside an "N / M"
+ * figure, and `MONEY_SEPARATOR`, between a currency code and its figure; output with neither
+ * figure nor amount, such as an instant, holds none.
+ */
 const SPECIAL_SPACES = /[\u202F\u00A0]/;
+
+/** The backend module whose `minor_unit_exponent` the API validates decided amounts with. */
+const DECISIONS_PY = new URL('../../../backend/src/ads_engine/decisions.py', import.meta.url);
+
+/** ISO 4217 currencies without a minor unit, as `decisions.py` lists them, sorted. */
+const ISO_ZERO_DIGITS: readonly string[] = [
+  'BIF',
+  'CLP',
+  'DJF',
+  'GNF',
+  'ISK',
+  'JPY',
+  'KMF',
+  'KRW',
+  'PYG',
+  'RWF',
+  'UGX',
+  'UYI',
+  'VND',
+  'VUV',
+  'XAF',
+  'XOF',
+  'XPF',
+];
+
+/** ISO 4217 currencies whose minor unit is a thousandth, as `decisions.py` lists them, sorted. */
+const ISO_THREE_DIGITS: readonly string[] = ['BHD', 'IQD', 'JOD', 'KWD', 'LYD', 'OMR', 'TND'];
+
+/**
+ * The sorted codes of one `frozenset` constant of `decisions.py`, such as
+ * `_ZERO_EXPONENT_CURRENCIES: Final[frozenset[str]] = frozenset({"BIF", …})`. Fails the test when
+ * the constant is not found, so a rename cannot pass silently.
+ */
+function backendCurrencySet(source: string, name: string): string[] {
+  const match = new RegExp(`^${name}\\b[^=\\n]*=\\s*frozenset\\(\\s*\\{([^}]*)\\}`, 'mu').exec(
+    source,
+  );
+  if (match === null) {
+    throw new Error(`${name} is not defined in decisions.py`);
+  }
+  return [...(match[1] ?? '').matchAll(/"([A-Z]{3})"/gu)].map(([, code = '']) => code).sort();
+}
 
 /**
  * Minutes since midnight of the 12-hour clock time in a formatted instant, such as
@@ -97,6 +154,21 @@ describe('constants', () => {
     expect(UNAVAILABLE).toBe('unavailable');
     expect(EM_DASH).toBe('\u2014');
     expect(NOT_APPLICABLE).toBe('n/a');
+    expect(FIGURE_SEPARATOR).toBe('\u00A0/\u00A0');
+    expect(MONEY_SEPARATOR).toBe('\u00a0');
+  });
+
+  it('emits no-break spaces only as FIGURE_SEPARATOR and MONEY_SEPARATOR', () => {
+    // A by-half money pair, as the Keywords review card composes it, and a sample line.
+    const pair = `${formatMoney('2.1', 'USD')}${FIGURE_SEPARATOR}${formatMoney('2.52', 'USD')}`;
+    expect(pair).toBe('USD\u00a02.10\u00A0/\u00A0USD\u00a02.52');
+    const sample = formatSample({ observed: 3100, required: 4200, unit: 'form opens' });
+    const parts = [
+      ...pair.split(FIGURE_SEPARATOR).flatMap((amount) => amount.split(MONEY_SEPARATOR)),
+      ...sample.split(FIGURE_SEPARATOR),
+    ];
+    expect(parts).toEqual(['USD', '2.10', 'USD', '2.52', '3,100', '4,200 form opens']);
+    expect(parts.filter((part) => SPECIAL_SPACES.test(part))).toEqual([]);
   });
 
   it('exports the unit vocabularies', () => {
@@ -120,7 +192,9 @@ describe('constants', () => {
       [
         'DAY_UNITS',
         'EM_DASH',
+        'FIGURE_SEPARATOR',
         'LOCALE',
+        'MONEY_SEPARATOR',
         'MONEY_UNITS',
         'MULTIPLE_UNITS',
         'NOT_APPLICABLE',
@@ -139,6 +213,7 @@ describe('constants', () => {
         'formatDateRange',
         'formatDays',
         'formatDecimal',
+        'formatExactMoney',
         'formatFloor',
         'formatInstant',
         'formatMetric',
@@ -151,6 +226,8 @@ describe('constants', () => {
         'formatTestLine',
         'formatWindowChip',
         'isDecimalString',
+        'percentDigits',
+        'ratioMetricDigits',
         'sourceLabel',
       ].sort(),
     );
@@ -211,43 +288,43 @@ describe('sourceLabel', () => {
 
 describe('formatMoney', () => {
   it('formats the verified outputs exactly', () => {
-    expect(formatMoney('1234.567891', 'EUR')).toBe('€1,234.57');
-    expect(formatMoney('40', 'GBP')).toBe('£40.00');
-    expect(formatMoney('1234.5', 'JPY')).toBe('¥1,235');
-    expect(formatMoney('-40', 'EUR')).toBe('-€40.00');
+    expect(formatMoney('1234.567891', 'EUR')).toBe('EUR\u00a01,234.57');
+    expect(formatMoney('40', 'GBP')).toBe('GBP\u00a040.00');
+    expect(formatMoney('1234.5', 'JPY')).toBe('JPY\u00a01,235');
+    expect(formatMoney('-40', 'EUR')).toBe('EUR\u00a0-40.00');
   });
 
   it('rounds the exact decimal string, never a float', () => {
-    expect(formatMoney('999999999999.994999', 'USD')).toBe('$999,999,999,999.99');
-    expect(formatMoney('123456789012.344999', 'USD')).toBe('$123,456,789,012.34');
-    expect(formatMoney('120.500000', 'USD')).toBe('$120.50');
+    expect(formatMoney('999999999999.994999', 'USD')).toBe('USD\u00a0999,999,999,999.99');
+    expect(formatMoney('123456789012.344999', 'USD')).toBe('USD\u00a0123,456,789,012.34');
+    expect(formatMoney('120.500000', 'USD')).toBe('USD\u00a0120.50');
   });
 
   it('differs from the Number() round trip, which loses the precision', () => {
     // The nearest double's shortest decimal is 999999999999.995 (and 123456789012.345), which
     // Intl rounds half up; the string keeps the trailing 4999 and rounds down.
-    expect(formatMoney(Number('999999999999.994999'), 'USD')).toBe('$1,000,000,000,000.00');
-    expect(formatMoney(Number('123456789012.344999'), 'USD')).toBe('$123,456,789,012.35');
+    expect(formatMoney(Number('999999999999.994999'), 'USD')).toBe('USD\u00a01,000,000,000,000.00');
+    expect(formatMoney(Number('123456789012.344999'), 'USD')).toBe('USD\u00a0123,456,789,012.35');
     expect(formatMoney('999999999999.994999', 'USD')).not.toBe(
       formatMoney(Number('999999999999.994999'), 'USD'),
     );
   });
 
   it('formats each currency independently, one amount per call', () => {
-    expect(formatMoney('40', 'GBP')).toBe('£40.00');
-    expect(formatMoney('1234.5', 'JPY')).toBe('¥1,235');
-    expect(formatMoney('40', 'EUR')).toBe('€40.00');
+    expect(formatMoney('40', 'GBP')).toBe('GBP\u00a040.00');
+    expect(formatMoney('1234.5', 'JPY')).toBe('JPY\u00a01,235');
+    expect(formatMoney('40', 'EUR')).toBe('EUR\u00a040.00');
     // Formatting one currency leaves the next call's currency untouched.
-    expect(formatMoney('40', 'GBP')).toBe('£40.00');
+    expect(formatMoney('40', 'GBP')).toBe('GBP\u00a040.00');
   });
 
   it('formats numbers and lower-case codes', () => {
-    expect(formatMoney(12.5, 'usd')).toBe('$12.50');
-    expect(formatMoney(' 12.5 ', ' USD ')).toBe('$12.50');
+    expect(formatMoney(12.5, 'usd')).toBe('USD\u00a012.50');
+    expect(formatMoney(' 12.5 ', ' USD ')).toBe('USD\u00a012.50');
   });
 
   it('never shows a sign on an amount that rounds to zero', () => {
-    expect(formatMoney('-0.001', 'USD')).toBe('$0.00');
+    expect(formatMoney('-0.001', 'USD')).toBe('USD\u00a00.00');
   });
 
   it.each([null, undefined, '', '  ', 'abc', Number.NaN, Number.POSITIVE_INFINITY])(
@@ -266,16 +343,112 @@ describe('formatMoney', () => {
   });
 
   it('falls back to the decimal and the code for a code Intl refuses', () => {
-    expect(formatMoney('5', 'EURO')).toBe('5 EURO');
+    expect(formatMoney('5', 'EURO')).toBe('5\u00a0EURO');
     // A second call reads the cached refusal.
-    expect(formatMoney('5.256', 'EURO')).toBe('5.26 EURO');
+    expect(formatMoney('5.256', 'EURO')).toBe('5.26\u00a0EURO');
   });
 
-  it('formats a well-formed unknown code with plain spaces', () => {
+  it('joins a well-formed unknown code to its figure with the no-break separator only', () => {
     const text = formatMoney('5', 'XYZ');
-    expect(text).toBe('XYZ 5.00');
-    expect(SPECIAL_SPACES.test(text)).toBe(false);
+    expect(text).toBe('XYZ\u00a05.00');
+    expect(/[\u202F ]/u.test(text)).toBe(false);
   });
+
+  it('words an amount as the backend reason texts do: the ISO code, a space, the figure', () => {
+    // budget.py, campaigns.py, keywords.py and white_papers.py render "Spent USD 517.85", with a
+    // plain space where the UI puts the no-break separator; the two render alike.
+    expect(formatMoney('517.850000', 'USD')).toBe('USD\u00a0517.85');
+    expect(formatMoney('1400', 'USD')).toBe('USD\u00a01,400.00');
+    expect(formatMoney('1.5', 'KWD')).toBe('KWD\u00a01.500');
+    expect(formatMoney('517.85', 'USD').replace(MONEY_SEPARATOR, ' ')).toBe('USD 517.85');
+  });
+
+  it.each([
+    ['a no-break space', '\u00a0'],
+    ['a narrow no-break space', '\u202f'],
+    ['a plain space', ' '],
+    ['no space', null],
+  ])('joins code and figure with MONEY_SEPARATOR when ICU emits %s there', (_, space) => {
+    const separator: Intl.NumberFormatPart[] =
+      space === null ? [] : [{ type: 'literal', value: space }];
+    const parts: Intl.NumberFormatPart[] = [
+      { type: 'minusSign', value: '-' },
+      { type: 'currency', value: 'USD' },
+      ...separator,
+      { type: 'integer', value: '1' },
+      { type: 'group', value: ',' },
+      { type: 'integer', value: '234' },
+      { type: 'decimal', value: '.' },
+      { type: 'fraction', value: '50' },
+    ];
+    const formatToParts = vi
+      .spyOn(Intl.NumberFormat.prototype, 'formatToParts')
+      .mockReturnValue(parts);
+    try {
+      expect(formatMoney('-1234.5', 'USD')).toBe('USD\u00a0-1,234.50');
+      expect(formatCost('-2469', 2, 'USD')).toBe('USD\u00a0-1,234.50');
+    } finally {
+      formatToParts.mockRestore();
+    }
+    expect(formatMoney('-1234.5', 'USD')).toBe('USD\u00a0-1,234.50');
+  });
+});
+
+describe('formatExactMoney', () => {
+  it('shows at least the minor digits and every significant digit up to one micro', () => {
+    // The backend's _format_amount in analysis/discrepancy.py renders the same strings, with a
+    // plain space where these have the no-break separator.
+    expect(formatExactMoney('200.000001', 'USD')).toBe('USD\u00a0200.000001');
+    expect(formatExactMoney('50.000000', 'USD')).toBe('USD\u00a050.00');
+    expect(formatExactMoney('100', 'USD')).toBe('USD\u00a0100.00');
+    expect(formatExactMoney('1500.5', 'USD')).toBe('USD\u00a01,500.50');
+    expect(formatExactMoney('12.345678', 'USD')).toBe('USD\u00a012.345678');
+    expect(formatExactMoney('5000', 'JPY')).toBe('JPY\u00a05,000');
+    expect(formatExactMoney('5000.5', 'JPY')).toBe('JPY\u00a05,000.5');
+    expect(formatExactMoney('1.5', 'KWD')).toBe('KWD\u00a01.500');
+    expect(formatExactMoney('2.5', 'JPY')).toBe('JPY\u00a02.5');
+  });
+
+  it('keeps a one-micro difference visible where formatMoney rounds it away', () => {
+    expect(formatMoney('200.000001', 'USD')).toBe(formatMoney('200.000000', 'USD'));
+    expect(formatExactMoney('200.000001', 'USD')).not.toBe(
+      formatExactMoney('200.000000', 'USD'),
+    );
+  });
+
+  it('rounds a digit beyond the sixth place half to even, as the backend Decimal does', () => {
+    expect(formatExactMoney('1.1234567', 'USD')).toBe('USD\u00a01.123457');
+    expect(formatExactMoney('1.1234565', 'USD')).toBe('USD\u00a01.123456');
+    expect(formatExactMoney('1.1234575', 'USD')).toBe('USD\u00a01.123458');
+  });
+
+  it('formats the exact decimal string, never a float', () => {
+    expect(formatExactMoney('999999999999.994999', 'USD')).toBe('USD\u00a0999,999,999,999.994999');
+    expect(formatExactMoney(' 50.00 ', ' usd ')).toBe('USD\u00a050.00');
+    expect(formatExactMoney(12.5, 'EUR')).toBe('EUR\u00a012.50');
+    expect(formatExactMoney('1.5e3', 'EUR')).toBe('EUR\u00a01,500.00');
+  });
+
+  it('prints a code Intl refuses, at two minor digits, and no code when there is none', () => {
+    expect(formatExactMoney('5', 'EURO')).toBe('EURO\u00a05.00');
+    expect(formatExactMoney('5', 'XYZ')).toBe('XYZ\u00a05.00');
+    expect(formatExactMoney('40.5', null)).toBe('40.50');
+    expect(formatExactMoney('7.000001', undefined)).toBe('7.000001');
+    expect(formatExactMoney('40.5', '  ')).toBe('40.50');
+  });
+
+  it('joins code and figure with the no-break separator, with no minus sign on a zero', () => {
+    expect(formatExactMoney('1234.5', 'USD')).toBe('USD\u00a01,234.50');
+    expect(formatExactMoney('-0.0000001', 'USD')).toBe('USD\u00a00.000000');
+    expect(formatExactMoney('-40', 'USD')).toBe('USD\u00a0-40.00');
+  });
+
+  it.each([null, undefined, '', '  ', 'abc', Number.NaN, Number.POSITIVE_INFINITY, '1e400'])(
+    'renders %j as unavailable',
+    (value) => {
+      expect(formatExactMoney(value, 'USD')).toBe(UNAVAILABLE);
+    },
+  );
 });
 
 describe('currencyMinorDigits and currencyStep', () => {
@@ -285,7 +458,16 @@ describe('currencyMinorDigits and currencyStep', () => {
     ['JPY', 0, '1'],
     ['KWD', 3, '0.001'],
     ['BHD', 3, '0.001'],
-  ])('%s has %i minor digits and step %s', (code, digits, step) => {
+    // ISO 4217 and the backend give IQD 3 places, AFN and ALL 2; CLDR, and so Intl, gives 0.
+    ['IQD', 3, '0.001'],
+    ['AFN', 2, '0.01'],
+    ['ALL', 2, '0.01'],
+    // A well-formed unknown code has the default two, as minor_unit_exponent gives it.
+    ['XYZ', 2, '0.01'],
+    // Trimmed and compared case-insensitively, as the backend compares it.
+    [' iqd ', 3, '0.001'],
+    ['jpy', 0, '1'],
+  ])('%j has %i minor digits and step %s', (code, digits, step) => {
     expect(currencyMinorDigits(code)).toBe(digits);
     expect(currencyStep(code)).toBe(step);
   });
@@ -293,6 +475,85 @@ describe('currencyMinorDigits and currencyStep', () => {
   it.each(['EURO', '', '  ', null, undefined])('defaults %j to 2 digits', (code) => {
     expect(currencyMinorDigits(code)).toBe(2);
     expect(currencyStep(code)).toBe('0.01');
+  });
+
+  it('pins the two ISO 4217 sets of the backend minor_unit_exponent', () => {
+    // Read from backend/src/ads_engine/decisions.py, the table the API validates decided amounts
+    // against: a currency added to or dropped from either side fails here.
+    const source = readFileSync(DECISIONS_PY, 'utf8');
+    expect(backendCurrencySet(source, '_ZERO_EXPONENT_CURRENCIES')).toEqual(ISO_ZERO_DIGITS);
+    expect(backendCurrencySet(source, '_THREE_EXPONENT_CURRENCIES')).toEqual(ISO_THREE_DIGITS);
+  });
+
+  it('gives every currency Intl knows the digits of the backend table', () => {
+    const zero = new Set(ISO_ZERO_DIGITS);
+    const three = new Set(ISO_THREE_DIGITS);
+    const codes = new Set([...Intl.supportedValuesOf('currency'), ...zero, ...three]);
+    for (const code of codes) {
+      const expected = zero.has(code) ? 0 : three.has(code) ? 3 : 2;
+      expect([code, currencyMinorDigits(code)]).toEqual([code, expected]);
+      expect([code, currencyMinorDigits(code.toLowerCase())]).toEqual([code, expected]);
+    }
+  });
+});
+
+describe('money parity with the backend reason and C0 texts', () => {
+  // The same literal strings, with a plain space where these have MONEY_SEPARATOR, are asserted
+  // by backend/tests/unit/test_analysis_money_text.py (ROUNDED_PARITY and GROUPED_PARITY:
+  // white_papers, campaigns, budget and keywords) and test_analysis_discrepancy.py
+  // (MONEY_PARITY: render_value). Change both sides together.
+  it.each([
+    ['517.85', 'USD', 'USD\u00a0517.85'],
+    ['40', 'EUR', 'EUR\u00a040.00'],
+    ['24.6', 'JPY', 'JPY\u00a025'],
+    ['2.3456', 'KWD', 'KWD\u00a02.346'],
+    ['50', 'IQD', 'IQD\u00a050.000'],
+    ['50.00', 'AFN', 'AFN\u00a050.00'],
+    ['12.3456', 'ALL', 'ALL\u00a012.35'],
+    ['5', 'XYZ', 'XYZ\u00a05.00'],
+    // Ties round half up, away from zero, as decisions.round_to_minor_unit rounds them.
+    ['89.225000', 'USD', 'USD\u00a089.23'],
+    ['-89.225', 'USD', 'USD\u00a0-89.23'],
+    ['1400', 'USD', 'USD\u00a01,400.00'],
+    ['2766', 'USD', 'USD\u00a02,766.00'],
+    ['1234.5', 'IQD', 'IQD\u00a01,234.500'],
+    ['5000', 'JPY', 'JPY\u00a05,000'],
+  ])('formatMoney(%j, %j) is %j, as the reason texts word it', (amount, code, expected) => {
+    expect(formatMoney(amount, code)).toBe(expected);
+    expect(formatMetric(metric(amount, { unit: 'currency', currency: code }))).toBe(expected);
+  });
+
+  it('rounds a tie half away from zero at every minor-unit width, never half to even', () => {
+    // The backend's test_white_paper_money_rounds_half_up_at_the_minor_unit_as_campaigns_and_
+    // budget_do pins the same figures for white_papers, campaigns and budget.
+    expect(formatMoney('0.125', 'USD')).toBe('USD\u00a00.13');
+    expect(formatMoney('0.0125', 'IQD')).toBe('IQD\u00a00.013');
+    expect(formatMoney('2.5', 'JPY')).toBe('JPY\u00a03');
+    expect(formatMoney('-2.5', 'JPY')).toBe('JPY\u00a0-3');
+    expect(formatCost('356.9', 4, 'USD')).toBe('USD\u00a089.23');
+  });
+
+  it.each([
+    ['400.000000', 'USD', 'USD\u00a0400.00'],
+    ['50.00', 'EUR', 'EUR\u00a050.00'],
+    ['5000', 'JPY', 'JPY\u00a05,000'],
+    ['5000.5', 'JPY', 'JPY\u00a05,000.5'],
+    ['1.5', 'KWD', 'KWD\u00a01.500'],
+    ['50.00', 'IQD', 'IQD\u00a050.000'],
+    ['1234.5', 'IQD', 'IQD\u00a01,234.500'],
+    ['50.000001', 'IQD', 'IQD\u00a050.000001'],
+    ['50.00', 'AFN', 'AFN\u00a050.00'],
+    ['50', 'ALL', 'ALL\u00a050.00'],
+    ['5', 'XYZ', 'XYZ\u00a05.00'],
+  ])('formatExactMoney(%j, %j) is %j, as render_value words it', (amount, code, expected) => {
+    expect(formatExactMoney(amount, code)).toBe(expected);
+    expect(formatExactMoney(amount, ` ${code.toLowerCase()} `)).toBe(expected);
+  });
+
+  it('rounds a cost once at the ISO minor unit of its currency', () => {
+    expect(formatCost('100', 3, 'IQD')).toBe('IQD\u00a033.333');
+    expect(formatCost('100', 3, 'AFN')).toBe('AFN\u00a033.33');
+    expect(formatCost('100', 3, 'JPY')).toBe('JPY\u00a033');
   });
 });
 
@@ -388,6 +649,90 @@ describe('formatPercent', () => {
   it.each([null, undefined, '', 'n/a', Number.NaN])('renders %j as unavailable', (value) => {
     expect(formatPercent(value)).toBe(UNAVAILABLE);
   });
+
+  it('shows exactly `digits` fraction digits when fixed, trailing zeros included', () => {
+    expect(formatPercent('0.008', 2, { fixed: true })).toBe('0.80%');
+    expect(formatPercent('0.000698', 3, { fixed: true })).toBe('0.070%');
+    expect(formatPercent('0.5', 1, { fixed: true })).toBe('50.0%');
+    expect(formatPercent('0.01', 2, { fixed: true })).toBe('1.00%');
+    expect(formatPercent(0, 2, { fixed: true })).toBe('0.00%');
+    expect(formatPercent('0.12345', 2, { fixed: true })).toBe('12.35%');
+  });
+
+  it('keeps the unpadded default when not fixed', () => {
+    expect(formatPercent('0.5', 1, {})).toBe('50%');
+    expect(formatPercent('0.5', 1, { fixed: false })).toBe('50%');
+    expect(formatPercent('0.008', 2)).toBe('0.8%');
+  });
+
+  it('renders a tiny non-zero ratio as a bound at the fixed digits', () => {
+    expect(formatPercent(0.000004, 3, { fixed: true })).toBe('< 0.001%');
+    expect(formatPercent('-0.000004', 3, { fixed: true })).toBe('> -0.001%');
+    expect(formatPercent('0.0002', 1, { fixed: true })).toBe('< 0.1%');
+    expect(formatPercent('n/a', 2, { fixed: true })).toBe(UNAVAILABLE);
+  });
+});
+
+describe('percentDigits', () => {
+  /** Each ratio at the digits `percentDigits` picks for the set, fixed. */
+  function rendered(ratios: readonly string[], min?: number): string[] {
+    const digits = percentDigits(ratios, min === undefined ? {} : { min });
+    return ratios.map((ratio) => formatPercent(ratio, digits, { fixed: true }));
+  }
+
+  it('keeps CR1 lead rates of 0.000722 and 0.000698 apart', () => {
+    expect(percentDigits(['0.000722', '0.000698'])).toBe(3);
+    expect(rendered(['0.000722', '0.000698'])).toEqual(['0.072%', '0.070%']);
+  });
+
+  it('keeps a CR3 click rate apart from its baseline, and an interval’s bounds apart', () => {
+    expect(rendered(['0.007501', '0.008120'])).toEqual(['0.75%', '0.81%']);
+    expect(rendered(['0.003937', '0.004278'])).toEqual(['0.39%', '0.43%']);
+    expect(percentDigits(['0.007501', '0.008120', '0.003937', '0.004107', '0.004278'])).toBe(2);
+  });
+
+  it('gives a variants column one precision, at least two places', () => {
+    expect(rendered(['0.008', '0.0058', '0.1239', '0.01'], 2)).toEqual([
+      '0.80%',
+      '0.58%',
+      '12.39%',
+      '1.00%',
+    ]);
+  });
+
+  it('adds digits until differing values read apart, up to the recorded precision', () => {
+    expect(rendered(['0.007994', '0.008014'], 2)).toEqual(['0.799%', '0.801%']);
+    expect(rendered(['0.004377', '0.004381'], 2)).toEqual(['0.4377%', '0.4381%']);
+    // Values recorded beyond six places can coincide at every count: the most, 4, is returned.
+    expect(percentDigits(['0.33333301', '0.33333302'])).toBe(4);
+    expect(percentDigits(['0.33333301', '0.33333302'], { max: 2 })).toBe(2);
+  });
+
+  it('counts equal values once, whatever their form', () => {
+    expect(percentDigits(['0.008004', '0.0080040', '0.008004'])).toBe(2);
+    expect(percentDigits([0.08, '0.0800', '.08'])).toBe(1);
+  });
+
+  it('asks two significant digits of every non-zero ratio, but none of zero', () => {
+    expect(percentDigits(['0', '0.5'])).toBe(1);
+    expect(percentDigits(['0.0000001'])).toBe(4);
+    expect(percentDigits(['1.15', '0.92'])).toBe(1);
+    expect(percentDigits(['-0.000722', '-0.000698'])).toBe(3);
+  });
+
+  it('ignores absent and non-numeric inputs', () => {
+    expect(percentDigits([])).toBe(1);
+    expect(percentDigits([null, undefined, '', 'n/a', Number.NaN, '0.5'])).toBe(1);
+    expect(percentDigits([null, '0.000722', 'not estimable', '0.000698'])).toBe(3);
+  });
+
+  it('clamps min and max, and never returns less than min', () => {
+    expect(percentDigits(['0.5'], { min: 0 })).toBe(0);
+    expect(percentDigits(['0.5'], { min: 3 })).toBe(3);
+    expect(percentDigits(['0.000722', '0.000698'], { min: 3, max: 1 })).toBe(3);
+    expect(percentDigits(['0.5'], { min: Number.NaN })).toBe(0);
+    expect(percentDigits(['0.5'], { min: 99 })).toBe(20);
+  });
 });
 
 describe('formatCost', () => {
@@ -399,7 +744,7 @@ describe('formatCost', () => {
     expect(formatCost('500', 0, 'USD')).toBe('—');
     expect(formatCost('500', 0, 'USD', 'no QL yet')).toBe('— (no QL yet)');
     expect(formatCost('500', 0, 'USD')).not.toMatch(/\d/);
-    expect(formatCost('500', 4, 'USD')).toBe('$125.00');
+    expect(formatCost('500', 4, 'USD')).toBe('USD\u00a0125.00');
   });
 
   // An absent denominator is unknown evidence, not a known zero: AAP 0.5.4.7 reserves "—" for
@@ -438,33 +783,33 @@ describe('formatCost', () => {
   });
 
   it('divides spend by the denominator in the currency', () => {
-    expect(formatCost('300', 4, 'USD')).toBe('$75.00');
-    expect(formatCost('300.000000', '3', 'EUR')).toBe('€100.00');
-    expect(formatCost('1000', 3, 'JPY')).toBe('¥333');
+    expect(formatCost('300', 4, 'USD')).toBe('USD\u00a075.00');
+    expect(formatCost('300.000000', '3', 'EUR')).toBe('EUR\u00a0100.00');
+    expect(formatCost('1000', 3, 'JPY')).toBe('JPY\u00a0333');
     expect(formatCost('10', 4, null)).toBe('2.5');
   });
 
   it('divides exactly, never through a binary float', () => {
-    // A Number route renders $1,000,000,000,000.00 and $0.02 for the first two.
-    expect(formatCost('999999999999.994999', 1, 'USD')).toBe('$999,999,999,999.99');
-    expect(formatCost('0.075', 3, 'USD')).toBe('$0.03');
-    expect(formatCost('-0.075', 3, 'USD')).toBe('-$0.03');
-    expect(formatCost('1.005', 1, 'USD')).toBe('$1.01');
-    expect(formatCost('1', '0.3', 'USD')).toBe('$3.33');
-    expect(formatCost('-300', 4, 'USD')).toBe('-$75.00');
-    expect(formatCost('0', 3, 'USD')).toBe('$0.00');
+    // A Number route renders USD 1,000,000,000,000.00 and USD 0.02 for the first two.
+    expect(formatCost('999999999999.994999', 1, 'USD')).toBe('USD\u00a0999,999,999,999.99');
+    expect(formatCost('0.075', 3, 'USD')).toBe('USD\u00a00.03');
+    expect(formatCost('-0.075', 3, 'USD')).toBe('USD\u00a0-0.03');
+    expect(formatCost('1.005', 1, 'USD')).toBe('USD\u00a01.01');
+    expect(formatCost('1', '0.3', 'USD')).toBe('USD\u00a03.33');
+    expect(formatCost('-300', 4, 'USD')).toBe('USD\u00a0-75.00');
+    expect(formatCost('0', 3, 'USD')).toBe('USD\u00a00.00');
   });
 
   it('reads exponent forms and numbers as their exact decimals', () => {
-    expect(formatCost('1.5e3', '1e1', 'USD')).toBe('$150.00');
+    expect(formatCost('1.5e3', '1e1', 'USD')).toBe('USD\u00a0150.00');
     expect(formatCost('3e-2', '1.2E1', null)).toBe('< 0.01');
-    expect(formatCost(1.005, 1, 'USD')).toBe('$1.01');
-    expect(formatCost(300.5, 2, 'USD')).toBe('$150.25');
+    expect(formatCost(1.005, 1, 'USD')).toBe('USD\u00a01.01');
+    expect(formatCost(300.5, 2, 'USD')).toBe('USD\u00a0150.25');
   });
 
   it('rounds once at the currency minor digits', () => {
-    expect(formatCost('2', '3', 'KWD')).toBe('KWD 0.667');
-    expect(formatCost('1', 3, 'EURO')).toBe('0.33 EURO');
+    expect(formatCost('2', '3', 'KWD')).toBe('KWD\u00a00.667');
+    expect(formatCost('1', 3, 'EURO')).toBe('0.33\u00a0EURO');
     expect(formatCost('0.01', 3, null)).toBe('< 0.01');
     expect(formatCost('-0.01', 3, null)).toBe('> -0.01');
   });
@@ -490,15 +835,15 @@ describe('formatCost', () => {
 describe('formatFloor', () => {
   it('marks counts and costs', () => {
     expect(formatFloor('12', 'min')).toBe('≥ 12');
-    expect(formatFloor(formatMoney('40', 'EUR'), 'max')).toBe('≤ €40.00');
-    expect(formatFloor('$75.00', 'max')).toBe('≤ $75.00');
+    expect(formatFloor(formatMoney('40', 'EUR'), 'max')).toBe('≤ EUR\u00a040.00');
+    expect(formatFloor('USD\u00a075.00', 'max')).toBe('≤ USD\u00a075.00');
     expect(formatFloor(' 12 ', 'min')).toBe('≥ 12');
-    expect(formatFloor('XYZ 5.00', 'max')).toBe('≤ XYZ 5.00');
+    expect(formatFloor('XYZ\u00a05.00', 'max')).toBe('≤ XYZ\u00a05.00');
   });
 
   it('never doubles a prefix the text already carries', () => {
     expect(formatFloor('≥ 12', 'min')).toBe('≥ 12');
-    expect(formatFloor('≤ $75.00', 'max')).toBe('≤ $75.00');
+    expect(formatFloor('≤ USD\u00a075.00', 'max')).toBe('≤ USD\u00a075.00');
     expect(formatFloor('≥ 12', 'max')).toBe('≥ 12');
     expect(formatFloor('< 0.01', 'min')).toBe('< 0.01');
     expect(formatFloor('> -0.01', 'min')).toBe('> -0.01');
@@ -576,12 +921,12 @@ describe('formatMetric', () => {
 
   it('formats money by currency code or money unit', () => {
     expect(formatMetric(metric('12.340000', { unit: 'currency', currency: 'USD' }))).toBe(
-      '$12.34',
+      'USD\u00a012.34',
     );
     expect(formatMetric(metric('12.340000', { unit: 'currency' }))).toBe('12.34');
     expect(formatMetric(metric('12.340000', { unit: 'spend', currency: '  ' }))).toBe('12.34');
-    expect(formatMetric(metric('7', { unit: 'clicks', currency: 'EUR' }))).toBe('€7.00');
-    expect(formatMetric(metric(1500, { unit: 'Cost', currency: 'JPY' }))).toBe('¥1,500');
+    expect(formatMetric(metric('7', { unit: 'clicks', currency: 'EUR' }))).toBe('EUR\u00a07.00');
+    expect(formatMetric(metric(1500, { unit: 'Cost', currency: 'JPY' }))).toBe('JPY\u00a01,500');
   });
 
   it('formats ratios, rates, percentage points, days, p-values and multiples', () => {
@@ -599,7 +944,7 @@ describe('formatMetric', () => {
   });
 
   it.each([...MONEY_UNITS])('formats the money unit %j in its currency', (unit) => {
-    expect(formatMetric(metric('40', { unit, currency: 'EUR' }))).toBe('€40.00');
+    expect(formatMetric(metric('40', { unit, currency: 'EUR' }))).toBe('EUR\u00a040.00');
     expect(formatMetric(metric('40', { unit }))).toBe('40');
   });
 
@@ -649,13 +994,72 @@ describe('formatMetric', () => {
   it('marks floors: a ceiling for money, a lower bound otherwise', () => {
     expect(
       formatMetric(metric('75', { unit: 'currency', currency: 'USD', floor: true })),
-    ).toBe('≤ $75.00');
+    ).toBe('≤ USD\u00a075.00');
     expect(
       formatMetric(metric('40', { unit: 'currency', currency: 'EUR', floor: true })),
-    ).toBe('≤ €40.00');
+    ).toBe('≤ EUR\u00a040.00');
     expect(formatMetric(metric(12, { unit: 'contacts', floor: true }))).toBe('≥ 12');
     expect(formatMetric(metric(12, { unit: 'contacts', floor: false }))).toBe('12');
     expect(formatMetric(metric(Number.NaN, { unit: 'meetings', floor: true }))).toBe(UNAVAILABLE);
+  });
+
+  it.each([...RATIO_UNITS])('renders the ratio unit %j at fixed ratioDigits', (unit) => {
+    expect(formatMetric(metric('0.123', { unit }), { ratioDigits: 2 })).toBe('12.30%');
+    expect(formatMetric(metric('0.000698', { unit }), { ratioDigits: 3 })).toBe('0.070%');
+    expect(formatMetric(metric('0.5', { unit }), { ratioDigits: 1 })).toBe('50.0%');
+  });
+
+  it('keeps the bound, the floor and pre-rendered text under ratioDigits', () => {
+    expect(formatMetric(metric('0.000004', { unit: 'ratio' }), { ratioDigits: 3 })).toBe(
+      '< 0.001%',
+    );
+    expect(formatMetric(metric('0.5', { unit: 'share', floor: true }), { ratioDigits: 2 })).toBe(
+      '≥ 50.00%',
+    );
+    expect(formatMetric(metric('n/a', { unit: 'ratio' }), { ratioDigits: 2 })).toBe('n/a');
+    expect(formatMetric(metric(null, { unit: 'ratio' }), { ratioDigits: 2 })).toBe(UNAVAILABLE);
+  });
+
+  it('applies ratioDigits to ratios only, and changes nothing without it', () => {
+    const cost = metric('12.340000', { unit: 'currency', currency: 'USD' });
+    expect(formatMetric(cost, { ratioDigits: 3 })).toBe('USD\u00a012.34');
+    expect(formatMetric(metric('0.3', { unit: 'conversions' }), { ratioDigits: 3 })).toBe('0.3');
+    expect(formatMetric(metric('79.1', { unit: 'percent' }), { ratioDigits: 3 })).toBe('79.1%');
+    expect(formatMetric(metric('0.0909', { unit: 'ratio' }), {})).toBe('9.1%');
+    expect(formatMetric(metric('0.0909', { unit: 'ratio' }))).toBe('9.1%');
+  });
+});
+
+describe('ratioMetricDigits', () => {
+  it('picks the digits of the metrics formatMetric renders as percentages', () => {
+    const rateA = metric('0.000722', { unit: 'ratio' });
+    const rateB = metric('0.000698', { unit: ' Ratio ' });
+    const digits = ratioMetricDigits([rateA, rateB, metric(5, { unit: 'leads' })]);
+    expect(digits).toBe(3);
+    expect(formatMetric(rateA, { ratioDigits: digits })).toBe('0.072%');
+    expect(formatMetric(rateB, { ratioDigits: digits })).toBe('0.070%');
+  });
+
+  it('ignores counts, money, unavailable, boolean and pre-rendered metrics', () => {
+    const tiny = '0.0000001';
+    expect(
+      ratioMetricDigits([
+        metric('0.5', { unit: 'ratio' }),
+        metric(tiny, { unit: 'leads' }),
+        metric(tiny, { unit: 'ratio', currency: 'USD' }),
+        metric(tiny, { unit: 'ratio', unavailable: true }),
+        metric(true, { unit: 'ratio' }),
+        metric('n/a', { unit: 'ratio' }),
+        { value: undefined, unit: 'ratio' },
+        { value: tiny },
+      ]),
+    ).toBe(1);
+  });
+
+  it('passes its options on', () => {
+    expect(ratioMetricDigits([])).toBe(1);
+    expect(ratioMetricDigits([], { min: 2 })).toBe(2);
+    expect(ratioMetricDigits([metric('0.000722', { unit: 'ratio' })], { max: 2 })).toBe(2);
   });
 });
 
@@ -681,14 +1085,22 @@ describe('formatDays', () => {
 describe('formatSample', () => {
   it('renders observed / required with the unit', () => {
     expect(formatSample({ observed: 37, required: 300, unit: 'clicks', projected: null })).toBe(
-      '37 / 300 clicks',
+      '37\u00A0/\u00A0300 clicks',
     );
     expect(formatSample({ observed: 3, required: 5, unit: 'spending days' })).toBe(
-      '3 / 5 spending days',
+      '3\u00A0/\u00A05 spending days',
     );
     expect(formatSample({ observed: 3100, required: '4200', unit: 'form opens' })).toBe(
-      '3,100 / 4,200 form opens',
+      '3,100\u00A0/\u00A04,200 form opens',
     );
+  });
+
+  it('joins observed and required with the no-break separator, so the figure never wraps', () => {
+    const line = formatSample({ observed: 0, required: 7, unit: 'known-budget days' });
+    expect(line).toBe(`0${FIGURE_SEPARATOR}7 known-budget days`);
+    // The only breakable space is the one before the unit; none sits inside "0 / 7".
+    expect(line.split(' ')).toEqual(['0\u00A0/\u00A07', 'known-budget', 'days']);
+    expect(line).not.toContain(' / ');
   });
 
   it('renders a typed evidence sample and its projection', () => {
@@ -698,7 +1110,7 @@ describe('formatSample', () => {
       unit: 'clicks',
       projected: null,
     } satisfies Sample;
-    expect(formatSample(clicks)).toBe('37 / 300 clicks');
+    expect(formatSample(clicks)).toBe('37\u00A0/\u00A0300 clicks');
 
     const impressions = {
       observed: 37,
@@ -711,7 +1123,7 @@ describe('formatSample', () => {
       },
     } satisfies Sample;
     const line = formatSample(impressions);
-    expect(line).toContain('37 / 300 clicks');
+    expect(line).toContain('37\u00A0/\u00A0300 clicks');
     expect(line).toContain('≈ 1,200 impressions');
     expect(line).toContain('projected through the observed open rate');
   });
@@ -729,7 +1141,8 @@ describe('formatSample', () => {
         },
       }),
     ).toBe(
-      '3,100 / 4,200 form opens · ≈ 52,000 impressions (projected through the observed open rate)',
+      '3,100\u00A0/\u00A04,200 form opens · ' +
+        '≈ 52,000 impressions (projected through the observed open rate)',
     );
     expect(
       formatSample({
@@ -738,22 +1151,24 @@ describe('formatSample', () => {
         unit: 'variants',
         projected: { value: 3.5, unit: ' ', basis: '' },
       }),
-    ).toBe('1 / 2 variants · ≈ 3.5');
+    ).toBe('1\u00A0/\u00A02 variants · ≈ 3.5');
   });
 
   it('omits a projection without a numeric value', () => {
     const base = { observed: 1, required: 2, unit: 'days' };
     expect(formatSample({ ...base, projected: { value: null, unit: 'days', basis: 'b' } })).toBe(
-      '1 / 2 days',
+      '1\u00A0/\u00A02 days',
     );
     expect(formatSample({ ...base, projected: { value: true, unit: 'days', basis: 'b' } })).toBe(
-      '1 / 2 days',
+      '1\u00A0/\u00A02 days',
     );
   });
 
   it('accepts a withheld sample with no unit', () => {
-    expect(formatSample({ observed: 3, required: 5, unit: null })).toBe('3 / 5');
-    expect(formatSample({ observed: '0.3', required: 10, unit: '  ' })).toBe('0.3 / 10');
+    expect(formatSample({ observed: 3, required: 5, unit: null })).toBe('3\u00A0/\u00A05');
+    expect(formatSample({ observed: '0.3', required: 10, unit: '  ' })).toBe(
+      '0.3\u00A0/\u00A010',
+    );
   });
 
   it('returns an empty line when no sample applies', () => {
@@ -765,13 +1180,15 @@ describe('formatSample', () => {
 
   it('renders a missing, boolean or pre-rendered figure without guessing', () => {
     expect(formatSample({ observed: null, required: 5, unit: 'days' })).toBe(
-      'unavailable / 5 days',
+      'unavailable\u00A0/\u00A05 days',
     );
     expect(formatSample({ observed: 4, required: null, unit: 'days' })).toBe(
-      '4 / unavailable days',
+      '4\u00A0/\u00A0unavailable days',
     );
-    expect(formatSample({ observed: true, required: 'n/a', unit: null })).toBe('yes / n/a');
-    expect(formatSample({ observed: false, required: 1, unit: null })).toBe('no / 1');
+    expect(formatSample({ observed: true, required: 'n/a', unit: null })).toBe(
+      'yes\u00A0/\u00A0n/a',
+    );
+    expect(formatSample({ observed: false, required: 1, unit: null })).toBe('no\u00A0/\u00A01');
   });
 });
 

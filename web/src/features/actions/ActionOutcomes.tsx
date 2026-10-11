@@ -9,8 +9,8 @@
  *
  * - **the announcement**: a polite `role="status"` region, rendered before the sections from
  *   the first render, in which every card action confirms its outcome ("Dismissed: Pause
- *   (Generic CRM — US)", "Decision recorded: Active · daily budget $160.00 (…)"). It is never
- *   `role="alert"`, which AAP 0.5.5 reserves for the discrepancy banner;
+ *   (Generic CRM — US)", "Decision recorded: Active · daily budget USD 160.00 (…)"). It is
+ *   never `role="alert"`, which AAP 0.5.5 reserves for the discrepancy banner;
  * - **the confirmations by recommendation**: each feedback recorded on this page, keyed by the
  *   item's recommendation identity (`SectionFrame`'s `itemIdentity`), with the same message.
  *   The sections read them ({@link useFeedbackConfirmations}) and show a

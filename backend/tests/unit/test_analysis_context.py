@@ -535,6 +535,129 @@ def test_flag_metric_baseline_sample_and_test_rendering() -> None:
         TestResult("z", 0.01, None, Decimal("0.05"))  # type: ignore[arg-type]
 
 
+def test_a_baseline_with_a_unit_and_currency_renders_them_and_one_without_keeps_its_shape() -> None:
+    # An unpaired money baseline (C1's account cost per outcome) carries its own unit and the
+    # account currency, so it is shown in that currency (AAP 0.5.5 "with currency").
+    money = Baseline(
+        "baseline_cost_per_outcome", "Account CPA", Decimal("37.986583"), "currency", "USD"
+    )
+    assert (money.unit, money.currency) == ("currency", "USD")
+    assert money.to_json() == {
+        "key": "baseline_cost_per_outcome",
+        "label": "Account CPA",
+        "value": "37.986583",
+        "unit": "currency",
+        "currency": "USD",
+    }
+    assert list(money.to_json()) == ["key", "label", "value", "unit", "currency"]
+    # A unit without a currency, and an unavailable money baseline, keep what is set.
+    assert Baseline("rate", "Rate", Decimal("0.04946"), "ratio").to_json() == {
+        "key": "rate",
+        "label": "Rate",
+        "value": "0.04946",
+        "unit": "ratio",
+    }
+    assert Baseline("cpa", "Account CPA", None, unit="currency", currency="EUR").to_json() == {
+        "key": "cpa",
+        "label": "Account CPA",
+        "value": None,
+        "unit": "currency",
+        "currency": "EUR",
+    }
+    # Without either key the JSON is exactly the {key, label, value} frozen before they existed.
+    plain = Baseline("baseline_rate", "Account conversions per click", Decimal("0.04946"))
+    assert (plain.unit, plain.currency) == (None, None)
+    assert plain.to_json() == {
+        "key": "baseline_rate",
+        "label": "Account conversions per click",
+        "value": "0.04946",
+    }
+
+
+@pytest.mark.parametrize(
+    ("unit", "currency", "match"),
+    [
+        ("", None, r"Baseline\.unit"),
+        ("   ", "USD", r"Baseline\.unit"),
+        ("currency", "", r"Baseline\.currency"),
+        ("currency", " ", r"Baseline\.currency"),
+        (None, "USD", r"'cpa' has a currency but no unit"),
+    ],
+    ids=["blank-unit", "space-unit", "blank-currency", "space-currency", "currency-without-unit"],
+)
+def test_a_baseline_refuses_a_blank_unit_or_currency_and_a_currency_without_a_unit(
+    unit: str | None, currency: str | None, match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        Baseline("cpa", "Account CPA", Decimal("40.5"), unit, currency)
+
+
+@pytest.mark.parametrize(
+    ("unit", "currency"),
+    [(1, None), ("currency", 840)],
+    ids=["numeric-unit", "numeric-currency"],
+)
+def test_a_baseline_refuses_a_unit_or_currency_that_is_not_text(
+    unit: object, currency: object
+) -> None:
+    with pytest.raises(ValueError, match=r"Baseline\.(unit|currency) must be a non-blank string"):
+        Baseline("cpa", "Account CPA", Decimal("40.5"), unit, currency)  # type: ignore[arg-type]
+
+
+def test_a_dataset_status_records_the_day_boundary_of_its_coverage_date() -> None:
+    # AAP 0.5.5: "Daily dates are shown as stored, labelled with their source's day boundary".
+    # HubSpot is no day source of the window, so its coverage date carries its own boundary.
+    hubspot = DatasetStatus("hubspot.contacts", "complete", date(2026, 10, 4), "UTC")
+    assert hubspot.boundary == "UTC"
+    assert hubspot.to_json() == {
+        "dataset": "hubspot.contacts",
+        "completeness": "complete",
+        "covered_through": "2026-10-04",
+        "boundary": "UTC",
+    }
+    assert list(hubspot.to_json()) == ["dataset", "completeness", "covered_through", "boundary"]
+    google = DatasetStatus(
+        "google.metrics_daily", "incomplete", date(2026, 10, 4), boundary="America/New_York"
+    )
+    assert google.to_json()["boundary"] == "America/New_York"
+    # Without a boundary the JSON is exactly the {dataset, completeness, covered_through} frozen
+    # before the key existed, with or without a coverage date.
+    plain = DatasetStatus("linkedin.leads", "complete", date(2026, 10, 4))
+    assert plain.boundary is None
+    assert plain.to_json() == {
+        "dataset": "linkedin.leads",
+        "completeness": "complete",
+        "covered_through": "2026-10-04",
+    }
+    assert DatasetStatus("google.entities", "unknown").to_json() == {
+        "dataset": "google.entities",
+        "completeness": "unknown",
+        "covered_through": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("covered_through", "boundary", "match"),
+    [
+        (date(2026, 10, 4), "", r"DatasetStatus\.boundary must be a non-blank string"),
+        (date(2026, 10, 4), "   ", r"DatasetStatus\.boundary must be a non-blank string"),
+        (date(2026, 10, 4), 0, r"DatasetStatus\.boundary must be a non-blank string"),
+        (None, "UTC", r"'hubspot\.contacts' has a boundary but no covered_through"),
+    ],
+    ids=["blank", "space", "not-text", "boundary-without-date"],
+)
+def test_a_dataset_status_refuses_a_blank_boundary_and_a_boundary_without_a_date(
+    covered_through: date | None, boundary: object, match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        DatasetStatus(
+            "hubspot.contacts",
+            "complete",
+            covered_through,
+            boundary,  # type: ignore[arg-type]
+        )
+
+
 def test_evidence_to_json_is_exact_and_json_serialisable() -> None:
     evidence = Evidence(
         window={"start": date(2026, 9, 7), "end": date(2026, 10, 4), "days": 28},
@@ -1232,6 +1355,16 @@ def test_freshness_staleness_and_status() -> None:
     assert row.is_complete
     assert not never.is_complete
     assert row.status() == DatasetStatus("google.metrics_daily", "complete", date(2026, 10, 4))
+    assert row.status(boundary="America/New_York") == DatasetStatus(
+        "google.metrics_daily", "complete", date(2026, 10, 4), "America/New_York"
+    )
+    # A row without a coverage date has no date to label, so the boundary is not recorded.
+    entities = Freshness(11, "google.entities", NOW, NOW, None, None, "complete")
+    assert entities.status(boundary="America/New_York") == DatasetStatus(
+        "google.entities", "complete", None
+    )
+    with pytest.raises(ValueError, match=r"DatasetStatus\.boundary"):
+        row.status(boundary=" ")
     with pytest.raises(ValueError, match="dataset"):
         Freshness(11, "google.facts", None, None, None, None, "unknown")
     with pytest.raises(TypeError):
@@ -2189,8 +2322,8 @@ def test_make_evidence_records_window_thresholds_datasets_and_provenance(
     assert json_value(evidence.window) == window.to_json()
     assert evidence.thresholds == {"crm.veto_min_leads": 20, "attribution.floor_share": 0.1}
     assert evidence.datasets == (
-        DatasetStatus("linkedin.leads", "complete", covered),
-        DatasetStatus("hubspot.contacts", "incomplete", covered),
+        DatasetStatus("linkedin.leads", "complete", covered, "UTC"),
+        DatasetStatus("hubspot.contacts", "incomplete", covered, "UTC"),
         DatasetStatus("hubspot.associations", "unknown", None),
     )
     assert evidence.provenance == (
@@ -2220,6 +2353,84 @@ def test_make_evidence_records_window_thresholds_datasets_and_provenance(
         context.make_evidence(
             required_datasets=("google.facts",), crm_scope=None, metrics=(), headline=None
         )
+
+
+def test_make_evidence_labels_each_coverage_date_with_its_source_day_boundary(
+    thresholds: Thresholds, window: AnalysisWindow
+) -> None:
+    # AAP 0.5.5: "Daily dates are shown as stored, labelled with their source's day boundary".
+    # Google and LinkedIn dates take the boundary the window records for their source; HubSpot,
+    # which the window's source_days never lists, records UTC, the boundary of its sync jobs'
+    # coverage dates and the one /sources names.
+    covered = date(2026, 10, 4)
+
+    def row(dataset_id: int, name: str, through: date | None) -> Freshness:
+        return Freshness(dataset_id, name, NOW, NOW, None, through, "complete")
+
+    freshness = {
+        (11, "google.metrics_daily"): row(11, "google.metrics_daily", covered),
+        (11, "google.entities"): row(11, "google.entities", None),
+        (12, "linkedin.analytics_daily"): row(12, "linkedin.analytics_daily", covered),
+        (13, "hubspot.google_contacts"): row(13, "hubspot.google_contacts", covered),
+        (14, "hubspot.deal_search"): row(14, "hubspot.deal_search", covered),
+    }
+    names = ("google.metrics_daily", "google.entities", "linkedin.analytics_daily")
+
+    def boundaries(context: AnalysisContext, crm: str, scope: Any) -> list[str | None]:
+        evidence = context.make_evidence(
+            required_datasets=(*names, crm, "hubspot.contacts"),
+            crm_scope=scope,
+            metrics=(),
+            headline=None,
+        )
+        return [status.boundary for status in evidence.datasets]
+
+    context = _context(thresholds, window, freshness=freshness)
+    assert window.boundary("google") == "America/New_York"
+    # hubspot.contacts has no freshness row: unknown, with no date and so no boundary.
+    assert boundaries(context, "hubspot.google_contacts", "google") == [
+        "America/New_York",
+        None,
+        "UTC",
+        "UTC",
+        None,
+    ]
+    # The companion CRM dataset is written by the same job, so it shares HubSpot's boundary.
+    assert boundaries(context, "hubspot.deal_search", "linkedin") == [
+        "America/New_York",
+        None,
+        "UTC",
+        "UTC",
+        None,
+    ]
+    rendered = context.make_evidence(
+        required_datasets=("hubspot.deal_search", "google.entities"),
+        crm_scope="linkedin",
+        metrics=(),
+        headline=None,
+    ).to_json()["datasets"]
+    assert rendered == [
+        {
+            "dataset": "hubspot.deal_search",
+            "completeness": "complete",
+            "covered_through": "2026-10-04",
+            "boundary": "UTC",
+        },
+        # A full-state dataset records no date, so its JSON keeps the shape without the key.
+        {"dataset": "google.entities", "completeness": "complete", "covered_through": None},
+    ]
+    # Google days are UTC while its account time zone is unknown, as the window records them.
+    utc = AnalysisWindow.default(thresholds, SourceDayInfo(None), now=NOW)
+    assert boundaries(
+        _context(thresholds, utc, freshness=freshness), "hubspot.deal_search", "linkedin"
+    ) == ["UTC", None, "UTC", "UTC", None]
+    # A day source the window does not list has no recorded boundary, so none is guessed.
+    google_only = AnalysisWindow.default(
+        thresholds, SourceDayInfo("Europe/Berlin", ("google",)), now=NOW
+    )
+    assert boundaries(
+        _context(thresholds, google_only, freshness=freshness), "hubspot.deal_search", "linkedin"
+    ) == ["Europe/Berlin", None, None, "UTC", None]
 
 
 def test_make_evidence_stores_the_headline_metric_it_is_given(

@@ -19,16 +19,22 @@
  *   (`Run.display_timezone`).
  *
  * Presentation: a list labelled "Data sources", one item per source, each starting with the
- * source's name so a screen reader announces it before its chips. Chips are text labels only
- * (AAP 0.4.5) and their tone only repeats what the text says. Nothing here is a live region and
- * nothing carries `role="alert"`, which AAP 0.5.5 reserves for discrepancies. UI comes only from
- * the design-system index (`Inline`, `Badge`), with no styles of this module's own (AAP 0.4.4).
+ * source's name so a screen reader announces it before its chips. The sources are stacked one
+ * per row at every width. A source's name, chips and last-sync text are wider than a third of
+ * the page's content area even on wide screens, so a wrapping row or a column grid would leave
+ * one source alone on a line beside a line the other two share, or split a last-sync time
+ * inside a narrow column. Within its row a source's parts wrap onto further lines only when the
+ * row is narrower than they are, so each source still reads as one unit on a phone.
+ * Chips are text labels only (AAP 0.4.5) and their tone only repeats what the text says.
+ * Nothing here is a live region and nothing carries `role="alert"`, which AAP 0.5.5 reserves for
+ * discrepancies. UI comes only from the design-system index (`Stack`, `Inline`, `Badge`), with
+ * no styles of this module's own (AAP 0.4.4).
  *
  * @packageDocumentation
  */
 import { useSources } from '../../api/queries';
 import type { DataMode, Overlay, Source, SourceName } from '../../api/types';
-import { Badge, Inline } from '../../design-system';
+import { Badge, Inline, Stack } from '../../design-system';
 import type { Tone } from '../../design-system';
 import { formatInstant, sourceLabel } from '../../lib/format';
 
@@ -225,7 +231,7 @@ function SourceChip({ source, mode, stale, incomplete, lastSync }: SourceChipPro
 
 /**
  * The source chips of the status bar: a list labelled "Data sources" with one item per source
- * in {@link SOURCE_CHIP_ORDER}.
+ * in {@link SOURCE_CHIP_ORDER}, stacked one source per row (see the module overview).
  *
  * Each item reads, in order: the source name ("Google", "LinkedIn", "HubSpot"); a mode chip,
  * "Live" (success) or "Simulated" (info), or "No data yet" (neutral) before the source has a
@@ -251,7 +257,7 @@ function SourceChip({ source, mode, stale, incomplete, lastSync }: SourceChipPro
 export function SourceChips({ overlay, displayTimezone }: SourceChipsProps) {
   const sources = useSources();
   return (
-    <Inline as="ul" gap={4} aria-label="Data sources">
+    <Stack as="ul" gap={4} aria-label="Data sources">
       {SOURCE_CHIP_ORDER.map((source) => (
         <SourceChip
           key={source}
@@ -262,6 +268,6 @@ export function SourceChips({ overlay, displayTimezone }: SourceChipsProps) {
           lastSync={lastSyncText(sources.data, sources.isError, source, displayTimezone)}
         />
       ))}
-    </Inline>
+    </Stack>
   );
 }

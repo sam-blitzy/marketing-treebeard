@@ -10,9 +10,10 @@
  *   discrepancies, oldest first, one card each, a page at a time with "Show more" (AAP 0.5.5
  *   "`DiscrepancyResolver` lists open and awaiting-platform discrepancies with the resolutions
  *   valid for each kind and subject type"). Its load, empty, refresh and closure outcomes are
- *   announced through one persistent polite status region. A link to
- *   `/decisions#discrepancy-{id}` loads pages until that card is shown, then scrolls it into
- *   view, or says the discrepancy is no longer unresolved.
+ *   announced through one persistent polite status region. When a resolution closes a
+ *   discrepancy and its card leaves, focus moves to the next card, else the previous one, else
+ *   that region. A link to `/decisions#discrepancy-{id}` loads pages until that card is shown,
+ *   then scrolls it into view, or says the discrepancy is no longer unresolved.
  *
  * Rules this file keeps:
  *
@@ -37,9 +38,10 @@
  *   `/actions`. Errors are plain critical banners that take focus; the outcome is a polite
  *   status message, and the list's own notices go to its polite status region.
  * - **Values come from the API only.** Each side of a discrepancy is rendered from its stored
- *   keys, statuses with `CAMPAIGN_STATUS_LABELS` and amounts with `formatMoney` in the subject's
- *   currency, and an amount finer than the currency's minor unit (a Google micro) also shows its
- *   exact digits, because C0 has no tolerance and rounding must not hide the mismatch it reports.
+ *   keys, statuses with `CAMPAIGN_STATUS_LABELS` and amounts with `formatExactMoney` in the
+ *   side's currency, every significant digit up to one micro, because C0 has no tolerance and
+ *   rounding must not hide the mismatch it reports. The wording is the backend's `render_value`
+ *   (`analysis/discrepancy.py`), so this card and the C0 card on `/actions` read alike.
  *
  * Server state goes only through `../../api/queries` (AAP 0.11.1); the resolve mutation there
  * already invalidates recommendations, discrepancies and decisions. UI comes only from the
@@ -70,6 +72,7 @@ import {
 } from '../../api/queries';
 import type { ApiError } from '../../api/queries';
 import type {
+  CampaignStatus,
   DecisionShape,
   Discrepancy,
   DiscrepancyKind,
@@ -91,11 +94,10 @@ import {
 } from '../../design-system';
 import {
   UNAVAILABLE,
-  currencyMinorDigits,
   formatCount,
-  formatDecimal,
+  formatExactMoney,
   formatInstant,
-  formatMoney,
+  isDecimalString,
   sourceLabel,
 } from '../../lib/format';
 import { CAMPAIGN_STATUS_LABELS, DecisionForm } from './DecisionForm';
@@ -160,14 +162,20 @@ const FALLBACK_ERROR_MESSAGE = 'The resolution failed.';
 /** The platform side of a `missing` discrepancy, worded as the backend's C0 item words it. */
 const NOT_RETURNED_TEXT = 'not returned by the platform';
 
-/** The decided side of an `untracked` discrepancy, which has no decision yet. */
-const NOTHING_DECIDED_TEXT = 'nothing decided yet';
+/**
+ * The decided side of an `untracked` discrepancy, which has no decision yet, worded as the
+ * backend's C0 item words it (`NO_DECISION_TEXT`).
+ */
+const NO_DECISION_TEXT = 'no decision recorded';
 
 /**
  * A side recording an acknowledged removal (`tombstone: true`), worded as `DecisionLog` words
- * the same decided state on this screen.
+ * the same decided state on this screen and as the backend's C0 item words it.
  */
 const REMOVAL_TEXT = 'Removal acknowledged';
+
+/** The status `acknowledge_removal` writes on a campaign, shown when a tombstone carries none. */
+const TOMBSTONE_STATUS = 'ended';
 
 /** A side whose status the platform did not report, worded as `DecisionLog` and `DecisionForm`. */
 const STATUS_NOT_REPORTED = 'status not reported';
@@ -177,12 +185,6 @@ const PART_SEPARATOR = ' · ';
 
 /** The zone instants are shown in until the default run names `DISPLAY_TIMEZONE`. */
 const FALLBACK_TIMEZONE = 'UTC';
-
-/**
- * The most decimal places a stored amount carries: one Google micro, the scale of the
- * `numeric(18,6)` money columns (AAP 0.5.2).
- */
-const MAX_AMOUNT_PLACES = 6;
 
 /** How many digits of an integer micro amount are fractional: 1 unit = 1,000,000 micros. */
 const MICRO_DIGITS = 6;
@@ -221,9 +223,6 @@ export const SUBJECT_TYPE_LABELS: Readonly<Record<SubjectType, string>> = Object
   budget: 'Shared budget',
 });
 
-/** A plain fixed-point decimal as the API serialises money, for example `"200.000001"`. */
-const PLAIN_DECIMAL_PATTERN = /^-?\d+(?:\.(\d+))?$/;
-
 // ---------------------------------------------------------------------------------------------
 // Value rendering (pure; mirrors `render_value` in the backend's `analysis/discrepancy.py`)
 // ---------------------------------------------------------------------------------------------
@@ -238,27 +237,12 @@ function textOrNull(value: string | null | undefined): string | null {
 }
 
 /**
- * Whether an amount carries a non-zero digit beyond the currency's minor unit, such as a Google
- * budget of `"200.000001"` USD. `formatMoney` rounds to the minor unit, which would show that
- * amount and `"200.000000"` alike.
+ * An amount a side reports as decimal text, trimmed; `null` for an absent, `null` or malformed
+ * one, which is unknown and never zero (the backend's `_amount`).
  */
-function isFinerThanMinorUnit(amount: Money, currency: string | null): boolean {
-  const match = PLAIN_DECIMAL_PATTERN.exec(amount.trim());
-  const fraction = match?.[1] ?? '';
-  return /[1-9]/.test(fraction.slice(currencyMinorDigits(currency)));
-}
-
-/**
- * One amount in the subject's currency through `formatMoney`. An amount finer than the
- * currency's minor unit is followed by its exact digits, "$200.00 (exactly 200.000001)": C0
- * compares at native precision with no tolerance (AAP 0.5.4.4), so a one-micro mismatch must
- * never render as two identical amounts.
- */
-function amountText(amount: Money, currency: string | null): string {
-  const formatted = formatMoney(amount, currency);
-  return isFinerThanMinorUnit(amount, currency)
-    ? `${formatted} (exactly ${formatDecimal(amount, MAX_AMOUNT_PLACES)})`
-    : formatted;
+function storedAmount(raw: Money | null | undefined): Money | null {
+  const text = textOrNull(raw);
+  return text !== null && isDecimalString(text) ? text : null;
 }
 
 /**
@@ -274,14 +258,22 @@ function microsToDecimal(micros: number): Money | null {
   return `${sign}${digits.slice(0, -MICRO_DIGITS)}.${digits.slice(-MICRO_DIGITS)}`;
 }
 
-/** The normalised status of a side by its label; `"status not reported"` when absent. */
-function statusText(value: DiscrepancyValue): string {
-  const status = value.status;
-  if (typeof status !== 'string') {
+/** Whether a status is one of the normalised campaign statuses `CAMPAIGN_STATUS_LABELS` labels. */
+function isCampaignStatus(status: string): status is CampaignStatus {
+  return Object.hasOwn(CAMPAIGN_STATUS_LABELS, status);
+}
+
+/**
+ * A normalised status by its label ("Paused"), as the backend's `_status_text` words it; an
+ * absent or blank status is "status not reported".
+ */
+function statusText(status: string | null | undefined): string {
+  const text = textOrNull(status);
+  if (text === null) {
     return STATUS_NOT_REPORTED;
   }
   // A status outside the contract's vocabulary is shown as sent rather than mislabelled.
-  return Object.hasOwn(CAMPAIGN_STATUS_LABELS, status) ? CAMPAIGN_STATUS_LABELS[status] : status;
+  return isCampaignStatus(text) ? CAMPAIGN_STATUS_LABELS[text] : text;
 }
 
 /** Whether a side describes a budget assignment, shared or not, rather than an amount. */
@@ -318,44 +310,61 @@ function assignmentText(value: DiscrepancyValue): string {
 
 /**
  * The amounts of an `own_budget` or `budget` side, each named by its field, never zero for an
- * amount the side does not report:
+ * amount the side does not report, worded as the backend's `_money_text` words them. Each
+ * amount goes through `formatExactMoney` in the side's own currency, else the subject's: every
+ * significant digit up to one micro ("USD 200.000001"), because C0 compares at native precision
+ * with no tolerance (AAP 0.5.4.4) and a one-micro mismatch must never read as two equal amounts.
  *
  * - "budget unavailable" when the side has none of the `daily_budget`, `total_budget` and
  *   `amount_micros` keys;
- * - "daily budget {amount}" and "total budget {amount}" for each of `daily_budget` and
- *   `total_budget` that holds an amount, daily first; `amount_micros` is then not read;
- * - otherwise "budget {amount}" from an `amount_micros` that is a safe integer;
- * - otherwise "no budget set" when the side has no `amount_micros` key, as a side whose
- *   `daily_budget` or `total_budget` is an explicit `null` reads;
- * - otherwise "budget unavailable", for an `amount_micros` that is `null` or not a safe integer.
+ * - a Google side's `amount_micros`, when it is a safe integer, converted exactly: "daily
+ *   budget {amount}" when only `daily_budget` holds an amount, "total budget {amount}" when only
+ *   `total_budget` does, otherwise "budget {amount}";
+ * - otherwise "daily budget {amount}" and "total budget {amount}" for each of `daily_budget`
+ *   and `total_budget` that holds an amount, daily first;
+ * - otherwise "budget unavailable" when the side has an `amount_micros` key (`null`, or beyond
+ *   exact integer precision) or reports an amount that is not a number;
+ * - otherwise "no budget set", as a side whose `daily_budget` and `total_budget` are `null` reads.
  *
  * @returns The parts to join, in display order.
  */
 function moneyParts(value: DiscrepancyValue, currency: string | null): string[] {
-  const { daily_budget: daily, total_budget: total, amount_micros: micros } = value;
-  if (daily === undefined && total === undefined && micros === undefined) {
+  const { daily_budget: dailyRaw, total_budget: totalRaw, amount_micros: micros } = value;
+  if (dailyRaw === undefined && totalRaw === undefined && micros === undefined) {
     return [`budget ${UNAVAILABLE}`];
   }
-  const parts: string[] = [];
-  if (typeof daily === 'string') {
-    parts.push(`daily budget ${amountText(daily, currency)}`);
+  const code = textOrNull(value.currency) ?? currency;
+  const daily = storedAmount(dailyRaw);
+  const total = storedAmount(totalRaw);
+  const exact = typeof micros === 'number' ? microsToDecimal(micros) : null;
+  if (exact !== null) {
+    const amount = formatExactMoney(exact, code);
+    if (daily !== null && total === null) {
+      return [`daily budget ${amount}`];
+    }
+    if (total !== null && daily === null) {
+      return [`total budget ${amount}`];
+    }
+    return [`budget ${amount}`];
   }
-  if (typeof total === 'string') {
-    parts.push(`total budget ${amountText(total, currency)}`);
+  const parts: string[] = [];
+  if (daily !== null) {
+    parts.push(`daily budget ${formatExactMoney(daily, code)}`);
+  }
+  if (total !== null) {
+    parts.push(`total budget ${formatExactMoney(total, code)}`);
   }
   if (parts.length > 0) {
     return parts;
   }
-  const exact = typeof micros === 'number' ? microsToDecimal(micros) : null;
-  if (exact !== null) {
-    return [`budget ${amountText(exact, currency)}`];
-  }
-  return micros === undefined ? ['no budget set'] : [`budget ${UNAVAILABLE}`];
+  const reported = (dailyRaw ?? null) !== null || (totalRaw ?? null) !== null;
+  return micros !== undefined || reported ? [`budget ${UNAVAILABLE}`] : ['no budget set'];
 }
 
 /**
- * One side of a discrepancy as one line: the status label, then each amount in the subject's
- * currency, or the budget a member is assigned to, joined by " · ".
+ * One side of a discrepancy as one line, exactly as the backend's `render_value` renders it for
+ * the C0 card on `/actions`: the status label, then each amount in the side's currency, or the
+ * budget a member is assigned to, joined by " · ".
  *
  * - `status`: the status alone.
  * - `budget`: the assignment of a shared member (or of any side carrying assignment keys),
@@ -364,51 +373,57 @@ function moneyParts(value: DiscrepancyValue, currency: string | null): string[] 
  *   shared budget, which has none.
  * - A tombstone side is "Removal acknowledged", followed by the campaign's decided status
  *   (" · Ended") on a campaign subject, as `DecisionLog` renders the same decision.
+ * - An absent side (`null`) is "unavailable".
  *
  * @param kind - The discrepancy kind.
  * @param shape - The subject's decision shape.
- * @param value - The stored side.
- * @param currency - The subject's account currency, or `null` when unknown.
+ * @param value - The stored side, or `null`.
+ * @param currency - The subject's account currency, used when the side names none, or `null`.
  * @returns The display text.
  */
 function describeValue(
   kind: DiscrepancyKind,
   shape: DecisionShape,
-  value: DiscrepancyValue,
+  value: DiscrepancyValue | null,
   currency: string | null,
 ): string {
+  if (value === null) {
+    return UNAVAILABLE;
+  }
   if (value.tombstone === true) {
     // acknowledge_removal writes status `ended` on campaigns; a shared budget has no status.
     return shape === 'budget'
       ? REMOVAL_TEXT
-      : [REMOVAL_TEXT, statusText({ status: value.status ?? 'ended' })].join(PART_SEPARATOR);
+      : [REMOVAL_TEXT, statusText(textOrNull(value.status) ?? TOMBSTONE_STATUS)].join(
+          PART_SEPARATOR,
+        );
   }
   if (kind === 'status') {
-    return statusText(value);
+    return statusText(value.status);
   }
   const assignment = shape === 'shared_member' || hasAssignment(value);
   const budgetParts = assignment ? [assignmentText(value)] : moneyParts(value, currency);
   if (kind === 'budget' || shape === 'budget') {
     return budgetParts.join(PART_SEPARATOR);
   }
-  return [statusText(value), ...budgetParts].join(PART_SEPARATOR);
+  return [statusText(value.status), ...budgetParts].join(PART_SEPARATOR);
 }
 
 /**
  * The "Platform shows {platform}, last decided {decided}" line of a discrepancy, worded as the
- * backend words the C0 item: an absent platform side (`missing`) is "not returned by the
- * platform" and an absent decided side (`untracked`) is "nothing decided yet".
+ * backend words the C0 item "Resolve: platform shows …, last decided …": the platform side of a
+ * `missing` discrepancy is "not returned by the platform", and the absent decided side of an
+ * `untracked` one is "no decision recorded".
  */
 function comparisonText(discrepancy: Discrepancy): string {
   const { kind, shape, subject, platform_value: platform, decided_value: decided } = discrepancy;
-  const currency =
-    textOrNull(subject.currency) ??
-    textOrNull(platform?.currency) ??
-    textOrNull(decided?.currency);
+  const currency = textOrNull(subject.currency);
   const platformText =
-    platform === null ? NOT_RETURNED_TEXT : describeValue(kind, shape, platform, currency);
+    kind === 'missing' ? NOT_RETURNED_TEXT : describeValue(kind, shape, platform, currency);
   const decidedText =
-    decided === null ? NOTHING_DECIDED_TEXT : describeValue(kind, shape, decided, currency);
+    kind === 'untracked' && decided === null
+      ? NO_DECISION_TEXT
+      : describeValue(kind, shape, decided, currency);
   return `Platform shows ${platformText}, last decided ${decidedText}`;
 }
 
@@ -595,8 +610,10 @@ function DiscrepancyResolutionBody({
   // so keyboard and screen-reader users stay on the control they used (WCAG 2.2 SC 2.4.3). So
   // does an intended-state save that settles after its dialog was closed, for focus lost after
   // the dialog returned it to "Record intended state". A failure's banner takes focus first (the
-  // effects above), and a closed discrepancy leaves the lists, where the browser's focus
-  // navigation starting point keeps the user's place, so nothing is focused for either.
+  // effects above), so nothing is focused here for it. Nor for a closed discrepancy: it leaves
+  // the list that shows it, so this button goes with it, and that list places focus instead, the
+  // `/decisions` resolver on a neighbouring card (DiscrepancyResolver) and a C0 card on
+  // `/actions` on its own status line.
   const buttonRefs = useRef(new Map<Resolution, HTMLButtonElement>());
   const [refocus, setRefocus] = useState<Resolution | null>(null);
   useEffect(() => {
@@ -913,6 +930,104 @@ interface Closure {
   at: number;
 }
 
+/**
+ * A discrepancy a resolution closed, kept until the next closure replaces it, so focus can be
+ * placed once its card has left the list (see {@link closedFocusTarget}).
+ */
+interface ClosedCard {
+  /** The closed discrepancy's id. */
+  readonly id: Discrepancy['id'];
+  /** Its card's index in the list shown when the resolution was reported. */
+  readonly index: number;
+  /**
+   * The ids of the other cards listed when the resolution was reported: those after it in list
+   * order, then those before it, nearest first. Focus goes to the first of them still listed.
+   */
+  readonly neighbours: readonly Discrepancy['id'][];
+}
+
+/** Where focus goes after a {@link ClosedCard}, as {@link closedFocusTarget} decides it. */
+type ClosedFocus =
+  | {
+      /** A card's list item. */
+      readonly kind: 'card';
+      /** The discrepancy whose card takes focus. */
+      readonly id: Discrepancy['id'];
+      /**
+       * Whether the closed card has left the list, so `id` is another card's; `false` while a
+       * failed read keeps the closed card itself listed.
+       */
+      readonly gone: boolean;
+    }
+  | {
+      /** The resolver's polite status region. */
+      readonly kind: 'status';
+    };
+
+/**
+ * The {@link ClosedCard} of a resolution that closed discrepancy `id`, from the cards `shown`
+ * when it was reported. When `shown` does not hold it, its index is 0 and it has no neighbours.
+ */
+function closedCard(id: Discrepancy['id'], shown: readonly Discrepancy[]): ClosedCard {
+  const ids = shown.map((discrepancy) => discrepancy.id);
+  const at = ids.indexOf(id);
+  return {
+    id,
+    index: Math.max(at, 0),
+    neighbours: at < 0 ? [] : [...ids.slice(at + 1), ...ids.slice(0, at).reverse()],
+  };
+}
+
+/**
+ * Whether `focus` names the card of discrepancy `id`, or the status region when `id` is
+ * omitted.
+ */
+function isClosedFocusOn(focus: ClosedFocus | null, id?: Discrepancy['id']): boolean {
+  if (focus === null) {
+    return false;
+  }
+  return id === undefined ? focus.kind === 'status' : focus.kind === 'card' && focus.id === id;
+}
+
+/**
+ * Where focus goes after a resolution closed a discrepancy (WCAG 2.2 SC 2.4.3), or `null` when
+ * nothing is closed or no list is loaded:
+ *
+ * - while the closed card is still listed: the card itself, which a failed read keeps on screen
+ *   (the resolver places focus there only once no read runs, because the read that drops the
+ *   card may not be shown yet);
+ * - once it has left the list: the card now next to where it was, which is the first of its
+ *   {@link ClosedCard.neighbours} still listed, the following card before the preceding one. A
+ *   neighbour is followed by id, so a later read that adds or drops other cards never moves the
+ *   target away from a card that holds focus. Should only cards listed since remain, the card
+ *   now at the closed card's index, or the last card when the list has shrunk past it;
+ * - with no card left: the resolver's status region, which then names the closure and says what
+ *   is left open. "Show more discrepancies" is never shown then: a page load keeps following the
+ *   API's next link while it has read no discrepancy (`useDiscrepancyPages`), so a list that
+ *   shows no card has been read to its end.
+ *
+ * @param closed - The latest closure, or `null` before the first.
+ * @param shown - The cards listed now, or `undefined` before the first read.
+ */
+function closedFocusTarget(
+  closed: ClosedCard | null,
+  shown: readonly Discrepancy[] | undefined,
+): ClosedFocus | null {
+  if (closed === null || shown === undefined) {
+    return null;
+  }
+  const listed = new Set(shown.map((discrepancy) => discrepancy.id));
+  if (listed.has(closed.id)) {
+    return { kind: 'card', id: closed.id, gone: false };
+  }
+  const neighbour =
+    closed.neighbours.find((id) => listed.has(id)) ??
+    shown[Math.min(closed.index, shown.length - 1)]?.id;
+  return neighbour === undefined
+    ? { kind: 'status' }
+    : { kind: 'card', id: neighbour, gone: true };
+}
+
 /** Props of {@link DiscrepancyCard}. */
 interface DiscrepancyCardProps {
   /** The discrepancy shown. */
@@ -1099,6 +1214,21 @@ function useLinkedDiscrepancy(query: DiscrepancyPagesQuery, busy: boolean): Link
  * after the last page removed it, moves to the first discrepancy the page added, unless the user
  * moved focus elsewhere (WCAG 2.2 SC 2.4.3). Every discrepancy stays reachable.
  *
+ * **Focus after a closing resolution** (WCAG 2.2 SC 2.4.3). A resolution that closes a
+ * discrepancy ("Platform is correct", "Adopt platform state", "Acknowledge removal") removes its
+ * card, and with it the clicked button, which kept focus while it loaded, so focus falls to the
+ * page. Once the refetched list is shown without the card, focus moves to the card now next to
+ * where it was: the following card, else the preceding one, else, with no card left, the status
+ * region below, which then names the closure and what is left open ("No open discrepancies" when
+ * nothing is).
+ * "Show more" is never shown with no card left, because a page load reads on while it has found
+ * none. A card or the region is focusable (`tabindex="-1"`) only as that target, and stays so
+ * once focused until the next closure, so a later read never drops the focus it holds; it takes
+ * the design system's focus ring. When the refetch fails and the closed card stays listed,
+ * the card itself takes focus, and focus moves on as above once a later read drops it. Focus the
+ * user has moved elsewhere is never taken back; a resolution that keeps its card listed
+ * (`awaiting_platform`) leaves focus on its button ({@link DiscrepancyResolution}).
+ *
  * **Linked discrepancy** (AAP 0.5.5 "with the blocking discrepancy linked"). When the location
  * hash names a card, `#discrepancy-{id}` as a held card's link on `/actions` does, on arrival or
  * by a later change, the resolver loads the next page while the pages loaded so far do not hold
@@ -1158,9 +1288,21 @@ export function DiscrepancyResolver() {
   const { retrying, buttonRef: retryButtonRef, retry } = useRetry(query.refetch);
 
   const [closure, setClosure] = useState<Closure | null>(null);
+  const [closed, setClosed] = useState<ClosedCard | null>(null);
+  // The cards the latest committed render shows, where a resolution that settles finds its card.
+  const shownRef = useRef<readonly Discrepancy[]>([]);
+  useEffect(() => {
+    shownRef.current = list?.discrepancies ?? [];
+  }, [list]);
   const handleResolved = (updated: Discrepancy) => {
     if (updated.state === 'resolved') {
       setClosure({ text: `${subjectTitle(updated)} resolved`, at: Date.now() });
+      // A read shown since the click may have dropped the card already; the list it was clicked
+      // in, which this callback's render showed, still holds it.
+      const shown = shownRef.current.some((discrepancy) => discrepancy.id === updated.id)
+        ? shownRef.current
+        : (list?.discrepancies ?? []);
+      setClosed(closedCard(updated.id, shown));
     }
   };
 
@@ -1196,6 +1338,44 @@ export function DiscrepancyResolver() {
       firstNew.focus();
     }
   }, [settledMore, dataUpdatedAt, errorUpdatedAt]);
+
+  // A closing resolution: focus is placed once while a failed read keeps the closed card listed,
+  // and once after the card has left the list, each time only when focus was lost (onto the
+  // page, or an element no longer in it), so focus the user moved is left where it is. The
+  // element focus was placed on stays focusable until the next closure, so a later read that
+  // changes the target (a discrepancy raised while the status region holds focus) or a poll in
+  // flight never strips the focused element of its tabindex, which would drop focus again.
+  const closedFocus = closedFocusTarget(closed, list?.discrepancies);
+  const reading = query.isFetching;
+  const [placed, setPlaced] = useState<{ closed: ClosedCard; focus: ClosedFocus } | null>(null);
+  const placedFocus = placed !== null && placed.closed === closed ? placed.focus : null;
+  const closedCardRef = useRef<HTMLLIElement>(null);
+  const statusRef = useRef<HTMLDivElement>(null);
+  const handledClosedRef = useRef<{ closed: ClosedCard; gone: boolean } | null>(null);
+  useEffect(() => {
+    if (closed === null || closedFocus === null) {
+      return;
+    }
+    const gone = closedFocus.kind !== 'card' || closedFocus.gone;
+    if (!gone && reading) {
+      // The read that drops the closed card may not be shown yet.
+      return;
+    }
+    const handled = handledClosedRef.current;
+    if (handled !== null && handled.closed === closed && (handled.gone || !gone)) {
+      return;
+    }
+    handledClosedRef.current = { closed, gone };
+    const active = document.activeElement;
+    if (active !== null && active !== document.body && active.isConnected) {
+      return;
+    }
+    const target = closedFocus.kind === 'card' ? closedCardRef.current : statusRef.current;
+    if (target !== null && target.isConnected) {
+      target.focus();
+      setPlaced({ closed, focus: closedFocus });
+    }
+  }, [closed, closedFocus, reading]);
 
   const showMore = async (): Promise<void> => {
     if (list === undefined || loadingMore || linked.loading) {
@@ -1303,19 +1483,42 @@ export function DiscrepancyResolver() {
     // BLITZY [DESIGN_SYSTEM_GAP]: the design system has no text or live-region primitive and
     // feature code carries no CSS (AAP 0.4.4), so the status region and its text lines are
     // unstyled <div> elements spaced by the Stack gap alone; Stack takes the region out of the
-    // column while it is empty.
+    // column while it is empty. The region and a card's list item are focusable only as the
+    // place a closing resolution or "Show more" puts focus, and take the base focus ring.
     <Stack gap={4}>
-      {list === undefined && failure === null ? <Spinner label={LOADING_LABEL} /> : null}
-      <div role="status">{notices.length === 0 ? null : <Stack gap={3}>{notices}</Stack>}</div>
+      {list === undefined && failure === null ? <Spinner label={LOADING_LABEL} showLabel /> : null}
+      <div
+        ref={statusRef}
+        role="status"
+        tabIndex={
+          isClosedFocusOn(closedFocus) || isClosedFocusOn(placedFocus) ? -1 : undefined
+        }
+      >
+        {notices.length === 0 ? null : <Stack gap={3}>{notices}</Stack>}
+      </div>
       {list !== undefined && list.discrepancies.length > 0 ? (
         <Stack as="ul" gap={4} aria-label={LIST_LABEL}>
           {list.discrepancies.map((discrepancy, index) => {
             const isFirstNew = settledMore !== null && index === settledMore.firstNew;
+            const isClosedFocus = isClosedFocusOn(closedFocus, discrepancy.id);
+            const focusable =
+              isFirstNew || isClosedFocus || isClosedFocusOn(placedFocus, discrepancy.id);
             return (
               <li
                 key={discrepancy.id}
-                ref={isFirstNew ? firstNewRef : undefined}
-                tabIndex={isFirstNew ? -1 : undefined}
+                ref={
+                  isFirstNew || isClosedFocus
+                    ? (element: HTMLLIElement | null) => {
+                        if (isFirstNew) {
+                          firstNewRef.current = element;
+                        }
+                        if (isClosedFocus) {
+                          closedCardRef.current = element;
+                        }
+                      }
+                    : undefined
+                }
+                tabIndex={focusable ? -1 : undefined}
               >
                 <DiscrepancyCard
                   discrepancy={discrepancy}

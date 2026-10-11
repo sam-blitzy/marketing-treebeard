@@ -93,6 +93,7 @@ import { DiscrepancyResolution, RESOLUTION_LABELS } from '../../decisions/Discre
 import type { FeedbackConfirmations } from '../ActionOutcomes';
 import { useLinkedB1Card } from '../B1Cards';
 import type { B1Card } from '../B1Cards';
+import { evidenceRatioDigits } from '../EvidenceTable';
 import { RecommendationCard } from '../RecommendationCard';
 import {
   PAUSE_SCALE_METRIC_KEYS,
@@ -272,13 +273,17 @@ function lateDiscrepancyText(count: number): string {
 
 /**
  * The metrics the evidence carries, as labelled fields in the order given: the backend's label
- * and the value through `formatMetric`. A key the evidence lacks (`null`) is left out.
+ * and the value through `formatMetric`. A key the evidence lacks (`null`) is left out. A
+ * percentage, such as C3a's segment share of impressions, takes its evidence table's precision
+ * (`ratioDigits`, {@link evidenceRatioDigits}), so the field reads exactly as the same metric's
+ * row in the card's evidence.
  */
-function metricFields(metrics: readonly (Metric | null)[]): FieldItem[] {
+function metricFields(metrics: readonly (Metric | null)[], ratioDigits: number): FieldItem[] {
   const fields: FieldItem[] = [];
   for (const metric of metrics) {
     if (metric !== null) {
-      fields.push({ key: metric.key, label: metric.label, value: formatMetric(metric) });
+      const value = formatMetric(metric, { ratioDigits });
+      fields.push({ key: metric.key, label: metric.label, value });
     }
   }
   return fields;
@@ -304,7 +309,10 @@ function CampaignEvidence({ item }: ItemProps): ReactElement | null {
   return (
     <FieldList
       label={CAMPAIGN_EVIDENCE_LABEL}
-      fields={metricFields(metricsByKeys(item, PAUSE_SCALE_METRIC_KEYS))}
+      fields={metricFields(
+        metricsByKeys(item, PAUSE_SCALE_METRIC_KEYS),
+        evidenceRatioDigits(item.evidence),
+      )}
     />
   );
 }
@@ -483,7 +491,13 @@ function LaunchGapEvidence({ item }: ItemProps): ReactElement | null {
     return (
       <FieldList
         label={SEGMENT_GAP_LABEL}
-        fields={[segmentField(gap), ...metricFields(metricsByKeys(item, SEGMENT_GAP_METRIC_KEYS))]}
+        fields={[
+          segmentField(gap),
+          ...metricFields(
+            metricsByKeys(item, SEGMENT_GAP_METRIC_KEYS),
+            evidenceRatioDigits(item.evidence),
+          ),
+        ]}
       />
     );
   }

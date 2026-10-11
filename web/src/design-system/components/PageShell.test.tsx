@@ -9,13 +9,23 @@
  * around the content; the page title as the single `<h1>`; and each section a `region` named by
  * its `<h2>` or `<h3>` heading with id `${id}-title`, the actions containers following the same
  * empty-slot rule.
+ *
+ * They also hold the static loading screen in `web/index.html` to the markup it copies by hand:
+ * the frame, top bar, one-link "Sign in" side navigation and labelled `Spinner` that this
+ * wrapper, `TopBar`, `SideNav` and `Spinner` render, placed right after an empty `#root`, which
+ * the `.ds-pageshell--boot` rule in `PageShell.css` depends on.
  */
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { fireEvent, render, screen, within } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 
 import { PageShell } from './PageShell';
 import { SideNav } from './SideNav';
+import { Spinner } from './Spinner';
 import { TopBar } from './TopBar';
 
 /** Slot values React renders as nothing, each of which must leave no container behind. */
@@ -335,5 +345,114 @@ describe('PageShell.Section', () => {
     );
 
     expect(container.querySelector('.ds-pageshell__actions')?.textContent).toBe('0');
+  });
+});
+
+/**
+ * `web/index.html`, from this file's own path. Resolved with `node:path`, because the jsdom
+ * environment's global `URL` does not resolve against a `file:` base.
+ */
+const INDEX_HTML_PATH = resolve(dirname(fileURLToPath(import.meta.url)), '../../../index.html');
+
+/** An element's classes and, in order, its element children's: the shape a class contract fixes. */
+interface ClassTree {
+  readonly classes: string;
+  readonly children: readonly ClassTree[];
+}
+
+/**
+ * The class tree of `element`.
+ *
+ * @param element - the root of the tree
+ * @returns its classes and its element children's trees, in document order
+ */
+function classTree(element: Element): ClassTree {
+  return { classes: element.className, children: Array.from(element.children).map(classTree) };
+}
+
+/**
+ * Serialises `element` with the whitespace between tags removed, as React renders markup.
+ *
+ * @param element - the element to serialise
+ * @returns its outer HTML without inter-tag whitespace
+ */
+function compactHtml(element: Element): string {
+  return element.outerHTML.replace(/>\s+</g, '><');
+}
+
+describe('the static loading screen in web/index.html', () => {
+  /** The entry document, parsed as the browser parses it before any script runs. */
+  const entry = new DOMParser().parseFromString(readFileSync(INDEX_HTML_PATH, 'utf8'), 'text/html');
+  const boot = entry.querySelector('.ds-pageshell--boot');
+
+  it('follows an empty #root directly, as the rule that hides it requires', () => {
+    const root = entry.getElementById('root');
+    expect(root?.childNodes).toHaveLength(0);
+    expect(boot).not.toBeNull();
+    expect(root?.nextElementSibling).toBe(boot);
+    expect(entry.querySelectorAll('.ds-pageshell--boot')).toHaveLength(1);
+  });
+
+  it('mirrors the PageShell frame, TopBar, sign-in SideNav and labelled Spinner', () => {
+    // The sign-in navigation of the router's screens of unknown session, never current here:
+    // the static document cannot know the path it is served for.
+    const { container } = render(
+      <PageShell
+        topBar={<TopBar productName="Ads Action Engine" />}
+        sideNav={
+          <SideNav
+            label="Primary"
+            items={[{ key: 'login', label: 'Sign in', href: '/login' }]}
+          />
+        }
+      >
+        <Spinner label="Loading Ads Action Engine" showLabel />
+      </PageShell>,
+    );
+    const shell = container.querySelector('.ds-pageshell');
+    if (shell === null || boot === null) {
+      throw new Error('a frame is missing');
+    }
+    const rendered = classTree(shell);
+
+    // The skip link is left out: it targets <main id="ds-main">, which only the app renders.
+    expect(classTree(boot)).toEqual({
+      classes: `${rendered.classes} ds-pageshell--boot`,
+      children: rendered.children.filter((child) => !child.classes.includes('ds-pageshell__skip')),
+    });
+    expect(boot.querySelector('.ds-topbar__product')?.textContent).toBe('Ads Action Engine');
+
+    const bootNav = boot.querySelector('nav');
+    const nav = shell.querySelector('nav');
+    if (bootNav === null || nav === null) {
+      throw new Error('a navigation landmark is missing');
+    }
+    expect(compactHtml(bootNav)).toBe(nav.outerHTML);
+    expect(boot.querySelectorAll('[aria-current], .ds-sidenav__link--current')).toHaveLength(0);
+
+    const status = boot.querySelector('[role="status"]');
+    const spinner = shell.querySelector('[role="status"]');
+    if (status === null || spinner === null) {
+      throw new Error('a status element is missing');
+    }
+    expect(compactHtml(status)).toBe(spinner.outerHTML);
+  });
+
+  it('adds no main or banner landmark, no id, inline style or inline script beside the app', () => {
+    if (boot === null) {
+      throw new Error('the loading screen is missing');
+    }
+    // One <main> and one banner per page: the app renders its own once it starts.
+    expect(boot.querySelectorAll('main, header')).toHaveLength(0);
+    // Its one navigation landmark is named as the app's own; it leaves the accessibility tree
+    // with the rest of the screen once the app renders into #root.
+    const navs = boot.querySelectorAll('nav');
+    expect(navs).toHaveLength(1);
+    expect(navs[0]?.getAttribute('aria-label')).toBe('Primary');
+    // No id beside the app's: the skip link's target and every anchor are the app's to own.
+    expect(boot.querySelectorAll('[id]')).toHaveLength(0);
+    // nginx serves the page with Content-Security-Policy default-src 'self'.
+    expect(entry.querySelectorAll('style, [style]')).toHaveLength(0);
+    expect(Array.from(entry.scripts).every((script) => script.src !== '')).toBe(true);
   });
 });

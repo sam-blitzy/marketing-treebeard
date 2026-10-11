@@ -15,8 +15,10 @@ reads:
   the Q-G6 finest partition kept as returned and reported incomplete; Q-G3 never goes below one
   campaign-day;
 * Q-G7: ``ad_group.id`` range halving, then a criterion keyset inside one capped ad group;
-* page tokens followed at once, call-budget interruption with deferred scopes, and
-  ``AccessDenied`` and ``QueryDefect`` propagating unchanged;
+* page tokens followed at once, a relay ignoring them (page 1 again under a fresh token, as the
+  live n8n workflow answers) read completely by date and id ranges, rows streamed into a sink,
+  call-budget interruption with deferred scopes, and ``AccessDenied`` and ``QueryDefect``
+  propagating unchanged;
 * safe absence: :func:`enumerate_campaigns` and :func:`enumerate_entities` report ``removed``,
   ``missing`` and absent keys only after complete reads;
 * resumption across syncs: scopes stored as JSON and validated on the way back, the shared
@@ -465,6 +467,9 @@ class FakeGoogle:
         token: The page token the relay issues.
         repeat_token: Whether the second page carries the same token again, as a broken relay
             might.
+        ignore_page_token: With :attr:`first_page_rows`, whether the relay ignores the token it
+            is sent, as the live n8n workflow does: every request is answered with its first
+            :attr:`first_page_rows` rows, plus a fresh token whenever more rows match.
         fault: Called with each call and its 1-based ordinal; a response it returns is sent
             instead of rows (an HTTP 403, 400 or 503).
         calls: Every request received, in order.
@@ -476,6 +481,7 @@ class FakeGoogle:
     first_page_rows: int | None = None
     token: str = "t1"
     repeat_token: bool = False
+    ignore_page_token: bool = False
     fault: Callable[[Call, int], httpx.Response | None] | None = None
     calls: list[Call] = field(default_factory=list)
 
@@ -512,6 +518,12 @@ class FakeGoogle:
         if self.first_page_rows is None:
             assert call.page_token is None, "the client sent a token the relay never issued"
             return rows[:PAGE_SIZE], None
+        if self.ignore_page_token:
+            assert call.page_token is None or call.page_token.startswith(f"{self.token}-"), (
+                "the client sent a token the relay never issued"
+            )
+            more = len(rows) > self.first_page_rows
+            return rows[: self.first_page_rows], f"{self.token}-{len(self.calls)}" if more else None
         if call.page_token is None:
             return rows[: self.first_page_rows], self.token
         assert call.page_token == self.token, "the client sent a token the relay never issued"
@@ -1212,6 +1224,91 @@ async def test_a_repeated_page_token_is_a_query_defect(connect: Connect) -> None
 
     assert raised.value.query_id == "Q-G2"
     assert [call.page_token for call in fake.calls] == [None, "t1"]
+
+
+def _paged_search_terms() -> tuple[FakeGoogle, dict[str, object]]:
+    """A token-ignoring relay paging by two rows, and a Q-G6 scope of four search-term days.
+
+    Day 1 holds terms ``a`` and ``b`` in campaign 10 and ``c`` in campaign 11; day 2 holds
+    ``d`` in campaign 10. The scope spans both days and both campaigns.
+    """
+    world = {
+        SEARCH_TERMS: [
+            search_term_fact("a", 100, 10, DAY1),
+            search_term_fact("b", 100, 10, DAY1),
+            search_term_fact("c", 110, 11, DAY1),
+            search_term_fact("d", 100, 10, DAY2),
+        ]
+    }
+    fake = FakeGoogle(world, first_page_rows=2, ignore_page_token=True)
+    return fake, day_scope(DAY1, DAY2, {CAMPAIGN_LO: 10, CAMPAIGN_HI: 11})
+
+
+async def test_a_relay_ignoring_page_tokens_is_read_by_date_and_campaign_ranges(
+    connect: Connect,
+) -> None:
+    """The live n8n relay answers a page token with page 1 again and a fresh token.
+
+    The client abandons that token and reports the partition capped, so the fetch narrows the
+    dates and then the campaign range until no partition needs a second page: every row is
+    read exactly once, and the repeated page is never kept.
+    """
+    fake, scope = _paged_search_terms()
+
+    outcome = await fetch(connect, fake, "Q-G6", scope)
+
+    narrowed = {CAMPAIGN_LO: 10, CAMPAIGN_HI: 11}
+    assert fake.scopes == [
+        scope,
+        day_scope(DAY1, DAY1, narrowed),
+        day_scope(DAY1, DAY1, {CAMPAIGN_LO: 10, CAMPAIGN_HI: 10}),
+        day_scope(DAY1, DAY1, {CAMPAIGN_LO: 11, CAMPAIGN_HI: 11}),
+        day_scope(DAY2, DAY2, narrowed),
+    ]
+    # The first token is sent back once and abandoned; no later token is followed at all.
+    assert [call.page_token is not None for call in fake.calls] == [False, True, *[False] * 4]
+    assert fake.returned == [2, 2, 2, 2, 1, 1]
+    assert sorted(terms_of(outcome.rows)) == ["a", "b", "c", "d"]
+    assert outcome.complete
+    assert (outcome.calls, outcome.partitions_read) == (6, 5)
+
+
+async def test_a_q_g6_finest_partition_behind_an_ignored_token_keeps_page_one_incomplete(
+    connect: Connect,
+) -> None:
+    """At one (day, ad group) the abandoned token's first page is kept as returned, once."""
+    world = {SEARCH_TERMS: [search_term_fact(term, 62, 61, DAY4) for term in ("a", "b", "c")]}
+    fake = FakeGoogle(world, first_page_rows=2, ignore_page_token=True)
+    scope = day_scope(
+        DAY4, DAY4, {CAMPAIGN_LO: 61, CAMPAIGN_HI: 61, AD_GROUP_LO: 62, AD_GROUP_HI: 62}
+    )
+
+    outcome = await fetch(connect, fake, "Q-G6", scope)
+
+    assert fake.scopes == [scope]
+    assert [call.page_token is not None for call in fake.calls] == [False, True]
+    assert terms_of(outcome.rows) == ["a", "b"]
+    assert outcome.reason == f"{REASON_FINEST_PARTITION} ({DAY4.isoformat()}, ad group 62)"
+    assert (outcome.completeness, outcome.calls) == ("incomplete", 2)
+
+
+async def test_a_streaming_fetch_hands_each_accepted_partition_to_its_sink(
+    connect: Connect,
+) -> None:
+    """With a sink, each accepted partition's rows are handed over in order and not kept."""
+    fake, scope = _paged_search_terms()
+    batches: list[list[str]] = []
+
+    async def sink(rows: tuple[Mapping[str, Any], ...]) -> None:
+        """Record the terms of one handed-over batch."""
+        batches.append(terms_of(rows))
+
+    async with connect(fake) as client:
+        outcome = await PartitionedFetcher(client).partitioned_fetch("Q-G6", scope, sink=sink)
+
+    assert batches == [["a", "b"], ["c"], ["d"]]
+    assert (outcome.rows, outcome.streamed, outcome.rows_read) == ((), 4, 4)
+    assert (outcome.completeness, outcome.calls) == ("complete", 6)
 
 
 async def test_budget_exhaustion_on_the_third_keyset_call_defers_the_rest_and_keeps_rows(

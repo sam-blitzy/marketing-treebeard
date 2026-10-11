@@ -8,9 +8,18 @@
  *     <span class="ds-visually-hidden">{label}</span>
  *   </span>
  *
- * role="status" is a polite live region, so the visually hidden label carries the loading state
+ * and, with showLabel, the label shown beside the ring:
+ *
+ *   <span role="status" class="ds-spinner ds-spinner--labelled">
+ *     <span class="ds-spinner__circle" aria-hidden="true"></span>
+ *     <span class="ds-spinner__label">{label}</span>
+ *   </span>
+ *
+ * role="status" is a polite live region, so the label, hidden or shown, carries the loading state
  * to assistive technology; the ring is decorative and hidden from the accessibility tree. The
- * class names are a contract with Spinner.tsx; keep them exactly as written.
+ * class names are a contract with Spinner.tsx, and with the static loading screen in
+ * web/index.html, which writes the showLabel markup out by hand so the browser can paint it
+ * before the bundle runs; keep them exactly as written.
  *
  * Plain global CSS with the ds- prefix and BEM elements, like every stylesheet in this folder.
  * Every size, colour and radius is a token from ../tokens.css, so binding Blitzy OS touches
@@ -62,11 +71,26 @@
 }
 
 /*
+ * Shown label (showLabel): the loading message beside the ring, for a page or page section that
+ * is still loading. The visually hidden label is absolutely positioned, so the gap applies only
+ * here, where the label is a flex item. The text is secondary, like EmptyState's reason:
+ * --color-text-muted is at least 4.5:1 on the surface and page backgrounds (WCAG 2.2 SC 1.4.3).
+ */
+.ds-spinner--labelled {
+  gap: var(--space-2);
+}
+
+.ds-spinner__label {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+
+/*
  * Reduced motion (WCAG 2.2 SC 2.3.3 Animation from Interactions, a AAA criterion applied here as
  * good practice): the ring stops and stays as a static track with its accent arc, while the
- * hidden label still announces the loading state. This rule is the component's own guarantee;
- * it does not rely on the global safety net at the end of ../tokens.css, which only shortens
- * animations to a single near-instant run.
+ * label, hidden or shown, still conveys the loading state. This rule is the component's own
+ * guarantee; it does not rely on the global safety net at the end of ../tokens.css, which only
+ * shortens animations to a single near-instant run.
  */
 @media (prefers-reduced-motion: reduce) {
   .ds-spinner__circle {

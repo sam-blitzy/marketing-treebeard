@@ -242,8 +242,10 @@ def _campaign_cost_per_conversion(ctx: AnalysisContext, campaign_id: int) -> Fra
 
 
 def _cents(value: Fraction) -> Decimal:
-    """A money value at the cent, as evidence shows it."""
-    return (Decimal(value.numerator) / Decimal(value.denominator)).quantize(Decimal("0.01"))
+    """A money value at the cent, as evidence shows it: the exact value rounded half up."""
+    cents = abs(value) * 100
+    whole = math.floor(cents + Fraction(1, 2))
+    return Decimal(whole if value >= 0 else -whole).scaleb(-2)
 
 
 def _window_days(ctx: AnalysisContext, keyword: KeywordInfo) -> list[KeywordDay]:

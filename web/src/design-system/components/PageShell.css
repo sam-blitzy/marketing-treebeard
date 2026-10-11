@@ -18,6 +18,11 @@
  *   .ds-pageshell__section-header the section heading row: heading plus optional actions
  *   .ds-pageshell__section-title  the <h2> or <h3>
  *   .ds-pageshell__actions        action slot of the title bar and of each section header
+ *   .ds-pageshell--boot           the static loading screen in web/index.html (rule below)
+ *
+ * web/index.html writes the frame, header, body, side-navigation and main classes out by hand,
+ * together with TopBar's, SideNav's and Spinner's, in that loading screen; keep them in step
+ * with it, which PageShell.test.tsx checks.
  *
  * Every colour, spacing and typography value is a token from ../tokens.css, so binding Blitzy OS
  * touches tokens.css alone (web/.stylelintrc.json enforces this). The literals, each listed in
@@ -40,6 +45,20 @@
   min-block-size: 100vh;
   background: var(--color-bg);
   color: var(--color-text);
+}
+
+/*
+ * Static loading screen: web/index.html renders this frame, with the product's top bar, the
+ * one-link "Sign in" side navigation and a labelled Spinner, right after the app's empty #root,
+ * so the first paint already says what is loading. It stays while the bundle downloads and also
+ * while the router presents nothing yet (React empties #root on its first render, and the router
+ * shows its own pending screen only after its pending delay), and it goes the moment the app
+ * renders anything into #root, taking its navigation landmark out of the accessibility tree
+ * with it. The selector depends on #root staying empty in web/index.html, without even
+ * whitespace, and on this frame following it.
+ */
+#root:not(:empty) ~ .ds-pageshell--boot {
+  display: none;
 }
 
 /* Header: a positioning context for anything TopBar anchors inside the banner landmark. */

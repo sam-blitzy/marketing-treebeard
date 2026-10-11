@@ -13,8 +13,11 @@
  * - `EvidenceTable` renders a captioned table (one row per metric, the value in its unit and
  *   currency, the paired baselines in the metric's unit), then only what the evidence holds: the
  *   unpaired baselines, "Sample: observed / required unit", "Test: …", "Thresholds applied" in
- *   key order and "Data used" with each dataset's completeness and coverage. The window,
- *   provenance and `extra` belong to other parts of the card and are not rendered here.
+ *   key order and "Data used" with each dataset's completeness and, when recorded, the date it
+ *   covers through, labelled with its source's day boundary: the entry's own, else the one
+ *   `window.source_days` recorded for the source. The
+ *   window itself, provenance and `extra` belong to other parts of the card and are not
+ *   rendered here.
  *
  * Evidence comes from `../../test/fixtures`, either as the backend-shaped page items (C1 pause,
  * B1 increase) or built in the test for a single edge case. The component makes no request, so
@@ -23,10 +26,18 @@
  * compares each rendering with `formatMetric`, `formatSample` and `formatTestLine` from
  * `lib/format`, so those assertions restate no locale rule of their own.
  */
-import { render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { Baseline, Item, Metric, Sample, StatTest } from '../../api/types';
+import type {
+  Baseline,
+  DatasetCoverage,
+  Item,
+  Metric,
+  Sample,
+  SourceDay,
+  StatTest,
+} from '../../api/types';
 import * as formatModule from '../../lib/format';
 import { formatMetric, formatSample, formatTestLine } from '../../lib/format';
 import {
@@ -36,7 +47,8 @@ import {
   makeEvidence,
   makeRecommendationsPage,
 } from '../../test/fixtures';
-import { renderWithProviders } from '../../test/render';
+import { KEEP_SPACES, renderWithProviders } from '../../test/render';
+import { textWithoutTooltips } from '../../test/text';
 import {
   BASELINES_LABEL,
   DATASETS_LABEL,
@@ -45,9 +57,11 @@ import {
   NO_METRICS_MESSAGE,
   OTHER_BASELINES_LABEL,
   THRESHOLDS_LABEL,
+  evidenceRatioDigits,
   formatThresholdValue,
   pairBaselines,
 } from './EvidenceTable';
+import { metricHelp } from './metricHelp';
 
 // ---------------------------------------------------------------------------------------------
 // Helpers
@@ -76,13 +90,14 @@ function keysOf(list: readonly Baseline[]): string[] {
 
 /**
  * The text of every cell of the evidence table, row by row, header row first: row headers
- * (`<th>`) and cells (`<td>`) in document order.
+ * (`<th>`) and cells (`<td>`) in document order, as a browser shows them, so a metric label
+ * reads without its closed `Tooltip` help text.
  */
 function tableTexts(caption: string = DEFAULT_EVIDENCE_CAPTION): string[][] {
   const table = screen.getByRole('table', { name: caption });
   return within(table)
     .getAllByRole('row')
-    .map((row) => Array.from(row.querySelectorAll('th, td'), (cell) => cell.textContent));
+    .map((row) => Array.from(row.querySelectorAll('th, td'), textWithoutTooltips));
 }
 
 /** The text of each entry of the list named `name`. */
@@ -240,21 +255,21 @@ describe('EvidenceTable', () => {
     const rows = tableTexts();
     expect(rows[0]).toEqual(['Metric', 'Value', 'Baseline']);
     expect(rows).toHaveLength(evidence.metrics.length + 1);
-    expect(rows).toContainEqual(['Window spend', '$5,148.00', '—']);
+    expect(rows).toContainEqual(['Window spend', 'USD\u00a05,148.00', '—']);
     expect(rows).toContainEqual(['Window days', '28 days', '—']);
     expect(rows).toContainEqual(['Window conversions', '62.5', '—']);
-    expect(rows).toContainEqual(['Window utilization (spend vs cap)', '99%', '—']);
+    expect(rows).toContainEqual(['Window utilization (spend vs cap)', '99.0%', '—']);
     expect(rows).toContainEqual([
       'Cost per conversion',
-      '$82.37',
-      'Account cost per conversion (same source and objective): $95.00' +
-        'Highest cost per outcome allowed to scale: $95.00',
+      'USD\u00a082.37',
+      'Account cost per conversion (same source and objective): USD\u00a095.00' +
+        'Highest cost per outcome allowed to scale: USD\u00a095.00',
     ]);
 
     const costRow = screen.getByRole('rowheader', { name: 'Cost per conversion' }).closest('tr');
     expect(costRow).not.toBeNull();
     if (costRow !== null) {
-      expect(within(costRow).getAllByText('$95.00')).toHaveLength(2);
+      expect(within(costRow).getAllByText('USD 95.00')).toHaveLength(2);
     }
     // Every baseline sits in the table, so no list of unpaired baselines follows it.
     expect(screen.queryByRole('list', { name: OTHER_BASELINES_LABEL })).toBeNull();
@@ -298,7 +313,7 @@ describe('EvidenceTable', () => {
     });
     render(<EvidenceTable evidence={evidence} />);
 
-    expect(tableTexts()[1]).toEqual(['Click rate', '1.2%', 'Campaign click rate: 2%']);
+    expect(tableTexts()[1]).toEqual(['Click rate', '1.2%', 'Campaign click rate: 2.0%']);
     expect(listTexts(OTHER_BASELINES_LABEL)).toEqual([
       'Account conversions per click: 0.04946',
       'Tracking enabled: yes',
@@ -340,10 +355,10 @@ describe('EvidenceTable', () => {
     render(<EvidenceTable evidence={evidence} />);
 
     expect(listTexts(DATASETS_LABEL)).toEqual([
-      'google.metrics_daily: complete, covered through 2026-10-05',
-      'google.search_terms: incomplete, covered through 2026-10-03',
-      'hubspot.contacts: unknown, covered through unavailable',
-      'hubspot.meetings: unknown, covered through unavailable',
+      'google.metrics_daily: complete, covered through 2026-10-05 (Google day, America/New_York)',
+      'google.search_terms: incomplete, covered through 2026-10-03 (Google day, America/New_York)',
+      'hubspot.contacts: unknown',
+      'hubspot.meetings: unknown',
     ]);
   });
 
@@ -439,8 +454,8 @@ describe('EvidenceTable', () => {
     expect(tableTexts().slice(1)).toEqual([
       ['Qualified Leads', 'unavailable', '—'],
       ['MQL', '≥ 12', '—'],
-      ['Cost per Qualified Lead', '≤ €40.00', '—'],
-      ['segment_cpl', '€8.00', 'max_segment_cpl: unavailable'],
+      ['Cost per Qualified Lead', '≤ EUR\u00a040.00', '—'],
+      ['segment_cpl', 'EUR\u00a08.00', 'max_segment_cpl: unavailable'],
     ]);
     expect(screen.queryByText(/\bnull\b|\bundefined\b/)).toBeNull();
   });
@@ -474,8 +489,12 @@ describe('EvidenceTable', () => {
     render(<EvidenceTable evidence={evidence} />);
 
     expect(tableTexts().slice(1)).toEqual([
-      ['Spend (Google)', '$10.00', 'Account spend: $30.00Account spend, again: $40.00'],
-      ['Spend (LinkedIn)', '€20.00', '—'],
+      [
+        'Spend (Google)',
+        'USD\u00a010.00',
+        'Account spend: USD\u00a030.00Account spend, again: USD\u00a040.00',
+      ],
+      ['Spend (LinkedIn)', 'EUR\u00a020.00', '—'],
     ]);
     expect(listTexts(OTHER_BASELINES_LABEL)).toEqual(['Rate A: 0.1', 'Rate B: 0.2']);
     expect(listTexts(DATASETS_LABEL)).toHaveLength(2);
@@ -483,8 +502,11 @@ describe('EvidenceTable', () => {
   });
 
   it('leaves the window, provenance and extra to the rest of the card', () => {
+    // No dataset is listed, so no "Data used" date carries the window's day-boundary label and
+    // any boundary in the text would be the window itself.
     const evidence = makeEvidence({
       metrics: [metric('spend', 'Spend', '1', 'currency', { currency: 'USD' })],
+      datasets: [],
       extra: { proposed_status: 'paused' },
     });
     const { container } = render(<EvidenceTable evidence={evidence} />);
@@ -564,8 +586,8 @@ describe('EvidenceTable inside the app providers', () => {
       currency: spend.currency,
     });
     const spendRow = within(metricRow('Spend'));
-    expect(spendRow.getByText(formatMetric(spend))).toBeDefined();
-    expect(spendRow.getByText(spendBaseline)).toBeDefined();
+    expect(spendRow.getByText(formatMetric(spend), KEEP_SPACES)).toBeDefined();
+    expect(spendRow.getByText(spendBaseline, KEEP_SPACES)).toBeDefined();
     expect(metricCells('Spend').baseline.textContent).toBe(`Account spend: ${spendBaseline}`);
 
     const clickCells = metricCells('Clicks');
@@ -609,7 +631,10 @@ describe('EvidenceTable inside the app providers', () => {
     );
 
     expect(screen.getByText('Sample: 37 / 64 clicks')).toBeDefined();
-    expect(`Sample: ${formatSample(clickSample)}`).toBe('Sample: 37 / 64 clicks');
+    // The figure is joined by no-break spaces (U+00A0), so it never wraps inside "37 / 64";
+    // getByText above matches because Testing Library collapses them in the rendered text.
+    expect(`Sample: ${formatSample(clickSample)}`).toBe('Sample: 37\u00A0/\u00A064 clicks');
+    expect(screen.getByText(/^Sample: /u).textContent).toBe('Sample: 37\u00A0/\u00A064 clicks');
     first.unmount();
 
     const openSample: Sample = {
@@ -624,8 +649,11 @@ describe('EvidenceTable inside the app providers', () => {
     };
     await renderWithProviders(<EvidenceTable evidence={makeEvidence({ sample: openSample })} />);
 
-    const line = screen.getByText(`Sample: ${formatSample(openSample)}`);
-    expect(line.textContent).toMatch(/^Sample: \S+ \/ \S+ form opens · ≈ /);
+    // Testing Library normalises the rendered text but not a string matcher, so the line is
+    // found by its prefix and its exact text, no-break spaces included, compared after.
+    const line = screen.getByText(/^Sample: /u);
+    expect(line.textContent).toBe(`Sample: ${formatSample(openSample)}`);
+    expect(line.textContent).toMatch(/^Sample: \S+\u00A0\/\u00A0\S+ form opens · ≈ /u);
     expect(line.textContent).toContain('impressions (projected through the observed open rate)');
   });
 
@@ -657,7 +685,7 @@ describe('EvidenceTable inside the app providers', () => {
 
     expect(listTexts(THRESHOLDS_LABEL)).toEqual(['k1.min_clicks_floor = 10']);
     expect(listTexts(DATASETS_LABEL)).toEqual([
-      'google.search_terms: complete, covered through 2026-10-01',
+      'google.search_terms: complete, covered through 2026-10-01 (Google day, America/New_York)',
     ]);
   });
 
@@ -699,5 +727,481 @@ describe('EvidenceTable rendered again', () => {
     // A new caption renders too.
     rerender(<EvidenceTable evidence={changed} caption="Budget evidence" />);
     expect(tableTexts('Budget evidence')[1]).toEqual(['Spend', expected, '—']);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// "Data used" coverage dates and their day boundaries
+// ---------------------------------------------------------------------------------------------
+
+describe('EvidenceTable "Data used" coverage dates', () => {
+  /**
+   * One dataset entry as the backend freezes it: with the day boundary of its coverage date
+   * when `boundary` is given, else in the shape frozen before entries recorded one.
+   */
+  function dataset(
+    name: string,
+    coveredThrough: string | null,
+    completeness: DatasetCoverage['completeness'] = 'complete',
+    boundary?: string | null,
+  ): DatasetCoverage {
+    const entry: DatasetCoverage = { dataset: name, completeness, covered_through: coveredThrough };
+    return boundary === undefined ? entry : { ...entry, boundary };
+  }
+
+  /**
+   * Renders `datasets` in evidence whose window records `sourceDays` (the fixture's Google
+   * `America/New_York` and LinkedIn `UTC` entries by default) and returns the "Data used"
+   * entries.
+   */
+  function dataUsed(
+    datasets: DatasetCoverage[],
+    sourceDays: SourceDay[] = makeEvidence().window.source_days,
+  ): string[] {
+    const base = makeEvidence();
+    const evidence = makeEvidence({
+      datasets,
+      window: { ...base.window, source_days: sourceDays },
+    });
+    render(<EvidenceTable evidence={evidence} />);
+    return listTexts(DATASETS_LABEL);
+  }
+
+  it("labels a Google date with the Google day boundary the item's window recorded", () => {
+    expect(dataUsed([dataset('google.metrics_daily', '2026-10-10')])).toEqual([
+      'google.metrics_daily: complete, covered through 2026-10-10 (Google day, America/New_York)',
+    ]);
+  });
+
+  it('takes the boundary from the evidence window, never from a client constant', () => {
+    const berlin: SourceDay = {
+      source: 'google',
+      start: '2026-09-13',
+      end: '2026-10-10',
+      boundary: 'Europe/Berlin',
+    };
+    expect(dataUsed([dataset('google.search_terms', '2026-10-10')], [berlin])).toEqual([
+      'google.search_terms: complete, covered through 2026-10-10 (Google day, Europe/Berlin)',
+    ]);
+  });
+
+  it('labels a LinkedIn date with its UTC day boundary', () => {
+    expect(dataUsed([dataset('linkedin.analytics_daily', '2026-10-09', 'incomplete')])).toEqual([
+      'linkedin.analytics_daily: incomplete, covered through 2026-10-09 (LinkedIn day, UTC)',
+    ]);
+  });
+
+  it('labels a HubSpot date with the UTC boundary its entry recorded, as /sources does', () => {
+    // HubSpot holds instants, so `source_days` never lists it: the entry carries its boundary.
+    expect(
+      dataUsed([
+        dataset('hubspot.contacts', '2026-10-10', 'complete', 'UTC'),
+        dataset('hubspot.deal_search', '2026-10-09', 'incomplete', 'UTC'),
+      ]),
+    ).toEqual([
+      'hubspot.contacts: complete, covered through 2026-10-10 (HubSpot day, UTC)',
+      'hubspot.deal_search: incomplete, covered through 2026-10-09 (HubSpot day, UTC)',
+    ]);
+  });
+
+  it("takes the entry's own boundary over the one the window recorded for its source", () => {
+    expect(
+      dataUsed([
+        dataset('google.metrics_daily', '2026-10-10', 'complete', ' Europe/Berlin '),
+        dataset('linkedin.leads', '2026-10-10', 'complete', 'Asia/Tokyo'),
+      ]),
+    ).toEqual([
+      'google.metrics_daily: complete, covered through 2026-10-10 (Google day, Europe/Berlin)',
+      'linkedin.leads: complete, covered through 2026-10-10 (LinkedIn day, Asia/Tokyo)',
+    ]);
+  });
+
+  it("falls back to the window's boundary when the entry records none or a blank one", () => {
+    // Evidence frozen before entries recorded a boundary omits the key; the API sends `null`.
+    expect(
+      dataUsed([
+        dataset('google.metrics_daily', '2026-10-10'),
+        dataset('google.search_terms', '2026-10-10', 'complete', null),
+        dataset('linkedin.leads', '2026-10-10', 'complete', '  '),
+      ]),
+    ).toEqual([
+      'google.metrics_daily: complete, covered through 2026-10-10 (Google day, America/New_York)',
+      'google.search_terms: complete, covered through 2026-10-10 (Google day, America/New_York)',
+      'linkedin.leads: complete, covered through 2026-10-10 (LinkedIn day, UTC)',
+    ]);
+  });
+
+  it('names the HubSpot day without a zone on evidence frozen without a boundary', () => {
+    // An older entry has no boundary, and the window lists none for HubSpot: no zone is guessed.
+    expect(
+      dataUsed([
+        dataset('hubspot.contacts', '2026-10-10'),
+        dataset('hubspot.associations', '2026-10-10', 'complete', null),
+      ]),
+    ).toEqual([
+      'hubspot.contacts: complete, covered through 2026-10-10 (HubSpot day)',
+      'hubspot.associations: complete, covered through 2026-10-10 (HubSpot day)',
+    ]);
+  });
+
+  it("names the source's day without a zone when its window entry has a blank boundary", () => {
+    const linkedinOnly = makeEvidence().window.source_days.filter(
+      (day) => day.source === 'linkedin',
+    );
+    const blankGoogle: SourceDay = {
+      source: 'google',
+      start: '2026-09-13',
+      end: '2026-10-10',
+      boundary: '  ',
+    };
+    expect(
+      dataUsed(
+        [dataset('google.metrics_daily', '2026-10-10'), dataset('linkedin.leads', '2026-10-10')],
+        [blankGoogle, ...linkedinOnly],
+      ),
+    ).toEqual([
+      'google.metrics_daily: complete, covered through 2026-10-10 (Google day)',
+      'linkedin.leads: complete, covered through 2026-10-10 (LinkedIn day, UTC)',
+    ]);
+  });
+
+  it('leaves out the coverage clause when no date was recorded', () => {
+    const entries = dataUsed([
+      dataset('google.entities', null),
+      dataset('linkedin.entities', '   ', 'unknown'),
+    ]);
+
+    expect(entries).toEqual(['google.entities: complete', 'linkedin.entities: unknown']);
+    for (const entry of entries) {
+      expect(entry).not.toContain('covered through');
+      expect(entry).not.toContain('unavailable');
+    }
+  });
+
+  it('shows the date as stored, unlabelled, when the dataset names no known source', () => {
+    expect(
+      dataUsed([
+        dataset('meta.ads_daily', '2026-10-10'),
+        dataset('constructor.daily', '2026-10-10'),
+        dataset('google', '2026-10-10'),
+        dataset('.metrics_daily', '2026-10-10'),
+      ]),
+    ).toEqual([
+      'meta.ads_daily: complete, covered through 2026-10-10',
+      'constructor.daily: complete, covered through 2026-10-10',
+      'google: complete, covered through 2026-10-10',
+      '.metrics_daily: complete, covered through 2026-10-10',
+    ]);
+  });
+
+  it('keeps the stored calendar date, never shifting it into another zone', () => {
+    // Parsing "2026-10-10" as UTC midnight and formatting it in Pacific/Honolulu (UTC-10) would
+    // read 2026-10-09: the stored date passes through untouched, only trimmed.
+    const honolulu: SourceDay = {
+      source: 'google',
+      start: '2026-09-13',
+      end: '2026-10-10',
+      boundary: 'Pacific/Honolulu',
+    };
+    expect(dataUsed([dataset('google.metrics_daily', ' 2026-10-10 ')], [honolulu])).toEqual([
+      'google.metrics_daily: complete, covered through 2026-10-10 (Google day, Pacific/Honolulu)',
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Unpaired baselines that record their own unit and currency
+// ---------------------------------------------------------------------------------------------
+
+describe('EvidenceTable unpaired baselines in their own unit and currency', () => {
+  /** C1's pause card: no metric is a cost per outcome, so its baseline pairs with none. */
+  const pauseMetrics: Metric[] = [
+    metric('spend', 'Window spend', '1519.463320', 'currency', { currency: 'USD' }),
+    metric('spend_days', 'Days with spend', 28, 'days'),
+    metric('outcomes', 'Window conversions', 0, 'conversions'),
+  ];
+  const label = 'Account cost per conversion (same source and objective)';
+
+  /** The C1 baseline as the backend now freezes it: unit `currency` and the account currency. */
+  function moneyBaseline(value: Baseline['value'], currency: string | null): Baseline {
+    return { key: 'baseline_cost_per_outcome', label, value, unit: 'currency', currency };
+  }
+
+  /** The text of the one entry under "Baselines", after checking nothing paired. */
+  function unpairedEntry(baselines: Baseline[]): string | null | undefined {
+    render(<EvidenceTable evidence={makeEvidence({ metrics: pauseMetrics, baselines })} />);
+    expect(screen.queryByRole('list', { name: OTHER_BASELINES_LABEL })).toBeNull();
+    const entries = listTexts(BASELINES_LABEL);
+    expect(entries).toHaveLength(baselines.length);
+    return entries[0];
+  }
+
+  it('shows an unpaired money baseline in its account currency, not as a raw decimal', () => {
+    expect(unpairedEntry([moneyBaseline('37.986583', 'USD')])).toBe(`${label}: USD\u00a037.99`);
+  });
+
+  it('formats it exactly as formatMetric formats a metric of that unit and currency', () => {
+    const recorded = moneyBaseline('412.505000', 'EUR');
+    expect(unpairedEntry([recorded])).toBe(
+      `${label}: ${formatMetric({ value: '412.505000', unit: 'currency', currency: 'EUR' })}`,
+    );
+    expect(screen.getByText(/412\.5/).textContent).toContain('EUR\u00a0');
+  });
+
+  it('keeps a zero-denominator "—" and an unavailable money baseline as they are', () => {
+    expect(unpairedEntry([moneyBaseline('—', 'USD'), moneyBaseline(null, 'USD')])).toBe(
+      `${label}: —`,
+    );
+    expect(listTexts(BASELINES_LABEL)[1]).toBe(`${label}: unavailable`);
+  });
+
+  it('formats a baseline with a unit and no currency in that unit', () => {
+    const share: Baseline = {
+      key: 'account_share',
+      label: 'Account share',
+      value: '0.25',
+      unit: 'ratio',
+      currency: null,
+    };
+    const expected = formatMetric({ value: '0.25', unit: 'ratio' });
+    expect(unpairedEntry([share])).toBe(`Account share: ${expected}`);
+    expect(expected).toBe('25%');
+  });
+
+  it('keeps six recorded places for a baseline with no unit, as frozen runs and K1 hold', () => {
+    const frozen = baseline('baseline_cost_per_outcome', label, '37.986583');
+    const rate: Baseline = {
+      key: 'baseline_rate',
+      label: 'Account conversions per click',
+      value: '0.04946',
+      unit: null,
+      currency: null,
+    };
+    const blank: Baseline = {
+      key: 'blank_unit',
+      label: 'Blank unit',
+      value: '0.123456',
+      unit: ' ',
+      currency: '',
+    };
+    expect(unpairedEntry([frozen, rate, blank])).toBe(`${label}: 37.986583`);
+    expect(listTexts(BASELINES_LABEL).slice(1)).toEqual([
+      'Account conversions per click: 0.04946',
+      'Blank unit: 0.123456',
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Metric help (AAP 0.4.2 "Help text on metrics": the Tooltip wrapper)
+// ---------------------------------------------------------------------------------------------
+
+describe('EvidenceTable metric help', () => {
+  const idle = metric('idle_days', 'Known idle days', 3, 'days');
+  const spend = metric('spend', 'Window spend', '120.00', 'currency', { currency: 'USD' });
+
+  /** The parts of the tooltip in the row header named `label`. */
+  function helpParts(label: string): {
+    header: HTMLElement;
+    wrapper: HTMLElement;
+    trigger: HTMLElement;
+    bubble: HTMLElement;
+  } {
+    const header = screen.getByRole('rowheader', { name: label });
+    const wrapper = header.querySelector<HTMLElement>(':scope > .ds-tooltip');
+    const trigger = wrapper?.querySelector<HTMLElement>(':scope > .ds-tooltip__trigger');
+    const describedBy = trigger?.getAttribute('aria-describedby') ?? '';
+    const bubble = describedBy === '' ? null : document.getElementById(describedBy);
+    if (wrapper === null || trigger === undefined || trigger === null || bubble === null) {
+      throw new Error(`the row header "${label}" has no tooltip`);
+    }
+    return { header, wrapper, trigger, bubble };
+  }
+
+  it('wraps a metric label that has help in a focusable Tooltip trigger described by its help', () => {
+    render(<EvidenceTable evidence={makeEvidence({ metrics: [idle, spend] })} />);
+
+    const { header, trigger, bubble } = helpParts('Known idle days');
+    expect(trigger.textContent).toBe('Known idle days');
+    expect(trigger.tabIndex).toBe(0);
+    // aria-describedby resolves to the role="tooltip" bubble holding the metric's help text.
+    expect(bubble.getAttribute('role')).toBe('tooltip');
+    expect(bubble.textContent).toBe(metricHelp('idle_days'));
+    expect(bubble.hidden).toBe(true);
+    expect(header.contains(bubble)).toBe(true);
+    // The help describes the label; the row header is still named by the label alone.
+    expect(screen.getByRole('rowheader', { name: 'Known idle days' })).toBe(header);
+    expect(textWithoutTooltips(header)).toBe('Known idle days');
+  });
+
+  it('shows the help while the label is hovered or focused, and Escape hides it', () => {
+    render(<EvidenceTable evidence={makeEvidence({ metrics: [idle] })} />);
+    const { wrapper, trigger, bubble } = helpParts('Known idle days');
+
+    fireEvent.mouseEnter(wrapper);
+    expect(bubble.hidden).toBe(false);
+    fireEvent.keyDown(document.body, { key: 'Escape' });
+    expect(bubble.hidden).toBe(true);
+    fireEvent.mouseLeave(wrapper);
+
+    act(() => {
+      trigger.focus();
+    });
+    expect(document.activeElement).toBe(trigger);
+    expect(bubble.hidden).toBe(false);
+    fireEvent.keyDown(trigger, { key: 'Escape' });
+    expect(bubble.hidden).toBe(true);
+    // Escape hides the help without moving focus.
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it('renders a metric without help as its plain label, with no tooltip or extra focus stop', () => {
+    render(<EvidenceTable evidence={makeEvidence({ metrics: [idle, spend] })} />);
+
+    const header = screen.getByRole('rowheader', { name: 'Window spend' });
+    expect(metricHelp('spend')).toBeUndefined();
+    expect(header.textContent).toBe('Window spend');
+    expect(header.querySelector('.ds-tooltip')).toBeNull();
+    expect(header.querySelector('[tabindex]')).toBeNull();
+    expect(within(header).queryByRole('tooltip', { hidden: true })).toBeNull();
+  });
+
+  it('keys the help on the metric key, so a blank-labelled metric shows its key with the help', () => {
+    const unknown = metric('not_a_metric', 'Custom count', 2, 'days');
+    const blank = metric('idle_days', '  ', 4, 'days');
+    render(<EvidenceTable evidence={makeEvidence({ metrics: [unknown, blank] })} />);
+
+    expect(screen.getByRole('rowheader', { name: 'Custom count' }).textContent).toBe(
+      'Custom count',
+    );
+    const { trigger, bubble } = helpParts('idle_days');
+    expect(trigger.textContent).toBe('idle_days');
+    expect(bubble.textContent).toBe(metricHelp('idle_days'));
+  });
+
+  it('gives every metric with help its own tooltip, so each label is described by its own help', () => {
+    const known = metric('known_days', 'Known-budget days', 9, 'days');
+    render(<EvidenceTable evidence={makeEvidence({ metrics: [known, idle, spend] })} />);
+
+    const bubbles = screen.getAllByRole('tooltip', { hidden: true });
+    expect(bubbles.map((bubble) => bubble.textContent)).toEqual([
+      metricHelp('known_days'),
+      metricHelp('idle_days'),
+    ]);
+    expect(new Set(bubbles.map((bubble) => bubble.id)).size).toBe(2);
+    expect(helpParts('Known-budget days').bubble).toBe(bubbles[0]);
+    expect(helpParts('Known idle days').bubble).toBe(bubbles[1]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// EvidenceTable ratio precision: one fixed precision for every percentage of the table
+// ---------------------------------------------------------------------------------------------
+
+describe('EvidenceTable ratio precision', () => {
+  /** A CR1 pair's evidence as `creative._pair_candidate` writes it. */
+  const pairEvidence = makeEvidence({
+    metrics: [
+      metric('rate_a', 'Variant A lead rate', '0.000722', 'ratio'),
+      metric('rate_b', 'Variant B lead rate', '0.000698', 'ratio'),
+      metric('leads_a', 'Variant A leads', 13, 'leads'),
+      metric('impressions_a', 'Variant A impressions', 18000, 'impressions'),
+    ],
+  });
+
+  /** A CR3 item's stage evidence (`creative._test_candidate`) with the QA run's figures. */
+  const stageEvidence = makeEvidence({
+    metrics: [
+      metric('click_rate', 'Click rate', '0.007501', 'ratio'),
+      metric('open_rate', 'Open rate', '0.004107', 'ratio'),
+      metric('open_rate_ci_low', 'Open rate interval low', '0.003937', 'ratio'),
+      metric('open_rate_ci_high', 'Open rate interval high', '0.004278', 'ratio'),
+      metric('completion_rate', 'Completion rate', '0.111748', 'ratio'),
+      metric('sample_per_variant', 'Impressions per variant for the next test', 52000, 'impressions'),
+    ],
+    baselines: [
+      baseline('click_rate_baseline', 'Account click rate baseline', '0.008120'),
+      baseline('open_rate_baseline', 'Account open rate baseline', '0.005547'),
+      baseline('completion_rate_baseline', 'Account completion rate baseline', '0.119287'),
+    ],
+  });
+
+  /** The Value column's text, top to bottom. */
+  function valueColumn(): string[] {
+    return tableTexts()
+      .slice(1)
+      .map((row) => row[1] ?? '');
+  }
+
+  it('keeps CR1 lead rates of 0.000722 and 0.000698 apart instead of "0.1%" twice', () => {
+    render(<EvidenceTable evidence={pairEvidence} />);
+
+    expect(valueColumn()).toEqual(['0.072%', '0.070%', '13', '18,000']);
+    expect(evidenceRatioDigits(pairEvidence)).toBe(3);
+  });
+
+  it('keeps a stage rate apart from its baseline and its interval bounds apart', () => {
+    render(<EvidenceTable evidence={stageEvidence} />);
+
+    // Every percentage of the table, value or baseline, at the same two places.
+    expect(valueColumn()).toEqual(['0.75%', '0.41%', '0.39%', '0.43%', '11.17%', '52,000']);
+    expect(metricCells('Click rate').baseline.textContent).toBe(
+      'Account click rate baseline: 0.81%',
+    );
+    expect(metricCells('Open rate').baseline.textContent).toBe(
+      'Account open rate baseline: 0.55%',
+    );
+    expect(metricCells('Completion rate').baseline.textContent).toBe(
+      'Account completion rate baseline: 11.93%',
+    );
+  });
+
+  it('pads every percentage of the table to one precision, leaving other units alone', () => {
+    const evidence = makeEvidence({
+      metrics: [
+        metric('window_utilization', 'Window utilization (spend vs cap)', '0.99', 'ratio'),
+        metric('spending_day_share', 'Share of known-budget days with spend', '1', 'ratio'),
+        metric('capped_days_share', 'Share of known-budget days that are capped', '0.5', 'ratio'),
+        metric('spend', 'Window spend', '5148.00', 'currency', { currency: 'USD' }),
+        metric('known_days', 'Known-budget days', 26, 'days'),
+        metric('utilization_text', 'Lifetime utilization', 'n/a', 'ratio'),
+      ],
+    });
+    render(<EvidenceTable evidence={evidence} />);
+
+    expect(valueColumn()).toEqual([
+      '99.0%',
+      '100.0%',
+      '50.0%',
+      'USD\u00a05,148.00',
+      '26 days',
+      'n/a',
+    ]);
+  });
+
+  it('counts paired baselines toward the precision, but not unpaired ones', () => {
+    const evidence = makeEvidence({
+      metrics: [metric('share', 'Share', '0.5', 'ratio')],
+      baselines: [
+        baseline('share_baseline', 'Account share', '0.5004'),
+        baseline('baseline_rate', 'Account conversions per click', '0.0000001'),
+      ],
+    });
+    render(<EvidenceTable evidence={evidence} />);
+
+    // 50% and 50.04% both read "50.0%" at one place, so the table takes two.
+    expect(evidenceRatioDigits(evidence)).toBe(2);
+    expect(metricCells('Share').value.textContent).toBe('50.00%');
+    expect(metricCells('Share').baseline.textContent).toBe('Account share: 50.04%');
+    expect(evidenceRatioDigits({ ...evidence, baselines: [] })).toBe(1);
+  });
+
+  it('formats each value as formatMetric does at the evidence digits', () => {
+    render(<EvidenceTable evidence={stageEvidence} />);
+
+    const ratioDigits = evidenceRatioDigits(stageEvidence);
+    expect(valueColumn()).toEqual(
+      stageEvidence.metrics.map((entry) => formatMetric(entry, { ratioDigits })),
+    );
   });
 });

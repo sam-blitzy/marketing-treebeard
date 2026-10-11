@@ -454,6 +454,10 @@ acting on zero-outcome rules". For that source, `K1`, `C1`, the zero-outcome bra
     `incomplete_dataset` finding per incomplete dataset it uses. A `google.search_terms` shortfall
     at the Q-G6 result limit names its days, so it counts only when the window includes one of
     them, and the flag and the finding name only those days.
+  - A section left with no item gets one `incomplete_dataset` finding, with `items` 0, for each
+    dataset its rules read that is not `complete` over the run's window, so its empty state
+    says why: a custom window ending before the backfill, for example. A dataset whose source
+    has no active dataset gives the reason "no active {source} dataset".
   - A successful sync of one dataset never clears the flag of another.
 - **P5 short window**: the `short_window` flag on every item and the short-window banner when the
   window is below `window.trusted_min_days` (default 14).
@@ -567,7 +571,7 @@ finding.
 - **Reason and extra output**: wasted spend (= spend), clicks, conversions, the matched keyword
   and n\*, against the account rate, the account cost per conversion and the spend floor (the
   `min_spend` baseline: `k1.min_spend_cpa_multiple` × the account cost per conversion, rounded
-  half-even at the minor unit like the spend): "Spent {spend} over {days} days with 0
+  half up at the minor unit like the spend): "Spent {spend} over {days} days with 0
   conversions across {clicks} clicks, at or above the minimum of {n\*} clicks for the account's
   conversion rate of {r} (conversions ÷ clicks), and {spend gate}." At the default multiple of
   1 the spend gate reads "at least 1x the account cost/conversion of {cost per conversion}";
@@ -690,8 +694,12 @@ listed below as "the CRM datasets".
   current platform state as the baseline decision (`origin=baseline`) for every campaign and
   every shared budget, each in its own decision shape.
 - **Action**: "Resolve: platform shows {platform}, last decided {decided}". Values render as, for
-  example, "daily budget USD 50.00", "shared budget 123", "not returned by the platform", "no
-  decision recorded" or "removed (acknowledged)". An `awaiting_platform` item adds "Awaiting a
+  example, "Paused", "daily budget USD 50.00", "Active · daily budget USD 400.00", "shared
+  budget 123", "status not reported", "not returned by the platform", "no decision recorded",
+  "Removal acknowledged · Ended" (a campaign) or "Removal acknowledged" (a shared budget): the
+  status labels, money style and " · " joins the `/decisions` resolver shows for the same
+  discrepancy, so both screens word a value alike. An amount keeps every significant digit up
+  to one micro ("daily budget USD 50.000001"). An `awaiting_platform` item adds "Awaiting a
   matching platform snapshot."
 - **Reason and extra output**: the `platform` and `decided` metrics side by side, followed by
   the headline `held_recommendations`, which precedence appends once every hold is final
@@ -1596,11 +1604,11 @@ recommendation showed. The shape is the `Evidence` schema of `GET /api/v1/recomm
 |-------|---------|
 | `window` | `start`, `end`, `days` and `source_days`: each source's `start`, `end` and day `boundary`; `boundaries_differ`, whether those boundaries differ; `description`, each source's range and boundary as one sentence |
 | `metrics[]` | Every number the reason cites: `key`, `label`, `value`, `unit`, optional `currency`, `floor` (renders "≥ N" or "≤ X") and `unavailable` (renders "unavailable", never 0) |
-| `baselines[]` | `key`, `label`, `value` of what the metrics were compared against |
+| `baselines[]` | `key`, `label`, `value` of what the metrics were compared against, plus optional `unit` and `currency`. `C1`, `C1b` and `C2` record their cost-per-outcome baselines with unit `currency` and the account currency, so `C1`'s and `C1b`'s, which no metric of the card pairs with, still show in the account currency. A baseline without a `unit` is shown in the unit of the metric it pairs with or, unpaired, as the six-place decimal it was recorded at |
 | `sample` | `observed`, `required` and `unit` in the rule's own unit, with an optional labelled `projected` (`value`, `unit`, `basis`) |
 | `test` | `name`, `p_value`, optional `p_adjusted` and `alpha`, where a statistical test was used |
 | `thresholds` | `{dotted key: configured value}` for every threshold the rule applied |
-| `datasets[]` | Each required dataset with its `completeness` and `covered_through` at compute time |
+| `datasets[]` | Each required dataset with its `completeness` and `covered_through` at compute time, plus an optional `boundary`: the time zone whose midnight ends `covered_through`, recorded with every coverage date. Google and LinkedIn datasets record the boundary the window lists for their source in `source_days`. HubSpot datasets record `UTC`, because HubSpot's sync jobs record their coverage as UTC dates and the window lists no HubSpot day. A dataset without a `boundary` shows its date with the boundary `source_days` lists for its source, or with the source's day alone |
 | `provenance[]` | `source`, `dataset_id`, `mode` and `role` of every dataset read, frozen at compute time and never replaced by the current source status |
 | `extra` | Rule-specific detail: `headline_metric` on every card (see [Headline number](#headline-number)), `rows` for white papers, `adjacent_terms` for `K2`, `resolutions` for `C0`, `funding` and `allocations` for `B1` and `B3`, `next_test` for `CR3`, `members` for shared budgets |
 
@@ -1673,7 +1681,7 @@ A finding is a non-action observation shown at the top of its section.
 | `pipeline_unavailable` | `C1`, `C1b`, `C2`, white paper attribution | The pipeline is unavailable for an entity, with the reason |
 | `skipped_stage` | White paper attribution | Contacts skipped a bound stage and are not counted |
 | `conversion_tracking_absent` | P2 | A source spent with zero outcomes; zero-outcome rules suppressed |
-| `incomplete_dataset` | P4 | A dataset a section uses is not complete over the window. `evidence.items` counts the section's stored items that read it incomplete (held and `C0` items included), after `G1`, P2 and feedback suppression, and `evidence.reasons` cites only reasons those items have. With no such item left, `items` is 0 and the reasons stay |
+| `incomplete_dataset` | P4 | A dataset a section uses is not complete over the window. `evidence.items` counts the section's stored items that read it incomplete (held and `C0` items included), after `G1`, P2 and feedback suppression, and `evidence.reasons` cites only reasons those items have. With no such item left, `items` is 0 and the reasons stay. A section with no stored item also gets one, with `items` 0, for each dataset its rules read that is not complete over the window ("no active {source} dataset" when its source has none) |
 
 ### Banners
 
@@ -1684,8 +1692,8 @@ Global banners are built from the run plus the read-time overlay, in this fixed 
 | `open_discrepancies` | critical (the only `alert` banner) | The live count of unresolved discrepancies, linking to Campaigns → Discrepancies |
 | `tracking_absent` | warning | A source with spend and no recorded outcomes (P2) |
 | `simulated_sources` | info | Each simulated source with its reason (P3) |
-| `stale_datasets` | warning | Datasets that are stale now |
-| `incomplete_datasets` | warning | Datasets that are not complete |
+| `stale_datasets` | warning | Datasets that are stale now. Every dataset of a source with no active dataset is listed, named together with the source's status and reason when the status is not `ok` and a reason is recorded |
+| `incomplete_datasets` | warning | Datasets that are not complete. Every dataset of a source with no active dataset is listed, named together as having none |
 | `short_window` | warning | "Window of {days} days is below the {trusted_min_days}-day trusted minimum" (P5); a one-day window reads "Window of 1 day …" |
 
 ### Withheld lines and suppression counts

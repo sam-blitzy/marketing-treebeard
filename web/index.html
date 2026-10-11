@@ -3,7 +3,7 @@
   Vite entry document for the Ads Action Engine SPA. It holds markup only: nginx serves the app
   with Content-Security-Policy default-src 'self', so no inline script, inline style, style
   attribute or external resource belongs here. src/main.tsx imports the global styles (tokens.css
-  first) and renders the app into #root.
+  first) and renders the app into #root; a static loading screen after #root covers the wait.
 -->
 <html lang="en">
   <head>
@@ -14,6 +14,48 @@
   </head>
   <body>
     <div id="root"></div>
+    <!--
+      Static loading screen, painted before the bundle runs: the design-system PageShell frame
+      with the product's TopBar, the "Primary" SideNav and a Spinner whose label is shown. The
+      build links the entry stylesheet in <head>, so it paints styled. It is class names, text
+      and one link only, mirroring PageShell.tsx, TopBar.tsx, SideNav.tsx and Spinner.tsx (whose
+      stylesheets note this copy, and PageShell.test.tsx compares them). Plain divs stand in for
+      <header> and <main>, which the app renders itself. Before the app runs, nothing knows
+      whether the visitor is signed in or which screen is loading, so the SideNav holds the one
+      link the router's screens of unknown session show, "Sign in" to /login, never marked
+      current, because this static document cannot know the path.
+
+      It sits after #root rather than inside it: React empties #root on its first render, and the
+      router presents nothing until its first screen or its own pending screen, so markup inside
+      #root would leave a blank page in between. PageShell.css hides this screen once #root has
+      any content, so #root stays written as an empty element, without even whitespace.
+    -->
+    <div class="ds-pageshell ds-pageshell--boot">
+      <div class="ds-pageshell__header">
+        <div class="ds-topbar">
+          <span class="ds-topbar__product">Ads Action Engine</span>
+        </div>
+      </div>
+      <div class="ds-pageshell__body">
+        <div class="ds-pageshell__sidenav">
+          <nav class="ds-sidenav" aria-label="Primary">
+            <ul class="ds-sidenav__list">
+              <li class="ds-sidenav__item">
+                <a href="/login" class="ds-sidenav__link">
+                  <span class="ds-sidenav__label">Sign in</span>
+                </a>
+              </li>
+            </ul>
+          </nav>
+        </div>
+        <div class="ds-pageshell__main">
+          <span role="status" class="ds-spinner ds-spinner--labelled">
+            <span class="ds-spinner__circle" aria-hidden="true"></span>
+            <span class="ds-spinner__label">Loading Ads Action Engine</span>
+          </span>
+        </div>
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

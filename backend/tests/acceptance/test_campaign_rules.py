@@ -1753,6 +1753,12 @@ def test_c1_fires_at_three_expected_outcomes_and_not_at_two_point_nine(
     spend = cast(Decimal, metrics["spend"])
     (baseline,) = item.evidence.baselines
     assert baseline.key == "baseline_cost_per_outcome"
+    # No metric pairs with the baseline, so it is money in the spend's account currency itself.
+    assert (baseline.unit, baseline.currency) == (
+        "currency",
+        item.evidence.metric("spend").currency,
+    )
+    assert baseline.currency is not None
     # Expected outcomes = spend at the account's baseline cost per outcome (AAP 0.5.4.1).
     assert abs(spend / cast(Decimal, baseline.value) - expected) < Decimal("0.0001")
     assert item.rank_key == (-spend,)
@@ -1883,6 +1889,12 @@ def test_c1b_fires_on_twenty_eligible_contacts_without_ql_or_meetings(
     assert {"spend", "outcomes", "expected_outcomes", "ql"} <= set(metrics)
     (baseline,) = item.evidence.baselines
     assert baseline.key == "baseline_cost_per_outcome"
+    # No metric pairs with the baseline, so it is money in the spend's account currency itself.
+    assert (baseline.unit, baseline.currency) == (
+        "currency",
+        item.evidence.metric("spend").currency,
+    )
+    assert baseline.currency is not None
     spend = cast(Decimal, metrics["spend"])
     expected = cast(Decimal, metrics["expected_outcomes"])
     assert abs(spend / cast(Decimal, baseline.value) - expected) < Decimal("0.0001")

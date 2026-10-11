@@ -30,6 +30,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import UTC
 from decimal import Context, Decimal, InvalidOperation
+from types import MappingProxyType
 from typing import Any, Final, get_args
 
 from ads_engine.analysis.context import (
@@ -55,6 +56,8 @@ __all__ = [
     "NOT_RETURNED_TEXT",
     "NO_DECISION_TEXT",
     "RESOLUTION_ORDER",
+    "STATUS_LABELS",
+    "STATUS_NOT_REPORTED_TEXT",
     "TOMBSTONE_TEXT",
     "UNAVAILABLE_TEXT",
     "evaluate",
@@ -92,8 +95,27 @@ NOT_RETURNED_TEXT: Final = "not returned by the platform"
 NO_DECISION_TEXT: Final = "no decision recorded"
 """The decided side of an ``untracked`` discrepancy before an intended state is recorded."""
 
-TOMBSTONE_TEXT: Final = "removed (acknowledged)"
-"""A decided state written by ``acknowledge_removal``."""
+TOMBSTONE_TEXT: Final = "Removal acknowledged"
+"""A decided state written by ``acknowledge_removal``; a campaign's adds its status label."""
+
+STATUS_LABELS: Final[Mapping[str, str]] = MappingProxyType(
+    {"active": "Active", "paused": "Paused", "ended": "Ended"}
+)
+"""The label of each normalised campaign status.
+
+The web client's decision log, decision form and discrepancy resolver show the same labels, so
+a value reads alike on ``/actions`` and ``/decisions``.
+"""
+
+STATUS_NOT_REPORTED_TEXT: Final = "status not reported"
+"""A side whose status is absent, worded as the web client's decision screens word it."""
+
+_PART_SEPARATOR: Final = " · "
+"""Joins the parts of one state (status, then each amount or the assignment), as the web
+client's decision screens join them."""
+
+_TOMBSTONE_STATUS: Final = "ended"
+"""The status ``acknowledge_removal`` writes on a campaign, shown when a tombstone carries none."""
 
 _AWAITING_SUFFIX: Final = " Awaiting a matching platform snapshot."
 """Appended to the reason of an ``awaiting_platform`` discrepancy."""
@@ -190,7 +212,8 @@ def _format_amount(amount: Decimal, currency: str | None) -> str:
     The amount shows at least the currency's minor-unit places (two for USD, none for JPY) and
     more when it has significant digits beyond them, up to one micro. A Google budget that
     differs by one micro therefore never renders as two identical amounts: C0 has no
-    tolerance, and rounding for display must not hide the mismatch it reports.
+    tolerance, and rounding for display must not hide the mismatch it reports. The web client's
+    ``formatExactMoney`` (``web/src/lib/format.ts``) renders the same text on ``/decisions``.
     """
     minor = _DEFAULT_MINOR_UNIT if currency is None else minor_unit_exponent(currency)
     exponent = amount.normalize(_EXACT).as_tuple().exponent
@@ -202,11 +225,30 @@ def _format_amount(amount: Decimal, currency: str | None) -> str:
 
 
 def _status_text(value: Mapping[str, Any]) -> str:
-    """Render the normalised status (``active``, ``paused``, ``ended``) of a value."""
+    """Render a value's normalised status by its :data:`STATUS_LABELS` label (``Paused``).
+
+    A status outside that vocabulary is shown as sent rather than mislabelled; an absent or
+    blank one is :data:`STATUS_NOT_REPORTED_TEXT`.
+    """
     status = value.get("status")
     if isinstance(status, str) and status.strip():
-        return status.strip()
-    return f"status {UNAVAILABLE_TEXT}"
+        text = status.strip()
+        return STATUS_LABELS.get(text, text)
+    return STATUS_NOT_REPORTED_TEXT
+
+
+def _tombstone_text(shape: DecisionShape, value: Mapping[str, Any]) -> str:
+    """Render a decided state written by ``acknowledge_removal``.
+
+    A shared budget has no status, so its tombstone is :data:`TOMBSTONE_TEXT` alone; a
+    campaign's adds its status label, ``ended`` unless the value names another:
+    "Removal acknowledged · Ended", as the decision log on ``/decisions`` words the decision.
+    """
+    if shape == "budget":
+        return TOMBSTONE_TEXT
+    status = value.get("status")
+    shown = value if isinstance(status, str) and status.strip() else {"status": _TOMBSTONE_STATUS}
+    return _PART_SEPARATOR.join((TOMBSTONE_TEXT, _status_text(shown)))
 
 
 def _has_assignment(value: Mapping[str, Any]) -> bool:
@@ -264,7 +306,7 @@ def _money_text(value: Mapping[str, Any], currency: str | None) -> str:
     if total is not None:
         parts.append(f"total budget {_format_amount(total, code)}")
     if parts:
-        return ", ".join(parts)
+        return _PART_SEPARATOR.join(parts)
     reported = value.get("daily_budget") is not None or value.get("total_budget") is not None
     if "amount_micros" in value or reported:
         return f"budget {UNAVAILABLE_TEXT}"
@@ -279,23 +321,33 @@ def render_value(
 ) -> str:
     """Render one side of a discrepancy (``decided_value`` or ``platform_value``) for display.
 
-    * ``status``: the normalised status, for example ``paused``.
+    The wording is the web client's on ``/decisions`` (``DiscrepancyResolver``, ``DecisionLog``),
+    so the C0 card on ``/actions`` and the resolver card show one value alike: status labels,
+    amounts as "{code} {amount}", and the parts of one state joined by " · ".
+
+    * ``status``: the status label (:data:`STATUS_LABELS`), for example ``Paused``; an absent
+      status is "status not reported".
     * ``budget``: a ``shared_member``'s (or any assignment value's) budget assignment,
       "shared budget {external_id}"; otherwise the amounts with the currency code at minor-unit
-      precision, Google micros converted exactly, for example "daily budget USD 50.00".
+      precision, Google micros converted exactly, for example "daily budget USD 50.00", a daily
+      and a total budget joined by " · ".
     * ``untracked`` and ``missing``: the complete state the subject's shape owns: status and
       amounts (``own_budget``), status and assignment (``shared_member``), or the amount alone
-      (``budget``), joined by "; ".
-    * A tombstone is "removed (acknowledged)"; ``None`` is "unavailable".
+      (``budget``), joined by " · ".
+    * A tombstone is "Removal acknowledged", followed on a campaign by its status label
+      ("Removal acknowledged · Ended"); ``None`` is "unavailable".
 
     Example:
         >>> render_value("status", "own_budget", {"status": "paused"}, "USD")
-        'paused'
+        'Paused'
         >>> value = {"daily_budget": "50.000001", "currency": "USD", "amount_micros": 50000001}
         >>> render_value("budget", "budget", value, "USD")
         'daily budget USD 50.000001'
+        >>> value = {"status": "active", "daily_budget": "400.000000", "currency": "USD"}
+        >>> render_value("untracked", "own_budget", value, "USD")
+        'Active · daily budget USD 400.00'
         >>> render_value("missing", "own_budget", {"status": "ended", "tombstone": True}, "USD")
-        'removed (acknowledged)'
+        'Removal acknowledged · Ended'
 
     Args:
         kind: The discrepancy kind.
@@ -314,7 +366,7 @@ def render_value(
     if value is None:
         return UNAVAILABLE_TEXT
     if value.get("tombstone") is True:
-        return TOMBSTONE_TEXT
+        return _tombstone_text(shape, value)
     if kind == "status":
         return _status_text(value)
     assignment = shape == "shared_member" or _has_assignment(value)
@@ -324,7 +376,7 @@ def render_value(
     if shape != "budget":
         parts.append(_status_text(value))
     parts.append(_assignment_text(value) if assignment else _money_text(value, currency))
-    return "; ".join(parts)
+    return _PART_SEPARATOR.join(parts)
 
 
 # ---------------------------------------------------------------------------

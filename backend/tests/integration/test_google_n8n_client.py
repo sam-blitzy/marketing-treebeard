@@ -5,8 +5,11 @@ AAP 0.3.3 prescribes. Each call is one ``POST {N8N_GOOGLE_ADS_WEBHOOK_URL}``, ca
 ``{customer_id, query, page_token}`` and the shared-secret header, for one GAQL query run as
 ``googleAds:search`` v25:
 
-* **Request**: the exact body and headers, a returned page token followed at once, n8n's
-  one-element array unwrapped, and errors relayed inside HTTP 200 classified;
+* **Request**: the exact body and headers, a returned page token followed at once while its
+  pages advance, a token the relay ignores (page 1 again, or an empty page with a token)
+  abandoned as a capped result and remembered by the client, the repeated-token defect and the
+  1,000-page cap, n8n's one-element array unwrapped, and errors relayed inside HTTP 200
+  classified;
 * **Keyset enumeration**: Q-G2 and Q-G4 keyset scans, a deferred page leaving
   ``google.entities`` incomplete, and Q-G2b ``IN`` chunks of 1,000 ids;
 * **Dated partitions**: date halving, then numeric ``campaign.id`` and ``ad_group.id`` ranges, the
@@ -67,6 +70,7 @@ from ads_engine.connectors.google_n8n.client import (
     UNMETERED,
     CallBudget,
     GoogleAdsWebhookClient,
+    SearchPage,
 )
 from ads_engine.connectors.google_n8n.parser import PARSERS, parse_campaign
 from ads_engine.connectors.google_n8n.partition import (
@@ -519,10 +523,14 @@ class _FakeGoogleAds:
     * an empty answer omits ``results`` and keeps ``fieldMask``, as Google does.
 
     Knobs: :attr:`tokens` makes a given call return a page of a chosen size with a
-    ``nextPageToken`` (a continuation resumes from it); :attr:`wrap_in_array` answers with n8n's
-    one-element array; :attr:`hook` may answer or raise instead of the data. Every call is
-    recorded in :attr:`received`, and the rows each data answer served in :attr:`served`.
-    Identical answers are serialised once, so a 63-level id-range descent stays fast.
+    ``nextPageToken`` (a continuation resumes from it); :attr:`ignore_page_token` plays the live
+    n8n workflow, which drops ``page_token``: every call, whatever token it carries, is answered
+    with the query's first rows again and, while more rows match, a fresh ``nextPageToken``
+    (the same one every time with :attr:`repeat_ignored_token`); :attr:`wrap_in_array` answers
+    with n8n's one-element array; :attr:`hook` may answer or raise instead of the data. Every
+    call is recorded in :attr:`received`, and the rows each data answer served in
+    :attr:`served`. Identical answers are serialised once, so a 63-level id-range descent stays
+    fast.
     """
 
     def __init__(self) -> None:
@@ -533,6 +541,8 @@ class _FakeGoogleAds:
         self.received: list[_Received] = []
         self.served: dict[int, int] = {}
         self.tokens: dict[int, tuple[str, int]] = {}
+        self.ignore_page_token: int | None = None
+        self.repeat_ignored_token = False
         self.wrap_in_array = False
         self.hook: ResponseHook | None = None
 
@@ -766,6 +776,15 @@ class _FakeGoogleAds:
     def _answer(self, received: _Received) -> httpx.Response:
         """Answer from the account: one page, at most 10,000 rows, a token only when scripted."""
         matched = self.match(received.parsed)
+        if self.ignore_page_token is not None:
+            # The live relay: any page_token, issued or bogus, is dropped, so the first rows
+            # come back again, and a token is still returned while more rows match.
+            first = matched[: self.ignore_page_token]
+            ignored: str | None = None
+            if len(matched) > len(first):
+                ignored = "ignored" if self.repeat_ignored_token else f"fresh-{received.number}"
+            self.served[received.number] = len(first)
+            return self._respond(received.parsed.template, first, ignored)
         offset = 0
         token = received.page_token
         if token is not None:
@@ -1140,6 +1159,191 @@ async def test_next_page_token_followed_at_once(
             await client.run_query("Q-G8")
     assert raised.value.query_id == "Q-G8"
     assert [call.page_token for call in looping.received] == [None, "tok-1"]
+
+
+async def test_page_token_the_relay_ignores_is_abandoned_and_learned(
+    google_credentials: Mapping[str, str],
+    contract_checked_transport: CheckedTransport,
+    captured_logs: LogCapture,
+) -> None:
+    """Request: a token that brings page 1 back is abandoned, and the client stops following.
+
+    The live n8n workflow drops ``page_token`` and answers every call with page 1 and a fresh
+    ``nextPageToken``. The follow-up page repeats page 1's rows, so it is discarded after one
+    extra call, the result is capped with ``token_abandoned`` (partition.py then narrows the
+    query), its rows are page 1's, and the client learns that the relay ignores tokens. The
+    next query on that client keeps its page 1 without following the token: one call. Neither
+    the warning nor the info line carries a token value.
+    """
+    captured_logs.configure(settings=get_settings())
+    fake = _FakeGoogleAds()
+    ids = _add_actions(fake, 15)
+    fake.ignore_page_token = 7
+    async with webhook_client(contract_checked_transport("google", fake.handler)) as client:
+        assert not client.page_tokens_ignored
+        first = await client.run_query("Q-G8")
+        learned = client.page_tokens_ignored
+        second = await client.run_query("Q-G8")
+
+    assert [row_id(row, "conversionAction") for row in first.rows] == ids[:7]
+    assert (first.pages, first.calls, first.capped, first.token_abandoned) == (1, 2, True, True)
+    assert learned
+    assert [call.page_token for call in fake.received[:2]] == [None, "fresh-1"]
+    assert [row_id(row, "conversionAction") for row in second.rows] == ids[:7]
+    assert (second.pages, second.calls, second.capped, second.token_abandoned) == (
+        1,
+        1,
+        True,
+        True,
+    )
+    assert len(fake.received) == 3
+    assert fake.received[2].page_token is None
+    records = captured_logs()
+    [ignored] = [record for record in records if record["event"] == "google.page_token_ignored"]
+    assert ignored["level"] == "warning"
+    assert {key: ignored[key] for key in ("source", "query_id", "page", "rows", "repeated")} == {
+        "source": "google",
+        "query_id": "Q-G8",
+        "page": 2,
+        "rows": 7,
+        "repeated": 7,
+    }
+    assert ignored["calls_made"] == 2
+    [not_followed] = [
+        record for record in records if record["event"] == "google.page_token_not_followed"
+    ]
+    assert (not_followed["level"], not_followed["query_id"], not_followed["page"]) == (
+        "info",
+        "Q-G8",
+        1,
+    )
+    for token in ("fresh-1", "fresh-2", "fresh-3"):
+        assert token not in captured_logs.text
+
+
+async def test_an_empty_follow_up_page_with_a_token_is_abandoned(
+    google_credentials: Mapping[str, str], contract_checked_transport: CheckedTransport
+) -> None:
+    """Request: a follow-up page with no row but another token cannot advance; it is dropped."""
+    fake = _FakeGoogleAds()
+    ids = _add_actions(fake, 9)
+    fake.tokens = {1: ("tok-1", 4), 2: ("tok-2", 0)}
+    async with webhook_client(contract_checked_transport("google", fake.handler)) as client:
+        result = await client.run_query("Q-G8")
+        assert client.page_tokens_ignored
+
+    assert [row_id(row, "conversionAction") for row in result.rows] == ids[:4]
+    assert (result.pages, result.calls, result.capped, result.token_abandoned) == (1, 2, True, True)
+    assert [call.page_token for call in fake.received] == [None, "tok-1"]
+
+
+async def test_advancing_page_tokens_are_still_followed_to_the_last_page(
+    google_credentials: Mapping[str, str], contract_checked_transport: CheckedTransport
+) -> None:
+    """Request: pages of distinct rows prove each token advanced, so every one is followed."""
+    fake = _FakeGoogleAds()
+    ids = _add_actions(fake, 15)
+    fake.tokens = {1: ("tok-1", 5), 2: ("tok-2", 5)}
+    async with webhook_client(contract_checked_transport("google", fake.handler)) as client:
+        result = await client.run_query("Q-G8")
+        assert not client.page_tokens_ignored
+
+    assert [row_id(row, "conversionAction") for row in result.rows] == ids
+    assert (result.pages, result.calls, result.capped, result.token_abandoned) == (
+        3,
+        3,
+        False,
+        False,
+    )
+    assert [call.page_token for call in fake.received] == [None, "tok-1", "tok-2"]
+
+
+async def test_on_page_receives_each_kept_page_instead_of_the_result(
+    google_credentials: Mapping[str, str], contract_checked_transport: CheckedTransport
+) -> None:
+    """``run_query(on_page=...)``: each kept page is awaited in order and ``rows`` is empty.
+
+    A relay that ignores the token hands over page 1 only; its discarded repeat never reaches
+    the callback.
+    """
+    honouring = _FakeGoogleAds()
+    ids = _add_actions(honouring, 15)
+    honouring.tokens = {1: ("tok-1", 5), 2: ("tok-2", 5)}
+    pages: list[list[int]] = []
+
+    async def collect(page: SearchPage) -> None:
+        pages.append([row_id(row, "conversionAction") for row in page.rows])
+
+    async with webhook_client(contract_checked_transport("google", honouring.handler)) as client:
+        result = await client.run_query("Q-G8", on_page=collect)
+
+    assert pages == [ids[:5], ids[5:10], ids[10:]]
+    assert (result.rows, result.pages, result.calls, result.capped) == ((), 3, 3, False)
+
+    ignoring = _FakeGoogleAds()
+    _add_actions(ignoring, 15)
+    ignoring.ignore_page_token = 7
+    pages.clear()
+    async with webhook_client(contract_checked_transport("google", ignoring.handler)) as client:
+        abandoned = await client.run_query("Q-G8", on_page=collect)
+
+    assert pages == [ids[:7]]
+    assert (abandoned.rows, abandoned.pages, abandoned.calls) == ((), 1, 2)
+    assert (abandoned.capped, abandoned.token_abandoned) == (True, True)
+
+
+async def test_streaming_search_ends_quietly_at_an_ignored_token(
+    google_credentials: Mapping[str, str], contract_checked_transport: CheckedTransport
+) -> None:
+    """``search`` yields page 1 once and ends when the relay hands page 1 back for its token."""
+    fake = _FakeGoogleAds()
+    ids = _add_actions(fake, 15)
+    fake.ignore_page_token = 7
+    yielded: list[int] = []
+    async with webhook_client(contract_checked_transport("google", fake.handler)) as client:
+        async for row in client.search("Q-G8"):
+            yielded.append(row_id(row, "conversionAction"))
+        assert client.page_tokens_ignored
+
+    assert yielded == ids[:7]
+    assert len(fake.received) == 2
+
+
+async def test_a_repeated_token_is_a_defect_even_when_its_page_repeats_page_one(
+    google_credentials: Mapping[str, str], contract_checked_transport: CheckedTransport
+) -> None:
+    """Request: the repeated-token ``QueryDefect`` is checked first and still wins.
+
+    The relay ignores ``page_token`` and returns the same token every time: the follow-up
+    page repeats page 1 and its token, which is the defect, not an abandoned token.
+    """
+    fake = _FakeGoogleAds()
+    _add_actions(fake, 15)
+    fake.ignore_page_token = 7
+    fake.repeat_ignored_token = True
+    async with webhook_client(contract_checked_transport("google", fake.handler)) as client:
+        with pytest.raises(QueryDefect, match="page token repeated") as raised:
+            await client.run_query("Q-G8")
+        assert not client.page_tokens_ignored
+
+    assert raised.value.query_id == "Q-G8"
+    assert [call.page_token for call in fake.received] == [None, "ignored"]
+
+
+async def test_the_page_cap_still_stops_a_query_of_advancing_pages(
+    google_credentials: Mapping[str, str], contract_checked_transport: CheckedTransport
+) -> None:
+    """Request: 1,000 pages of distinct rows, each with a fresh token, end in a defect."""
+    fake = _FakeGoogleAds()
+    _add_actions(fake, 1_001)
+    fake.tokens = {number: (f"tok-{number}", 1) for number in range(1, 1_001)}
+    async with webhook_client(contract_checked_transport("google", fake.handler)) as client:
+        with pytest.raises(QueryDefect, match="beyond 1000 pages") as raised:
+            await client.run_query("Q-G8")
+        assert not client.page_tokens_ignored
+
+    assert raised.value.query_id == "Q-G8"
+    assert len(fake.received) == 1_000
 
 
 async def test_one_element_array_unwrapped(

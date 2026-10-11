@@ -26,6 +26,7 @@ import './Badge.css';
 import type { ReactNode } from 'react';
 
 import type { Tone } from '../tokens';
+import { withIdentifierBreaks } from './identifierBreaks';
 
 /**
  * Props of {@link Badge}.
@@ -44,7 +45,9 @@ export interface BadgeProps {
   tone?: Tone;
   /**
    * The chip's label, for example `"Simulated data"` or `"Stale"`. It carries the whole meaning
-   * of the chip, so it must never be empty or rely on colour to be understood.
+   * of the chip, so it must never be empty or rely on colour to be understood. A string label
+   * gets a line-break opportunity after each underscore of a long identifier
+   * ({@link withIdentifierBreaks}), with its text unchanged.
    */
   children: ReactNode;
   /**
@@ -63,6 +66,11 @@ export interface BadgeProps {
  * mounted while its text changes, as `ActionsPage` keeps for its state notices. `Banner` is
  * silent content unless its `alert` prop sets `role="alert"`, which is reserved for the
  * open-discrepancies banner (AAP 0.5.5).
+ *
+ * A string label, such as a flag message written by the API, passes through
+ * {@link withIdentifierBreaks}. A label quoting a long identifier, such as an environment
+ * variable name, therefore wraps at its underscores inside a narrow chip. Such a label is held in
+ * one inner `<span>`; every other label is the chip's only content, as given.
  *
  * The component holds no state and has no effects; its output depends only on its props.
  *
@@ -84,7 +92,7 @@ export interface BadgeProps {
 export function Badge({ tone = 'neutral', children, id }: BadgeProps) {
   return (
     <span id={id} className={`ds-badge ds-badge--${tone}`}>
-      {children}
+      {withIdentifierBreaks(children)}
     </span>
   );
 }

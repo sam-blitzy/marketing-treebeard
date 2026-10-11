@@ -25,7 +25,7 @@
  * fails the test on any request.
  */
 import { mockApi } from '../../../test/mockApi';
-import { renderWithProviders } from '../../../test/render';
+import { KEEP_SPACES, renderWithProviders } from '../../../test/render';
 import { fireEvent, screen, within } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
@@ -47,6 +47,7 @@ import {
   makeSection,
   makeWithheld,
 } from '../../../test/fixtures';
+import { metricHelp } from '../metricHelp';
 import { BudgetSection } from './BudgetSection';
 
 // ---------------------------------------------------------------------------------------------
@@ -265,7 +266,7 @@ describe('BudgetSection layout', () => {
     const withheld = screen.getByRole('list', { name: 'Patterns withheld for sample size' });
     expect(screen.getByText('Patterns withheld for sample size').tagName).toBe('STRONG');
     expect(listLines(section as HTMLElement, 'Patterns withheld for sample size')).toEqual([
-      'B4 · Generic CRM — US: 3 weekend days of 4 required — 3 / 4 weekend days',
+      'B4 · Generic CRM — US: 3 weekend days of 4 required — 3\u00A0/\u00A04 weekend days',
     ]);
     expect(follows(group as HTMLElement, withheld)).toBe(true);
 
@@ -320,22 +321,96 @@ describe('BudgetSection layout', () => {
       }),
     );
 
-    const reason = document.querySelector('.ds-emptystate__reason');
-    expect(document.querySelector('.ds-emptystate__title')?.textContent).toBe(
-      'No actions in this section',
+    // One sentence: the G1 count comes first, and the withheld line is not repeated in it.
+    const empty = document.querySelector('.ds-emptystate');
+    expect(empty?.querySelector('.ds-emptystate__title')?.textContent).toBe(
+      'No actions to show: 2 spend increases blocked by the high-utilization guard',
     );
-    expect([...(reason?.querySelectorAll('span') ?? [])].map((line) => line.textContent)).toEqual([
-      '2 spend increases blocked by the high-utilization guard',
-      'B2 · Generic CRM — US: spending days 4 of 5 required — 4 / 5 spending days',
-    ]);
+    expect(empty?.querySelector('.ds-emptystate__reason')).toBeNull();
+    expect(empty?.textContent).not.toContain('B2 · Generic CRM — US');
     expect(
       listLines(
         document.getElementById('section-budget') as HTMLElement,
         'Patterns withheld for sample size',
       ),
-    ).toEqual(['B2 · Generic CRM — US: spending days 4 of 5 required — 4 / 5 spending days']);
+    ).toEqual([
+      'B2 · Generic CRM — US: spending days 4 of 5 required — 4\u00A0/\u00A05 spending days',
+    ]);
     expect(document.getElementById('group-budget-changes')).toBeNull();
   });
+
+  it('states the shared B1 minimum when every campaign of the leading rule falls short of it', async () => {
+    // The shape a short custom window yields: each campaign's B1 line records the same minimum.
+    const campaign = (id: string, name: string) =>
+      makeWithheld({
+        rule_id: 'B1',
+        entity: { source: 'google', type: 'campaign', id, name },
+        reason: 'known-budget days 0 of 7 required; spending days 0 of 5 required',
+        sample: { observed: 0, required: 7, unit: 'known-budget days' },
+      });
+    await renderBudget(
+      makeSection('budget', {
+        groups: [makeGroup({ key: 'changes', title: 'Budget changes', items: [] })],
+        withheld: [
+          campaign('21000301', 'Brand - Search'),
+          campaign('21000302', 'Generic CRM — US'),
+          makeWithheld({
+            rule_id: 'B4',
+            entity: null,
+            reason: 'window 4 days of 7 required',
+            sample: { observed: 4, required: 7, unit: 'days' },
+          }),
+        ],
+      }),
+    );
+
+    const empty = document.querySelector('.ds-emptystate');
+    expect(empty?.querySelector('.ds-emptystate__title')?.textContent).toBe(
+      'No campaign met the B1 minimum of 7 known-budget days',
+    );
+    expect(empty?.querySelector('.ds-emptystate__reason')).toBeNull();
+    // The three lines are listed once, below the empty state, under the Budget title.
+    expect(
+      listLines(
+        document.getElementById('section-budget') as HTMLElement,
+        'Patterns withheld for sample size',
+      ),
+    ).toHaveLength(3);
+  });
+
+  it('states the B4 reason, not a minimum, when the only pattern met its sample minimum', async () => {
+    // The record `analysis/budget.py` writes when B4's sample gates pass but the rate test does
+    // not: 264 outcomes observed against the 10 required, so no minimum was missed.
+    const reason =
+      'weekend and weekday rates not distinguishable (two-sample Poisson rate test p = 0.1195, ' +
+      'alpha 0.05): 8 weekend days, 20 weekdays, 264 outcomes';
+    await renderBudget(
+      makeSection('budget', {
+        groups: [],
+        withheld: [
+          makeWithheld({
+            rule_id: 'B4',
+            entity: { source: 'linkedin', type: 'campaign', id: '1', name: 'Capped - Lead gen' },
+            reason,
+            sample: { observed: 264, required: 10, unit: 'outcomes' },
+          }),
+        ],
+      }),
+    );
+
+    const empty = document.querySelector('.ds-emptystate');
+    expect(empty?.querySelector('.ds-emptystate__title')?.textContent).toBe(
+      `B4 withheld for Capped - Lead gen: ${reason}`,
+    );
+    expect(empty?.textContent).not.toContain('minimum');
+    expect(
+      listLines(
+        document.getElementById('section-budget') as HTMLElement,
+        'Patterns withheld for sample size',
+      ),
+    ).toEqual([`B4 · Capped - Lead gen: ${reason} — 264\u00A0/\u00A010 outcomes`]);
+  });
+
 
   it('collapses a card held by a discrepancy behind the held disclosure', async () => {
     const b1 = pageItem(FIXTURE_ITEM_IDS.b1);
@@ -412,13 +487,20 @@ describe('B1 increase card', () => {
     ]);
 
     expect(groupFields(b1, 'Utilization')).toEqual([
-      'Window utilization (spend vs cap): 99%',
-      // The stricter of capped_days (5) and capped_share (19) binds.
-      'Days (observed / required): Spending days 26 / 5 · Capped days 22 / 19',
+      'Window utilization (spend vs cap): 99.0%',
+      // The stricter of capped_days (5) and capped_share (19) binds. Each "observed / required"
+      // figure is joined by no-break spaces, so a line never wraps inside it.
+      'Days (observed / required): Spending days 26\u00A0/\u00A05 · Capped days 22\u00A0/\u00A019',
     ]);
+    // The field reads exactly as the same metric's row of the card's evidence table, at the
+    // table's one percentage precision.
+    const evidenceRow = within(within(b1).getByRole('table', { name: 'Evidence' }))
+      .getByRole('rowheader', { name: 'Window utilization (spend vs cap)' })
+      .closest('tr');
+    expect(evidenceRow?.querySelector('td')?.textContent).toBe('99.0%');
     expect(groupFields(b1, 'Efficiency')).toEqual([
-      'Cost per conversion: $82.37',
-      'Account cost per conversion (same source and objective): $95.00',
+      'Cost per conversion: USD\u00a082.37',
+      'Account cost per conversion (same source and objective): USD\u00a095.00',
     ]);
   });
 
@@ -442,8 +524,8 @@ describe('B1 increase card', () => {
 
     expect(listLines(card(B1_ACTION), 'Budget details')).toEqual([
       'Window conversions: 62.5',
-      'Latest effective daily budget: $200.00',
-      'Proposed daily budget: $240.00',
+      'Latest effective daily budget: USD\u00a0200.00',
+      'Proposed daily budget: USD\u00a0240.00',
     ]);
   });
 
@@ -483,8 +565,8 @@ describe('B1 increase card', () => {
 
     expect(
       within(card(B1_ACTION)).getByText(
-        'Raise by $400.00: $400.00 funded by reallocation from Donor A, Donor B, ' +
-          '$0.00 from new budget',
+        'Raise by USD 400.00: USD 400.00 funded by reallocation from Donor A, Donor B, ' +
+          'USD 0.00 from new budget',
       ),
     ).toBeTruthy();
   });
@@ -500,7 +582,7 @@ describe('B1 increase card', () => {
 
     expect(
       within(card(B1_ACTION)).getByText(
-        'Raise by $40.00: $0.00 funded by reallocation, $40.00 from new budget',
+        'Raise by USD 40.00: USD 0.00 funded by reallocation, USD 40.00 from new budget',
       ),
     ).toBeTruthy();
   });
@@ -526,11 +608,11 @@ describe('B3 under-utilized card', () => {
     const b3 = card(B3_ACTION);
     expect(groupFields(b3, 'Utilization')).toEqual([
       'Window utilization (spend vs cap): 44.3%',
-      'Days (observed / required): Spending days 24 / 5 · Under-utilized days 20 / 17',
+      'Days (observed / required): Spending days 24\u00A0/\u00A05 · Under-utilized days 20\u00A0/\u00A017',
     ]);
     expect(groupFields(b3, 'Efficiency')).toEqual([
-      'Cost per conversion: $48.00',
-      'Account cost per conversion (same source and objective): $95.00',
+      'Cost per conversion: USD\u00a048.00',
+      'Account cost per conversion (same source and objective): USD\u00a095.00',
     ]);
     expect(tableOf(b3, 'Budget days').rows).toEqual([
       ['Budget-active days', '24', '7'],
@@ -542,8 +624,8 @@ describe('B3 under-utilized card', () => {
     ]);
     expect(listLines(b3, 'Budget details')).toEqual([
       'Window conversions: 31',
-      'Latest effective daily budget: $140.00',
-      'Proposed daily budget: $110.00',
+      'Latest effective daily budget: USD\u00a0140.00',
+      'Proposed daily budget: USD\u00a0110.00',
     ]);
   });
 
@@ -627,8 +709,8 @@ describe('B3 under-utilized card', () => {
         .getAllByRole('listitem')
         .map((entry) => entry.textContent),
     ).toEqual([
-      "Move $20.00 to fund Receiver — Search's recommended increase (B1)",
-      "Move $10.00 to fund Receiver — Shared's recommended increase (B1)",
+      "Move USD\u00a020.00 to fund Receiver — Search's recommended increase (B1)",
+      "Move USD\u00a010.00 to fund Receiver — Shared's recommended increase (B1)",
     ]);
     expect(
       within(list)
@@ -653,7 +735,7 @@ describe('B3 under-utilized card', () => {
     await renderBudget(budgetWith([b3]));
 
     expect(listLines(card(B3_ACTION), 'Reallocations to recommended increases')).toEqual([
-      "Move $30.00 to fund Pipeline Search — US's recommended increase (B1)",
+      "Move USD\u00a030.00 to fund Pipeline Search — US's recommended increase (B1)",
     ]);
   });
 
@@ -670,7 +752,7 @@ describe('B3 under-utilized card', () => {
     expect(
       within(article).queryByRole('list', { name: 'Reallocations to recommended increases' }),
     ).toBeNull();
-    expect(within(article).getByText('Plain decrease: $30.00')).toBeTruthy();
+    expect(within(article).getByText('Plain decrease: USD 30.00')).toBeTruthy();
   });
 
   it('falls back to the freed amount when no split is recorded', async () => {
@@ -680,7 +762,7 @@ describe('B3 under-utilized card', () => {
       unallocated: undefined,
     });
     await renderBudget(budgetWith([b3]));
-    expect(within(card(B3_ACTION)).getByText('Plain decrease: $30.00')).toBeTruthy();
+    expect(within(card(B3_ACTION)).getByText('Plain decrease: USD 30.00')).toBeTruthy();
   });
 
   it('never computes a remainder the backend did not record', async () => {
@@ -793,7 +875,7 @@ describe('reallocation from two donors into one B1 increase of 400', () => {
     expect(listLines(second, 'Reallocations to recommended increases')).toEqual([
       "Move USD 100.00 to fund Receiver — Lead gen's recommended increase (B1)",
     ]);
-    expect(within(second).getByText('Plain decrease: $100.00')).toBeTruthy();
+    expect(within(second).getByText('Plain decrease: USD 100.00')).toBeTruthy();
   });
 });
 
@@ -846,12 +928,12 @@ describe('other budget cards', () => {
     expect(utilizationCell.parentElement).toBe(namedGroup(article, 'Utilization and efficiency'));
     expect(follows(utilizationCell, efficiencyCell)).toBe(true);
     expect(groupFields(article, 'Utilization')).toEqual([
-      'Window utilization (spend vs cap): 93%',
-      'Days (observed / required): Spending days 10 / 7 · High-utilization days 9 / 7',
+      'Window utilization (spend vs cap): 93.0%',
+      'Days (observed / required): Spending days 10\u00A0/\u00A07 · High-utilization days 9\u00A0/\u00A07',
     ]);
     expect(groupFields(article, 'Efficiency')).toEqual([
-      'Cost per lead: $310.00',
-      'Account cost per lead: $120.00',
+      'Cost per lead: USD\u00a0310.00',
+      'Account cost per lead: USD\u00a0120.00',
     ]);
     expect(tableOf(article, 'Budget days').rows).toEqual([
       ['Known-budget days', '10', '7'],
@@ -862,8 +944,8 @@ describe('other budget cards', () => {
     expect(listLines(article, 'Budget details')).toEqual([
       'Window leads: 9',
       'Qualified Leads (CRM): 1',
-      'Latest effective daily budget: $100.00',
-      'Proposed daily budget: $80.00',
+      'Latest effective daily budget: USD\u00a0100.00',
+      'Proposed daily budget: USD\u00a080.00',
     ]);
     expect(within(article).queryByText(/^Raise by/u)).toBeNull();
     expect(within(article).queryByText(/^Plain decrease/u)).toBeNull();
@@ -873,7 +955,7 @@ describe('other budget cards', () => {
     const b4 = budgetItem({
       id: 6002,
       rule_id: 'B4',
-      action: 'Adjust weekend schedule or bids: weekend cost/outcome $90.00 vs weekday $45.00',
+      action: 'Adjust weekend schedule or bids: weekend cost/outcome USD 90.00 vs weekday USD 45.00',
       metrics: [
         metric('outcomes', 'Window conversions', 30, 'conversions'),
         usd('cost_per_outcome', 'Cost per conversion', '60.00'),
@@ -899,7 +981,7 @@ describe('other budget cards', () => {
     await renderBudget(budgetWith([b4]));
 
     const article = card(
-      'Adjust weekend schedule or bids: weekend cost/outcome $90.00 vs weekday $45.00',
+      'Adjust weekend schedule or bids: weekend cost/outcome USD 90.00 vs weekday USD 45.00',
     );
     expect(groupFields(article, 'Utilization')).toEqual(['Window utilization (spend vs cap): n/a']);
     // Neither B4's gate nor any budget-history minimum requires these days here, so none is shown.
@@ -921,7 +1003,8 @@ describe('other budget cards', () => {
     // budget._b4_candidate in API order: the pattern's day counts come before the history's
     // (_history_metrics(history, None)); extra.gate is B4's own gate and
     // extra.budget_history.minimums the history's minimums.
-    const action = 'Adjust weekend schedule or bids: weekend cost/outcome $24.10 vs weekday $19.80';
+    const action =
+      'Adjust weekend schedule or bids: weekend cost/outcome USD 24.10 vs weekday USD 19.80';
     const built = budgetItem({
       id: 6006,
       rule_id: 'B4',
@@ -973,9 +1056,9 @@ describe('other budget cards', () => {
 
     const article = card(action);
     expect(groupFields(article, 'Utilization')).toEqual([
-      'Window utilization (spend vs cap): 77%',
-      'Days (observed / required): Spending days 28 / 5 · Weekend days with spend 8 / 4 · ' +
-        'Weekdays with spend 20 / 10',
+      'Window utilization (spend vs cap): 77.0%',
+      'Days (observed / required): Spending days 28\u00A0/\u00A05 · ' +
+        'Weekend days with spend 8\u00A0/\u00A04 · Weekdays with spend 20\u00A0/\u00A010',
     ]);
     // AAP 0.5.4.1 order, whatever the API's metric order.
     expect(tableOf(article, 'Budget days').rows).toEqual([
@@ -989,6 +1072,31 @@ describe('other budget cards', () => {
     ]);
     // The outcome gate, observed against b4.min_outcomes, is the evidence table's sample line.
     expect(within(article).getByText('Sample: 397 / 10 outcomes')).toBeTruthy();
+  });
+
+  it('keeps a day figure with no requirement on one line, so "—" never wraps alone', async () => {
+    const b4 = budgetItem({
+      id: 6006,
+      rule_id: 'B4',
+      action: 'Adjust weekend schedule or bids: weekend cost/outcome USD 67.64 vs weekday USD 10.92',
+      metrics: [
+        usd('cost_per_outcome', 'Cost per conversion', '67.64'),
+        metric('window_utilization', 'Window utilization (spend vs cap)', 'N/A', 'ratio'),
+        days('spending_days', 'Spending days', 0),
+      ],
+      extra: { currency: 'USD' },
+    });
+    await renderBudget(budgetWith([b4]));
+
+    const article = card(
+      'Adjust weekend schedule or bids: weekend cost/outcome USD 67.64 vs weekday USD 10.92',
+    );
+    // No-break spaces (U+00A0) join "0", "/" and "—": the line may wrap before the figure,
+    // never inside it.
+    expect(groupFields(article, 'Utilization')).toEqual([
+      'Window utilization (spend vs cap): n/a',
+      'Days (observed / required): Spending days 0\u00A0/\u00A0—',
+    ]);
   });
 
   it('says the members are unavailable on a shared budget whose evidence lists none', async () => {
@@ -1086,7 +1194,7 @@ describe('utilization and efficiency edge cases', () => {
     // The baseline reads in the cost's own currency.
     expect(groupFields(zeroCard, 'Efficiency')).toEqual([
       'Cost per conversion: —',
-      'Account cost per conversion: €75.00',
+      'Account cost per conversion: EUR\u00a075.00',
     ]);
     expect(groupFields(card('Zero outcomes as a decimal string'), 'Efficiency')).toEqual([
       'Cost per conversion: —',
@@ -1242,12 +1350,13 @@ describe('amounts in each account currency', () => {
       within(eurCard).getByText(
         `Raise by ${formatMoney('40.00', 'EUR')}: ${formatMoney('0.00', 'EUR')} funded by ` +
           `reallocation, ${formatMoney('40.00', 'EUR')} from new budget`,
+        KEEP_SPACES,
       ),
     ).toBeTruthy();
 
-    // Neither card borrows the other's currency.
-    expect(usdCard.textContent).not.toContain('€');
-    expect(eurCard.textContent).not.toContain('$');
+    // Neither card borrows the other's currency, whichever space follows the code.
+    expect(usdCard.textContent).not.toMatch(/EUR\s/u);
+    expect(eurCard.textContent).not.toMatch(/USD\s/u);
 
     // No total line: nothing labelled a total, and neither the spend sum (2,790 + 4,200) nor
     // the daily-budget sum (100 + 200) appears in any currency.
@@ -1275,5 +1384,78 @@ describe('data-state flags on budget cards', () => {
     expect(flags).toContain('Simulated data');
     expect(flags).toContain(`Stale: ${makeFlag('stale').message}`);
     expect(flags).toContain(makeFlag('incomplete').message);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Utilization and efficiency help (AAP 0.4.2 "Help text on metrics": the Tooltip wrapper)
+// ---------------------------------------------------------------------------------------------
+
+describe('utilization and efficiency help', () => {
+  /** The title trigger of the named cell, and the tooltip bubble its `aria-describedby` names. */
+  function titleHelp(
+    scope: HTMLElement,
+    name: string,
+  ): { trigger: HTMLElement; bubble: HTMLElement } {
+    const cell = namedGroup(scope, name);
+    const trigger = cell.querySelector<HTMLElement>(
+      ':scope > span > .ds-tooltip > .ds-tooltip__trigger',
+    );
+    const describedBy = trigger?.getAttribute('aria-describedby') ?? '';
+    const bubble = describedBy === '' ? null : document.getElementById(describedBy);
+    if (trigger === null || bubble === null) {
+      throw new Error(`the "${name}" cell title has no tooltip`);
+    }
+    return { trigger, bubble };
+  }
+
+  it('gives the Utilization title the window utilization definition as its help', async () => {
+    await renderBudget(budgetWith([backendB1()]));
+
+    const { trigger, bubble } = titleHelp(card(B1_ACTION), 'Utilization');
+    expect(trigger.textContent).toBe('Utilization');
+    expect(trigger.tabIndex).toBe(0);
+    expect(bubble.getAttribute('role')).toBe('tooltip');
+    expect(bubble.textContent).toBe(metricHelp('window_utilization'));
+    expect(bubble.textContent).toContain('Window spend divided by the sum of daily budgets');
+    expect(bubble.hidden).toBe(true);
+  });
+
+  it('gives the Efficiency title the cost per outcome definition as its help', async () => {
+    await renderBudget(budgetWith([backendB1()]));
+
+    const { trigger, bubble } = titleHelp(card(B1_ACTION), 'Efficiency');
+    expect(trigger.textContent).toBe('Efficiency');
+    expect(trigger.tabIndex).toBe(0);
+    expect(bubble.getAttribute('role')).toBe('tooltip');
+    expect(bubble.textContent).toBe(metricHelp('cost_per_outcome'));
+    expect(bubble.textContent).toContain('account baseline');
+  });
+
+  it('keeps each cell named by its title alone, with its fields unchanged', async () => {
+    await renderBudget(budgetWith([backendB1()]));
+
+    const b1 = card(B1_ACTION);
+    const grid = namedGroup(b1, 'Utilization and efficiency');
+    expect([...grid.children].map((cell) => cell.getAttribute('aria-label'))).toEqual([
+      'Utilization',
+      'Efficiency',
+    ]);
+    expect(groupFields(b1, 'Utilization')[0]).toMatch(/^Window utilization \(spend vs cap\): /u);
+    expect(groupFields(b1, 'Efficiency')[0]).toMatch(/^Cost per conversion: /u);
+  });
+
+  it('shows a title’s help on hover and hides it on Escape', async () => {
+    await renderBudget(budgetWith([backendB1()]));
+
+    const { trigger, bubble } = titleHelp(card(B1_ACTION), 'Utilization');
+    const wrapper = trigger.parentElement;
+    if (wrapper === null) {
+      throw new Error('the Utilization trigger has no wrapper');
+    }
+    fireEvent.mouseEnter(wrapper);
+    expect(bubble.hidden).toBe(false);
+    fireEvent.keyDown(document.body, { key: 'Escape' });
+    expect(bubble.hidden).toBe(true);
   });
 });

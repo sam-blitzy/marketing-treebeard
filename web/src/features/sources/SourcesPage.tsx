@@ -1056,7 +1056,7 @@ export function SourcesPage(): ReactElement {
         ))
       );
   } else if (failure === null) {
-    notice = <Spinner label={LOADING_LABEL} />;
+    notice = <Spinner label={LOADING_LABEL} showLabel />;
   } else {
     notice = (
       <EmptyState

@@ -37,7 +37,7 @@
 import { apiError, json, mockApi } from '../../../test/mockApi';
 import type { MockHandlers, MockResponse, RecordedCall } from '../../../test/mockApi';
 import { LiveSection, feedbackConfirmationText, feedbackFlow } from '../../../test/feedbackFlow';
-import { renderWithProviders } from '../../../test/render';
+import { KEEP_SPACES, renderWithProviders } from '../../../test/render';
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { memo, useEffect, useMemo, useState } from 'react';
 import type { ReactElement } from 'react';
@@ -169,7 +169,7 @@ function tableOf(scope: HTMLElement, caption: string): { headers: string[]; rows
 }
 
 /** The C0 action of the default page. */
-const C0_ACTION = 'Resolve: platform shows paused, last decided active';
+const C0_ACTION = 'Resolve: platform shows Paused, last decided Active';
 
 /** The live list the C0 card of the default page reads. */
 function openDiscrepancies() {
@@ -369,8 +369,11 @@ describe('CampaignsSection layout', () => {
     const api = mockApi({});
     await renderCampaigns(makeSection('campaigns'), makeOverlay({ open_discrepancies: 0 }));
 
-    expect(screen.getByText('No actions in this section')).toBeTruthy();
-    expect(screen.getByText('No rule fired for this window')).toBeTruthy();
+    const empty = document.querySelector('.ds-emptystate');
+    expect(empty?.querySelector('.ds-emptystate__title')?.textContent).toBe(
+      'No rule fired for this window',
+    );
+    expect(empty?.querySelector('.ds-emptystate__reason')).toBeNull();
     expect(api.calls).toHaveLength(0);
   });
 
@@ -426,7 +429,7 @@ describe('C0 discrepancy cards', () => {
     await renderCampaigns(defaultCampaigns());
 
     const c0 = card(C0_ACTION);
-    expect(c0.textContent).toContain('Platform shows paused, last decided active');
+    expect(c0.textContent).toContain('Platform shows Paused, last decided Active');
     // While the first read runs, the footer holds the persistent status line, still empty, and
     // after it the spinner's own polite region; no control yet.
     const statuses = within(c0).getAllByRole('status');
@@ -629,7 +632,7 @@ describe('C0 discrepancy cards', () => {
       expect(within(c0).queryByRole('button', { name: label })).toBeNull();
     }
     // The frozen comparison line stays on the card beside the live controls.
-    expect(c0.textContent).toContain('Platform shows paused, last decided active');
+    expect(c0.textContent).toContain('Platform shows Paused, last decided Active');
   });
 
   it('renders a single resolution when that is all the API lists', async () => {
@@ -755,7 +758,7 @@ describe('C0 discrepancy cards', () => {
       expect(within(c0).queryByRole('button')).toBeNull();
       expect(within(c0).queryByText(DISCREPANCY_NOT_LISTED_TEXT)).toBeNull();
       // The frozen comparison still states what the run saw.
-      expect(c0.textContent).toContain('Platform shows paused, last decided active');
+      expect(c0.textContent).toContain('Platform shows Paused, last decided Active');
       await settle();
       expect(discrepancyReads(api.calls)).toEqual([['open', 'awaiting_platform'], ['resolved']]);
       expect(screen.queryByRole('alert')).toBeNull();
@@ -939,7 +942,7 @@ describe('C0 discrepancy cards', () => {
       within(article).queryByRole('link', { name: /^View (blocking|open) discrepanc/u }),
     ).toBeNull();
     // The frozen comparison and the history-only notice, in the status line.
-    expect(article.textContent).toContain('Platform shows paused, last decided active');
+    expect(article.textContent).toContain('Platform shows Paused, last decided Active');
     expect(statusLine(article).textContent).toBe(HISTORICAL_RESOLUTION_NOTICE);
 
     // The resolutions the run froze (platform_correct, decision_correct), in that order, every
@@ -1193,7 +1196,9 @@ describe('the empty discrepancy group', () => {
     expect(document.getElementById(DISCREPANCY_GROUP_ANCHOR)?.textContent).toContain(
       '2 open discrepancies detected since this run was computed',
     );
-    expect(screen.getByText('No actions in this section')).toBeTruthy();
+    expect(document.querySelector('.ds-emptystate__title')?.textContent).toBe(
+      'No rule fired for this window',
+    );
   });
 });
 
@@ -1548,7 +1553,7 @@ describe('pause and scale cards', () => {
 
     const c1 = card('Pause');
     expect(listLines(c1, CAMPAIGN_EVIDENCE_LABEL)).toEqual([
-      'Window spend: $314.50',
+      'Window spend: USD\u00a0314.50',
       'Window conversions: 0',
       'Expected conversions at the account baseline: 3.4',
     ]);
@@ -1568,7 +1573,7 @@ describe('pause and scale cards', () => {
     await renderCampaigns(oneGroup('pause', 'Pause', [linked]));
 
     expect(listLines(card('Pause'), CAMPAIGN_EVIDENCE_LABEL)).toEqual([
-      'Window spend: $314.50',
+      'Window spend: USD\u00a0314.50',
       'Window conversions: 0',
       'Expected conversions at the account baseline: 3.4',
       'Qualified Leads (CRM): 2',
@@ -1581,7 +1586,7 @@ describe('pause and scale cards', () => {
 
     const hold = card('Hold: platform outcomes are not reaching Qualified Lead');
     expect(listLines(hold, CAMPAIGN_EVIDENCE_LABEL)).toEqual([
-      'Window spend: $1,500.00',
+      'Window spend: USD\u00a01,500.00',
       'Window leads: 48',
       'Qualified Leads: 0',
     ]);
@@ -1646,7 +1651,7 @@ describe('pause and scale cards', () => {
     const article = card('Scale');
     expect(article.id).toBe(`item-${String(OWN_BUDGET_SCALE_ID)}`);
     expect(listLines(article, CAMPAIGN_EVIDENCE_LABEL)).toEqual([
-      'Window spend: $1,500.00',
+      'Window spend: USD\u00a01,500.00',
       'Window leads: 48',
       'Expected leads at the account baseline: 37.5',
       'Qualified Leads: 6',
@@ -1675,7 +1680,8 @@ describe('pause and scale cards', () => {
 
     // The card states what the saved decision recorded, its status kept and the new amount.
     const recorded = await within(article).findByText(
-      `${DECISION_RECORDED_MESSAGE}: Active · daily budget $72.00`,
+      `${DECISION_RECORDED_MESSAGE}: Active · daily budget USD\u00a072.00`,
+      KEEP_SPACES,
     );
     expect(recorded.getAttribute('role')).toBe('status');
     expect(screen.queryByRole('dialog')).toBeNull();
@@ -1718,7 +1724,7 @@ describe('pause and scale cards', () => {
     expect(article.textContent).toContain('Search Shared Budget');
     // No Google CRM link, so no veto was read: no QL line and no pipeline table.
     expect(listLines(article, CAMPAIGN_EVIDENCE_LABEL)).toEqual([
-      'Window spend: $9,500.00',
+      'Window spend: USD\u00a09,500.00',
       'Window conversions: 125',
       'Expected conversions at the account baseline: 100',
     ]);
@@ -1746,7 +1752,8 @@ describe('pause and scale cards', () => {
 
     // A shared budget has no status: the card states the amount the decision recorded on it.
     const recorded = await within(article).findByText(
-      `${DECISION_RECORDED_MESSAGE}: daily budget $600.00`,
+      `${DECISION_RECORDED_MESSAGE}: daily budget USD\u00a0600.00`,
+      KEEP_SPACES,
     );
     expect(recorded.getAttribute('role')).toBe('status');
     expect(screen.queryByRole('dialog')).toBeNull();
@@ -1818,7 +1825,7 @@ describe('pause and scale cards', () => {
     // A pause card lists spend, outcomes, expected outcomes and the CRM QL (AAP 0.5.5); the
     // platform leads and the other pipeline counts stay out of this list.
     expect(listLines(article, CAMPAIGN_EVIDENCE_LABEL)).toEqual([
-      'Window spend: €2,240.00',
+      'Window spend: EUR\u00a02,240.00',
       'Window leads: 40',
       'Expected leads at the account baseline: 32',
       'Qualified Leads: 0',
@@ -1874,7 +1881,7 @@ describe('pause and scale cards', () => {
 
     const article = card('Pause or rework targeting');
     expect(within(article).queryByRole('table', { name: PIPELINE_EVIDENCE_CAPTION })).toBeNull();
-    expect(listLines(article, CAMPAIGN_EVIDENCE_LABEL)).toEqual(['Window spend: $10.00']);
+    expect(listLines(article, CAMPAIGN_EVIDENCE_LABEL)).toEqual(['Window spend: USD\u00a010.00']);
   });
 });
 
@@ -2175,9 +2182,9 @@ describe('launch idea cards', () => {
     expect(terms.headers).toEqual(['Term', 'Spend', 'Conversions']);
     // Conversions stay fractional under data-driven attribution.
     expect(terms.rows).toEqual([
-      ['cloud data warehouse', '$132.00', '3'],
-      ['data warehouse tools', '$96.00', '2.5'],
-      ['data warehouse pricing', '$59.00', '1.5'],
+      ['cloud data warehouse', 'USD\u00a0132.00', '3'],
+      ['data warehouse tools', 'USD\u00a096.00', '2.5'],
+      ['data warehouse pricing', 'USD\u00a059.00', '1.5'],
     ]);
   });
 
@@ -2206,7 +2213,7 @@ describe('launch idea cards', () => {
     // A member without a term is not a cluster term.
     expect(tableOf(article, CLUSTER_TERMS_CAPTION).rows).toEqual([
       ['erp suite', 'unavailable', '2'],
-      ['erp pricing', '$40.00', 'unavailable'],
+      ['erp pricing', 'USD\u00a040.00', 'unavailable'],
     ]);
   });
 
@@ -2257,9 +2264,14 @@ describe('launch idea cards', () => {
     expect(listLines(article, SEGMENT_GAP_LABEL)).toEqual([
       'Segment: job function: Finance',
       'Segment leads: 6',
-      'Segment cost per lead: €28.50',
-      'Segment share of campaign impressions: 12%',
+      'Segment cost per lead: EUR\u00a028.50',
+      'Segment share of campaign impressions: 12.0%',
     ]);
+    // The field reads exactly as the same metric's row of the card's evidence table.
+    const evidenceRow = within(within(article).getByRole('table', { name: 'Evidence' }))
+      .getByRole('rowheader', { name: 'Segment share of campaign impressions' })
+      .closest('tr');
+    expect(evidenceRow?.querySelector('td')?.textContent).toBe('12.0%');
     expect(within(article).queryByRole('table', { name: CLUSTER_TERMS_CAPTION })).toBeNull();
   });
 

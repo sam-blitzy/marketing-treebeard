@@ -21,8 +21,10 @@ Rows carry camelCase keys and INT64 values as strings, use only the fields their
 ``row_*.json`` contract defines, and the first and last row of every response are checked
 against that contract. Rows are rendered from compact :class:`Cell` runs of keys, and identical
 responses are serialised once, so a 63-level id-range descent stays fast. Deliberately
-misbehaving relays (an ignored filter, an ignored ``LIMIT``, a malformed row, a repeated token)
-are opt-in and named where used. No test touches the network, a database or a real sleep.
+misbehaving relays (an ignored filter, an ignored ``LIMIT``, a malformed row, a repeated token,
+an ignored page token answered with page 1 and a fresh token, as the live n8n workflow does)
+are opt-in and named where used. Fetches that stream into a ``sink`` are covered alongside
+those that return their rows. No test touches the network, a database or a real sleep.
 """
 
 import functools
@@ -31,6 +33,7 @@ import itertools
 import json
 import re
 from bisect import bisect_left, bisect_right
+from collections import Counter
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import FrozenInstanceError, dataclass, field, replace
@@ -56,6 +59,7 @@ from ads_engine.connectors.google_n8n.client import (
     SIMULATED_WEBHOOK_URL,
     UNMETERED,
     CallBudget,
+    GoogleAdsRow,
     GoogleAdsWebhookClient,
 )
 from ads_engine.connectors.google_n8n.partition import (
@@ -435,6 +439,8 @@ class FakeGoogle:
         page_rows: When set, results come in pages of this many rows chained by
             ``nextPageToken``. The specified n8n response carries no token.
         repeat_token: Whether every page carries the same token, as a broken relay might.
+        ignore_page_token: Whether the relay ignores the ``page_token`` it is sent and answers
+            the first page again with a fresh token, as the live n8n workflow does.
         calls: Every request received, in order.
     """
 
@@ -445,6 +451,7 @@ class FakeGoogle:
     fault: Callable[[ParsedQuery], tuple[int, object] | None] | None = None
     page_rows: int | None = None
     repeat_token: bool = False
+    ignore_page_token: bool = False
     calls: list[Call] = field(default_factory=list)
     _tokens: dict[str, tuple[str, int]] = field(default_factory=dict)
     _bodies: dict[object, bytes] = field(default_factory=dict)
@@ -473,6 +480,8 @@ class FakeGoogle:
             assert token in self._tokens, "the client sent a token the relay never issued"
             issued_for, offset = self._tokens[token]
             assert issued_for == query, "a page token was sent back with another query"
+            if self.ignore_page_token:
+                offset = 0
         selected = self._select(parsed)
         if self.page_rows is None:
             page, next_token = _window(selected, 0, PAGE_SIZE), None
@@ -482,6 +491,9 @@ class FakeGoogle:
             next_token = None
             if end < sum(len(keys) for _, keys in selected):
                 next_token = "again" if self.repeat_token else f"page-{end}"
+                if self.ignore_page_token:
+                    # A fresh token on every call, so the client's repeated-token check passes.
+                    next_token = f"{next_token}-call-{len(self.calls)}"
                 self._tokens[next_token] = (query, end)
         return httpx.Response(
             200,
@@ -1116,6 +1128,288 @@ async def test_a_repeated_page_token_is_a_query_defect() -> None:
     assert [call.page_token for call in fake.calls] == [None, "again"]
 
 
+# --- a relay that ignores page tokens ---------------------------------------------------------
+
+
+def _ignored_token_world(query_id: str) -> dict[str, list[Cell]]:
+    """Q-G3 or Q-G6 rows: day 1 holds 10,001, on both sides of the full range's midpoint.
+
+    Day 1 splits into ``campaign.id`` ranges of 9,999 and 2 rows; day 2 holds 2 rows. The live
+    relay answers a 10,000-row page with a token whenever more rows match, and answers that
+    token with page 1 again, so only partitioning can read the rows beyond page 1.
+    """
+    if query_id == "Q-G3":
+        return {
+            "Q-G3": [
+                Cell(range(1, PAGE_SIZE), day=DAY1),
+                Cell(range(FULL_MID + 1, FULL_MID + 3), day=DAY1),
+                Cell(range(1, 3), day=DAY2),
+            ]
+        }
+    return {
+        "Q-G6": [
+            Cell(range(1, PAGE_SIZE), day=DAY1, campaign=HEAVY_CAMPAIGN, ad_group=HEAVY_AD_GROUP),
+            Cell(range(1, 3), day=DAY1, campaign=OTHER_CAMPAIGN, ad_group=5),
+            Cell(range(1, 3), day=DAY2, campaign=HEAVY_CAMPAIGN, ad_group=HEAVY_AD_GROUP),
+        ]
+    }
+
+
+# The fields that identify one row of each dated template the token tests read.
+_ROW_KEY_FIELDS: Mapping[str, tuple[str, ...]] = {
+    "Q-G3": ("segments.date", "campaign.id"),
+    "Q-G6": ("segments.date", "ad_group.id", "search_term_view.search_term"),
+}
+
+
+def _row_keys(query_id: str, rows: Sequence[Mapping[str, Any]]) -> list[tuple[Any, ...]]:
+    """Return the identifying fields of every row, in row order."""
+    return [tuple(_value(row, name) for name in _ROW_KEY_FIELDS[query_id]) for row in rows]
+
+
+def _ignoring_relay(query_id: str) -> FakeGoogle:
+    """The live relay's shape: 10,000-row pages, and every page token answered with page 1."""
+    return FakeGoogle(_ignored_token_world(query_id), page_rows=PAGE_SIZE, ignore_page_token=True)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("query_id", ["Q-G3", "Q-G6"])
+async def test_a_relay_ignoring_page_tokens_is_read_completely_by_partitioning(
+    query_id: str, captured: list[EventDict]
+) -> None:
+    """An abandoned token caps its partition; dates and id ranges then read each row once."""
+    fake = _ignoring_relay(query_id)
+
+    async with _client(fake) as client:
+        outcome = await PartitionedFetcher(client).partitioned_fetch(
+            query_id, {START: DAY1, END: DAY2}
+        )
+        learned = client.page_tokens_ignored
+
+    day1 = {START: DAY1, END: DAY1}
+    assert fake.scopes == [
+        {START: DAY1, END: DAY2},
+        day1,
+        {**day1, CAMPAIGN_LO: INT64_MIN_ID, CAMPAIGN_HI: FULL_MID},
+        {**day1, CAMPAIGN_LO: FULL_MID + 1, CAMPAIGN_HI: INT64_MAX},
+        {START: DAY2, END: DAY2},
+    ]
+    # Only the first token is sent back; the client then knows the relay ignores tokens.
+    assert [call.page_token is not None for call in fake.calls] == [False, True, *[False] * 4]
+    assert learned
+    read = _row_keys(query_id, outcome.rows)
+    assert len(read) == len(set(read)) == PAGE_SIZE + 3
+    assert (outcome.completeness, outcome.reason) == ("complete", None)
+    assert (outcome.calls, outcome.partitions_read) == (6, 5)
+    (ignored,) = _events(captured, "google.page_token_ignored")
+    assert (ignored["query_id"], ignored["page"], ignored["repeated"]) == (query_id, 2, PAGE_SIZE)
+    (not_followed,) = _events(captured, "google.page_token_not_followed")
+    assert (not_followed["query_id"], not_followed["page"]) == (query_id, 1)
+    assert not any("-call-" in str(value) for entry in captured for value in entry.values())
+
+
+@pytest.mark.anyio
+async def test_a_q_g6_finest_partition_behind_an_ignored_token_is_kept_and_incomplete() -> None:
+    """At one (day, ad group), page 1 of an abandoned token is kept once, at the finest reason."""
+    heavy = Cell(
+        range(1, PAGE_SIZE + 2), day=DAY1, campaign=HEAVY_CAMPAIGN, ad_group=HEAVY_AD_GROUP
+    )
+    fake = FakeGoogle({"Q-G6": [heavy]}, page_rows=PAGE_SIZE, ignore_page_token=True)
+
+    outcome = await _fetch(fake, "Q-G6", _finest_scope(HEAVY_AD_GROUP, HEAVY_AD_GROUP))
+
+    assert [call.page_token is not None for call in fake.calls] == [False, True]
+    terms = [_value(row, "search_term_view.search_term") for row in outcome.rows]
+    assert terms == [f"term {key}" for key in range(1, PAGE_SIZE + 1)]
+    assert not outcome.complete
+    assert outcome.reason == (
+        f"{REASON_FINEST_PARTITION} ({DAY1.isoformat()}, ad group {HEAVY_AD_GROUP})"
+    )
+    assert (outcome.calls, outcome.partitions_read, outcome.deferred) == (2, 1, ())
+
+
+# --- streaming into a sink --------------------------------------------------------------------
+
+
+class _Sink:
+    """A row sink recording each batch it is handed and the webhook calls received by then.
+
+    Attributes:
+        batches: Every batch handed over, in order.
+        calls_seen: How many requests the fake had received when each batch arrived.
+    """
+
+    def __init__(self, fake: FakeGoogle, error: Exception | None = None) -> None:
+        self._fake = fake
+        self._error = error
+        self.batches: list[tuple[GoogleAdsRow, ...]] = []
+        self.calls_seen: list[int] = []
+
+    async def __call__(self, rows: tuple[GoogleAdsRow, ...]) -> None:
+        """Record one batch, or raise the scripted error instead."""
+        if self._error is not None:
+            raise self._error
+        self.batches.append(rows)
+        self.calls_seen.append(len(self._fake.calls))
+
+    @property
+    def rows(self) -> list[GoogleAdsRow]:
+        """Every row handed over, in order."""
+        return [row for batch in self.batches for row in batch]
+
+
+async def _stream(
+    fake: FakeGoogle,
+    query_id: str,
+    scope: Mapping[str, object],
+    sink: _Sink,
+    budget: CallBudget = UNMETERED,
+) -> FetchOutcome:
+    """Run one ``partitioned_fetch(query_id, scope, sink=sink)`` against ``fake``."""
+    async with _client(fake, budget) as client:
+        return await PartitionedFetcher(client).partitioned_fetch(query_id, scope, sink=sink)
+
+
+@pytest.mark.anyio
+async def test_a_sink_receives_each_accepted_partition_in_order_and_nothing_is_kept(
+    captured: list[EventDict],
+) -> None:
+    """Each partition goes to the sink once accepted; rows stays empty, streamed counts them."""
+    scope = {START: DAY1, END: DAY2}
+    returned = await _fetch(_ignoring_relay("Q-G3"), "Q-G3", scope)
+    fake = _ignoring_relay("Q-G3")
+    sink = _Sink(fake)
+
+    outcome = await _stream(fake, "Q-G3", scope, sink)
+
+    # One batch per accepted partition, each handed over right after its own call.
+    assert [len(batch) for batch in sink.batches] == [PAGE_SIZE - 1, 2, 2]
+    assert sink.calls_seen == [4, 5, 6]
+    assert sink.rows == list(returned.rows)
+    assert outcome.rows == ()
+    assert (outcome.streamed, outcome.rows_read) == (PAGE_SIZE + 3, PAGE_SIZE + 3)
+    assert (returned.streamed, returned.rows_read) == (0, PAGE_SIZE + 3)
+    assert (outcome.completeness, outcome.calls, outcome.partitions_read) == ("complete", 6, 5)
+    # The fetch that kept its rows logged first, then the streaming one.
+    kept, streamed = _events(captured, "google.partitioned_fetch")
+    assert (streamed["rows"], streamed["streamed"]) == (PAGE_SIZE + 3, PAGE_SIZE + 3)
+    assert (kept["rows"], kept["streamed"]) == (PAGE_SIZE + 3, 0)
+
+
+@pytest.mark.anyio
+async def test_a_sink_streams_a_multi_page_partition_from_its_second_page() -> None:
+    """Page 1 is held until page 2 proves the token advances; then each page goes at once."""
+    fake = FakeGoogle({"Q-G3": [Cell(range(1, 6), day=DAY1)]}, page_rows=2)
+    sink = _Sink(fake)
+
+    outcome = await _stream(fake, "Q-G3", {START: DAY1, END: DAY1}, sink)
+
+    assert [_ids(batch, "campaign.id") for batch in sink.batches] == [[1, 2], [3, 4], [5]]
+    assert sink.calls_seen == [2, 2, 3]
+    assert (outcome.rows, outcome.streamed, outcome.rows_read) == ((), 5, 5)
+    assert outcome.complete
+    assert (outcome.calls, outcome.partitions_read) == (3, 1)
+
+
+@pytest.mark.anyio
+async def test_a_streamed_partition_that_ends_capped_is_split_and_re_read() -> None:
+    """Pages handed over before a capped last page are handed over again by the halves."""
+    world = {
+        "Q-G3": [
+            Cell(keys, day=day)
+            for day in (DAY1, DAY2)
+            for keys in (range(1, PAGE_SIZE), range(INT64_MAX, INT64_MAX + 1))
+        ]
+    }
+    fake = FakeGoogle(world, page_rows=PAGE_SIZE)
+    sink = _Sink(fake)
+
+    outcome = await _stream(fake, "Q-G3", {START: DAY1, END: DAY2}, sink)
+
+    # Two pages of 10,000, the last with no token, then each day's two campaign halves.
+    assert [len(batch) for batch in sink.batches] == [
+        PAGE_SIZE,
+        PAGE_SIZE,
+        PAGE_SIZE - 1,
+        1,
+        PAGE_SIZE - 1,
+        1,
+    ]
+    handed = Counter(_row_keys("Q-G3", sink.rows))
+    assert len(handed) == 2 * PAGE_SIZE
+    assert set(handed.values()) == {2}
+    assert (outcome.rows, outcome.streamed) == ((), 4 * PAGE_SIZE)
+    assert outcome.complete
+    assert (outcome.calls, outcome.partitions_read) == (8, 7)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("page_rows", [None, 2], ids=["one page", "pages"])
+@pytest.mark.parametrize(
+    "error",
+    [
+        TransientError("database unavailable", source="google", endpoint="search"),
+        QueryDefect("row_campaign_daily: bad row", source="google", endpoint="search"),
+        RuntimeError("dataset not writable"),
+    ],
+    ids=["transient", "defect", "other"],
+)
+async def test_an_error_the_sink_raises_propagates_unchanged(
+    page_rows: int | None, error: Exception
+) -> None:
+    """A sink failure ends the fetch as raised; it is never taken for an interruption."""
+    fake = FakeGoogle({"Q-G3": [Cell(range(1, 6), day=DAY1)]}, page_rows=page_rows)
+
+    with pytest.raises(type(error)) as caught:
+        await _stream(fake, "Q-G3", {START: DAY1, END: DAY1}, _Sink(fake, error))
+
+    assert caught.value is error
+    # The sink is first called once a partition is accepted, or once page 2 proves paging.
+    assert len(fake.calls) == (1 if page_rows is None else 2)
+
+
+@pytest.mark.anyio
+async def test_an_interrupted_streaming_fetch_keeps_its_rows_handed_over() -> None:
+    """Rows already in the sink stay there; the deferral is exactly the one without a sink."""
+    without = await _fetch(
+        FakeGoogle(_four_day_world()), "Q-G3", {START: DAY1, END: DAY4}, _Budget(4)
+    )
+    fake = FakeGoogle(_four_day_world())
+    sink = _Sink(fake)
+
+    outcome = await _stream(fake, "Q-G3", {START: DAY1, END: DAY4}, sink, _Budget(4))
+
+    assert [len(batch) for batch in sink.batches] == [PAGE_SIZE - 1, 1]
+    assert sink.rows == list(without.rows)
+    assert outcome.deferred == without.deferred == ({START: DAY3, END: DAY4},)
+    assert outcome.reason == without.reason == f"{REASON_BUDGET}; 1 partition deferred"
+    assert (outcome.rows, outcome.streamed) == ((), PAGE_SIZE)
+
+
+@pytest.mark.anyio
+async def test_an_interruption_mid_partition_keeps_its_streamed_pages_and_re_reads_it() -> None:
+    """Pages streamed before the budget ran out stay handed over; the resumed partition re-reads."""
+    fake = FakeGoogle({"Q-G3": [Cell(range(1, 6), day=DAY1)]}, page_rows=2)
+    sink = _Sink(fake)
+    budget = _Budget(2)
+    scope = {START: DAY1, END: DAY1}
+
+    async with _client(fake, budget) as client:
+        fetcher = PartitionedFetcher(client)
+        interrupted = await fetcher.partitioned_fetch("Q-G3", scope, sink=sink)
+        handed_before_resume = [_ids(batch, "campaign.id") for batch in sink.batches]
+        budget.allowed += 3
+        resumed = await fetcher.partitioned_fetch("Q-G3", interrupted.deferred[0], sink=sink)
+
+    assert handed_before_resume == [[1, 2], [3, 4]]
+    assert isinstance(interrupted.interrupted_by, CallBudgetExhausted)
+    assert interrupted.deferred == (scope,)
+    assert (interrupted.rows, interrupted.streamed, interrupted.partitions_read) == ((), 4, 0)
+    assert resumed.complete
+    assert resumed.streamed == 5
+    assert [_ids(batch, "campaign.id") for batch in sink.batches[2:]] == [[1, 2], [3, 4], [5]]
+
+
 # --- interruption: call budget and transient failures -----------------------------------------
 
 
@@ -1706,16 +2000,18 @@ async def test_the_bound_fetcher_reads_a_query_id_and_scope_passed_positionally(
 
 
 def test_partitioned_fetch_takes_exactly_a_query_id_and_an_optional_scope() -> None:
-    """The method's parameters are ``self``, ``query_id`` and ``scope=None``, in that order."""
+    """The parameters are ``self``, ``query_id`` and ``scope=None``, then keyword-only ``sink``."""
     parameters = inspect.signature(PartitionedFetcher.partitioned_fetch).parameters
 
-    assert list(parameters) == ["self", "query_id", "scope"]
+    assert list(parameters) == ["self", "query_id", "scope", "sink"]
     assert all(
-        parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
-        for parameter in parameters.values()
+        parameters[name].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        for name in ("self", "query_id", "scope")
     )
+    assert parameters["sink"].kind is inspect.Parameter.KEYWORD_ONLY
     assert parameters["query_id"].default is inspect.Parameter.empty
     assert parameters["scope"].default is None
+    assert parameters["sink"].default is None
     assert inspect.iscoroutinefunction(PartitionedFetcher.partitioned_fetch)
 
 

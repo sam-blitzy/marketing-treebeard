@@ -16,7 +16,8 @@
  *
  * Only test files import this module; application code never does. It renders nothing but the
  * two providers, the component under test and the `Outlet`, and it never fetches: stub the
- * network with `./mockApi`.
+ * network with `./mockApi`. It also exports {@link KEEP_SPACES}, the text-query options that
+ * find a formatted amount by its exact text.
  *
  * @example
  * ```tsx
@@ -39,12 +40,24 @@ import {
   createRouter,
   useRouter,
 } from '@tanstack/react-router';
-import { render, waitFor } from '@testing-library/react';
+import { getDefaultNormalizer, render, waitFor } from '@testing-library/react';
 import type { RenderResult } from '@testing-library/react';
 import { useEffect } from 'react';
 import type { ReactElement } from 'react';
 
 import type { Run } from '../api/types';
+
+// ---------------------------------------------------------------------------------------------
+// Text queries
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Text-query options that compare each node's text with its spaces kept as they are. The
+ * default normalizer turns the no-break space `src/lib/format.ts` puts between a currency code
+ * and its figure into a plain space, so a query for a formatted amount needs these to match it:
+ * `getByText(formatMoney('40', 'EUR'), KEEP_SPACES)`.
+ */
+export const KEEP_SPACES = { normalizer: getDefaultNormalizer({ collapseWhitespace: false }) };
 
 // ---------------------------------------------------------------------------------------------
 // Query client

@@ -20,9 +20,11 @@
  *   `X-Requested-With: ads-engine`, the header and value `backend/src/ads_engine/api/security.py`
  *   requires (`CSRF_HEADER`, `CSRF_VALUE`, `MUTATING_METHODS`). `GET` never carries it.
  * - **Errors.** Every failure becomes an {@link ApiError}: the API's
- *   `{"error": {"code", "message"}}` envelope keeps its code and message, a response without
- *   that envelope (an nginx 502 page, an empty body) gets `http_<status>`, an unreachable server
- *   gets status 0 and `network_error`, and an unreadable success body gets `invalid_response`,
+ *   `{"error": {"code", "message"}}` envelope keeps its code and message, and so does the same
+ *   envelope that `web/nginx.conf` sends for an error nginx makes itself (the API down, a body
+ *   over 1 MB). A response without that envelope (an empty body, or an HTML page from a proxy
+ *   in front of nginx) gets `http_<status>`, an unreachable server gets status 0 and
+ *   `network_error`, and an unreadable success body gets `invalid_response`,
  *   as does a paged response whose `Link` header cannot be parsed or names a next page outside
  *   {@link API_BASE}. The one exception is a caller-initiated abort, which rejects with the
  *   original abort error so TanStack Query treats it as a cancellation rather than a failure.
@@ -120,7 +122,10 @@ const TOKEN_CHAR = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]$/;
 /** Fallback message for a request this client cannot encode, so never sends. */
 const INVALID_REQUEST_MESSAGE = 'The request could not be sent: its body cannot be encoded.';
 
-/** Fallback message for a gateway or availability failure without the API's error envelope. */
+/**
+ * Fallback message for a gateway or availability failure without the API's error envelope.
+ * `web/nginx.conf` sends the same text in its own 502, 503 and 504 envelopes.
+ */
 const UNAVAILABLE_MESSAGE = 'The server is temporarily unavailable. Try again shortly.';
 
 /** Statuses that mean the API is down or unreachable behind nginx, not that the request failed. */
@@ -200,9 +205,11 @@ export interface ApiPage<T> {
  *
  * Server codes are the `error.code` values the API's `{"error": {"code", "message"}}` envelope
  * carries, taken from the backend that emits them: `api/deps.py`, `api/app.py`,
- * `api/routes/*.py`, `analysis/window.py`, `analysis/lock.py` and `decisions.py`. Client codes
- * (`network_error`, `invalid_response`, `invalid_request` and `http_<status>`) are produced here
- * when no envelope is available.
+ * `api/routes/*.py`, `analysis/window.py`, `analysis/lock.py` and `decisions.py`. Gateway
+ * codes are the ones `web/nginx.conf` sends in the same envelope for an error nginx makes
+ * itself under `/api/`, before or instead of the API's answer. Client codes (`network_error`,
+ * `invalid_response`, `invalid_request` and `http_<status>`) are produced here when no
+ * envelope is available.
  *
  * The union documents the contract and gives `switch` statements a checked vocabulary.
  * {@link ApiError.code} itself stays `string`, so a code a newer API adds still reaches the
@@ -233,7 +240,11 @@ export type ApiErrorCode =
    * unknown, or no default analysis run has succeeded yet ("No analysis run yet").
    */
   | 'not_found'
-  /** 405: the path does not support the method. */
+  /**
+   * 405: the path does not support the method. nginx (`web/nginx.conf`) sends the same code and
+   * body for a `TRACE` request, or one whose method is not `GET`, `HEAD`, `POST`, `PUT`,
+   * `PATCH`, `DELETE` or `OPTIONS`, which it refuses before the API sees it.
+   */
   | 'method_not_allowed'
   // --- Conflicts (409) -------------------------------------------------------------------------
   /** 409: the requested run has not succeeded (it is still running or it failed). */
@@ -321,12 +332,34 @@ export type ApiErrorCode =
   // --- Server errors ---------------------------------------------------------------------------
   /** 500: a `config/*.yaml` file or stored CRM binding is invalid; the message names it. */
   | 'config_error'
-  /** 500: an unexpected server failure. */
+  /** 500: an unexpected server failure, in the API or in nginx (`web/nginx.conf`). */
   | 'internal_error'
   /** 503: `GET /healthz` could not reach the database. */
   | 'database_unavailable'
   /** Any other framework-raised HTTP error status. */
   | 'http_error'
+  // --- Gateway codes (`web/nginx.conf`) --------------------------------------------------------
+  /**
+   * 400: nginx could not read the request (a malformed request line, header or body), so the
+   * API never saw it.
+   */
+  | 'bad_request'
+  /** 400: the request's headers or cookies are larger than nginx accepts. */
+  | 'request_header_too_large'
+  /** 413: the request body is larger than nginx's 1 MB limit (`client_max_body_size`). */
+  | 'payload_too_large'
+  /** 501: the request's `Transfer-Encoding` is one nginx does not support (only `chunked` is). */
+  | 'not_implemented'
+  /**
+   * 502 or 503: nginx could not reach the API, which is stopped, restarting or not yet
+   * resolvable. The message is the "temporarily unavailable" text.
+   */
+  | 'upstream_unavailable'
+  /**
+   * 504: nginx gave up on the API, with no connection within 5 s or no answer within 120 s.
+   * The message is the "temporarily unavailable" text.
+   */
+  | 'upstream_timeout'
   // --- Client-side codes -------------------------------------------------------------------
   /** Status 0: the request never reached the server, or its response was lost. */
   | 'network_error'
@@ -340,8 +373,8 @@ export type ApiErrorCode =
   /** Status 0: the body cannot be encoded as JSON, or a `GET` was given one; nothing was sent. */
   | 'invalid_request'
   /**
-   * An error response without the API's envelope, for example nginx's HTML 502 page or an empty
-   * body: `http_502`, `http_404` and so on.
+   * An error response without the envelope, for example an empty body or an HTML page from a
+   * proxy in front of nginx: `http_502`, `http_404` and so on.
    */
   | `http_${number}`;
 

@@ -20,7 +20,11 @@
  *   nothing sent and focus on the first field in error;
  * - a 422 `validation_error` naming `body.email` or `body.password`, shown under that field;
  * - 401 `invalid_credentials`, 429 `rate_limited` with and without a usable `Retry-After`, any
- *   other API failure, and the pending state that blocks a second submission.
+ *   other refusal, and the pending state that blocks a second submission;
+ * - outages (a 5xx, with or without the API's envelope, and a request that never reached the
+ *   server): one message at the head of the form, in the polite status region mounted with the
+ *   page, no field marked invalid, nothing typed cleared, and focus back on "Sign in" when it had
+ *   fallen to `<body>`.
  *
  * @packageDocumentation
  */
@@ -28,7 +32,7 @@ import { apiError, html, json, mockApi } from '../../test/mockApi';
 import type { MockResponse } from '../../test/mockApi';
 import { renderWithProviders } from '../../test/render';
 import { fireEvent, screen, waitFor, within } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { queryKeys } from '../../api/queries';
 import type { Me } from '../../api/types';
@@ -671,27 +675,129 @@ describe('LoginPage', () => {
     expect(controls().password.value).toBe('');
   });
 
-  it("shows the API's own message for any other API failure", async () => {
+  it("shows the API's own message for any other refusal, under the password too", async () => {
     mockApi({
-      'POST /auth/login': apiError(503, 'database_unavailable', 'Database unavailable'),
+      'POST /auth/login': apiError(403, 'csrf_header_missing', 'Missing X-Requested-With header'),
     });
     await renderWithProviders(<LoginPage redirectTo="/actions" />, { path: '/login' });
 
     signIn(ADMIN_EMAIL, TYPED_PASSWORD);
 
-    expect(await screen.findAllByText('Database unavailable')).toHaveLength(2);
+    const message = 'Missing X-Requested-With header';
+    expect(await screen.findAllByText(message)).toHaveLength(2);
+    expect(descriptionOf(controls().password)).toEqual([message]);
     expect(controls().password.value).toBe('');
   });
 
-  it("shows the client's message for an error page without the API's envelope", async () => {
+  /** Case, the stub that makes the attempt fail, and the message the page shows for it. */
+  const OUTAGES: readonly (readonly [string, () => void, string])[] = [
+    [
+      "a 503 with the API's envelope",
+      () => {
+        mockApi({
+          'POST /auth/login': apiError(503, 'database_unavailable', 'Database unavailable'),
+        });
+      },
+      'Database unavailable',
+    ],
+    [
+      "a 502 error page without the API's envelope",
+      () => {
+        mockApi({ 'POST /auth/login': html(502, '<html><body>Bad gateway</body></html>') });
+      },
+      'The server is temporarily unavailable. Try again shortly.',
+    ],
+    [
+      'a request that never reached the server',
+      () => {
+        mockApi({});
+        vi.stubGlobal('fetch', () => Promise.reject(new TypeError('Failed to fetch')));
+      },
+      'The server could not be reached. Check your connection and try again.',
+    ],
+  ];
+
+  it.each(OUTAGES)(
+    'shows %s once, at the head of the form, and keeps what was typed',
+    async (_case, stub, message) => {
+      stub();
+      await renderWithProviders(<LoginPage redirectTo="/actions" />, { path: '/login' });
+      // The polite region exists, empty, before the first attempt, so its message is announced.
+      const region = screen.getByRole('status');
+      expect(region.childNodes).toHaveLength(0);
+
+      signIn(ADMIN_EMAIL, TYPED_PASSWORD);
+
+      const shown = await screen.findAllByText(message);
+      expect(shown).toHaveLength(1);
+      expect(region.contains(shown[0] ?? null)).toBe(true);
+      expect(screen.getByRole('status')).toBe(region);
+      // The API never judged the credentials: no field is invalid or described by the message,
+      // and nothing typed is cleared.
+      const { email, password, submit } = controls();
+      expect(password.getAttribute('aria-invalid')).toBeNull();
+      expect(descriptionOf(password)).toEqual([]);
+      expect(email.getAttribute('aria-invalid')).toBeNull();
+      expect(descriptionOf(email)).toEqual([]);
+      expect(password.value).toBe(TYPED_PASSWORD);
+      expect(email.value).toBe(ADMIN_EMAIL);
+      // Focus was on <body>, off the busy button; it returns to "Sign in", where Enter retries.
+      await waitFor(() => {
+        expect(document.activeElement).toBe(submit);
+      });
+      expect(submit.disabled).toBe(false);
+      expect(screen.queryByRole('alert')).toBeNull();
+    },
+  );
+
+  it('leaves focus in the password field after an outage submitted from it', async () => {
     mockApi({ 'POST /auth/login': html(502, '<html><body>Bad gateway</body></html>') });
     await renderWithProviders(<LoginPage redirectTo="/actions" />, { path: '/login' });
+    const { email, password } = controls();
+    fireEvent.change(email, { target: { value: ADMIN_EMAIL } });
+    fireEvent.change(password, { target: { value: TYPED_PASSWORD } });
 
+    // Enter pressed in the password field: the form submits with focus in that field.
+    password.focus();
+    fireEvent.submit(loginForm());
+
+    await screen.findByText('The server is temporarily unavailable. Try again shortly.');
+    await waitFor(() => {
+      expect(controls().submit.disabled).toBe(false);
+    });
+    expect(document.activeElement).toBe(password);
+    expect(password.value).toBe(TYPED_PASSWORD);
+    expect(password.getAttribute('aria-invalid')).toBeNull();
+  });
+
+  it('clears an outage message while the retry is pending and shows what that attempt gets', async () => {
+    const api = mockApi({
+      'POST /auth/login': apiError(503, 'database_unavailable', 'Database unavailable'),
+    });
+    await renderWithProviders(<LoginPage redirectTo="/actions" />, { path: '/login' });
     signIn(ADMIN_EMAIL, TYPED_PASSWORD);
+    await screen.findByText('Database unavailable');
+    const region = screen.getByRole('status');
 
-    expect(
-      await screen.findAllByText('The server is temporarily unavailable. Try again shortly.'),
-    ).toHaveLength(2);
+    const retry = heldResponse();
+    api.use({ 'POST /auth/login': () => retry.promise });
+    fireEvent.click(controls().submit);
+
+    // The region empties while the retry runs, so a repeated outage would be new content.
+    await waitFor(() => {
+      expect(region.childNodes).toHaveLength(0);
+    });
+    retry.release(apiError(401, 'invalid_credentials', 'Invalid email or password'));
+
+    expect(await screen.findAllByText('Email or password is incorrect')).toHaveLength(2);
+    expect(screen.queryByText('Database unavailable')).toBeNull();
+    expect(region.childNodes).toHaveLength(0);
+    expect(controls().password.value).toBe('');
+    // The retry sent the password the outage had kept, exactly as typed.
+    expect(api.calls.map((call) => call.body)).toEqual([
+      { email: ADMIN_EMAIL, password: TYPED_PASSWORD },
+      { email: ADMIN_EMAIL, password: TYPED_PASSWORD },
+    ]);
   });
 
   it('is busy while the request is pending and ignores a second submission', async () => {

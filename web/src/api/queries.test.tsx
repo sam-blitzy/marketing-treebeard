@@ -21,6 +21,11 @@
  *   an observer enabled again), and
  *   the `/actions` prefetch, which reads the configuration and sources (and the latest default
  *   run only for an addressed run) without polling and never reads the custom-run list;
+ * - `useActionsRefreshFailure`: the failed refresh of the page, the sources, the unresolved
+ *   discrepancies or the configuration while the entry keeps its data, page first, the same
+ *   error object while the entry is read again and `null` after its next success; never a
+ *   failed first read, the latest default run, the resolved list or another run's page; no
+ *   request, no observer, and no re-render while the reported failure stays the same;
  * - `useDiscrepancies` paging: a first page at `limit=500`, every `Link: rel="next"` page
  *   followed exactly as named however short the page, a repeated page rejected, one restart
  *   from the first page after a 422 `invalid_cursor`, and its `enabled: false` option, which
@@ -68,6 +73,7 @@ import {
   meQueryOptions,
   queryKeys,
   sourcesQueryOptions,
+  useActionsRefreshFailure,
   useConfig,
   useCreateRun,
   useCustomRuns,
@@ -618,9 +624,13 @@ function pagedHeaders(total: number, after?: number): Record<string, string> {
 }
 
 afterEach(() => {
-  for (const client of clients.splice(0)) {
-    client.clear();
-  }
+  // Inside act: this runs before Testing Library unmounts the hook under test, and a mounted
+  // `useActionsRefreshFailure` reads the query cache directly, so clearing it re-renders the hook.
+  act(() => {
+    for (const client of clients.splice(0)) {
+      client.clear();
+    }
+  });
   // The polling lifecycle cases take the page out of view through a spied
   // `document.visibilityState` getter or TanStack's `focusManager`. Both go back to the
   // browser's own state, so no later test starts with its polls suspended.
@@ -2120,6 +2130,190 @@ describe('usePrefetchActionsReads', () => {
     }, setup);
     await act(() => Promise.resolve());
     expect(mock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('useActionsRefreshFailure', () => {
+  /** The keys the hook checks for the default page, in its order. */
+  const WATCHED_KEYS: readonly (readonly [string, QueryKey])[] = [
+    ['the page', queryKeys.recommendations('default')],
+    ['the sources', queryKeys.sources],
+    ['the unresolved discrepancies', queryKeys.discrepancies(DEFAULT_DISCREPANCY_STATES)],
+    ['the configuration', queryKeys.config],
+  ];
+
+  /**
+   * The error the client rejects with while nginx answers 502 for a stopped API.
+   *
+   * @returns A fresh error.
+   */
+  function outage(): ApiError {
+    return new ApiError(
+      502,
+      'http_502',
+      'The server is temporarily unavailable. Try again shortly.',
+    );
+  }
+
+  /**
+   * Settles the entry under `queryKey` with a failed fetch, as a failed poll does: the entry keeps
+   * whatever data it holds. The query function rejects by itself, so no request is sent.
+   *
+   * @param client - The query client.
+   * @param queryKey - The exact key.
+   * @param error - What the fetch rejects with.
+   */
+  async function failRead(client: QueryClient, queryKey: QueryKey, error: ApiError): Promise<void> {
+    await act(async () => {
+      await rejection(client.fetchQuery({ queryKey, queryFn: () => Promise.reject(error) }));
+    });
+  }
+
+  /**
+   * Settles the entry under `queryKey` with a successful fetch of `data`, sending no request.
+   *
+   * @param client - The query client.
+   * @param queryKey - The exact key.
+   * @param data - What the fetch resolves to.
+   */
+  async function succeedRead(
+    client: QueryClient,
+    queryKey: QueryKey,
+    data: unknown,
+  ): Promise<void> {
+    await act(async () => {
+      await client.fetchQuery({ queryKey, queryFn: () => Promise.resolve(data) });
+    });
+  }
+
+  it('reports nothing while no watched entry holds data, a failed first read included', async () => {
+    const mock = stubFetch(unexpected);
+    const { result, queryClient } = renderWithWrapper(() => useActionsRefreshFailure());
+    expect(result.current).toBeNull();
+
+    // A first read that failed holds no data: the component reading it shows its own failure.
+    await failRead(queryClient, queryKeys.sources, outage());
+    await nextMacrotask();
+    expect(queryClient.getQueryState(queryKeys.sources)?.status).toBe('error');
+    expect(result.current).toBeNull();
+    expect(mock).not.toHaveBeenCalled();
+  });
+
+  it.each(WATCHED_KEYS)(
+    'reports a failed refresh of %s, which keeps its data, until the next success',
+    async (_name, queryKey) => {
+      stubFetch(unexpected);
+      const { result, queryClient } = renderWithWrapper(() => useActionsRefreshFailure());
+      queryClient.setQueryData(queryKey, { seeded: queryKey });
+      await nextMacrotask();
+      expect(result.current).toBeNull();
+
+      const error = outage();
+      await failRead(queryClient, queryKey, error);
+      await waitFor(() => expect(result.current).toBe(error));
+      expect(queryClient.getQueryData(queryKey)).toEqual({ seeded: queryKey });
+
+      await succeedRead(queryClient, queryKey, { seeded: queryKey });
+      await waitFor(() => expect(result.current).toBeNull());
+    },
+  );
+
+  it('keeps the same error while the entry is read again, so the notice never flickers', async () => {
+    stubFetch(unexpected);
+    const queryKey = queryKeys.recommendations('default');
+    const { result, queryClient } = renderWithWrapper(() => useActionsRefreshFailure());
+    queryClient.setQueryData(queryKey, pagePayload());
+    const error = outage();
+    await failRead(queryClient, queryKey, error);
+    await waitFor(() => expect(result.current).toBe(error));
+
+    const held = deferred<ReturnType<typeof pagePayload>>();
+    let refetch: Promise<unknown> = Promise.resolve();
+    act(() => {
+      refetch = queryClient.fetchQuery({ queryKey, queryFn: () => held.promise });
+    });
+    await nextMacrotask();
+    expect(queryClient.getQueryState(queryKey)?.fetchStatus).toBe('fetching');
+    expect(result.current).toBe(error);
+
+    held.resolve(pagePayload());
+    await act(async () => {
+      await refetch;
+    });
+    await waitFor(() => expect(result.current).toBeNull());
+  });
+
+  it('reports the page before the other reads, then the next failure once the page recovers', async () => {
+    stubFetch(unexpected);
+    const { result, queryClient } = renderWithWrapper(() => useActionsRefreshFailure());
+    for (const [, queryKey] of WATCHED_KEYS) {
+      queryClient.setQueryData(queryKey, { seeded: queryKey });
+    }
+    const configFailure = outage();
+    const pageFailure = new ApiError(503, 'database_unavailable', 'Database unavailable');
+    await failRead(queryClient, queryKeys.config, configFailure);
+    await failRead(queryClient, queryKeys.recommendations('default'), pageFailure);
+    await waitFor(() => expect(result.current).toBe(pageFailure));
+
+    await succeedRead(queryClient, queryKeys.recommendations('default'), pagePayload());
+    await waitFor(() => expect(result.current).toBe(configFailure));
+  });
+
+  it('watches the addressed run only, and never the latest default run or the resolved list', async () => {
+    stubFetch(unexpected);
+    const { result, queryClient } = renderWithWrapper(() =>
+      useActionsRefreshFailure(CUSTOM_RUN_ID),
+    );
+    const ignored: readonly QueryKey[] = [
+      queryKeys.recommendations('default'),
+      queryKeys.recommendations(DEFAULT_RUN_ID),
+      queryKeys.runs.latest,
+      queryKeys.discrepancies(['resolved']),
+      queryKeys.discrepancyPages(DEFAULT_DISCREPANCY_STATES),
+      queryKeys.decisions({}),
+    ];
+    for (const queryKey of ignored) {
+      queryClient.setQueryData(queryKey, { seeded: queryKey });
+      await failRead(queryClient, queryKey, outage());
+    }
+    await nextMacrotask();
+    expect(result.current).toBeNull();
+
+    const addressed = queryKeys.recommendations(CUSTOM_RUN_ID);
+    queryClient.setQueryData(addressed, pagePayload(CUSTOM_RUN_ID, 'custom'));
+    const error = outage();
+    await failRead(queryClient, addressed, error);
+    await waitFor(() => expect(result.current).toBe(error));
+  });
+
+  it('sends no request, registers no observer and re-renders only when the failure changes', async () => {
+    const mock = stubFetch(unexpected);
+    let renders = 0;
+    const { result, queryClient } = renderWithWrapper(() => {
+      renders += 1;
+      return useActionsRefreshFailure();
+    });
+    queryClient.setQueryData(queryKeys.sources, sourcesPayload());
+    const error = outage();
+    await failRead(queryClient, queryKeys.sources, error);
+    await waitFor(() => expect(result.current).toBe(error));
+    const settledRenders = renders;
+
+    // Cache events that leave the reported failure as it is: another entry's data, and a second
+    // entry failing behind the first in the hook's order.
+    queryClient.setQueryData(queryKeys.config, configPayload());
+    queryClient.setQueryData(queryKeys.runs.latest, runPayload());
+    await failRead(queryClient, queryKeys.config, outage());
+    await nextMacrotask();
+    expect(result.current).toBe(error);
+    expect(renders).toBe(settledRenders);
+
+    for (const [, queryKey] of WATCHED_KEYS) {
+      expect(
+        queryClient.getQueryCache().find({ queryKey, exact: true })?.getObserversCount() ?? 0,
+      ).toBe(0);
+    }
+    expect(mock).not.toHaveBeenCalled();
   });
 });
 

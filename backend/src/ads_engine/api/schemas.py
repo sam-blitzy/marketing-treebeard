@@ -1051,15 +1051,25 @@ class Metric(ApiModel):
 class Baseline(ApiModel):
     """A value an item's metrics were compared against (``Evidence.baselines``).
 
+    A baseline that no metric of its item shares a unit with carries its own ``unit`` and,
+    for money, ``currency``, so it is formatted in the account currency (AAP 0.5.5).
+
     Attributes:
         key: Stable machine key, for example ``account_cost_per_outcome``.
         label: Display label.
         value: The baseline; ``None`` when unavailable.
+        unit: The unit, for example ``currency`` or ``ratio``. ``None`` for a baseline shown
+            in the unit of the metric it pairs with, a unitless one, and one frozen by a run
+            that predates this key.
+        currency: ISO currency code for a money value. ``None`` otherwise, and on evidence
+            frozen by a run that predates this key.
     """
 
     key: str
     label: str
     value: MetricValue
+    unit: str | None = None
+    currency: str | None = None
 
 
 class Projection(ApiModel):
@@ -1113,15 +1123,24 @@ class StatTest(ApiModel):
 class DatasetCoverage(ApiModel):
     """A dataset an item read, with its completeness and coverage at compute time.
 
+    A coverage date travels with its day boundary, so it is shown labelled with its source's
+    day boundary (AAP 0.5.5), HubSpot's included, which ``Evidence.window.source_days`` does
+    not list.
+
     Attributes:
         dataset: The dataset name, for example ``google.search_terms``.
         completeness: ``complete``, ``incomplete`` or ``unknown``.
         covered_through: The last native date the dataset covered; ``None`` when unknown.
+        boundary: The IANA zone whose midnight ends ``covered_through``, for example
+            ``America/New_York`` for Google or ``UTC`` for LinkedIn and HubSpot. ``None``
+            without a ``covered_through``, and on evidence frozen by a run that predates this
+            key, whose Google and LinkedIn dates take their boundary from ``source_days``.
     """
 
     dataset: str
     completeness: Completeness
     covered_through: date | None
+    boundary: str | None = None
 
 
 class ProvenanceEntry(ApiModel):

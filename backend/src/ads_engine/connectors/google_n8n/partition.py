@@ -36,10 +36,26 @@ construction. Its ``partitioned_fetch(query_id, scope)`` reads one template of
 
 Partitions are processed from an explicit stack, depth first and deterministically: dates
 ascending, then ranges ascending (children are pushed in reverse). A capped response's rows are
-discarded when it is split, and its children re-read them. Partitions are disjoint, and every
-accepted row is checked against the partition it was read for (its date, id ranges, ad group and
-keyset position), so a relay that ignored a filter fails as a ``QueryDefect`` instead of
-duplicating rows.
+discarded when it is split, and its children re-read them. A response is capped when its last
+page holds exactly 10,000 rows with no token, or when the client abandoned a page token the
+relay ignored (``QueryResult.token_abandoned``: the live n8n workflow answers a follow-up call
+with page 1 again), so a relay that does not honour ``page_token`` is read completely by date and
+id partitioning instead. Partitions are disjoint, and every accepted row is checked against the
+partition it was read for (its date, id ranges, ad group and keyset position), so a relay that
+ignored a filter fails as a ``QueryDefect`` instead of duplicating rows.
+
+Streaming:
+    Without a sink, a fetch returns every accepted row in :attr:`FetchOutcome.rows`. With a
+    ``sink`` (a :data:`RowSink`), each accepted partition's rows are awaited into it as soon as
+    the partition is accepted, in partition order, and are not kept, so a fetch of any size
+    holds at most one partition: :attr:`FetchOutcome.rows` is then empty and
+    :attr:`FetchOutcome.streamed` counts the rows handed over. A dated partition answered in
+    several pages (a relay that does honour page tokens) is handed over page by page: its first
+    page is held until a second page proves the token advanced, then every page is checked
+    against the partition and handed over at once. If such a partition still ends capped, it is
+    split as usual and its children re-read the rows already handed over; the sink's writes are
+    idempotent upserts, so a row handed over twice changes nothing. An error the sink raises
+    (a database refusal, a parser ``QueryDefect``) propagates unchanged and ends the fetch.
 
 Termination:
     Every step either accepts a partition, replaces it by two partitions that are strictly
@@ -57,9 +73,11 @@ Cost:
 
 Interruption:
     A ``TransientError`` that survives ``send_json``'s retries, ``CallBudgetExhausted`` included,
-    stops the fetch at once. Rows already accepted are kept; the interrupted partition, whose
-    partial pages are discarded because page tokens expire, and every partition still on the
-    stack are returned in :attr:`FetchOutcome.deferred`, in the order they would have been read.
+    stops the fetch at once. Rows already accepted are kept, or with a sink stay handed over
+    (pages of the interrupted partition already streamed included); the interrupted partition,
+    whose partial pages are otherwise discarded because page tokens expire, and every partition
+    still on the stack are returned in :attr:`FetchOutcome.deferred`, in the order they would
+    have been read; a resumed partition re-reads what was handed over, harmlessly.
     Each entry is a scope :meth:`PartitionedFetcher.partitioned_fetch` accepts, so ``sync``
     resumes them in a later 24 h window; the dataset stays ``incomplete`` until they finish,
     which ``sync`` records. :func:`scope_to_json` and :func:`scope_from_json` turn a scope
@@ -111,14 +129,20 @@ Example:
         for scope in outcome.deferred:
             ...  # resumed later with fetcher.partitioned_fetch("Q-G6", scope)
 
+    or streams a large range into its writes, one partition at a time, through an async
+    ``buffer.add(rows)``::
+
+        outcome = await fetcher.partitioned_fetch("Q-G6", scope, sink=buffer.add)
+        # outcome.rows is empty; outcome.streamed rows went to buffer.add
+
 Only the standard library, :mod:`ads_engine.logging`, :mod:`ads_engine.connectors.errors` and
 this package's ``queries``, ``parser`` and ``client`` are imported. Nothing here imports ``sync``,
 ``simulation``, ``db``, ``analysis`` or ``api``.
 """
 
 import re
-from collections.abc import Collection, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from types import MappingProxyType
@@ -134,6 +158,7 @@ from ads_engine.connectors.google_n8n.client import (
     GoogleAdsRow,
     GoogleAdsWebhookClient,
     QueryResult,
+    SearchPage,
 )
 from ads_engine.connectors.google_n8n.parser import get_field
 from ads_engine.connectors.google_n8n.queries import (
@@ -170,6 +195,7 @@ __all__ = [
     "EnumerationQueryId",
     "FetchOutcome",
     "PartitionedFetcher",
+    "RowSink",
     "enumerate_campaigns",
     "enumerate_entities",
     "interruption_reason",
@@ -256,6 +282,11 @@ EntityQueryId = Literal["Q-G4", "Q-G7"]
 
 EnumerationQueryId = Literal["Q-G2", "Q-G4", "Q-G7"]
 """The safe-absence enumerations an :class:`EnumerationProgress` resumes."""
+
+RowSink = Callable[[tuple[GoogleAdsRow, ...]], Awaitable[None]]
+"""Receives the accepted rows of a streaming fetch, one non-empty batch per accepted partition
+or page, in partition order. ``partitioned_fetch(..., sink=...)`` awaits it between connector
+calls, so it may write to the database; whatever it raises propagates unchanged."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -436,7 +467,8 @@ class FetchOutcome:
         query_id: The template id, such as ``"Q-G6"``.
         rows: The accepted REST ``GoogleAdsRow`` objects, in partition order. Partitions are
             disjoint, so no row appears twice; rows of capped responses that were split are not
-            included, because the narrower partitions re-read them.
+            included, because the narrower partitions re-read them. Empty when the fetch
+            streamed its rows into a sink (see :attr:`streamed`).
         completeness: ``complete`` when every partition was read in full; ``incomplete`` when
             the fetch was interrupted (see :attr:`deferred`), a single (day, ad group) of Q-G6
             or a ``single`` query hit the result limit.
@@ -454,6 +486,9 @@ class FetchOutcome:
             unless interrupted.
         interrupted_by: The ``TransientError`` (``CallBudgetExhausted`` included) that stopped
             the fetch, or ``None``.
+        streamed: Rows handed to the fetch's sink, in partition order, instead of being kept
+            in :attr:`rows`; ``0`` without a sink. A multi-page partition that ended capped
+            and was split counts the rows it handed over before its children re-read them.
     """
 
     query_id: str
@@ -464,11 +499,17 @@ class FetchOutcome:
     partitions_read: int
     deferred: tuple[Mapping[str, object], ...]
     interrupted_by: TransientError | None
+    streamed: int = 0
 
     @property
     def complete(self) -> bool:
         """Whether :attr:`completeness` is ``complete``."""
         return self.completeness == "complete"
+
+    @property
+    def rows_read(self) -> int:
+        """Rows the fetch accepted: those kept in :attr:`rows` plus those :attr:`streamed`."""
+        return len(self.rows) + self.streamed
 
 
 @dataclass(frozen=True, slots=True)
@@ -559,6 +600,69 @@ class _Step:
     capped_kept: bool = False
 
 
+# Strategies whose answer is accepted by a per-row partition check alone, so the pages of a
+# multi-page answer can be handed to a sink as they arrive. A keyset page and a Q-G2b chunk are
+# checked as a whole (ids increasing and unique, each requested campaign at most once) and stay
+# within one page by construction, so they are handed over once accepted.
+_PAGE_STREAMED: Final[frozenset[str]] = frozenset({"dated", "ad_group_ranges", "single"})
+
+
+class _PageStream:
+    """Hands the pages of one partition to a sink as they arrive, once paging is proven.
+
+    The first page is held, so a one-page answer is decided by :func:`_read_step` exactly as
+    without a sink: a capped one is split before anything is handed over, and Q-G6's finest
+    partition keeps it as returned. A second page proves that the relay advanced the page
+    token, because the client discards a follow-up page that does not, so the held page and
+    every later page are checked against the partition and handed to the sink at once.
+
+    Attributes:
+        held: The first page's rows while no second page has arrived; empty afterwards.
+        streamed: Rows handed to the sink.
+        failure: The ``TransientError`` the sink itself raised, if any, so the fetch tells it
+            from an interruption of a webhook call and propagates it unchanged.
+    """
+
+    __slots__ = ("_partition", "_sink", "_template", "failure", "held", "pages", "streamed")
+
+    def __init__(
+        self, template: QueryTemplate, partition: Mapping[str, object], sink: RowSink
+    ) -> None:
+        """Bind the partition being read and the sink its proven pages go to."""
+        self._template = template
+        self._partition = partition
+        self._sink = sink
+        self.held: tuple[GoogleAdsRow, ...] = ()
+        self.pages = 0
+        self.streamed = 0
+        self.failure: TransientError | None = None
+
+    async def take(self, page: SearchPage) -> None:
+        """Hold page 1; from page 2 on, check and hand over the held page and each later page.
+
+        Raises:
+            QueryDefect: A row outside the partition; nothing of that page is handed over.
+            Exception: Whatever the sink raises, unchanged.
+        """
+        self.pages += 1
+        if self.pages == 1:
+            self.held = page.rows
+            return
+        batches = (self.held, page.rows) if self.pages == 2 else (page.rows,)
+        self.held = ()
+        for rows in batches:
+            _check_rows_in_partition(self._template, self._partition, rows)
+        for rows in batches:
+            if not rows:
+                continue
+            try:
+                await self._sink(rows)
+            except TransientError as exc:
+                self.failure = exc
+                raise
+            self.streamed += len(rows)
+
+
 # ---------------------------------------------------------------------------------------------
 # partitioned_fetch
 # ---------------------------------------------------------------------------------------------
@@ -604,13 +708,18 @@ class PartitionedFetcher:
         return f"{type(self).__name__}(client={self._client!r})"
 
     async def partitioned_fetch(
-        self, query_id: str, scope: Mapping[str, object] | None = None
+        self,
+        query_id: str,
+        scope: Mapping[str, object] | None = None,
+        *,
+        sink: RowSink | None = None,
     ) -> FetchOutcome:
         """Read one GAQL template to completion, partitioning every capped response.
 
         The template's ``strategy`` decides how the scope is narrowed (see the module
         docstring). Every partition is one :meth:`GoogleAdsWebhookClient.run_query` on the
-        bound client, which follows a returned page token at once.
+        bound client, which follows a returned page token at once and abandons one the relay
+        ignores, reporting the partition capped so that it is narrowed instead.
 
         Example::
 
@@ -620,6 +729,7 @@ class PartitionedFetcher:
             outcome = await fetcher.partitioned_fetch(
                 "Q-G3", {"start": date(2026, 9, 1), "end": date(2026, 9, 28)}
             )
+            outcome = await fetcher.partitioned_fetch("Q-G6", scope, sink=write)  # streamed
 
         Args:
             query_id: A key of :data:`~ads_engine.connectors.google_n8n.queries.QUERIES`.
@@ -638,10 +748,16 @@ class PartitionedFetcher:
                   single day.
 
                 Every :attr:`FetchOutcome.deferred` entry is a valid scope.
+            sink: When given, the rows of each accepted partition are awaited into it as soon
+                as the partition is accepted, in partition order, and are not kept, so the
+                fetch holds at most one partition (see the module's "Streaming" note); the
+                outcome's ``rows`` is then empty and its ``streamed`` counts them. ``None``
+                keeps every row in the outcome.
 
         Returns:
-            The rows read and their completeness. An interruption by a ``TransientError``
-            returns an ``incomplete`` outcome rather than raising.
+            The rows read, or with a sink their count, and their completeness. An interruption
+            by a ``TransientError`` returns an ``incomplete`` outcome rather than raising; rows
+            already handed to the sink stay handed over.
 
         Raises:
             AccessDenied: The webhook or Google refused the credentials; propagated unchanged.
@@ -650,19 +766,24 @@ class PartitionedFetcher:
                 chunk or Q-G3 campaign-day, or a row outside the partition it was read for.
             ValueError: ``query_id`` is unknown or ``scope`` is invalid for its template;
                 nothing is sent.
+            Exception: Whatever the sink raises, unchanged, a ``TransientError`` included: it
+                is the caller's own error, not one the connector classifies, so it is neither
+                taken for an interruption nor turned into a connector error.
         """
-        return await _partitioned_fetch(self._client, query_id, scope)
+        return await _partitioned_fetch(self._client, query_id, scope, sink=sink)
 
 
 async def _partitioned_fetch(
     client: GoogleAdsWebhookClient,
     query_id: str,
     scope: Mapping[str, object] | None = None,
+    *,
+    sink: RowSink | None = None,
 ) -> FetchOutcome:
     """Run :meth:`PartitionedFetcher.partitioned_fetch` through an explicitly passed client.
 
-    The safe-absence enumerations call it with the client they were given. Arguments, result,
-    logging and errors are those the method documents.
+    The safe-absence enumerations call it with the client they were given and no sink.
+    Arguments, result, logging and errors are those the method documents.
     """
     template = _template(query_id)
     initial = _initial_partitions(template, scope)
@@ -670,6 +791,7 @@ async def _partitioned_fetch(
     # The stack's top is its end: children are pushed in reverse, so the first is read first.
     stack: list[dict[str, object]] = list(reversed(initial))
     rows: list[GoogleAdsRow] = []
+    streamed = 0
     finest_overflows: list[tuple[date, int]] = []
     capped_kept = False
     partitions_read = 0
@@ -678,17 +800,40 @@ async def _partitioned_fetch(
     try:
         while stack:
             partition = stack.pop()
+            pages = (
+                _PageStream(template, partition, sink)
+                if sink is not None
+                and LAST_ID not in partition
+                and template.strategy in _PAGE_STREAMED
+                else None
+            )
             try:
-                result = await client.run_query(template.query_id, partition)
+                result = await client.run_query(
+                    template.query_id, partition, on_page=None if pages is None else pages.take
+                )
             except TransientError as exc:
+                if pages is not None and exc is pages.failure:
+                    raise  # The sink's own error, not an interruption of a webhook call.
                 # CallBudgetExhausted included. The partition's partial pages are dropped by
-                # run_query and re-read on resume, because page tokens expire.
+                # run_query, or stay handed to the sink, and are re-read on resume, because
+                # page tokens expire.
                 interrupted_by = exc
                 deferred = tuple(_frozen(item) for item in (partition, *reversed(stack)))
                 break
+            finally:
+                if pages is not None:
+                    streamed += pages.streamed
             partitions_read += 1
+            if pages is not None:
+                # Pages already handed over are not decided again: the step sees only the
+                # held first page, which is every row when the answer had a single page.
+                result = replace(result, rows=pages.held)
             step = _read_step(template, partition, result)
-            rows.extend(step.rows)
+            if sink is None:
+                rows.extend(step.rows)
+            elif step.rows:
+                await sink(step.rows)
+                streamed += len(step.rows)
             if step.finest_overflow is not None:
                 finest_overflows.append(step.finest_overflow)
             capped_kept = capped_kept or step.capped_kept
@@ -701,7 +846,7 @@ async def _partitioned_fetch(
                 "query_id": template.query_id,
                 "partitions_read": partitions_read,
                 "calls": client.calls_made - calls_before,
-                "rows": len(rows),
+                "rows": len(rows) + streamed,
             },
         )
         raise
@@ -723,6 +868,7 @@ async def _partitioned_fetch(
         partitions_read=partitions_read,
         deferred=deferred,
         interrupted_by=interrupted_by,
+        streamed=streamed,
     )
     _log_outcome(outcome, finest_overflows=len(finest_overflows))
     return outcome
@@ -1336,13 +1482,18 @@ def _finest_partition_reason(overflows: Sequence[tuple[date, int]]) -> str:
 
 
 def _log_outcome(outcome: FetchOutcome, *, finest_overflows: int) -> None:
-    """Log one ``google.partitioned_fetch`` event: counts only, never GAQL text or ids."""
+    """Log one ``google.partitioned_fetch`` event: counts only, never GAQL text or ids.
+
+    ``rows`` is :attr:`FetchOutcome.rows_read`, kept and streamed rows alike; ``streamed`` is
+    the part handed to a sink.
+    """
     fields: dict[str, object] = {
         "source": _SOURCE,
         "query_id": outcome.query_id,
         "partitions_read": outcome.partitions_read,
         "calls": outcome.calls,
-        "rows": len(outcome.rows),
+        "rows": outcome.rows_read,
+        "streamed": outcome.streamed,
         "completeness": outcome.completeness,
         "deferred": len(outcome.deferred),
         "finest_partition_overflows": finest_overflows,

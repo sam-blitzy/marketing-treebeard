@@ -427,8 +427,8 @@ describe('DecisionLog states', () => {
         'Oct 4, 2026, 2:15 PM UTC',
         'User',
         'admin@example.com',
-        'status: paused',
-        'Paused · daily budget $240.00',
+        'status: Paused',
+        'Paused · daily budget USD\u00a0240.00',
         'Paused from another session',
       ]);
     } finally {
@@ -531,8 +531,10 @@ describe('DecisionLog subjects', () => {
 
     await renderLog();
 
-    expect(onlyRow(await findTable('Campaign 77'))[4]).toBe('Active · daily budget $200.00');
-    expect(onlyRow(await findTable('Shared budget 77'))[4]).toBe('daily budget $500.00');
+    expect(onlyRow(await findTable('Campaign 77'))[4]).toBe(
+      'Active · daily budget USD\u00a0200.00',
+    );
+    expect(onlyRow(await findTable('Shared budget 77'))[4]).toBe('daily budget USD\u00a0500.00');
     expect(document.getElementById('decision-subject-campaign-77')).not.toBeNull();
     expect(document.getElementById('decision-subject-budget-77')).not.toBeNull();
   });
@@ -582,8 +584,8 @@ describe('DecisionLog subjects', () => {
         'Oct 3, 2026, 9:30 AM UTC',
         'User',
         'admin@example.com',
-        'daily budget: $240.00',
-        'Active · daily budget $240.00',
+        'daily budget: USD\u00a0240.00',
+        'Active · daily budget USD\u00a0240.00',
         'Raised after the B1 card',
       ],
       [
@@ -591,7 +593,7 @@ describe('DecisionLog subjects', () => {
         'Baseline',
         'System',
         'Platform state at first sync',
-        'Active · daily budget $200.00',
+        'Active · daily budget USD\u00a0200.00',
         '—',
       ],
     ]);
@@ -608,7 +610,7 @@ describe('DecisionLog subjects', () => {
       'Baseline',
       'System',
       'Platform state at first sync',
-      'daily budget $500.00',
+      'daily budget USD\u00a0500.00',
       '—',
     ]);
   });
@@ -663,7 +665,7 @@ const CELLS: readonly CellCase[] = [
       status: 'paused',
       patch: { status: 'paused' },
     }),
-    { 1: 'Recommendation', 3: 'status: paused', 4: 'Paused · daily budget $200.00' },
+    { 1: 'Recommendation', 3: 'status: Paused', 4: 'Paused · daily budget USD\u00a0200.00' },
   ],
   [
     'a row carrying a recommendation id whatever its stored origin',
@@ -685,8 +687,8 @@ const CELLS: readonly CellCase[] = [
       patch: { total_budget: '4500', daily_budget: '120', status: 'paused' },
     }),
     {
-      3: 'status: paused; daily budget: $120.00; total budget: $4,500.00',
-      4: 'Paused · daily budget $120.00 · total budget $4,500.00',
+      3: 'status: Paused; daily budget: USD\u00a0120.00; total budget: USD\u00a04,500.00',
+      4: 'Paused · daily budget USD\u00a0120.00 · total budget USD\u00a04,500.00',
     },
   ],
   [
@@ -722,12 +724,12 @@ const CELLS: readonly CellCase[] = [
   [
     'a shared budget on a custom period',
     makeDecision('budget', { daily_budget: null, total_budget: '9000.00' }),
-    { 4: 'total budget $9,000.00' },
+    { 4: 'total budget USD\u00a09,000.00' },
   ],
   [
     'an own-budget row without a status',
     makeDecision('own_budget', { status: null }),
-    { 4: 'status not reported · daily budget $200.00' },
+    { 4: 'status not reported · daily budget USD\u00a0200.00' },
   ],
   [
     'a shared member whose budget no row of the log names',
@@ -763,7 +765,10 @@ const CELLS: readonly CellCase[] = [
       total_budget: '3000.00',
       patch: { daily_budget: '100.00' },
     }),
-    { 3: 'daily budget: €100.00', 4: 'Active · daily budget €100.00 · total budget €3,000.00' },
+    {
+      3: 'daily budget: EUR\u00a0100.00',
+      4: 'Active · daily budget EUR\u00a0100.00 · total budget EUR\u00a03,000.00',
+    },
   ],
   [
     'a status and daily budget patch on a LinkedIn EUR campaign',
@@ -782,8 +787,8 @@ const CELLS: readonly CellCase[] = [
     }),
     {
       1: 'User',
-      3: 'status: paused; daily budget: €120.00',
-      4: 'Paused · daily budget €120.00',
+      3: 'status: Paused; daily budget: EUR\u00a0120.00',
+      4: 'Paused · daily budget EUR\u00a0120.00',
     },
   ],
 ];
@@ -989,8 +994,8 @@ describe('DecisionLog "Record decision"', () => {
     expect(first?.slice(1, 5)).toEqual([
       'User',
       'admin@example.com',
-      'status: paused',
-      'Paused · daily budget $240.00',
+      'status: Paused',
+      'Paused · daily budget USD\u00a0240.00',
     ]);
     // The form's own status left with the dialog; the log's region announces the save, and the
     // dialog returned focus to the action that opened it.

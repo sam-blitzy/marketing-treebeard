@@ -73,7 +73,7 @@ from ads_engine.analysis import metrics, runner
 from ads_engine.analysis.context import Freshness
 from ads_engine.analysis.thresholds import Thresholds
 from ads_engine.connectors.errors import AccessDenied, CallBudgetExhausted
-from ads_engine.connectors.google_n8n.partition import FetchOutcome, scope_from_json
+from ads_engine.connectors.google_n8n.partition import FetchOutcome, RowSink, scope_from_json
 from ads_engine.connectors.google_n8n.queries import END, INT64_MAX, START, parse_query
 from ads_engine.connectors.http import RetryPolicy
 from ads_engine.db import repositories
@@ -4337,8 +4337,10 @@ class _InterruptedFetcher:
         self.deferred = deferred
         self.fetched: list[tuple[str, Mapping[str, object]]] = []
 
-    async def partitioned_fetch(self, query_id: str, scope: Mapping[str, object]) -> FetchOutcome:
-        """Return an interrupted outcome that defers :attr:`deferred`."""
+    async def partitioned_fetch(
+        self, query_id: str, scope: Mapping[str, object], *, sink: RowSink | None = None
+    ) -> FetchOutcome:
+        """Return an interrupted outcome that defers :attr:`deferred`; ``sink`` gets no row."""
         self.fetched.append((query_id, scope))
         return FetchOutcome(
             query_id=query_id,
@@ -4368,18 +4370,20 @@ async def test_metrics_deferral_instants_survive_interruption_merging_and_storag
     def days(first: int, last: int) -> dict[str, date]:
         return {START: day + timedelta(days=first), END: day + timedelta(days=last)}
 
-    written: list[tuple[date, date] | None] = []
+    written: list[int] = []
 
-    async def write(
-        _session: AsyncSession, _outcome: FetchOutcome, covered: tuple[date, date] | None
-    ) -> jobs._Written:
-        written.append(covered)
+    async def write(_session: AsyncSession, rows: Sequence[Mapping[str, Any]]) -> jobs._Written:
+        written.append(len(rows))
         return jobs._Written()
+
+    async def flush(writes: jobs._DatasetWrites) -> None:
+        pytest.fail(f"{writes.name}: an interrupted read that returned no row flushed")
 
     stored_scope, own_scope = days(0, 3), days(10, 12)
     fetcher = _InterruptedFetcher(deferred=(days(0, 1), days(2, 3)))
     fetched: list[jobs._Fetched] = []
-    reads = jobs._QueryReads("Q-G5", write, fetched)
+    buffer = jobs._DatasetWrites("google.metrics_daily", flush)
+    reads = jobs._QueryReads("Q-G5", write, fetched, buffer)
     await reads.read(fetcher, stored_scope, T0)  # type: ignore[arg-type]
     await reads.read(fetcher, own_scope, T2)  # type: ignore[arg-type]
     assert fetcher.fetched == [("Q-G5", stored_scope)], "an interrupted query reads no more"

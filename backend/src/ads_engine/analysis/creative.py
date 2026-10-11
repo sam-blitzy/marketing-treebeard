@@ -126,6 +126,7 @@ __all__ = [
     "NOT_ESTIMABLE_ZERO_IMPRESSIONS",
     "NO_WEAK_STAGE_TEXT",
     "REQUIRED_DATASETS",
+    "SECTION_DATASETS",
     "STAGES",
     "STAGE_VARIABLE",
     "STAGE_VARIABLE_KEY",
@@ -235,6 +236,14 @@ EXPLORATORY_TEXT: Final = "exploratory: tests the stage lowest relative to its b
 
 REQUIRED_DATASETS: Final[tuple[str, ...]] = ("linkedin.analytics_daily", "linkedin.entities")
 """The datasets every CR item reads: creative totals and the creative/campaign entities."""
+
+SECTION_DATASETS: Final[tuple[str, ...]] = REQUIRED_DATASETS
+"""Every dataset the Copy / creative section reads: exactly :data:`REQUIRED_DATASETS`.
+
+Precedence judges these over the run's window when the section stores no item, so an empty
+section says which of its datasets do not cover the window (AAP 0.5.5 "Each section shows an
+EmptyState with the reason").
+"""
 
 CR1_THRESHOLD_KEYS: Final[tuple[str, ...]] = (
     "cr.min_impressions",

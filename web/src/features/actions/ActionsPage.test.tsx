@@ -35,25 +35,30 @@
  *   found" with "Back to default" for an unknown custom run (404 or 422); otherwise "Actions
  *   could not be loaded" with the API's message and a Retry that keeps the failure screen
  *   while it reads again and returns focus to its button. A failed background refetch keeps the
- *   page; a failure never carries over to another run.
+ *   page, with a polite "Actions could not be refreshed" warning, never an alert, in the region
+ *   the page mounted with after the global banners (the open-discrepancies banner first) and
+ *   before the section navigation and the sections, for the page's own read, the source chips,
+ *   the discrepancy list and the configuration alike, cleared by the next successful read; a
+ *   failure never carries over to another run.
  * - **Polls.** A poll in flight, a poll that returns the same page and one whose overlay differs
  *   only in `computed_at` render no section again, even when the overlay's dataset lists arrive
  *   as new arrays equal in value; a changed overlay field, dataset list or item still reaches
  *   the screen, every section renders again for a changed list, and only the section holding a
- *   changed item renders again.
+ *   changed item renders again. A failed poll renders no section again, and its warning stays
+ *   the same element while the next poll is in flight.
  */
-import { apiError, json, mockApi } from '../../test/mockApi';
+import { apiError, html, json, mockApi } from '../../test/mockApi';
 import type { ApiMock, MockHandlers, MockResponse, RecordedCall } from '../../test/mockApi';
 
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { replaceEqualDeep } from '@tanstack/react-query';
-import type { QueryClient } from '@tanstack/react-query';
+import type { QueryClient, QueryKey } from '@tanstack/react-query';
 import { useSearch } from '@tanstack/react-router';
 import { Profiler } from 'react';
 import type { ReactElement } from 'react';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 
-import { queryKeys } from '../../api/queries';
+import { DEFAULT_DISCREPANCY_STATES, queryKeys } from '../../api/queries';
 import { SECTION_ORDER } from '../../api/types';
 import type { RecommendationsPage, Run, SectionKey } from '../../api/types';
 import {
@@ -305,6 +310,44 @@ function outcomeRegion(): HTMLElement {
   return region;
 }
 
+/**
+ * The loaded page's refresh region (`ActionsContent`): the one `<div role="status">` after the
+ * status bar (outside it, whose window picker has a region of its own) and before the section
+ * navigation, where a failed refresh of the page's reads is announced.
+ */
+function refreshRegion(): HTMLElement {
+  const status = screen.getByRole('region', { name: 'Analysis status' });
+  const nav = screen.getByRole('navigation', { name: 'Sections' });
+  const regions = Array.from(document.querySelectorAll<HTMLElement>('div[role="status"]')).filter(
+    (region) => !status.contains(region) && precedes(status, region) && precedes(region, nav),
+  );
+  expect(regions).toHaveLength(1);
+  const [region] = regions;
+  if (region === undefined) {
+    throw new Error('the page has no refresh region');
+  }
+  return region;
+}
+
+/** The title of the warning a failed refresh of the loaded page's reads shows. */
+const REFRESH_TITLE = 'Actions could not be refreshed';
+
+/**
+ * The reads of the loaded page besides its own whose failed refresh it states: a name for the
+ * test title, the handler key, the exact cache key and a successful answer.
+ */
+const OTHER_REFRESHED_READS: readonly (readonly [string, string, QueryKey, () => MockResponse])[] =
+  [
+    ['the source chips', 'GET /sources', queryKeys.sources, () => json(200, makeSources())],
+    [
+      'the discrepancy list',
+      'GET /discrepancies',
+      queryKeys.discrepancies(DEFAULT_DISCREPANCY_STATES),
+      () => json(200, [makeDiscrepancy('status')]),
+    ],
+    ['the configuration', 'GET /config', queryKeys.config, () => json(200, makeConfig())],
+  ];
+
 // ---------------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------------
@@ -534,20 +577,113 @@ describe('ActionsPage', () => {
       expect(screen.queryByText('Repeated keywords')).toBeNull();
     });
 
-    it('keeps the page on screen when a background refetch fails', async () => {
+    it('keeps the page on screen under a refresh warning when a background refetch fails', async () => {
       const { api, queryClient } = await renderPage(defaultHandlers());
       await loadedPage();
+      // Without a failure the refresh region is empty, and it is a direct child of the page's
+      // Stack column, which takes an empty polite region out of the column: it adds no space.
+      const emptyRegion = refreshRegion();
+      expect(emptyRegion.childNodes).toHaveLength(0);
+      expect(emptyRegion.parentElement?.classList.contains('ds-stack')).toBe(true);
+      expect(emptyRegion.parentElement).toBe(
+        screen.getByRole('navigation', { name: 'Sections' }).parentElement,
+      );
 
       api.use({
         'GET /recommendations': apiError(503, 'unavailable', 'The API is restarting'),
       });
-      await queryClient.refetchQueries({ queryKey: queryKeys.recommendationsAll });
+      // Each refetch settles inside act: the warning reads the query cache directly, so the
+      // settling read re-renders the page at once.
+      await act(async () => {
+        await queryClient.refetchQueries({ queryKey: queryKeys.recommendationsAll });
+      });
 
+      const region = refreshRegion();
+      await within(region).findByText(REFRESH_TITLE);
+      expect(
+        within(region).getByText('The API is restarting Showing the last loaded state.'),
+      ).toBeTruthy();
       expect(recommendationReads(api)).toHaveLength(2);
       expect(sectionHeadings()).toEqual(SECTION_TITLES);
       expect(screen.queryByText('Actions could not be loaded')).toBeNull();
-      expect(screen.queryByText('The API is restarting')).toBeNull();
+      // The same polite region the page mounted with, so the failure is announced, and never an
+      // alert: the open-discrepancies banner stays the page's only alert (AAP 0.5.5).
+      expect(region).toBe(emptyRegion);
+      expect(region.getAttribute('role')).toBe('status');
+      expect(within(region).queryByRole('alert')).toBeNull();
+      const alerts = screen.getAllByRole('alert');
+      expect(alerts).toHaveLength(1);
+      const [discrepancies] = alerts;
+      if (discrepancies === undefined) {
+        throw new Error('no discrepancy banner');
+      }
+      expect(within(discrepancies).getByText('1 open discrepancy to resolve first')).toBeTruthy();
+      // AAP 0.5.5: the discrepancy banner sits above everything, the global banners keep their
+      // fixed order, and the warning comes after all of them, before the section navigation and
+      // the first section: status bar, discrepancies, tracking, simulated sources, incomplete
+      // data, the warning, the navigation, Keywords to adjust.
+      const status = screen.getByRole('region', { name: 'Analysis status' });
+      const [tracking, simulated, incomplete] = FIXTURE_BANNERS.slice(1, 4).map((banner) =>
+        screen.getByText(banner.message),
+      );
+      const nav = screen.getByRole('navigation', { name: 'Sections' });
+      const keywords = screen.getByRole('region', { name: 'Keywords to adjust' });
+      const banners = [discrepancies, tracking, simulated, incomplete];
+      const ordered = [status, ...banners, region, nav, keywords];
+      for (const [index, element] of ordered.entries()) {
+        const next = ordered[index + 1];
+        if (element === undefined || next === undefined) {
+          continue;
+        }
+        expect(precedes(element, next)).toBe(true);
+      }
+
+      // The next successful read clears it.
+      api.use({ 'GET /recommendations': json(200, makeRecommendationsPage()) });
+      await act(async () => {
+        await queryClient.refetchQueries({ queryKey: queryKeys.recommendationsAll });
+      });
+      await waitFor(() => {
+        expect(refreshRegion().childNodes).toHaveLength(0);
+      });
+      expect(sectionHeadings()).toEqual(SECTION_TITLES);
     });
+
+    it.each(OTHER_REFRESHED_READS)(
+      'warns while %s can no longer be refreshed, and clears once it is read again',
+      async (_name, route, queryKey, answer) => {
+        const { api, queryClient } = await renderPage(defaultHandlers());
+        await loadedPage();
+        await waitFor(() => {
+          expect(queryClient.getQueryData(queryKey)).toBeDefined();
+        });
+        expect(refreshRegion().childNodes).toHaveLength(0);
+
+        api.use({ [route]: html(502, '<html><body>502 Bad Gateway</body></html>') });
+        await act(async () => {
+          await queryClient.refetchQueries({ queryKey, exact: true });
+        });
+
+        const region = refreshRegion();
+        await within(region).findByText(REFRESH_TITLE);
+        expect(
+          within(region).getByText(
+            'The server is temporarily unavailable. Try again shortly. Showing the last loaded state.',
+          ),
+        ).toBeTruthy();
+        expect(queryClient.getQueryData(queryKey)).toBeDefined();
+        expect(sectionHeadings()).toEqual(SECTION_TITLES);
+        expect(within(region).queryByRole('alert')).toBeNull();
+
+        api.use({ [route]: answer() });
+        await act(async () => {
+          await queryClient.refetchQueries({ queryKey, exact: true });
+        });
+        await waitFor(() => {
+          expect(refreshRegion().childNodes).toHaveLength(0);
+        });
+      },
+    );
 
     it('holds an empty polite outcome region between the navigation and the sections', async () => {
       await renderPage(defaultHandlers());
@@ -1258,6 +1394,44 @@ describe('ActionsPage polls', () => {
     });
     await settle({ queryClient, commits });
     expect(recommendationReads(api)).toHaveLength(3);
+    expect(frames.mock.calls).toHaveLength(sectionRenders);
+    expect(sectionHeadings()).toEqual(SECTION_TITLES);
+  });
+
+  it('renders no section again for a failed poll, and keeps its warning through the next poll in flight', async () => {
+    const frames = vi.spyOn(sectionFrameModule, 'SectionFrame');
+    const { api, queryClient, commits } = await renderProfiledPage(defaultHandlers());
+    await loadedPage();
+    await settle({ queryClient, commits });
+    const sectionRenders = frames.mock.calls.length;
+
+    // The poll fails: the warning appears below the global banners, and no section renders again,
+    // because the page keeps the very data it had. Each poll settles inside act: the warning
+    // reads the query cache directly, so the settling read re-renders the page at once.
+    const failed = await startPoll(api, queryClient);
+    await act(async () => {
+      failed.release(apiError(503, 'unavailable', 'The API is restarting'));
+      await failed.done;
+    });
+    const warning = await within(refreshRegion()).findByText(REFRESH_TITLE);
+    await settle({ queryClient, commits });
+    expect(frames.mock.calls).toHaveLength(sectionRenders);
+
+    // While the next poll is in flight the same warning stays on screen: it never flickers.
+    const next = await startPoll(api, queryClient);
+    expect(queryClient.isFetching()).toBeGreaterThan(0);
+    expect(warning.isConnected).toBe(true);
+    expect(within(refreshRegion()).getByText(REFRESH_TITLE)).toBe(warning);
+
+    // It succeeds with the same page: the warning leaves, and still no section renders again.
+    await act(async () => {
+      next.release(json(200, makeRecommendationsPage()));
+      await next.done;
+    });
+    await waitFor(() => {
+      expect(refreshRegion().childNodes).toHaveLength(0);
+    });
+    await settle({ queryClient, commits });
     expect(frames.mock.calls).toHaveLength(sectionRenders);
     expect(sectionHeadings()).toEqual(SECTION_TITLES);
   });

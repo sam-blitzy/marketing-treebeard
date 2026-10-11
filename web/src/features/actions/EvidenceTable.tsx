@@ -6,27 +6,38 @@
  * every number sits beside the claim it supports (AAP 0.1.2):
  *
  * 1. A captioned {@link DataTable} of the cited metrics (`evidence.metrics`), one row per metric:
- *    its label, its value in its unit and currency, and the baselines it was compared against.
+ *    its label, with the metric's help text in a `Tooltip` when {@link metricHelp} defines one,
+ *    its value in its unit and currency, and the baselines it was compared against.
  *    Floors render as "≥ N" for counts and "≤ X" for costs, and a missing value renders
- *    "unavailable", never `0` (AAP 0.5.4.7, 0.11.1). All of that formatting is
- *    {@link formatMetric}'s; this file formats no number of its own.
- * 2. The baselines no metric row carries (see {@link pairBaselines}).
+ *    "unavailable", never `0` (AAP 0.5.4.7, 0.11.1). Every percentage in the table, value or
+ *    paired baseline, shows one fixed precision ({@link evidenceRatioDigits}), so compared rates
+ *    read apart. All of that formatting is {@link formatMetric}'s; this file formats no number
+ *    of its own.
+ * 2. The baselines no metric row carries (see {@link pairBaselines}), each in its own unit and
+ *    currency when it records them, as C1's account cost per outcome does ("USD 37.99").
  * 3. The sample line, "Sample: {observed} / {required} {unit}", with its labelled projection when
  *    the rule recorded one (AAP 0.5.4.6 CR3).
  * 4. The test line, "Test: {test} · p = … · adjusted p = … · α …", when a test was used.
  * 5. "Thresholds applied": every `key = value` pair from `evidence.thresholds`, in key order. The
  *    values are the configured ones frozen with the run, never literals of this client
  *    (AAP 0.5.4).
- * 6. "Data used": each dataset the item read, with its completeness and the last native date it
- *    covered, exactly as stored (AAP 0.5.4.1: dates are never re-bucketed).
+ * 6. "Data used": each dataset the item read, with its completeness and, when the dataset
+ *    recorded one, the last native date it covered: "google.metrics_daily: complete, covered
+ *    through 2026-10-10 (Google day, America/New_York)". The date is shown exactly as stored and
+ *    labelled with its source's day boundary (AAP 0.5.5 Behaviour; AAP 0.5.4.1: dates are never
+ *    re-bucketed): the boundary the dataset entry recorded, as HubSpot's "(HubSpot day, UTC)",
+ *    else, on evidence frozen before entries recorded one, the source's boundary from
+ *    `evidence.window.source_days`. A dataset with no recorded date, such as `google.entities`,
+ *    reads "google.entities: complete", with no coverage clause.
  *
  * Each part after the table renders only when the evidence holds it. Three evidence fields are
  * deliberately not rendered here, because another part of the card owns them: `window` (the
- * card's window chip), `provenance` (the card's historical-data notice) and `extra` (the
- * section-specific fields, such as white-paper creative rows or adjacent search terms).
+ * card's window chip; only its sources' day boundaries are read here, to label the "Data used"
+ * dates), `provenance` (the card's historical-data notice) and `extra` (the section-specific
+ * fields, such as white-paper creative rows or adjacent search terms).
  *
- * Built only on the design-system index (AAP 0.4.4): `DataTable` for the table, `Stack` and
- * `Inline` for layout and lists, with no styles of its own.
+ * Built only on the design-system index (AAP 0.4.4): `DataTable` for the table, `Tooltip` for
+ * metric help, `Stack` and `Inline` for layout and lists, with no styles of its own.
  *
  * @packageDocumentation
  */
@@ -38,19 +49,24 @@ import type {
   DatasetCoverage,
   Evidence,
   Metric,
-  MetricValue,
+  SourceDay,
+  SourceName,
   StatTest,
 } from '../../api/types';
-import { DataTable, Inline, Stack, type DataTableColumn } from '../../design-system';
+import { DataTable, Inline, Stack, Tooltip, type DataTableColumn } from '../../design-system';
 import {
   EM_DASH,
   UNAVAILABLE,
   formatDecimal,
   formatMetric,
   formatSample,
+  formatSourceDate,
   formatTestLine,
   isDecimalString,
+  ratioMetricDigits,
+  type MetricInput,
 } from '../../lib/format';
+import { metricHelp } from './metricHelp';
 
 // ---------------------------------------------------------------------------------------------
 // Labels
@@ -84,10 +100,11 @@ const NONE = 'none';
 const BASELINE_KEY_SUFFIX = '_baseline';
 
 /**
- * Fraction digits of a baseline that no metric gives a unit to. The backend records rates and
- * costs at up to six places (`analysis/budget.py`, `analysis/keywords.py`), so six keeps the
- * figure it recorded: K1's conversions per click `0.04946` stays `0.04946`, from which the
- * card's minimum click count can be checked, where a two-place count would read `0.05`.
+ * Fraction digits of an unpaired baseline that records no unit or currency of its own. The
+ * backend records rates and costs at up to six places (`analysis/budget.py`,
+ * `analysis/keywords.py`), so six keeps the figure it recorded: K1's conversions per click
+ * `0.04946` stays `0.04946`, from which the card's minimum click count can be checked, where a
+ * two-place count would read `0.05`.
  */
 const RECORDED_DIGITS = 6;
 
@@ -213,21 +230,79 @@ export function pairBaselines(
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Formats a paired baseline in its metric's unit and currency: a cost-per-outcome baseline as
- * money in the metric's currency, a stage-rate baseline as a percentage. The metric's floor and
- * unavailable markers describe the metric's own value, so neither is carried over; a `null`
- * baseline still renders "unavailable", never `0`.
+ * A paired baseline as the value {@link formatMetric} formats: the baseline's value in its
+ * metric's unit and currency. The metric's floor and unavailable markers describe the metric's
+ * own value, so neither is carried over.
  */
-function formatPairedBaseline(baseline: Baseline, metric: Metric): string {
-  return formatMetric({ value: baseline.value, unit: metric.unit, currency: metric.currency });
+function pairedBaselineInput(baseline: Baseline, metric: Metric): MetricInput {
+  return { value: baseline.value, unit: metric.unit, currency: metric.currency };
 }
 
 /**
- * Formats a baseline that no metric gives a unit to: a number at the precision the backend
- * recorded it ({@link RECORDED_DIGITS}), anything else as {@link formatMetric} renders a
- * unitless value (text verbatim, booleans as "yes" or "no", `null` as "unavailable").
+ * Formats a paired baseline in its metric's unit and currency: a cost-per-outcome baseline as
+ * money in the metric's currency, a stage-rate baseline as a percentage at the evidence's
+ * `ratioDigits` ({@link evidenceRatioDigits}), so a rate and its baseline read at one
+ * precision. A `null` baseline still renders "unavailable", never `0`.
  */
-function formatUnpairedBaseline(value: MetricValue): string {
+function formatPairedBaseline(baseline: Baseline, metric: Metric, ratioDigits: number): string {
+  return formatMetric(pairedBaselineInput(baseline, metric), { ratioDigits });
+}
+
+/**
+ * The digits shared by the percentages of a metrics table: {@link ratioMetricDigits} over every
+ * metric and every baseline paired with one, each as the table formats it.
+ */
+function tableRatioDigits(metrics: readonly Metric[], pairing: BaselinePairing): number {
+  const baselines = metrics.flatMap((metric, index) =>
+    (pairing.byMetric[index] ?? []).map((baseline) => pairedBaselineInput(baseline, metric)),
+  );
+  return ratioMetricDigits([...metrics, ...baselines]);
+}
+
+/**
+ * The one fixed fraction-digit count of every percentage in an item's evidence table: its ratio
+ * metrics and the baselines paired with them ({@link pairBaselines}). At it, a rate, its
+ * baseline and its interval bounds read at one precision and stay apart whenever their values
+ * differ, and each non-zero rate shows at least two significant digits (`percentDigits`):
+ * CR1 lead rates of 0.000722 and 0.000698 read "0.072%" and "0.070%" rather than "0.1%" twice
+ * (AAP 0.5.4.8). The card's headline figure is formatted with the same count, so it reads
+ * exactly as the metric's row does.
+ *
+ * @param evidence - The item's frozen evidence.
+ * @returns The fraction digits, to pass to {@link formatMetric} as `ratioDigits`.
+ *
+ * @example
+ * ```ts
+ * const digits = evidenceRatioDigits(item.evidence); // 3 for rates 0.000722 and 0.000698
+ * formatMetric(rateB, { ratioDigits: digits }); // "0.070%"
+ * ```
+ */
+export function evidenceRatioDigits(evidence: Pick<Evidence, 'metrics' | 'baselines'>): number {
+  return tableRatioDigits(evidence.metrics, pairBaselines(evidence.metrics, evidence.baselines));
+}
+
+/**
+ * Formats a baseline that no metric gives a unit to:
+ *
+ * - one that records its own unit or currency, as C1's account cost per outcome does, through
+ *   {@link formatMetric} in that unit and currency, so `"37.986583"` in `USD` reads `"USD 37.99"`
+ *   (AAP 0.5.5: numbers are formatted in the account currency);
+ * - one with neither, such as K1's account conversions per click or a baseline frozen before
+ *   baselines recorded a unit, as a number at the precision the backend recorded it
+ *   ({@link RECORDED_DIGITS}), and anything else as {@link formatMetric} renders a unitless
+ *   value (text verbatim, booleans as "yes" or "no", `null` as "unavailable").
+ *
+ * Blank unit or currency text counts as none, so it never turns a recorded rate into a count.
+ *
+ * @param baseline - The unpaired baseline as frozen in the evidence.
+ * @returns The display text.
+ */
+function formatUnpairedBaseline(baseline: Baseline): string {
+  const { value, unit, currency } = baseline;
+  const ownsUnit = (unit ?? '').trim() !== '' || (currency ?? '').trim() !== '';
+  if (ownsUnit) {
+    return formatMetric({ value, unit, currency });
+  }
   if (typeof value === 'number' || (typeof value === 'string' && isDecimalString(value))) {
     return formatDecimal(value, RECORDED_DIGITS);
   }
@@ -298,16 +373,75 @@ function testLine(test: StatTest): string {
 }
 
 /**
- * One dataset of "Data used": `"{dataset}: {completeness}, covered through {date}"`, the date
- * exactly as stored (a source-native calendar date, never re-parsed), or "unavailable" when the
- * dataset's coverage is unknown.
+ * The sources a dataset name can be prefixed with (`google.metrics_daily`; `DatasetName`). A
+ * record, so a source added to {@link SourceName} must be listed here before this compiles.
  */
-function datasetText(entry: DatasetCoverage): string {
-  const through =
-    entry.covered_through === null || entry.covered_through.trim() === ''
-      ? UNAVAILABLE
-      : entry.covered_through;
-  return `${entry.dataset}: ${entry.completeness}, covered through ${through}`;
+const DATASET_SOURCES: Readonly<Record<SourceName, true>> = {
+  google: true,
+  linkedin: true,
+  hubspot: true,
+};
+
+/** Whether `prefix` names a known source, so its dates can carry that source's day label. */
+function isDatasetSource(prefix: string): prefix is SourceName {
+  return Object.hasOwn(DATASET_SOURCES, prefix);
+}
+
+/**
+ * The source a dataset belongs to: the name's prefix before its first `.`, as `google` in
+ * `google.metrics_daily`. `null` when the name has no prefix or the prefix names no known
+ * source.
+ */
+function datasetSource(dataset: string): SourceName | null {
+  const dot = dataset.indexOf('.');
+  if (dot <= 0) {
+    return null;
+  }
+  const prefix = dataset.slice(0, dot);
+  return isDatasetSource(prefix) ? prefix : null;
+}
+
+/**
+ * The day boundary the item's window recorded for `source` (its first `source_days` entry), or
+ * `null` when the window lists none. HubSpot holds instants, so its datasets have no entry.
+ */
+function sourceBoundary(sourceDays: readonly SourceDay[], source: SourceName): string | null {
+  return sourceDays.find((day) => day.source === source)?.boundary ?? null;
+}
+
+/**
+ * One dataset of "Data used" (AAP 0.5.4.8: the datasets read, with completeness and coverage):
+ *
+ * - `"{dataset}: {completeness}, covered through {date}"` when the dataset recorded the last
+ *   native date it covered. The date is shown exactly as stored, never parsed or shifted, and
+ *   labelled with its source's day boundary (AAP 0.5.5 Behaviour) by {@link formatSourceDate},
+ *   the formatter `/sources` labels its dates with, so both read alike: `"2026-10-10 (Google
+ *   day, America/New_York)"`, `"2026-10-10 (HubSpot day, UTC)"`. The boundary is the entry's own
+ *   `boundary` when it is not blank; otherwise, for evidence frozen before entries recorded one,
+ *   the boundary the item's `window.source_days` froze for the source. A source with neither
+ *   names its day alone, never a guessed zone: an older HubSpot entry reads `"2026-10-10
+ *   (HubSpot day)"`, since HubSpot holds instants and the window lists no HubSpot boundary. A
+ *   dataset whose prefix names no known source shows the bare date, with no label.
+ * - `"{dataset}: {completeness}"` when the date is `null` or blank, as for `google.entities`:
+ *   the coverage clause is left out rather than reading "covered through unavailable".
+ *
+ * @param entry - the dataset as frozen in the evidence
+ * @param sourceDays - the evidence window's `source_days`
+ * @returns the entry's text
+ */
+function datasetText(entry: DatasetCoverage, sourceDays: readonly SourceDay[]): string {
+  const head = `${entry.dataset}: ${entry.completeness}`;
+  const through = entry.covered_through?.trim() ?? '';
+  if (through === '') {
+    return head;
+  }
+  const source = datasetSource(entry.dataset);
+  if (source === null) {
+    return `${head}, covered through ${through}`;
+  }
+  const own = entry.boundary?.trim() ?? '';
+  const boundary = own === '' ? sourceBoundary(sourceDays, source) : own;
+  return `${head}, covered through ${formatSourceDate(through, source, boundary)}`;
 }
 
 /**
@@ -340,11 +474,29 @@ interface MetricRow {
   readonly metric: Metric;
   /** The baselines the metric was compared against, in evidence order. */
   readonly baselines: readonly Baseline[];
+  /**
+   * The fixed fraction digits of every percentage in the table ({@link evidenceRatioDigits}),
+   * the same on every row, so the Value and Baseline columns each read at one precision.
+   */
+  readonly ratioDigits: number;
 }
 
 /** The metric's display label, or its key when the label is blank, so no row header is empty. */
 function metricLabel(metric: Metric): string {
   return metric.label.trim() === '' ? metric.key : metric.label;
+}
+
+/**
+ * The row header of a metric: its {@link metricLabel}, with the metric's help text in a
+ * `Tooltip` when {@link metricHelp} has one for its key (AAP 0.4.2 "Help text on metrics"). The
+ * help is the label's accessible description, through `aria-describedby`, never part of its
+ * name, so the row header is still named by the label alone. A metric without help renders its
+ * plain label.
+ */
+function MetricLabel({ metric }: { metric: Metric }): ReactNode {
+  const label = metricLabel(metric);
+  const help = metricHelp(metric.key);
+  return help === undefined ? label : <Tooltip content={help}>{label}</Tooltip>;
 }
 
 /** The baseline's display label, or its key when the label is blank. */
@@ -378,7 +530,7 @@ function BaselineCell({ row }: { row: MetricRow }): ReactNode {
         <BaselineEntry
           key={keys[index] ?? baseline.key}
           label={baselineLabel(baseline)}
-          value={formatPairedBaseline(baseline, row.metric)}
+          value={formatPairedBaseline(baseline, row.metric, row.ratioDigits)}
         />
       ))}
     </Stack>
@@ -395,13 +547,13 @@ const COLUMNS: readonly DataTableColumn<MetricRow>[] = [
     key: 'metric',
     header: 'Metric',
     isRowHeader: true,
-    render: (row) => metricLabel(row.metric),
+    render: (row) => <MetricLabel metric={row.metric} />,
   },
   {
     key: 'value',
     header: 'Value',
     align: 'end',
-    render: (row) => formatMetric(row.metric),
+    render: (row) => formatMetric(row.metric, { ratioDigits: row.ratioDigits }),
   },
   {
     key: 'baseline',
@@ -492,8 +644,8 @@ export interface EvidenceTableProps {
  * @example
  * ```tsx
  * <EvidenceTable evidence={item.evidence} />
- * // Caption "Evidence"; rows such as "Cost per outcome | €80.00 | Account cost per lead (same
- * // source and objective): €40.00"; then "Sample: 9 / 7 known-budget days",
+ * // Caption "Evidence"; rows such as "Cost per outcome | EUR 80.00 | Account cost per lead (same
+ * // source and objective): EUR 40.00"; then "Sample: 9 / 7 known-budget days",
  * // "Thresholds applied" and "Data used".
  * ```
  */
@@ -507,10 +659,12 @@ export const EvidenceTable = memo(function EvidenceTable({
   const { metrics, baselines, sample, test, thresholds, datasets } = evidence;
   const pairing = pairBaselines(metrics, baselines);
   const rowKeys = uniqueKeys(metrics.map((metric) => metric.key));
+  const ratioDigits = tableRatioDigits(metrics, pairing);
   const rows: MetricRow[] = metrics.map((metric, index) => ({
     rowKey: rowKeys[index] ?? metric.key,
     metric,
     baselines: pairing.byMetric[index] ?? [],
+    ratioDigits,
   }));
 
   const pairedCount = pairing.byMetric.reduce((count, list) => count + list.length, 0);
@@ -536,7 +690,7 @@ export const EvidenceTable = memo(function EvidenceTable({
             <li key={unpairedKeys[index] ?? baseline.key}>
               <BaselineEntry
                 label={baselineLabel(baseline)}
-                value={formatUnpairedBaseline(baseline.value)}
+                value={formatUnpairedBaseline(baseline)}
               />
             </li>
           ))}
@@ -554,7 +708,9 @@ export const EvidenceTable = memo(function EvidenceTable({
       {datasets.length > 0 ? (
         <LabelledList label={DATASETS_LABEL} layout="stack">
           {datasets.map((entry, index) => (
-            <li key={datasetKeys[index] ?? entry.dataset}>{datasetText(entry)}</li>
+            <li key={datasetKeys[index] ?? entry.dataset}>
+              {datasetText(entry, evidence.window.source_days)}
+            </li>
           ))}
         </LabelledList>
       ) : null}

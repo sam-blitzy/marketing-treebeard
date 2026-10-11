@@ -33,6 +33,10 @@
  * emits exactly that from `web/index.html`. No plugin that injects inline `<script>` or `<style>`
  * belongs here, and assets are never inlined as `data:` URIs (see `build.assetsInlineLimit`).
  *
+ * Site icon: the product ships no icon set, so `index.html` links no icon. nginx answers the
+ * browser's automatic `/favicon.ico` request with an empty 204, and the dev and preview servers
+ * do the same through {@link noFaviconPlugin}, so no server logs a 404 or a console error for it.
+ *
  * Imports in `src/` are relative and `tsconfig.json` sets no `paths`, so there is no
  * `resolve.alias`: tsc, Vite and Vitest resolve every module the same way.
  *
@@ -49,6 +53,7 @@ import { Agent as HttpsAgent } from 'node:https';
 import { isIP } from 'node:net';
 
 import react from '@vitejs/plugin-react';
+import type { Connect, Plugin } from 'vite';
 import { defineConfig } from 'vitest/config';
 
 // ---------------------------------------------------------------------------------------------
@@ -132,11 +137,67 @@ function resolveApiProxyAgent(target: string): HttpsAgent | undefined {
 const apiProxyAgent = resolveApiProxyAgent(apiProxyTarget);
 
 // ---------------------------------------------------------------------------------------------
+// Site icon
+// ---------------------------------------------------------------------------------------------
+
+/** The path a browser requests a site icon from on its own when the page links none. */
+const FAVICON_PATH = '/favicon.ico';
+
+/** The request methods answered at {@link FAVICON_PATH}: a browser fetches an icon with GET. */
+const FAVICON_METHODS: ReadonlySet<string> = new Set(['GET', 'HEAD']);
+
+/** HTTP 204 No Content: the answer at {@link FAVICON_PATH}, with an empty body. */
+const NO_CONTENT = 204;
+
+/**
+ * Answers `GET` and `HEAD` `/favicon.ico` with an empty 204, as nginx.conf's
+ * `location = /favicon.ico { return 204; }` does in the stack, and passes every other request on.
+ * Only the path is compared, so a query string (`/favicon.ico?v=2`) gets the same answer.
+ *
+ * @param req - The incoming request; its `url` is the path and query.
+ * @param res - The response, ended here for a favicon request.
+ * @param next - Hands any other request to the next middleware.
+ */
+const answerFavicon: Connect.NextHandleFunction = (req, res, next) => {
+  const path = req.url?.split('?', 1)[0];
+  if (path !== FAVICON_PATH || req.method === undefined || !FAVICON_METHODS.has(req.method)) {
+    next();
+    return;
+  }
+  res.statusCode = NO_CONTENT;
+  res.end();
+};
+
+/**
+ * The plugin that gives `npm run dev` and `vite preview` nginx's answer at `/favicon.ico`.
+ *
+ * The product ships no icon set until the Blitzy OS icon source is available, so `index.html`
+ * links no icon, and no icon file or `data:` URI (which the Content Security Policy would block
+ * in the stack anyway) stands in for one. Browsers still request `/favicon.ico` by themselves.
+ * nginx answers that with 204, while the dev and preview servers would answer 404, which the
+ * browser logs as a console error on every fresh load. The middleware is registered directly in
+ * each server hook, so it runs before Vite's own static and fallback handling.
+ *
+ * @returns The plugin, named `ads-engine:no-favicon`.
+ */
+function noFaviconPlugin(): Plugin {
+  return {
+    name: 'ads-engine:no-favicon',
+    configureServer(server) {
+      server.middlewares.use(answerFavicon);
+    },
+    configurePreviewServer(server) {
+      server.middlewares.use(answerFavicon);
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------------------------
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), noFaviconPlugin()],
 
   build: {
     outDir: 'dist',
@@ -198,7 +259,8 @@ export default defineConfig({
       include: ['src/**/*.{ts,tsx}'],
       exclude: [
         'src/**/*.test.{ts,tsx}',
-        // Only the bootstrap: it builds the query client and router and renders them.
+        // Only the bootstrap: it builds the query client and router, renders them, and empties
+        // and reloads a page the browser keeps in its back/forward cache.
         'src/main.tsx',
         'src/**/*.d.ts',
         // Test-only support code (the typed API payload fixtures) is never shipped, so it must

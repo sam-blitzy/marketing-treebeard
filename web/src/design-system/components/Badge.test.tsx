@@ -65,4 +65,29 @@ describe('Badge', () => {
 
     expect(screen.getByText('Floor').hasAttribute('id')).toBe(false);
   });
+
+  it('keeps an ordinary label as its only content', () => {
+    const { container } = render(<Badge tone="info">Simulated data (Google)</Badge>);
+
+    expect(container.querySelector('.ds-badge')?.innerHTML).toBe('Simulated data (Google)');
+  });
+
+  it('breaks long identifiers of a string label at their underscores, keeping its text', () => {
+    const label =
+      'No CRM link for Google campaigns: HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY and ' +
+      'HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY not configured';
+    const { container } = render(<Badge tone="info">{label}</Badge>);
+
+    const chip = container.querySelector('.ds-badge');
+    expect(chip?.className).toBe('ds-badge ds-badge--info');
+    expect(chip?.textContent).toBe(label);
+    // One inner span holds the runs and breaks, so the chip's flex layout sees a single item.
+    expect(chip?.children).toHaveLength(1);
+    expect(chip?.firstElementChild?.tagName).toBe('SPAN');
+    const breaks = chip?.querySelectorAll('wbr') ?? [];
+    expect(breaks).toHaveLength(7);
+    for (const wbr of breaks) {
+      expect(wbr.previousSibling?.textContent?.endsWith('_')).toBe(true);
+    }
+  });
 });

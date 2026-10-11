@@ -52,6 +52,11 @@ persists the run (AAP 0.5.1 "G1 guard, holds, suppression, flags, ranking"):
     ``evidence.items`` over the section's surviving items that read the dataset incomplete,
     held and C0 items included, and cites only the reasons those items have; a finding with no
     such item keeps its reasons with ``items`` 0 (:func:`_recount_incomplete_datasets`).
+    Each section left with no item then gets one ``incomplete_dataset`` finding, ``items`` 0,
+    per dataset its rules read that is not ``complete`` over the run's window and that no
+    finding of the section names yet, so an empty section states why (AAP 0.5.5 "Each
+    section shows an EmptyState with the reason"); a dataset that resolves to no dataset
+    gives the reason "no active {source} dataset" (:func:`_section_data_findings`).
     Every surviving C0 item then leads with ``held_recommendations`` (AAP 0.1.2 "Every card
     leads with one headline number"; P1 "resolve first, before any other recommendation is
     trusted"): the number of surviving non-C0 items whose ``extra.blocking_discrepancies``
@@ -94,7 +99,7 @@ from decimal import Decimal
 from types import MappingProxyType
 from typing import Any, Final
 
-from ads_engine.analysis import budget, metrics
+from ads_engine.analysis import budget, campaigns, keywords, metrics, white_papers
 from ads_engine.analysis.context import (
     B1,
     B2,
@@ -103,6 +108,7 @@ from ads_engine.analysis.context import (
     C1,
     CAMPAIGNS,
     CR1,
+    CREATIVE,
     DATA_LIVE,
     DATA_MIXED,
     DATA_SIMULATED,
@@ -157,6 +163,7 @@ from ads_engine.analysis.context import (
     short_window_message,
     unverified_message,
 )
+from ads_engine.analysis.creative import SECTION_DATASETS as CREATIVE_DATASETS
 from ads_engine.analysis.thresholds import Thresholds
 
 __all__ = [
@@ -210,6 +217,23 @@ card carries at compute time and at read time are judged over the same range.
 
 _LOOKBACK_DAYS_KEYS: Final[Mapping[str, str]] = MappingProxyType({K1: "k1.baseline_days"})
 """The threshold giving each lookback's length, used when its frozen start is unusable."""
+
+_SECTION_DATASETS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
+    {
+        KEYWORDS: keywords.SECTION_DATASETS,
+        CAMPAIGNS: campaigns.SECTION_DATASETS,
+        BUDGET: budget.SECTION_DATASETS,
+        CREATIVE: CREATIVE_DATASETS,
+        WHITE_PAPERS: white_papers.SECTION_DATASETS,
+    }
+)
+"""``section -> datasets``: every dataset each section's rules read, from the rule modules.
+
+A section that stores no item is judged over these (:func:`_section_data_findings`), so its
+empty state names each dataset that does not cover the window (AAP 0.5.5 "Each section shows
+an EmptyState with the reason"). Each module derives its tuple from its own rule-dataset
+constants, so the two never drift.
+"""
 
 _WINDOW_START_LABEL: Final = "window start"
 """How an incomplete reason names a required range that starts at the window start."""
@@ -373,7 +397,9 @@ class PrecedenceOutput:
         findings: The findings of each section: P2 tracking findings first, then the rules'
             findings (a ``no_crm_link`` finding's ``items`` recounted over the section's
             stored items), then P4 ``incomplete_dataset`` findings (``items`` and ``reasons``
-            recounted over the section's stored items).
+            recounted over the section's stored items; a section with no stored item also gets
+            one, ``items`` 0, per dataset it reads that is not complete over the window), by
+            dataset name and id.
         withheld: The withheld patterns of each section, in rule order (P6).
         suppressed: Per section, ``{reason: count}`` of the items precedence or a rule
             suppressed: ``g1_blocked``, ``tracking_absent``, ``feedback_*`` and any rule-level
@@ -1986,6 +2012,110 @@ def _recount_incomplete_datasets(
     }
 
 
+def _no_dataset_reason(ctx: AnalysisContext, name: str) -> str:
+    """Why a section dataset resolves to no dataset: the source whose active dataset is missing.
+
+    ``google.*`` and ``linkedin.*`` name their own source. A ``hubspot.*`` name resolves to the
+    effective CRM dataset of the LinkedIn dataset in use (AAP 0.5.4.1, 0.3.3), so while
+    LinkedIn has no active dataset that is the one missing; otherwise HubSpot's is.
+    """
+    source = name.split(".", 1)[0]
+    if source == "hubspot" and ctx.dataset("linkedin") is None:
+        source = "linkedin"
+    return f"no active {_SOURCE_LABELS.get(source, source)} dataset"
+
+
+def _section_data_findings(
+    ctx: AnalysisContext,
+    findings: Mapping[str, tuple[Finding, ...]],
+    candidates: Sequence[Candidate],
+) -> dict[str, tuple[Finding, ...]]:
+    """Say why a section that stores no item is empty, from its own datasets (P4).
+
+    AAP 0.5.5: "Each section shows an EmptyState with the reason when it has no items". A
+    section with no item gets no item-based ``incomplete_dataset`` finding from step 7, yet
+    the usual reason it is empty is that its data does not cover the window: a custom window
+    ending before the backfill, or a source left with no active dataset after a probe defect
+    (AAP 0.3.3: a defect never falls back to simulated data). So, for every section with no
+    surviving ``candidates``, each dataset its rules read (:data:`_SECTION_DATASETS`) is
+    judged over the run's window, with no rule lookback, exactly as
+    :meth:`~ads_engine.analysis.context.Freshness.is_complete_over` judges an item's.
+    ``google.*`` and ``linkedin.*`` resolve to their source's active primary and ``hubspot.*``
+    to the effective CRM dataset (``crm_scope="linkedin"``). Each dataset that is not
+    ``complete`` over the window, and that no ``incomplete_dataset`` finding of the section
+    already names, adds one finding of the step-7 shape with ``items`` 0. Its reasons are
+    :func:`_incomplete_reasons`, or "no active {source} dataset" when the name resolves to no
+    dataset (:func:`_no_dataset_reason`). A section with a surviving item is left unchanged:
+    its items carry their own flags and findings.
+
+    The section's ``incomplete_dataset`` findings are then ordered by dataset name and id, as
+    step 7 orders them. The result depends only on the set of ``candidates``, never their
+    order.
+
+    Args:
+        ctx: The analysis context the rules evaluated.
+        findings: The recounted ``incomplete_dataset`` findings per section.
+        candidates: The items that survived every suppression step.
+
+    Returns:
+        The ``incomplete_dataset`` findings per section, in :data:`SECTION_ORDER`.
+    """
+    window = ctx.window
+    stale_after = ctx.stale_after
+    occupied = {candidate.section for candidate in candidates}
+    result: dict[str, tuple[Finding, ...]] = {}
+    for section in SECTION_ORDER:
+        existing = tuple(findings.get(section, ()))
+        if section in occupied:
+            result[section] = existing
+            continue
+        named = {
+            finding.evidence["dataset"]
+            for finding in existing
+            if finding.code == FINDING_INCOMPLETE_DATASET
+        }
+        added: list[Finding] = []
+        for name in _SECTION_DATASETS[section]:
+            if name in named:
+                continue
+            dataset_id = ctx.dataset_id_for(
+                name, crm_scope="linkedin" if name.startswith("hubspot.") else None
+            )
+            row = ctx.freshness_for(name, dataset_id)
+            if row is not None and row.is_complete_over(
+                window_start=window.start, window_end=window.end
+            ):
+                continue
+            if dataset_id is None:
+                reasons: tuple[str, ...] = (_no_dataset_reason(ctx, name),)
+            else:
+                stale = row is None or row.is_stale(
+                    now=ctx.now, stale_after=stale_after, window_end=window.end
+                )
+                check = _Check(
+                    name,
+                    dataset_id,
+                    row,
+                    window.start,
+                    _WINDOW_START_LABEL,
+                    stale=stale,
+                    incomplete=True,
+                )
+                reasons = _incomplete_reasons(check, window.end)
+            found = _IncompleteDataset(name, dataset_id, row, dict.fromkeys(reasons))
+            added.append(_incomplete_finding(section, found))
+        result[section] = tuple(
+            sorted(
+                (*existing, *added),
+                key=lambda finding: (
+                    finding.evidence["dataset"],
+                    _orderable(finding.evidence["dataset_id"]),
+                ),
+            )
+        )
+    return result
+
+
 def _with_held_counts(candidates: Sequence[Candidate]) -> list[Candidate]:
     """Lead every C0 item with the number of stored recommendations its discrepancy holds.
 
@@ -2188,9 +2318,11 @@ def apply_precedence(
 
     The steps run in the fixed order of the module docstring: collect, G1, B3 allocation,
     P1, P2, P3, P4, P5, the P6/P7/P8 checks, feedback suppression with the ``no_crm_link``
-    and ``incomplete_dataset`` recounts and each C0 item's ``held_recommendations``
-    headline over the surviving items, the headline post-check, ranking. Pure: the inputs
-    are unchanged, and the same inputs, in any order, give the same output.
+    and ``incomplete_dataset`` recounts, the ``incomplete_dataset`` findings of each section
+    left with no item (one per section dataset not complete over the window, ``items`` 0)
+    and each C0 item's ``held_recommendations`` headline over the surviving items, the
+    headline post-check, ranking. Pure: the inputs are unchanged, and the same inputs, in
+    any order, give the same output.
 
     Args:
         results: The ``RuleResult`` of every rule module (``discrepancy``, ``keywords``,
@@ -2252,11 +2384,13 @@ def apply_precedence(
     _check_items(candidates)
 
     # 10. Feedback suppression (C0 exempt), then the no_crm_link and incomplete_dataset item
-    # counts and each C0 item's held-recommendation headline over the surviving items, and the
-    # independent headline post-check.
+    # counts over the surviving items, the incomplete_dataset findings of each section left with
+    # no item, each C0 item's held-recommendation headline, and the independent headline
+    # post-check.
     candidates = _apply_feedback(ctx, candidates, counts)
     rule_findings = _recount_no_crm_link(collected.findings, candidates)
     incomplete = _recount_incomplete_datasets(ctx, incomplete, candidates)
+    incomplete = _section_data_findings(ctx, incomplete, candidates)
     candidates = _with_held_counts(candidates)
     _check_headlines(candidates)
 

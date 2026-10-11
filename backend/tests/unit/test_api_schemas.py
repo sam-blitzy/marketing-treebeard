@@ -71,6 +71,7 @@ from ads_engine.api.schemas import (
     ContentAssetView,
     CreateRunRequest,
     CrmBindingsView,
+    DatasetCoverage,
     DatasetFreshnessView,
     DatasetView,
     Decision,
@@ -1461,7 +1462,16 @@ def _frozen_evidence(thresholds: Thresholds) -> context.Evidence:
             context.Metric("utilization", "Utilization", "n/a", "ratio"),
             context.Metric("ql", "Qualified Leads", None, "contacts"),
         ),
-        baselines=(context.Baseline("account_cpa", "Account CPA", Decimal("38.20")),),
+        baselines=(
+            context.Baseline("account_cpa", "Account CPA", Decimal("38.20")),
+            context.Baseline(
+                "baseline_cost_per_outcome",
+                "Account cost per conversion (same source and objective)",
+                Decimal("37.986583"),
+                "currency",
+                "USD",
+            ),
+        ),
         sample=context.Sample(
             observed=310,
             required=1000,
@@ -1478,6 +1488,7 @@ def _frozen_evidence(thresholds: Thresholds) -> context.Evidence:
         datasets=(
             context.DatasetStatus("google.search_terms", "complete", DEFAULT_END),
             context.DatasetStatus("google.metrics_daily", "unknown", None),
+            context.DatasetStatus("hubspot.contacts", "complete", DEFAULT_END, "UTC"),
         ),
         provenance=(
             context.ProvenanceEntry("google", 1, "simulated", "primary"),
@@ -1505,11 +1516,30 @@ def test_evidence_round_trips_exactly_what_the_runner_freezes(thresholds: Thresh
         "floor",
         "unavailable",
     }
-    assert set(dumped["baselines"][0]) == {"key", "label", "value"}
+    assert set(dumped["baselines"][0]) == {"key", "label", "value", "unit", "currency"}
+    # A baseline without a unit renders both keys null; an unpaired money baseline keeps its own
+    # unit and currency, so the client formats it in the account currency (AAP 0.5.5).
+    assert (dumped["baselines"][0]["unit"], dumped["baselines"][0]["currency"]) == (None, None)
+    assert dumped["baselines"][1] == {
+        "key": "baseline_cost_per_outcome",
+        "label": "Account cost per conversion (same source and objective)",
+        "value": "37.986583",
+        "unit": "currency",
+        "currency": "USD",
+    }
     assert set(dumped["sample"]) == {"observed", "required", "unit", "projected"}
     assert set(dumped["sample"]["projected"]) == {"value", "unit", "basis"}
     assert set(dumped["test"]) == {"name", "p_value", "p_adjusted", "alpha"}
-    assert set(dumped["datasets"][0]) == {"dataset", "completeness", "covered_through"}
+    assert set(dumped["datasets"][0]) == {"dataset", "completeness", "covered_through", "boundary"}
+    # A status frozen without a boundary renders it null; a HubSpot coverage date keeps its UTC
+    # boundary, so the client labels it as /sources does (AAP 0.5.5).
+    assert dumped["datasets"][0]["boundary"] is None
+    assert dumped["datasets"][2] == {
+        "dataset": "hubspot.contacts",
+        "completeness": "complete",
+        "covered_through": DEFAULT_END.isoformat(),
+        "boundary": "UTC",
+    }
     assert set(dumped["provenance"][0]) == {"source", "dataset_id", "mode", "role"}
     assert dumped["sample"]["projected"]["value"] == "25000"
     assert dumped["extra"]["rows"] == [{"creative": "urn:li:sponsoredCreative:9", "mql": 3}]
@@ -3041,7 +3071,13 @@ _DEFAULTED_RESPONSE_KEYS: tuple[
         lambda: {"key": "spend", "label": "Spend", "value": "412.500000", "unit": "currency"},
         ("currency", "floor", "unavailable"),
     ),
+    (
+        Baseline,
+        lambda: {"key": "account_cpa", "label": "Account CPA", "value": "38.200000"},
+        ("unit", "currency"),
+    ),
     (Sample, lambda: {"observed": 240, "required": 300, "unit": "clicks"}, ("projected",)),
+    (DatasetCoverage, lambda: _evidence()["datasets"][0], ("boundary",)),
     (
         StatTest,
         lambda: {"name": "Fisher's exact test", "p_value": "0.012", "alpha": "0.05"},
@@ -3073,7 +3109,11 @@ _DEFAULTED_RESPONSE_KEYS: tuple[
     ),
 )
 """Every response model with a defaulted field: a minimal payload and its ``None``-default
-keys, which ``web/src/api/types.ts`` declares as required ``X | null`` properties."""
+keys, which ``web/src/api/types.ts`` declares as required ``X | null`` properties, except
+``Baseline.unit``, ``Baseline.currency`` and ``DatasetCoverage.boundary``: optional ``X | null``
+there, because they extend the ``{key, label, value}`` and ``{dataset, completeness,
+covered_through}`` shapes clients already build. The API emits them as ``null`` all the
+same."""
 
 _DEFAULTED_REQUEST_KEYS: tuple[tuple[type[schemas.RequestModel], tuple[str, ...]], ...] = (
     (DecisionPatchIn, ("status", "daily_budget", "total_budget")),
@@ -3087,8 +3127,8 @@ _DEFAULTED_REQUEST_KEYS: tuple[tuple[type[schemas.RequestModel], tuple[str, ...]
 
 def test_the_defaulted_response_keys_cover_every_defaulted_response_field() -> None:
     listed = {model: set(keys) for model, _, keys in _DEFAULTED_RESPONSE_KEYS}
-    assert len(listed) == 12
-    assert sum(len(keys) for keys in listed.values()) == 23
+    assert len(listed) == 14
+    assert sum(len(keys) for keys in listed.values()) == 26
     for model, keys in listed.items():
         defaulted = {name for name, field in model.model_fields.items() if not field.is_required()}
         assert defaulted == keys, model.__name__

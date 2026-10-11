@@ -12,8 +12,15 @@
  *
  * - **Auth guard**: a 401 from `GET /auth/me` redirects to `/login` carrying the requested href
  *   (path, search and hash) as `redirect`, and sign-in returns there without asking
- *   `GET /auth/me` again; any other failure shows the error screen with Retry, never the sign-in
- *   form; the user is read once across navigations; a slow guard shows the "Loading" spinner.
+ *   `GET /auth/me` again; any other failure (a 503, or nginx's 502 during an outage) shows the
+ *   error screen with Retry inside the signed-in shell (primary navigation and "Sign out", no
+ *   email, no page read), never the sign-in form, and Retry asks again and restores the screen.
+ *   On `/actions` (trailing slash and search included) that screen is the page's own failure
+ *   state, "Actions could not be loaded", whose Retry, when it fails again, returns focus to the
+ *   new screen's Retry; elsewhere it is "Something went wrong". The user is read once across
+ *   navigations; a slow guard shows the "Loading" spinner in the same shell.
+ * - **Error screen outside the layout**: a failed sign-in screen keeps a `PageShell` with the
+ *   one-link "Sign in" navigation, current and keeping its `redirect`, and Retry recovers it.
  * - **`/`** redirects to `/actions`.
  * - **Layout**: each of the four screens renders inside one `PageShell` with the signed-in email,
  *   "Sign out" and the primary navigation, whose current link carries `aria-current="page"`.
@@ -21,10 +28,17 @@
  *   and Login eager ones, and each lazy screen renders inside the layout once its chunk loads.
  * - **`/actions?run=`** keeps only positive safe integers, and a rejected value is removed from the
  *   URL by a replacing redirect; **`/login?redirect=`** keeps only same-origin paths the same way.
+ * - **`/login` session check**: a signed-in visitor is sent on, replacing `/login`, to the
+ *   `redirect` (search included) or to `/actions`; a signed-out visitor and a failed
+ *   `GET /auth/me` (503) get the sign-in form; a preload of `/login` asks nothing. The guard's
+ *   own 401 redirect, marked in its history state, asks nothing more than the guard's read;
+ *   every other visit asks again, so a tab holding a 401 from before a sign-in in another tab
+ *   is sent on from either "Sign in" link (the form's own, or the one framing a failed sign-in
+ *   screen), an in-app navigation, or Back to the marked entry.
  * - **Not found**: an unknown path renders "Page not found" inside the shell when signed in, and
  *   sends a signed-out visitor to sign in.
- * - **Sign out**: success and a 401 clear the cache and open `/login`, so the guard asks the API
- *   again; any other failure keeps the session and explains itself beside the button, in the
+ * - **Sign out**: success and a 401 clear the cache and open `/login`, so `/login` and the guard
+ *   ask the API again; any other failure keeps the session and explains itself beside the button, in the
  *   polite status region mounted with the layout, and returns focus to the button only when focus
  *   had fallen to `<body>`.
  * - **Focus after navigation**: focus moves to `<main>` only when the focused control was removed.
@@ -42,7 +56,7 @@
 // mockApi registers an afterEach hook that fails a test with an unmatched request. Vitest skips
 // the remaining afterEach hooks once one throws and runs them in reverse order of registration,
 // so this import comes before Testing Library's, whose cleanup must still run.
-import { apiError, json, mockApi } from './test/mockApi';
+import { apiError, html, json, mockApi } from './test/mockApi';
 import type { ApiMock, MockHandlers, MockResponse, RecordedCall } from './test/mockApi';
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
@@ -57,6 +71,8 @@ import type { Container, Root, RootOptions } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { queryKeys } from './api/queries';
+import type * as LoginPageModule from './features/auth/LoginPage';
+import type { LoginPageProps } from './features/auth/LoginPage';
 import { createAppRouter } from './router';
 import type { AppRouter } from './router';
 import {
@@ -107,6 +123,32 @@ vi.mock('react-dom/client', async (importOriginal) => {
       };
     },
   };
+});
+
+/**
+ * Whether the sign-in screen throws while it renders, so a test reaches the error screen of a
+ * route outside the authenticated layout. Off unless a test turns it on, and reset after each.
+ */
+const loginPageFault = vi.hoisted(() => ({ throwOnRender: false }));
+
+// A transparent wrapper: the sign-in screen is the real one, unless a test sets
+// `loginPageFault.throwOnRender`, which makes it throw as a render failure would.
+vi.mock('./features/auth/LoginPage', async (importOriginal) => {
+  const actual = await importOriginal<typeof LoginPageModule>();
+  const { createElement } = await import('react');
+  return {
+    ...actual,
+    LoginPage: (props: LoginPageProps): ReactNode => {
+      if (loginPageFault.throwOnRender) {
+        throw new Error('The sign-in screen failed to render');
+      }
+      return createElement(actual.LoginPage, props);
+    },
+  };
+});
+
+afterEach(() => {
+  loginPageFault.throwOnRender = false;
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -340,7 +382,7 @@ describe('auth guard', () => {
     expect(reads.every((call) => call.search.get('run_id') === '202')).toBe(true);
   });
 
-  it('shows any other failure on the error screen with Retry, not the sign-in form', async () => {
+  it('shows any other failure inside the signed-in shell with Retry, not the sign-in form', async () => {
     const api = mockApi({
       ...pageReads(),
       'GET /auth/me': apiError(503, 'database_unavailable', 'Database unavailable'),
@@ -351,22 +393,140 @@ describe('auth guard', () => {
     expect(screen.getByText('Database unavailable')).toBeTruthy();
     expect(router.state.location.pathname).toBe('/settings');
     expect(screen.queryByRole('heading', { name: 'Sign in' })).toBeNull();
-    // Outside the layout the error screen brings its own shell: one <main>, one <h1>, no
-    // navigation or sign-out, and no alert role (reserved for open discrepancies).
+    // Only /actions has a failure state of its own; every other screen gets the generic one.
+    expect(screen.queryByText('Actions could not be loaded')).toBeNull();
+    // The layout's own error screen keeps the signed-in shell (AAP 0.5.5: PageShell, TopBar and
+    // SideNav on every screen): one <main>, one <h1>, the primary navigation beside <main> with
+    // the requested screen current, "Sign out" in the top bar, and no alert role (reserved for
+    // open discrepancies).
     expect(screen.getAllByRole('main')).toHaveLength(1);
     expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
-    expect(screen.getByText('Ads Action Engine')).toBeTruthy();
-    expect(screen.queryByRole('navigation', { name: 'Primary' })).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Sign out' })).toBeNull();
+    const banner = screen.getByRole('banner');
+    expect(banner.textContent).toContain('Ads Action Engine');
+    expect(within(banner).getByRole('button', { name: 'Sign out' })).toBeTruthy();
+    const links = within(primaryNav()).getAllByRole('link');
+    expect(links.map((link) => link.textContent)).toEqual([
+      'Actions',
+      'Decisions',
+      'Sources',
+      'Settings',
+    ]);
+    const current = links.filter((link) => link.getAttribute('aria-current') === 'page');
+    expect(current.map((link) => link.textContent)).toEqual(['Settings']);
+    const main = screen.getByRole('main');
+    expect(within(main).getByText('Database unavailable')).toBeTruthy();
+    expect(within(main).getByRole('button', { name: 'Retry' })).toBeTruthy();
+    expect(main.contains(primaryNav())).toBe(false);
     expect(screen.queryByRole('alert')).toBeNull();
+    // Fail-closed: no session was confirmed, so no email shows and no screen reads its data.
+    expect(screen.queryByText(ADMIN_EMAIL)).toBeNull();
+    expect(screen.queryByRole('heading', { name: 'Settings' })).toBeNull();
+    expect(api.calls.filter((call) => call.path !== '/auth/me')).toEqual([]);
 
     api.use(SIGNED_IN);
-    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    fireEvent.click(within(main).getByRole('button', { name: 'Retry' }));
 
     await findTitle('Settings');
     expect(primaryNav()).toBeTruthy();
     expect(screen.queryByText('Database unavailable')).toBeNull();
+    expect(within(screen.getByRole('banner')).getByText(ADMIN_EMAIL)).toBeTruthy();
     expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(2);
+  });
+
+  it("shows a reload of /actions in an outage as the page's failure state, and Retry recovers", async () => {
+    const api = mockApi({
+      ...pageReads(),
+      'GET /auth/me': html(502, '<html><body>502 Bad Gateway</body></html>'),
+    });
+    const { router } = renderApp('/actions');
+
+    await findTitle('Actions');
+    await waitForPath(router, '/actions');
+    const main = screen.getByRole('main');
+    // The page's failure state, not the generic error screen: "Actions could not be loaded" with
+    // the client's safe outage message and Retry, announced in a polite status region.
+    const notice = within(main).getByText('Actions could not be loaded');
+    expect(notice.closest('[role="status"]')).not.toBeNull();
+    expect(
+      within(main).getByText('The server is temporarily unavailable. Try again shortly.'),
+    ).toBeTruthy();
+    expect(within(main).getByRole('button', { name: 'Retry' })).toBeTruthy();
+    expect(screen.queryByText('Something went wrong')).toBeNull();
+    // Inside the signed-in shell (AAP 0.5.5): one <main>, one <h1>, the primary navigation with
+    // Actions current, "Sign out" in the top bar, and no alert role (reserved for discrepancies).
+    expect(screen.getAllByRole('main')).toHaveLength(1);
+    expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
+    const actions = within(primaryNav()).getByRole('link', { name: 'Actions' });
+    expect(actions.getAttribute('aria-current')).toBe('page');
+    expect(main.contains(primaryNav())).toBe(false);
+    const banner = screen.getByRole('banner');
+    expect(within(banner).getByRole('button', { name: 'Sign out' })).toBeTruthy();
+    expect(screen.queryByRole('alert')).toBeNull();
+    // Fail-closed: no email, and no page read before the guard has confirmed the session.
+    expect(screen.queryByText(ADMIN_EMAIL)).toBeNull();
+    expect(api.calls.filter((call) => call.path !== '/auth/me')).toEqual([]);
+    // The initial load leaves focus on <body>, as every first load does.
+    expect(document.activeElement).toBe(document.body);
+
+    // A Retry that fails again: the guard asks the API again, the button shows as loading
+    // meanwhile, and the new failure screen returns focus to its own Retry.
+    const retry = within(main).getByRole('button', { name: 'Retry' });
+    retry.focus();
+    fireEvent.click(retry);
+    // A loading Button is inert but never natively disabled, so it keeps focus meanwhile.
+    expect(retry.getAttribute('aria-busy')).toBe('true');
+    expect(retry.getAttribute('aria-disabled')).toBe('true');
+    await waitFor(() => {
+      expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(2);
+    });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Retry' }));
+    });
+    // The router replaced the screen, so this is a new button that took focus back.
+    expect(screen.getByRole('button', { name: 'Retry' })).not.toBe(retry);
+    expect(screen.getByText('Actions could not be loaded')).toBeTruthy();
+    expect(primaryNav()).toBeTruthy();
+    expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
+    expect(api.calls.filter((call) => call.path !== '/auth/me')).toEqual([]);
+
+    api.use(SIGNED_IN);
+    fireEvent.click(within(screen.getByRole('main')).getByRole('button', { name: 'Retry' }));
+
+    // The guard passes: the page itself renders, here its first-start state, and reads its data.
+    await screen.findByText('No analysis run yet');
+    await waitForPath(router, '/actions');
+    expect(screen.queryByText('Actions could not be loaded')).toBeNull();
+    expect(screen.getAllByRole('heading', { level: 1 }).map((h) => h.textContent)).toEqual([
+      'Actions',
+    ]);
+    expect(within(screen.getByRole('banner')).getByText(ADMIN_EMAIL)).toBeTruthy();
+    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(3);
+    expect(callsTo(api, 'GET', '/recommendations').length).toBeGreaterThan(0);
+  });
+
+  it('shows the /actions failure state for a guard 503 on /actions/ with a run search too', async () => {
+    const api = mockApi({
+      ...pageReads(),
+      'GET /auth/me': apiError(503, 'database_unavailable', 'Database unavailable'),
+    });
+    renderApp('/actions/?run=202');
+
+    await findTitle('Actions');
+    const main = screen.getByRole('main');
+    await within(main).findByText('Actions could not be loaded');
+    expect(within(main).getByText('Database unavailable')).toBeTruthy();
+    expect(within(main).getByRole('button', { name: 'Retry' })).toBeTruthy();
+    expect(screen.queryByText('Something went wrong')).toBeNull();
+    expect(screen.getAllByRole('main')).toHaveLength(1);
+    expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
+    const links = within(primaryNav()).getAllByRole('link');
+    const current = links.filter((link) => link.getAttribute('aria-current') === 'page');
+    expect(current.map((link) => link.textContent)).toEqual(['Actions']);
+    const banner = screen.getByRole('banner');
+    expect(within(banner).getByRole('button', { name: 'Sign out' })).toBeTruthy();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByText(ADMIN_EMAIL)).toBeNull();
+    expect(api.calls.filter((call) => call.path !== '/auth/me')).toEqual([]);
   });
 
   it('reads GET /auth/me once while navigating between screens', async () => {
@@ -385,24 +545,73 @@ describe('auth guard', () => {
     expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
   });
 
-  it('shows the "Loading" spinner while the guard waits for GET /auth/me', async () => {
+  it('shows the "Loading" spinner inside the signed-in shell while the guard waits for GET /auth/me', async () => {
     let answer: (response: MockResponse) => void = () => undefined;
     const pending = new Promise<MockResponse>((resolve) => {
       answer = resolve;
     });
-    mockApi({ ...pageReads(), 'GET /auth/me': () => pending });
+    const api = mockApi({ ...pageReads(), 'GET /auth/me': () => pending });
     const { router } = renderApp('/settings');
 
     const label = await screen.findByText('Loading', {}, { timeout: 4000 });
     expect(label.closest('[role="status"]')).not.toBeNull();
+    // Framed as the screen will be once the guard passes: the spinner in the one <main>, beside
+    // the primary navigation, under a top bar with "Sign out" but no email yet, and no heading.
     expect(screen.getAllByRole('main')).toHaveLength(1);
-    expect(screen.queryByRole('navigation', { name: 'Primary' })).toBeNull();
+    expect(screen.getByRole('main').contains(label)).toBe(true);
+    expect(within(primaryNav()).getAllByRole('link')).toHaveLength(4);
+    const banner = screen.getByRole('banner');
+    expect(within(banner).getByRole('button', { name: 'Sign out' })).toBeTruthy();
+    expect(screen.queryByText(ADMIN_EMAIL)).toBeNull();
+    expect(screen.queryAllByRole('heading', { level: 1 })).toHaveLength(0);
+    expect(api.calls.filter((call) => call.path !== '/auth/me')).toEqual([]);
 
     answer(json(200, makeMe()));
 
     await findTitle('Settings');
     await waitForPath(router, '/settings');
     expect(screen.queryByText('Loading')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Screens outside the layout
+// ---------------------------------------------------------------------------------------------
+
+describe('error screen outside the layout', () => {
+  it('frames a failed sign-in screen with the one-link sign-in navigation, and Retry recovers it', async () => {
+    loginPageFault.throwOnRender = true;
+    mockApi({ ...pageReads(), ...SIGNED_OUT });
+    const { router } = renderApp('/login?redirect=%2Fsettings');
+
+    await findTitle('Something went wrong');
+    await waitForPath(router, '/login');
+    expect(screen.getByText('The page could not be loaded. Try again.')).toBeTruthy();
+    // AAP 0.5.5: PageShell, TopBar and SideNav on every screen. One <main> and one <h1>, no
+    // alert role, no signed-in control, and a navigation that lists the sign-in screen alone,
+    // marked current and keeping the redirect a sign-in returns to.
+    expect(screen.getAllByRole('main')).toHaveLength(1);
+    expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
+    expect(screen.getByRole('banner').textContent).toBe('Ads Action Engine');
+    expect(screen.queryByRole('button', { name: 'Sign out' })).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+    const links = within(primaryNav()).getAllByRole('link');
+    expect(links.map((link) => link.textContent)).toEqual(['Sign in']);
+    const [signInLink] = links;
+    expect(signInLink?.getAttribute('aria-current')).toBe('page');
+    expect(signInLink?.getAttribute('class')).toBe('ds-sidenav__link ds-sidenav__link--current');
+    expect(signInLink?.getAttribute('href')).toBe('/login?redirect=%2Fsettings');
+    expect(screen.getByRole('main').contains(primaryNav())).toBe(false);
+
+    loginPageFault.throwOnRender = false;
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+
+    await findTitle('Sign in');
+    expect(router.state.location.search).toEqual({ redirect: '/settings' });
+    expect(screen.queryByText('Something went wrong')).toBeNull();
+    expect(within(primaryNav()).getAllByRole('link').map((link) => link.textContent)).toEqual([
+      'Sign in',
+    ]);
   });
 });
 
@@ -677,7 +886,7 @@ describe('/login redirect search', () => {
   const KEPT: readonly string[] = ['/settings', '/actions?run=202', '/actions#section-budget'];
 
   it.each(KEPT)('keeps the same-origin path %s', async (target) => {
-    mockApi({});
+    mockApi(SIGNED_OUT);
     const { router } = renderApp(`/login?redirect=${encodeURIComponent(target)}`);
 
     await findTitle('Sign in');
@@ -699,7 +908,7 @@ describe('/login redirect search', () => {
   ];
 
   it.each(DROPPED)('removes %s from the URL with a replacing redirect', async (_case, raw) => {
-    mockApi({});
+    mockApi(SIGNED_OUT);
     const { router } = renderApp(`/login?redirect=${raw}`);
 
     await findTitle('Sign in');
@@ -714,7 +923,7 @@ describe('/login redirect search', () => {
   it.each(DROPPED)(
     'removes %s that a later history entry carries, replacing that entry',
     async (_case, raw) => {
-      mockApi({});
+      mockApi(SIGNED_OUT);
       const { router } = renderApp('/login');
       await findTitle('Sign in');
       await waitForPath(router, '/login');
@@ -734,7 +943,7 @@ describe('/login redirect search', () => {
   );
 
   it('signs in to /actions when the redirect was dropped', async () => {
-    mockApi({ ...pageReads(), ...LOGIN_OK });
+    mockApi({ ...pageReads(), ...SIGNED_OUT, ...LOGIN_OK });
     const { router } = renderApp(`/login?redirect=${encodeURIComponent('//evil.example')}`);
     await findTitle('Sign in');
     await waitForPath(router, '/login');
@@ -747,7 +956,7 @@ describe('/login redirect search', () => {
   });
 
   it('signs in to /actions when /login carries no redirect', async () => {
-    mockApi({ ...pageReads(), ...LOGIN_OK });
+    mockApi({ ...pageReads(), ...SIGNED_OUT, ...LOGIN_OK });
     const { router } = renderApp('/login');
     await findTitle('Sign in');
 
@@ -755,6 +964,244 @@ describe('/login redirect search', () => {
 
     await findTitle('Actions');
     await waitForPath(router, '/actions');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// /login session check
+// ---------------------------------------------------------------------------------------------
+
+describe('/login session check', () => {
+  /** Case, the `/login` URL opened, where a signed-in visitor lands, and that page's title. */
+  const SENT_ON: readonly (readonly [string, string, string, string])[] = [
+    ['its redirect', `/login?redirect=${encodeURIComponent('/settings')}`, '/settings', 'Settings'],
+    [
+      'its redirect, search included',
+      `/login?redirect=${encodeURIComponent('/actions?run=202')}`,
+      '/actions?run=202',
+      'Actions',
+    ],
+    ['/actions without a redirect', '/login', '/actions', 'Actions'],
+    [
+      'the target of a redirect that is a /login URL itself',
+      `/login?redirect=${encodeURIComponent(`/login?redirect=${encodeURIComponent('/settings')}`)}`,
+      '/settings',
+      'Settings',
+    ],
+  ];
+
+  it.each(SENT_ON)(
+    'sends a signed-in visitor on to %s, replacing /login',
+    async (_case, path, target, title) => {
+      const api = mockApi({ ...pageReads(), ...SIGNED_IN });
+      const { router } = renderApp(path);
+
+      await findTitle(title);
+      await waitFor(() => {
+        expect(router.state.status).toBe('idle');
+        expect(router.state.location.href).toBe(target);
+      });
+      // The redirect replaced the /login entry, so Back does not return to the form.
+      expect(router.history.length).toBe(1);
+      expect(screen.queryByRole('heading', { name: 'Sign in' })).toBeNull();
+      // The signed-in top bar, not the sign-in screen's.
+      expect(screen.getByText(ADMIN_EMAIL)).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Sign out' })).toBeTruthy();
+      // The check's read is the one the layout's guard then takes from the cache.
+      expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
+      expect(callsTo(api, 'POST', '/auth/login')).toHaveLength(0);
+    },
+  );
+
+  it('sends a signed-in user who navigates to /login on from the cache, asking nothing', async () => {
+    const api = mockApi({ ...pageReads(), ...SIGNED_IN });
+    const { router } = renderApp('/settings');
+    await findTitle('Settings');
+
+    await act(() => router.navigate({ to: '/login', search: { redirect: '/sources' } }));
+
+    await findTitle('Sources');
+    await waitForPath(router, '/sources');
+    // /settings, then /sources in place of /login.
+    expect(router.history.length).toBe(2);
+    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
+  });
+
+  it('shows the sign-in form to a signed-out visitor, keeping the redirect', async () => {
+    const api = mockApi(SIGNED_OUT);
+    const { router } = renderApp(`/login?redirect=${encodeURIComponent('/settings')}`);
+
+    await findTitle('Sign in');
+    await waitForPath(router, '/login');
+    expect(router.state.location.search).toEqual({ redirect: '/settings' });
+    expect(router.history.length).toBe(1);
+    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
+  });
+
+  it('shows the sign-in form, not the error screen, when GET /auth/me fails', async () => {
+    const api = mockApi({
+      'GET /auth/me': apiError(503, 'database_unavailable', 'Database unavailable'),
+    });
+    const { router } = renderApp(`/login?redirect=${encodeURIComponent('/settings')}`);
+
+    await findTitle('Sign in');
+    await waitForPath(router, '/login');
+    expect(router.state.location.search).toEqual({ redirect: '/settings' });
+    expect(screen.queryByRole('heading', { name: 'Something went wrong' })).toBeNull();
+    expect(screen.queryByText('Database unavailable')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
+  });
+
+  it('sends no GET /auth/me for a preload of /login, only for a visit', async () => {
+    const api = mockApi({
+      ...pageReads(),
+      'GET /auth/me': apiError(503, 'database_unavailable', 'Database unavailable'),
+    });
+    const { router } = renderApp('/settings');
+    await findTitle('Something went wrong');
+    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
+
+    // A hovered or focused "Sign in" link preloads /login ('intent'). The cache holds no user,
+    // only the failed read, so a check would ask the API again.
+    await act(async () => {
+      await router.preloadRoute({ to: '/login' });
+    });
+
+    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
+    expect(router.state.location.pathname).toBe('/settings');
+
+    // Opening /login does check, and shows the form when the check fails.
+    await act(() => router.navigate({ to: '/login' }));
+    await findTitle('Sign in');
+    await waitForPath(router, '/login');
+    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(2);
+  });
+
+  it('asks GET /auth/me once for the guard redirect of a signed-out visitor, and marks it', async () => {
+    const api = mockApi({ ...pageReads(), ...SIGNED_OUT });
+    const { router } = renderApp('/settings');
+
+    await findTitle('Sign in');
+    await waitForPath(router, '/login');
+    expect(router.state.location.search).toEqual({ redirect: '/settings' });
+    // The guard's redirect, and only it, carries the mark /login takes the guard's 401 from.
+    expect(router.state.location.state.authGuardSignedOut).toBe(true);
+    await settle();
+    // The guard's read only: /login took its 401 instead of asking again.
+    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
+    expect(api.calls.filter((call) => call.path !== '/auth/me')).toEqual([]);
+  });
+
+  /** Case, and the address tab A shows the sign-in form at while signed out. */
+  const STALE_401_STARTS: readonly (readonly [string, string])[] = [
+    ['arrived through the guard redirect', '/settings'],
+    ['was opened directly', `/login?redirect=${encodeURIComponent('/settings')}`],
+  ];
+
+  it.each(STALE_401_STARTS)(
+    'asks again when the "Sign in" link is activated on a form that %s, after a sign-in in another tab',
+    async (_case, start) => {
+      // Tab A: signed out, so the cache holds the API's 401.
+      const api = mockApi({ ...pageReads(), ...SIGNED_OUT });
+      const { router, queryClient } = renderApp(start);
+      await findTitle('Sign in');
+      await waitForPath(router, '/login');
+      expect(router.state.location.search).toEqual({ redirect: '/settings' });
+      expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
+      expect(queryClient.getQueryState(queryKeys.me)?.status).toBe('error');
+
+      // Tab B signs in; the session cookie is shared, so tab A's next GET /auth/me finds it.
+      api.use(SIGNED_IN);
+      fireEvent.click(within(primaryNav()).getByRole('link', { name: 'Sign in' }));
+
+      await findTitle('Settings');
+      await waitFor(() => {
+        expect(router.state.status).toBe('idle');
+        expect(router.state.location.href).toBe('/settings');
+      });
+      // Exactly one new read: /login's check, whose user the guard then takes from the cache.
+      expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(2);
+      expect(within(screen.getByRole('banner')).getByText(ADMIN_EMAIL)).toBeTruthy();
+      expect(screen.queryByRole('heading', { name: 'Sign in' })).toBeNull();
+    },
+  );
+
+  it.each(STALE_401_STARTS)(
+    'asks again for an in-app navigation to /login from a form that %s, after a sign-in in another tab',
+    async (_case, start) => {
+      const api = mockApi({ ...pageReads(), ...SIGNED_OUT });
+      const { router } = renderApp(start);
+      await findTitle('Sign in');
+      await waitForPath(router, '/login');
+      expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
+
+      api.use(SIGNED_IN);
+      await act(() => router.navigate({ to: '/login', search: { redirect: '/settings' } }));
+
+      await findTitle('Settings');
+      await waitFor(() => {
+        expect(router.state.status).toBe('idle');
+        expect(router.state.location.href).toBe('/settings');
+      });
+      expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(2);
+    },
+  );
+
+  it('asks again on Back to the guard-redirected entry: its mark spares only its first load', async () => {
+    const api = mockApi({ ...pageReads(), ...SIGNED_OUT });
+    const { router } = renderApp('/settings');
+    await findTitle('Sign in');
+    await waitForPath(router, '/login');
+    expect(router.state.location.state.authGuardSignedOut).toBe(true);
+    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
+
+    // Still signed out: an in-app visit to /login asks, gets 401 and keeps the form.
+    await act(() => router.navigate({ to: '/login', search: { redirect: '/sources' } }));
+    await findTitle('Sign in');
+    await waitFor(() => {
+      expect(router.state.status).toBe('idle');
+      expect(router.state.location.search).toEqual({ redirect: '/sources' });
+    });
+    expect(router.state.location.state.authGuardSignedOut).toBeUndefined();
+    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(2);
+
+    // Another tab signs in; Back returns to the marked entry, whose mark is spent, so it asks.
+    api.use(SIGNED_IN);
+    act(() => {
+      router.history.back();
+    });
+
+    await findTitle('Settings');
+    await waitFor(() => {
+      expect(router.state.status).toBe('idle');
+      expect(router.state.location.href).toBe('/settings');
+    });
+    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(3);
+  });
+
+  it('asks again from the "Sign in" link of a failed sign-in screen, after a sign-in in another tab', async () => {
+    loginPageFault.throwOnRender = true;
+    const api = mockApi({ ...pageReads(), ...SIGNED_OUT });
+    const { router } = renderApp('/settings');
+    // The guard's redirect lands on a sign-in screen that fails, framed by the router's own
+    // one-link sign-in navigation instead of LoginPage's.
+    await findTitle('Something went wrong');
+    await waitForPath(router, '/login');
+    expect(router.state.location.state.authGuardSignedOut).toBe(true);
+    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
+
+    loginPageFault.throwOnRender = false;
+    api.use(SIGNED_IN);
+    fireEvent.click(within(primaryNav()).getByRole('link', { name: 'Sign in' }));
+
+    await findTitle('Settings');
+    await waitFor(() => {
+      expect(router.state.status).toBe('idle');
+      expect(router.state.location.href).toBe('/settings');
+    });
+    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(2);
+    expect(screen.queryByText('Something went wrong')).toBeNull();
   });
 });
 
@@ -839,6 +1286,30 @@ const LOGOUT_FAILED = apiError(500, 'internal_error', 'Internal error');
 const SIGN_OUT_FAILED = 'Sign-out failed. Try again.';
 
 /**
+ * `GET /auth/me` and `POST /auth/logout` over one session, as the API answers them. The session
+ * holds until a sign-out the API accepts (2xx), or refuses with 401 because the session had
+ * already ended; from then on `GET /auth/me` answers 401 `unauthenticated`, so the `/login`
+ * route, which asks after a sign-out has cleared the cache, finds the visitor signed out. A
+ * sign-out failing any other way (a 500) keeps the session.
+ *
+ * @param logout - The sign-out's answer.
+ * @returns The two handlers, sharing the session.
+ */
+function sessionUntilSignOut(logout: MockResponse): MockHandlers {
+  let signedIn = true;
+  return {
+    'GET /auth/me': () =>
+      signedIn ? json(200, makeMe()) : apiError(401, 'unauthenticated', 'Not signed in'),
+    'POST /auth/logout': () => {
+      if (logout.status < 300 || logout.status === 401) {
+        signedIn = false;
+      }
+      return logout;
+    },
+  };
+}
+
+/**
  * The top bar's polite status region, which holds "Sign out" and, after a failure, the message.
  *
  * @returns The `role="status"` element inside the `banner` landmark.
@@ -851,10 +1322,9 @@ describe('sign out', () => {
   it('posts /auth/logout with the CSRF header, clears the cache and opens /login', async () => {
     const api = mockApi({
       ...pageReads(),
-      ...SIGNED_IN,
       // The stub answers as the API does, 200 with the signed-out `{email}` (routes/auth.py),
       // not with a 204: the test exercises the response the client really receives.
-      'POST /auth/logout': json(200, makeMe()),
+      ...sessionUntilSignOut(json(200, makeMe())),
     });
     const { router, queryClient } = renderApp('/settings');
     await findTitle('Settings');
@@ -868,24 +1338,24 @@ describe('sign out', () => {
     expect(posts).toHaveLength(1);
     expect(posts[0]?.headers.get('X-Requested-With')).toBe('ads-engine');
     expect(queryClient.getQueryData(queryKeys.me)).toBeUndefined();
+    // The guard's first read, then /login's: the cleared cache held no user, so it asked the API.
+    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(2);
     // The sign-in screen's own navigation lists itself only, never a signed-in screen.
     expect(within(primaryNav()).getAllByRole('link').map((link) => link.textContent)).toEqual([
       'Sign in',
     ]);
 
-    // The cleared cache cannot let the guard pass: it asks the API, which says signed out.
-    api.use(SIGNED_OUT);
+    // The cleared cache cannot let the guard pass either: it asks the API, which says signed out.
     await act(() => router.navigate({ to: '/actions' }));
     await waitForPath(router, '/login');
     expect(router.state.location.search).toEqual({ redirect: '/actions' });
-    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(2);
+    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(3);
   });
 
   it('treats a 401 from /auth/logout as signed out: the session had already ended', async () => {
     mockApi({
       ...pageReads(),
-      ...SIGNED_IN,
-      'POST /auth/logout': apiError(401, 'unauthenticated', 'Not signed in'),
+      ...sessionUntilSignOut(apiError(401, 'unauthenticated', 'Not signed in')),
     });
     const { router, queryClient } = renderApp('/settings');
     await findTitle('Settings');
@@ -930,7 +1400,7 @@ describe('sign out', () => {
     expect(screen.queryByRole('alert')).toBeNull();
 
     // A second attempt that succeeds signs out.
-    api.use({ 'POST /auth/logout': json(200, makeMe()) });
+    api.use(sessionUntilSignOut(json(200, makeMe())));
     fireEvent.click(signOut);
     await findTitle('Sign in');
     await waitForPath(router, '/login');
@@ -1112,7 +1582,7 @@ describe('focus after navigation', () => {
   });
 
   it('moves focus to the new <main> when the focused control left with its screen', async () => {
-    mockApi({ ...pageReads(), ...SIGNED_IN, 'POST /auth/logout': json(200, makeMe()) });
+    mockApi({ ...pageReads(), ...sessionUntilSignOut(json(200, makeMe())) });
     const { router } = renderApp('/settings');
     await findTitle('Settings');
     const button = screen.getByRole('button', { name: 'Sign out' });
@@ -1543,7 +2013,9 @@ describe('expired session, through the production bootstrap (src/main.tsx)', () 
     await settle();
     expect(api.calls).toHaveLength(settled);
     expect(router.state.location.search).toEqual({ redirect: RUN_HREF });
-    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
+    // The boot's read, then /login's check of the session, which the cleared cache no longer
+    // held: the API said 401, so the form shows instead of sending the user on.
+    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(2);
 
     const configReads = callsTo(api, 'GET', '/config').length;
     api.use({ ...pageReads(), ...SIGNED_IN, ...LOGIN_OK });
@@ -1559,7 +2031,7 @@ describe('expired session, through the production bootstrap (src/main.tsx)', () 
     expect(callsTo(api, 'POST', '/auth/login')).toHaveLength(1);
     // Sign-in seeded the user, so the guard asked nothing; the configuration, fresh in the
     // cache before the session ended, is read again because the cache was cleared.
-    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
+    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(2);
     expect(callsTo(api, 'GET', '/config').length).toBeGreaterThan(configReads);
     expect(queryClient.getQueryData(queryKeys.me)).toEqual(makeMe());
   });

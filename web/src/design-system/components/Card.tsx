@@ -25,7 +25,8 @@
  *
  * The Blitzy OS source is not available, so this is a product wrapper at the last
  * graceful-degradation step: it renders semantic HTML styled by semantic tokens, except for the
- * headline's `flex: 1 1 auto` factor and the rank prefix's visually hidden `1px` box and
+ * header's `auto minmax(0, 1fr)` grid tracks and grid line numbers (a leading rank column and
+ * the content column beside it) and the rank prefix's visually hidden `1px` box and
  * `inset(50%)` clip that `../GAPS.md` lists, and binding Blitzy OS later changes only this file
  * and `Card.css` (AAP 0.4.5, `../GAPS.md`).
  *
@@ -69,7 +70,10 @@ export interface CardHeaderProps {
   title: ReactNode;
   /**
    * The heading level of the headline. Defaults to `3`, below a section's `<h2>`; use `4` when
-   * the card sits inside a group headed by an `<h3>`, so no heading level is skipped.
+   * the card sits inside a group headed by an `<h3>`, so no heading level is skipped. The level
+   * also sets the headline's size, one step below the heading above the card: `--font-size-md`
+   * at level 3 and `--font-size-sm` at level 4, which the headline figure's value follows
+   * (`Card.css`).
    */
   headingLevel?: 3 | 4;
   /**
@@ -81,7 +85,7 @@ export interface CardHeaderProps {
   rank?: ReactNode;
   /**
    * The headline number that justifies the action, for example `{ label: 'Wasted spend', value:
-   * '$186.40' }`. It is shown prominently after the headline and before the entity line, as a
+   * 'USD 186.40' }`. It is shown prominently after the headline and before the entity line, as a
    * paragraph that reads "{label} {value}", outside the heading, so the card's accessible name
    * stays the action. The caller passes the value already formatted; the header never computes
    * it. Omitted, or with a `label` or `value` that renders nothing (`undefined`, `null`, a
@@ -128,8 +132,9 @@ const CardTitleIdContext = createContext<string | null>(null);
  *
  * React renders nothing for `undefined`, `null`, booleans and the empty string, so a
  * conditional slot such as `rank={ranked && position}` must not leave an empty container
- * behind: `Card.css` spaces the header parts with a flex gap, so an empty container would still
- * indent the headline, and an empty rank would still announce its visually hidden "Rank "
+ * behind: `Card.css` gives the rank a trailing margin and spaces the header rows with a row gap,
+ * so an empty rank would still indent the headline, an empty figure or entity line would still
+ * add a row gap under it, and an empty rank would still announce its visually hidden "Rank "
  * prefix with no value. Any other value, including `0`, renders and counts.
  *
  * @param node - the `rank` or `meta` value, or the `figure`'s `label` or `value`
@@ -237,7 +242,7 @@ function CardFooter({ children }: CardFooterProps) {
  *   <Card.Header
  *     rank={1}
  *     title="Pause"
- *     figure={{ label: 'Spend', value: '$1,240.00' }}
+ *     figure={{ label: 'Spend', value: 'USD 1,240.00' }}
  *     meta="Spring webinar · LinkedIn"
  *     headingLevel={4}
  *   />

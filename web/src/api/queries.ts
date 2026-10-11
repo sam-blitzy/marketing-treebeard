@@ -40,7 +40,9 @@
  *   loaded. {@link useSources} polls every {@link SOURCES_POLL_MS}. Polling runs only while
  *   the page is visible and stops when the last component using the query unmounts. A
  *   prefetch ({@link usePrefetchActionsReads}, and {@link useCreateRun}'s read of the page of
- *   the run it creates) registers no component, so it reads once and never polls.
+ *   the run it creates) registers no component, so it reads once and never polls. A failed
+ *   poll keeps the entry's last data, and {@link useActionsRefreshFailure} reports such a
+ *   failure among the reads `/actions` shows, so the page can say so.
  *
  * Path ids are always sent as `encodeURIComponent(String(id))`, because `apiFetch` does not
  * encode path segments.
@@ -80,8 +82,8 @@ import {
   useQuery,
   useQueryClient,
 } from '@tanstack/react-query';
-import type { InfiniteData, QueryClient } from '@tanstack/react-query';
-import { useCallback, useEffect } from 'react';
+import type { InfiniteData, QueryClient, QueryKey } from '@tanstack/react-query';
+import { useCallback, useEffect, useSyncExternalStore } from 'react';
 
 import { ApiError, apiFetch, apiFetchPage, isApiError } from './client';
 import type { ApiPage } from './client';
@@ -1147,6 +1149,86 @@ export function usePrefetchActionsReads(runId?: RunId): void {
       void queryClient.prefetchQuery(defaultRunQueryOptions(queryClient));
     }
   }, [queryClient, runId]);
+}
+
+/**
+ * The cache entries of the reads a loaded `/actions` page shows whose failed refresh
+ * {@link useActionsRefreshFailure} reports, in the order it checks them:
+ *
+ * 1. `queryKeys.recommendations(runId ?? 'default')`: the page itself, its cards, banners and
+ *    overlay (the discrepancy count among them);
+ * 2. `queryKeys.sources`: the status bar's source chips and their last sync times;
+ * 3. `queryKeys.discrepancies(DEFAULT_DISCREPANCY_STATES)`: the unresolved list the C0 cards
+ *    (`CampaignsSection`) and the held cards' blocker links (`BlockingDiscrepancies`) read;
+ * 4. `queryKeys.config`: the window picker's presets and the White papers fallback header.
+ *
+ * Two reads of the page are left out. `queryKeys.runs.latest`: the window picker states its
+ * failure itself, with a Retry of its own ("Could not read the latest default run"), so a
+ * second notice would repeat it. The resolved discrepancy list: `CampaignsSection` reads it only
+ * while a C0 card's discrepancy is missing from the unresolved list, from the same endpoint at
+ * the same cadence, so an outage fails the unresolved read as well, and its entry outlives that
+ * lookup, so a failure left in it would stay on screen after the lookup ended.
+ *
+ * @param runId - The run `/actions?run=<id>` addresses; omitted for the latest default run.
+ * @returns The exact keys, most important first.
+ */
+function actionsRefreshKeys(runId: RunId | undefined): readonly QueryKey[] {
+  return [
+    queryKeys.recommendations(runId ?? 'default'),
+    queryKeys.sources,
+    queryKeys.discrepancies(DEFAULT_DISCREPANCY_STATES),
+    queryKeys.config,
+  ];
+}
+
+/**
+ * Whether a refresh of the loaded `/actions` page failed, and with what: the {@link ApiError}
+ * of the first entry of {@link actionsRefreshKeys} that holds data but whose last fetch failed,
+ * or `null` while each of them is current (AAP 0.5.5: trust problems are surfaced before the
+ * actions they affect).
+ *
+ * TanStack Query keeps `data` when a refetch fails, so every component reading one of these
+ * entries keeps showing its last result, and a failed poll would otherwise go unnoticed: during
+ * an outage the cards, the source chips' sync times and the discrepancy count would look
+ * current. TanStack v5 keeps the entry's `error` while a later refetch of an entry with data
+ * runs, and clears it on the next success, so the result neither flickers during a poll nor
+ * outlives the recovery. Each polled entry recovers by itself once the API answers again;
+ * `config`, which is not polled, clears on its next successful read (on refocus, on reconnect,
+ * or when a new reader finds it stale). An entry without data is not reported: the component
+ * reading it shows its own loading or failure state.
+ *
+ * It only reads the query cache, through `QueryCache.subscribe` and React's
+ * `useSyncExternalStore`. It sends no request and registers no observer, so it never fetches,
+ * polls or keeps an entry alive. Its snapshot is the `ApiError` object the entry holds, or
+ * `null`, each the same reference until that entry's state changes, so its caller re-renders
+ * only when the reported failure changes and a memoized child given it is not rebuilt.
+ *
+ * @param runId - The run `/actions?run=<id>` addresses; omitted for the latest default run.
+ * @returns The first failed refresh among those reads, or `null`.
+ *
+ * @example
+ * ```tsx
+ * const refreshFailure = useActionsRefreshFailure(runId);
+ * // While the API is down and the page holds data:
+ * // ApiError "The server is temporarily unavailable. Try again shortly." (502)
+ * ```
+ */
+export function useActionsRefreshFailure(runId?: RunId): ApiError | null {
+  const queryCache = useQueryClient().getQueryCache();
+  const subscribe = useCallback(
+    (onStoreChange: () => void) => queryCache.subscribe(onStoreChange),
+    [queryCache],
+  );
+  const getSnapshot = (): ApiError | null => {
+    for (const queryKey of actionsRefreshKeys(runId)) {
+      const state = queryCache.find({ queryKey, exact: true })?.state;
+      if (state !== undefined && state.data !== undefined && state.error !== null) {
+        return state.error;
+      }
+    }
+    return null;
+  };
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }
 
 // ---------------------------------------------------------------------------------------------

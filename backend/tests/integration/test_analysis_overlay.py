@@ -101,7 +101,7 @@ from ads_engine.db.models.analysis import (
     RunFinding,
 )
 from ads_engine.db.models.decisions import Discrepancy
-from ads_engine.db.models.ops import DatasetFreshness, SourceConnection, SourceDataset
+from ads_engine.db.models.ops import DATASETS, DatasetFreshness, SourceConnection, SourceDataset
 
 pytestmark = pytest.mark.integration
 
@@ -734,20 +734,45 @@ async def _freshness(
 
 
 async def _connection(
-    session: AsyncSession, source: str, mode: str, reason: str | None, dataset: SourceDataset
+    session: AsyncSession,
+    source: str,
+    mode: str,
+    reason: str | None,
+    dataset: SourceDataset | None,
+    *,
+    status: str = "ok",
 ) -> None:
-    """Insert the ``source_connection`` row of ``source``."""
+    """Insert the ``source_connection`` row of ``source``; ``dataset`` ``None`` has none active."""
     session.add(
         SourceConnection(
             source=source,
             mode=mode,
-            status="ok",
+            status=status,
             reason=reason,
-            active_dataset_id=dataset.id,
+            active_dataset_id=None if dataset is None else dataset.id,
             last_attempt_at=FRESH,
         )
     )
     await session.flush()
+
+
+async def _covered(
+    session: AsyncSession, *sources: str, through: date = WINDOW_END
+) -> list[SourceDataset]:
+    """Give each of ``sources`` an active live dataset whose every dataset is fresh and complete.
+
+    A source with no active dataset has every one of its datasets listed stale and incomplete
+    on every page, so a test about something else gives the sources it does not exercise
+    complete data, covering through ``through`` (a run ending later needs a later one).
+    """
+    datasets: list[SourceDataset] = []
+    for source in sources:
+        dataset = await _dataset(session, source)
+        for name in DATASETS:
+            if name.startswith(f"{source}."):
+                await _freshness(session, dataset, name, through=through)
+        datasets.append(dataset)
+    return datasets
 
 
 async def _run(
@@ -989,6 +1014,7 @@ async def test_a_discrepancy_detected_after_the_run_holds_dependent_items_at_rea
         google = await _dataset(session, "google")
         for name in ("google.entities", "google.metrics_daily", "google.search_terms"):
             await _freshness(session, google, name)
+        await _covered(session, "linkedin", "hubspot")
         run = await _run(session)
         provenance = _prov(google)
         c0 = await _item(
@@ -1416,6 +1442,7 @@ async def test_the_simulated_banner_names_the_denial_that_keeps_a_source_simulat
             session, "google", mode="simulated", reason="credentials not configured"
         )
         await _connection(session, "google", "simulated", denial, google)
+        await _covered(session, "linkedin", "hubspot")
         run = await _run(session)
 
     result = await _page(sessions, run.id, thresholds=shipped)
@@ -1622,20 +1649,25 @@ async def test_stale_and_incomplete_flags_derive_from_each_items_required_datase
         ),
     )
     assert result.overlay.source_modes == {"google": "live", "linkedin": "live", "hubspot": None}
-    # The page lists what the cards flag: hubspot.deal_search has no current dataset at all.
+    # The page lists what the cards flag; HubSpot has no active dataset at all, so every one
+    # of its datasets is listed and both banners name them together, once.
+    hubspot = ("hubspot.contacts", "hubspot.associations", "hubspot.deal_search")
+    no_hubspot = f"{', '.join(hubspot)}, hubspot.google_contacts (no active HubSpot dataset)"
     assert result.overlay.stale_datasets == (
         "google.metrics_daily",
         "google.search_terms",
         "linkedin.analytics_daily",
         "linkedin.segments",
         "linkedin.leads",
-        "hubspot.deal_search",
+        *hubspot,
+        "hubspot.google_contacts",
     )
     assert result.overlay.incomplete_datasets == (
         "google.search_terms",
         "linkedin.segments",
         "linkedin.leads",
-        "hubspot.deal_search",
+        *hubspot,
+        "hubspot.google_contacts",
     )
     assert result.banners == (
         BannerView(
@@ -1646,10 +1678,9 @@ async def test_stale_and_incomplete_flags_derive_from_each_items_required_datase
                 "google.search_terms (last success Oct 7, 2026, 11:00 AM UTC), "
                 "linkedin.analytics_daily (last success Oct 6, 2026, 11:59 AM UTC), "
                 "linkedin.segments (no successful sync), "
-                "linkedin.leads (last success Oct 7, 2026, 11:00 AM UTC), "
-                "hubspot.deal_search (no successful sync)"
+                f"linkedin.leads (last success Oct 7, 2026, 11:00 AM UTC), {no_hubspot}"
             ),
-            count=6,
+            count=9,
         ),
         BannerView(
             code=BANNER_INCOMPLETE_DATASETS,
@@ -1658,9 +1689,9 @@ async def test_stale_and_incomplete_flags_derive_from_each_items_required_datase
                 "Incomplete data: google.search_terms (result limit reached at finest "
                 "partition; covers through 2026-10-05, before the window end 2026-10-06), "
                 "linkedin.segments (unknown; covers no dates), "
-                "linkedin.leads (covers no dates), hubspot.deal_search (no freshness record)"
+                f"linkedin.leads (covers no dates), {no_hubspot}"
             ),
-            count=4,
+            count=7,
         ),
     )
 
@@ -1673,6 +1704,7 @@ async def test_staleness_reads_the_configured_stale_after_hours(
     async with sessions() as session, session.begin():
         google = await _dataset(session, "google")
         await _freshness(session, google, "google.metrics_daily", success=OLD)
+        await _covered(session, "linkedin", "hubspot")
         run = await _run(session)
         item = await _item(
             session, run, provenance=_prov(google), required=("google.metrics_daily",)
@@ -1709,6 +1741,7 @@ async def test_coverage_starting_after_the_window_start_is_incomplete_over_the_w
         # Entity syncs re-read full current state and record no date range.
         await _freshness(session, google, "google.entities", through=None)
         await _freshness(session, linkedin, "linkedin.entities", success=OLD, through=None)
+        await _covered(session, "hubspot")
         run = await _run(session, start=window_start, end=window_end)
         # K2 reads no lookback, so its required range is exactly the run's window (a K1
         # item's google.metrics_daily must also cover its baseline: tested below).
@@ -1800,6 +1833,7 @@ async def test_a_finest_partition_day_outside_the_window_flags_nothing(
                 f"{finest} (2026-09-01, ad group 990200000000; 2026-10-08, ad group 990200000000)"
             ),
         )
+        await _covered(session, "linkedin", "hubspot", through=date(2026, 10, 8))
         excluding = await _run(session)
         outside = await _item(
             session,
@@ -1894,6 +1928,7 @@ async def test_a_k1_items_metrics_must_cover_its_frozen_baseline_window(
         google = await _dataset(session, "google")
         for name in ("google.search_terms", "google.metrics_daily"):
             await _freshness(session, google, name, covered_from=window_start, through=window_end)
+        await _covered(session, "linkedin", "hubspot")
         run = await _run(session, start=window_start, end=window_end)
         required = ("google.search_terms", "google.metrics_daily")
 
@@ -2055,6 +2090,7 @@ async def test_stale_banner_and_flags_render_instants_in_the_display_timezone(
             through=WINDOW_END - timedelta(days=1),
         )
         await _freshness(session, linkedin, "linkedin.analytics_daily", success=OLD)
+        await _covered(session, "hubspot")
         run = await _run(session)
         expand = await _item(
             session, run, rule_id=K2, provenance=_prov(google), required=("google.metrics_daily",)
@@ -2107,6 +2143,7 @@ async def test_coverage_ending_before_the_window_end_is_stale_and_incomplete(
         await _freshness(
             session, linkedin, "linkedin.analytics_daily", through=WINDOW_END - timedelta(days=2)
         )
+        await _covered(session, "hubspot")
         run = await _run(session)
         expand = await _item(
             session, run, rule_id=K2, provenance=_prov(google), required=("google.metrics_daily",)
@@ -2233,32 +2270,32 @@ async def test_the_page_lists_and_banners_name_required_datasets_without_freshne
         Flag(FLAG_STALE, "Data as of: no successful sync of hubspot.contacts"),
         Flag(FLAG_INCOMPLETE, "Incomplete: hubspot.contacts (no freshness record)"),
     )
-    # Each dataset counts once, however many cards require it.
-    assert result.overlay.stale_datasets == (
-        "google.search_terms",
-        "linkedin.leads",
+    # Each dataset counts once, however many cards require it. HubSpot has no active dataset,
+    # so every one of its datasets is listed, and both banners name them together, once.
+    hubspot = (
         "hubspot.contacts",
+        "hubspot.associations",
+        "hubspot.deal_search",
+        "hubspot.google_contacts",
     )
-    assert result.overlay.incomplete_datasets == ("google.search_terms", "hubspot.contacts")
+    no_hubspot = f"{', '.join(hubspot)} (no active HubSpot dataset)"
+    assert result.overlay.stale_datasets == ("google.search_terms", "linkedin.leads", *hubspot)
+    assert result.overlay.incomplete_datasets == ("google.search_terms", *hubspot)
     assert result.banners == (
         BannerView(
             code=BANNER_STALE_DATASETS,
             tone="warning",
             message=(
                 "Stale data: google.search_terms (no successful sync), "
-                "linkedin.leads (last success Oct 6, 2026, 11:00 AM UTC), "
-                "hubspot.contacts (no successful sync)"
+                f"linkedin.leads (last success Oct 6, 2026, 11:00 AM UTC), {no_hubspot}"
             ),
-            count=3,
+            count=6,
         ),
         BannerView(
             code=BANNER_INCOMPLETE_DATASETS,
             tone="warning",
-            message=(
-                "Incomplete data: google.search_terms (no freshness record), "
-                "hubspot.contacts (no freshness record)"
-            ),
-            count=2,
+            message=f"Incomplete data: google.search_terms (no freshness record), {no_hubspot}",
+            count=5,
         ),
     )
     # Every dataset a card flags is on the page.
@@ -2269,10 +2306,108 @@ async def test_the_page_lists_and_banners_name_required_datasets_without_freshne
                 names = result.overlay.incomplete_datasets
             assert any(name in flag.message for name in names), flag
 
-    # Only the items on the page contribute: a page without them lists the rows alone.
+    # Only the items on the page contribute: a page without them lists the rows and the
+    # source with no active dataset alone.
     rows_only = await _page_of(sessions, run.id, [], shipped)
-    assert rows_only.overlay.stale_datasets == ("linkedin.leads",)
-    assert rows_only.overlay.incomplete_datasets == ()
+    assert rows_only.overlay.stale_datasets == ("linkedin.leads", *hubspot)
+    assert rows_only.overlay.incomplete_datasets == hubspot
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_a_source_with_no_active_dataset_is_named_with_its_status_and_reason(
+    sessions: Sessions, shipped: Thresholds
+) -> None:
+    # A Google probe defect at first start: no fallback and no mock (AAP 0.3.3), so Google
+    # has no active dataset and Keywords is empty. The page still says why.
+    defect = "probe Q-G1: QueryError (query Q-G1)"
+    google_names = ("google.entities", "google.metrics_daily", "google.search_terms")
+    async with sessions() as session, session.begin():
+        retired = await _dataset(session, "google", state="retired")
+        linkedin, hubspot = await _covered(session, "linkedin", "hubspot")
+        await _connection(session, "google", "live", defect, None, status="error")
+        await _connection(session, "linkedin", "live", None, linkedin)
+        # A degraded source that still has its active dataset adds no source part.
+        await _connection(session, "hubspot", "live", "HTTP 503", hubspot, status="stale")
+        run = await _run(session)
+        pause = await _item(
+            session,
+            run,
+            rule_id=C1,
+            section="campaigns",
+            group="pause",
+            entity_type="campaign",
+            entity_id="31",
+            provenance=_prov(linkedin),
+            required=("linkedin.entities", "linkedin.analytics_daily"),
+        )
+        # An older item of the replaced Google dataset, with K1's wider metrics range.
+        replaced = await _item(
+            session,
+            run,
+            evidence=_k1_evidence(run, _prov(retired), thresholds={"k1.baseline_days": 90}),
+            required=("google.search_terms", "google.metrics_daily"),
+        )
+
+    result = await _page(sessions, run.id, thresholds=shipped)
+    assert result.overlay.source_modes == {"google": None, "linkedin": "live", "hubspot": "live"}
+    assert result.overlay.stale_datasets == google_names
+    assert result.overlay.incomplete_datasets == google_names
+    listed = ", ".join(google_names)
+    assert result.banners == (
+        BannerView(
+            code=BANNER_STALE_DATASETS,
+            tone="warning",
+            message=(
+                f"Stale data: {listed} (no active Google dataset; Google status error: {defect})"
+            ),
+            count=3,
+        ),
+        BannerView(
+            code=BANNER_INCOMPLETE_DATASETS,
+            tone="warning",
+            message=f"Incomplete data: {listed} (no active Google dataset)",
+            count=3,
+        ),
+    )
+    assert result.items[pause.id] == ItemOverlayView(
+        held_now=False, historical=False, data_status_now="live"
+    )
+    # The replaced item's own cards still say what it reads; the page counts each name once.
+    assert result.items[replaced.id].historical
+    assert result.items[replaced.id].flags_now[1] == Flag(
+        FLAG_INCOMPLETE,
+        "Incomplete: google.search_terms (no freshness record); "
+        "google.metrics_daily (no freshness record)",
+    )
+
+    # The same page with no item at all, as an empty custom run reads.
+    empty = await _page_of(sessions, run.id, [], shipped)
+    assert empty.overlay.stale_datasets == google_names
+    assert empty.banners == result.banners
+
+    # The status and reason are named only when the status is not ok and a reason exists.
+    for status, reason in (("ok", defect), ("error", None)):
+        async with sessions() as session, session.begin():
+            await session.execute(
+                update(SourceConnection)
+                .where(SourceConnection.source == "google")
+                .values(status=status, reason=reason)
+            )
+        plain = await _page(sessions, run.id, thresholds=shipped)
+        assert plain.banners[0] == BannerView(
+            code=BANNER_STALE_DATASETS,
+            tone="warning",
+            message=f"Stale data: {listed} (no active Google dataset)",
+            count=3,
+        )
+        assert plain.banners[1] == result.banners[1]
+
+    # Without any source_connection row the source is still named.
+    async with sessions() as session, session.begin():
+        await session.execute(text("DELETE FROM source_connection WHERE source = 'google'"))
+    bare = await _page(sessions, run.id, thresholds=shipped)
+    assert bare.banners[0].message == f"Stale data: {listed} (no active Google dataset)"
 
 
 # ---------------------------------------------------------------------------------------
@@ -2311,23 +2446,30 @@ async def test_without_active_datasets_any_provenance_is_historical(
     assert result.overlay == OverlayView(
         open_discrepancies=0,
         source_modes={"google": None, "linkedin": None, "hubspot": None},
-        stale_datasets=("google.metrics_daily",),
-        incomplete_datasets=("google.metrics_daily",),
+        stale_datasets=DATASETS,
+        incomplete_datasets=DATASETS,
         computed_at=NOW,
     )
-    # The historical item's required dataset has no current dataset: the page says so too.
+    # No source has a current dataset: the page lists every dataset, and both banners name
+    # each source's datasets together, once.
+    none_active = (
+        "google.entities, google.metrics_daily, google.search_terms (no active Google dataset), "
+        "linkedin.entities, linkedin.analytics_daily, linkedin.segments, linkedin.leads "
+        "(no active LinkedIn dataset), hubspot.contacts, hubspot.associations, "
+        "hubspot.deal_search, hubspot.google_contacts (no active HubSpot dataset)"
+    )
     assert result.banners == (
         BannerView(
             code=BANNER_STALE_DATASETS,
             tone="warning",
-            message="Stale data: google.metrics_daily (no successful sync)",
-            count=1,
+            message=f"Stale data: {none_active}",
+            count=len(DATASETS),
         ),
         BannerView(
             code=BANNER_INCOMPLETE_DATASETS,
             tone="warning",
-            message="Incomplete data: google.metrics_daily (no freshness record)",
-            count=1,
+            message=f"Incomplete data: {none_active}",
+            count=len(DATASETS),
         ),
     )
     # The frozen mode stands in for a source that has no current dataset.
@@ -2395,6 +2537,7 @@ async def test_unverifiable_provenance_is_historical_even_when_its_ids_are_curre
     async with sessions() as session, session.begin():
         google = await _dataset(session, "google")
         await _freshness(session, google, "google.metrics_daily")
+        others = await _covered(session, "linkedin", "hubspot")
         run = await _run(session)
         complete = _prov(google)[0]
         required = ("google.metrics_daily",)
@@ -2442,7 +2585,9 @@ async def test_unverifiable_provenance_is_historical_even_when_its_ids_are_curre
     assert result.banners == ()
 
     async with sessions() as session:
-        assert await current_dataset_ids(session) == frozenset({google.id})
+        assert await current_dataset_ids(session) == frozenset(
+            {google.id, *(dataset.id for dataset in others)}
+        )
         assert await item_is_current(session, current)
         for item in unverifiable:
             assert not await item_is_current(session, item), item.evidence
@@ -2578,6 +2723,7 @@ async def test_the_tracking_banner_names_the_sources_of_the_runs_stored_findings
     sessions: Sessions, shipped: Thresholds
 ) -> None:
     async with sessions() as session, session.begin():
+        await _covered(session, "google", "linkedin", "hubspot")
         run = await _run(session)
         other = await _run(session, kind="custom")
         await _finding(
@@ -2667,6 +2813,7 @@ async def test_the_short_window_banner_uses_the_trusted_minimum_the_run_stored(
     )
     assert config.trusted_min_days == read_min
     async with sessions() as session, session.begin():
+        await _covered(session, "google", "linkedin", "hubspot")
         run = await _run(
             session, start=WINDOW_END - timedelta(days=days - 1), trusted_min_days=stored_min
         )
@@ -2696,6 +2843,7 @@ async def test_a_one_day_short_window_banner_reads_1_day(
     The "{trusted_min_days}-day" adjective stays singular whatever the minimum.
     """
     async with sessions() as session, session.begin():
+        await _covered(session, "google", "linkedin", "hubspot")
         run = await _run(session, start=WINDOW_END, trusted_min_days=shipped.trusted_min_days)
 
     result = await _page(sessions, run.id, thresholds=shipped)
@@ -2716,6 +2864,7 @@ async def test_every_banner_renders_in_the_fixed_order(
     async with sessions() as session, session.begin():
         google = await _dataset(session, "google")
         await _dataset(session, "linkedin", mode="simulated", reason="credentials not configured")
+        await _covered(session, "hubspot")
         await _freshness(session, google, "google.metrics_daily", success=OLD)
         await _freshness(
             session,

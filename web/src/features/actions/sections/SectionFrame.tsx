@@ -26,11 +26,17 @@
  *    `../ActionOutcomes`) in its place, between the same neighbours, for as long as the run
  *    still lists the item, so the outcome shows where the user acted; it is counted as hidden
  *    all the same;
- * 4. an `EmptyState` with its reason when no group has a card or a confirmation to show
- *    (AAP 0.5.5): the cards feedback has hidden since the run, the run's suppression counts, the
- *    first withheld lines and the finding messages, so a section emptied by feedback or
- *    suppression says so. "No rule fired for this window" is reserved for a section with none
- *    of these;
+ * 4. an `EmptyState` whose title is the one sentence that says why, when no group has a card or
+ *    a confirmation to show (AAP 0.5.5): the cards feedback has hidden since the run and the
+ *    run's suppression counts first, so a section emptied by feedback or suppression says so;
+ *    else the leading withheld line's reason (`withheldReason`, for example "No search term met
+ *    the K1 minimum of 70 clicks"); else, when datasets the section needs do not cover the
+ *    window, one sentence summarising its `incomplete_dataset` findings
+ *    (`incompleteDataReason`, for example "Data does not fully cover this window:
+ *    google.entities, google.metrics_daily (no active Google dataset)"); else the first finding
+ *    that explains the absence. "No rule fired for this window" is reserved for a section with
+ *    none of these. The findings above and the lists below are not repeated inside it, and a
+ *    long identifier the sentence quotes wraps at its underscores, as in the finding's banner;
  * 5. the patterns withheld for sample size, with observed and required sizes (AAP 0.5.4.2 P6);
  * 6. the counts of what the run did not show, by suppression reason (`run_suppression`,
  *    AAP 0.5.4.2), plus the cards hidden by feedback given since the run.
@@ -63,6 +69,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 
 import type {
+  Finding,
   FindingCode,
   Group,
   Item,
@@ -71,7 +78,15 @@ import type {
   Section,
   SectionKey,
 } from '../../../api/types';
-import { Banner, Button, EmptyState, Inline, PageShell, Stack } from '../../../design-system';
+import {
+  Banner,
+  Button,
+  EmptyState,
+  Inline,
+  PageShell,
+  Stack,
+  withIdentifierBreaks,
+} from '../../../design-system';
 import type { Tone } from '../../../design-system';
 import { focusElement } from '../../../lib/focus';
 import { UNAVAILABLE, formatCount } from '../../../lib/format';
@@ -81,7 +96,7 @@ import {
   useFeedbackConfirmations,
   type FeedbackConfirmations,
 } from '../ActionOutcomes';
-import { WithheldList, withheldLine } from '../WithheldList';
+import { WithheldList, withheldReason } from '../WithheldList';
 import { discrepancyRef } from '../evidenceExtra';
 import {
   ACTION_NOUN,
@@ -978,10 +993,10 @@ function hasContent(node: ReactNode): boolean {
  *   label="Keyword details"
  *   fields={[
  *     { key: 'term', label: 'Term', value: 'crm software' },
- *     { key: 'spend', label: 'Spend', value: '$412.30' },
+ *     { key: 'spend', label: 'Spend', value: 'USD 412.30' },
  *   ]}
  * />
- * // <ul aria-label="Keyword details"><li>Term: crm software</li><li>Spend: $412.30</li></ul>
+ * // <ul aria-label="Keyword details"><li>Term: crm software</li><li>Spend: USD 412.30</li></ul>
  * ```
  */
 export function FieldList({ fields, label }: FieldListProps): ReactElement | null {
@@ -1050,10 +1065,20 @@ export function suppressionLabel(reason: string): string {
 
 /**
  * The suppression counts a section reports: each `[reason, count]` entry of `suppressed` whose
- * count is finite and positive, in API order. The "Not shown" list and the empty-state reason
- * both read this one result, so they never disagree.
+ * count is finite and positive, in API order. The "Not shown" list, the empty-state reason and
+ * a Keywords sub-list's empty-tab reason all read this one result, so they never disagree. The
+ * counts are the section's, never a rule's (AAP 0.5.3 `Section.suppressed: {reason: count}`).
+ *
+ * @param section - the section, as the API returned it
+ * @returns the entries, in API order; empty when the section suppressed nothing
+ *
+ * @example
+ * ```ts
+ * reportedSuppressions({ ...section, suppressed: { feedback_dismiss: 2, g1_blocked: 0 } });
+ * // [['feedback_dismiss', 2]]
+ * ```
  */
-function reportedSuppressions(section: Section): [string, number][] {
+export function reportedSuppressions(section: Section): [string, number][] {
   return Object.entries(section.suppressed).filter(
     ([, count]) => Number.isFinite(count) && count > 0,
   );
@@ -1064,9 +1089,21 @@ function reportedSuppressions(section: Section): [string, number][] {
  * exactly 1 takes the reason's singular label when {@link SUPPRESSION_SINGULAR_LABELS} has one
  * ("1 spend increase blocked by the high-utilization guard"); every other count, and every
  * reason without a singular form, takes {@link suppressionLabel}. Only the singular map's own
- * keys match, so a key such as `constructor` is not read from the object prototype.
+ * keys match, so a key such as `constructor` is not read from the object prototype. The "Not
+ * shown" list, {@link notShownReason} and a Keywords sub-list's empty-tab reason all write their
+ * counts with it, so a count reads the same everywhere.
+ *
+ * @param reason - the `run_suppression.reason` key
+ * @param count - the count, finite and positive ({@link reportedSuppressions})
+ * @returns the line
+ *
+ * @example
+ * ```ts
+ * suppressionLine('feedback_dismiss', 2); // "2 dismissed"
+ * suppressionLine('g1_blocked', 1); // "1 spend increase blocked by the high-utilization guard"
+ * ```
  */
-function suppressionLine(reason: string, count: number): string {
+export function suppressionLine(reason: string, count: number): string {
   const label =
     count === 1 && Object.hasOwn(SUPPRESSION_SINGULAR_LABELS, reason)
       ? (SUPPRESSION_SINGULAR_LABELS[reason] ?? suppressionLabel(reason))
@@ -1145,23 +1182,179 @@ export interface SectionFrameProps {
   beforeGroups?: ReactNode;
 }
 
-/** How many withheld lines an empty section quotes as its reason; the full list follows. */
-const EMPTY_REASON_WITHHELD_LINES = 3;
-
-/** The empty-state title of a section with no card to show. */
-const EMPTY_TITLE = 'No actions in this section';
-
 /**
  * The empty-state reason of a genuinely empty section: no card hidden by feedback since the run,
- * no suppression count, nothing withheld and no finding.
+ * no suppression count, nothing withheld and no finding with a message. Exported so a sub-list
+ * of an unknown rule (Keywords) says the same.
  */
-const EMPTY_NO_REASON = 'No rule fired for this window';
+export const NO_RULE_FIRED_REASON = 'No rule fired for this window';
 
 /**
- * The empty-state reason for items feedback given since the run hides now, after their count:
+ * The count text for items feedback given since the run hides now, after their count:
  * "{n} hidden by feedback since this run (dismissed, snoozed or done)".
  */
 const EMPTY_HIDDEN_REASON = 'hidden by feedback since this run (dismissed, snoozed or done)';
+
+/** The lead of the empty-state reason of cards that exist but are not shown. */
+const NOT_SHOWN_LEAD = 'No actions to show';
+
+/**
+ * Findings that describe what a section shows rather than explain why it shows nothing: search-
+ * term coverage, the missing Google CRM link and skipped stages. An empty section names one of
+ * these as its reason only when no other finding has a message.
+ */
+const INFORMATIONAL_FINDINGS: ReadonlySet<FindingCode> = new Set<FindingCode>([
+  'search_term_coverage',
+  'no_crm_link',
+  'skipped_stage',
+]);
+
+/**
+ * The empty-state reason of cards that exist but are not shown: "No actions to show: {parts}",
+ * the parts joined by "; " in this order:
+ *
+ * 1. "{n} hidden by feedback since this run (dismissed, snoozed or done)", when `hiddenCount` is
+ *    positive;
+ * 2. one "{count} {label}" part per suppression entry, in the order given, as the "Not shown"
+ *    list writes it ("2 dismissed", "1 spend increase blocked by the high-utilization guard").
+ *
+ * Every count is the API's (the run's `suppressed` counts) or the live overlay's (cards with
+ * `current.hidden_by`); none is written into the client.
+ *
+ * @param hiddenCount - how many cards feedback given since the run hides now
+ * @param suppressions - the run's suppression counts as `[reason, count]` entries, each finite
+ *   and positive, in API order; none by default
+ * @returns the reason, or `null` when nothing is hidden or suppressed
+ *
+ * @example
+ * ```ts
+ * notShownReason(1); // "No actions to show: 1 hidden by feedback since this run (dismissed, snoozed or done)"
+ * notShownReason(0, [['feedback_dismiss', 2]]); // "No actions to show: 2 dismissed"
+ * notShownReason(0); // null
+ * ```
+ */
+export function notShownReason(
+  hiddenCount: number,
+  suppressions: readonly (readonly [string, number])[] = [],
+): string | null {
+  const parts = suppressions.map(([reason, count]) => suppressionLine(reason, count));
+  if (hiddenCount > 0) {
+    parts.unshift(`${formatCount(hiddenCount)} ${EMPTY_HIDDEN_REASON}`);
+  }
+  return parts.length === 0 ? null : `${NOT_SHOWN_LEAD}: ${parts.join('; ')}`;
+}
+
+/** The lead of the empty-state reason of a section whose datasets do not cover the window. */
+const INCOMPLETE_DATA_LEAD = 'Data does not fully cover this window';
+
+/**
+ * The reason text of an `incomplete_dataset` finding's `evidence.reasons`: its non-blank string
+ * entries, trimmed, joined by "; ". `null` when `reasons` is not an array or leaves no entry.
+ */
+function datasetReasonsText(reasons: unknown): string | null {
+  if (!Array.isArray(reasons)) {
+    return null;
+  }
+  const texts = reasons.map((entry: unknown) => textOr(entry, '')).filter((text) => text !== '');
+  return texts.length === 0 ? null : texts.join('; ');
+}
+
+/**
+ * The empty-state reason of a section whose datasets do not cover the window, summarised from
+ * its `incomplete_dataset` findings (AAP 0.5.4.2 P4) in one sentence that names every such
+ * dataset once per cause, rather than repeating one finding's banner:
+ * "Data does not fully cover this window: {part}; {part}".
+ *
+ * The findings with code `incomplete_dataset` are read in API order. Each names its dataset in
+ * `evidence.dataset`, a non-blank string; a finding without one is skipped (its message still
+ * reaches the empty state through `findingReason` when nothing else explains the absence). Its
+ * cause is `evidence.reasons`: the non-blank string entries, joined by "; ". Entries of any
+ * other type are ignored, and a finding with none left, or whose `reasons` is not an array, has
+ * no cause. Datasets that share a cause form one part, "{datasets} ({cause})", or just
+ * "{datasets}" when they have none: parts in the order their cause first appears, datasets in
+ * API order and joined by ", ", each named once in its part. `evidence` is read defensively,
+ * because the API types it only as an object.
+ *
+ * Every name and cause is the API's own text; nothing is written into the client. The function
+ * is pure: it reads only `findings`.
+ *
+ * @param findings - the section's findings, as the API returned them
+ * @returns the reason, or `null` when no `incomplete_dataset` finding names a dataset
+ *
+ * @example
+ * ```ts
+ * const gap = (dataset: unknown, reasons: unknown): Finding => ({
+ *   code: 'incomplete_dataset',
+ *   section: 'keywords',
+ *   entity: null,
+ *   message: `${String(dataset)} is not complete over the window`,
+ *   evidence: { dataset, reasons },
+ * });
+ * incompleteDataReason([
+ *   gap('google.entities', ['no active Google dataset']),
+ *   gap('google.metrics_daily', ['no active Google dataset']),
+ * ]);
+ * // "Data does not fully cover this window: google.entities, google.metrics_daily (no active Google dataset)"
+ * incompleteDataReason([
+ *   gap('hubspot.contacts', ['covers from 2026-04-12']),
+ *   gap('linkedin.leads', [7, ' ']),
+ *   gap('hubspot.deal_search', ['covers from 2026-04-12']),
+ * ]);
+ * // "Data does not fully cover this window: hubspot.contacts, hubspot.deal_search (covers from 2026-04-12); linkedin.leads"
+ * incompleteDataReason([gap(42, ['no active Google dataset'])]); // null
+ * ```
+ */
+export function incompleteDataReason(findings: readonly Finding[]): string | null {
+  const byCause = new Map<string | null, string[]>();
+  for (const finding of findings) {
+    if (finding.code !== 'incomplete_dataset') {
+      continue;
+    }
+    const evidence: unknown = finding.evidence;
+    if (typeof evidence !== 'object' || evidence === null || Array.isArray(evidence)) {
+      continue;
+    }
+    const fields = evidence as Readonly<Record<string, unknown>>;
+    const dataset = textOr(fields.dataset, '');
+    if (dataset === '') {
+      continue;
+    }
+    const cause = datasetReasonsText(fields.reasons);
+    const datasets = byCause.get(cause);
+    if (datasets === undefined) {
+      byCause.set(cause, [dataset]);
+    } else if (!datasets.includes(dataset)) {
+      datasets.push(dataset);
+    }
+  }
+  if (byCause.size === 0) {
+    return null;
+  }
+  const parts = [...byCause].map(([cause, datasets]) =>
+    cause === null ? datasets.join(', ') : `${datasets.join(', ')} (${cause})`,
+  );
+  return `${INCOMPLETE_DATA_LEAD}: ${parts.join('; ')}`;
+}
+
+/**
+ * The message of the first finding, in API order, that explains an absence (any code outside
+ * {@link INFORMATIONAL_FINDINGS}, such as `incomplete_dataset` or `k1_no_baseline`), else of the
+ * first finding of any code; blank messages are skipped. `null` when no finding has a message.
+ */
+function findingReason(findings: readonly Finding[]): string | null {
+  let informational: string | null = null;
+  for (const finding of findings) {
+    const message = textOr(finding.message, '');
+    if (message === '') {
+      continue;
+    }
+    if (!INFORMATIONAL_FINDINGS.has(finding.code)) {
+      return message;
+    }
+    informational ??= message;
+  }
+  return informational;
+}
 
 /** Returns `text` trimmed, or `fallback` when it is not a string or holds only whitespace. */
 function textOr(text: unknown, fallback: string): string {
@@ -1353,33 +1546,40 @@ function renderGroupEntry({ part, content, repeatsSectionTitle }: GroupEntry): R
 }
 
 /**
- * The reason lines of an empty section, in this order:
+ * The one-sentence reason of an empty section, the first that applies:
  *
- * 1. "{n} hidden by feedback since this run (dismissed, snoozed or done)", when `hiddenTotal`
- *    is positive;
- * 2. one "{count} {label}" line per entry of `suppressions`, in API order;
- * 3. the first withheld lines, as the API wrote them;
- * 4. the finding messages, as the API wrote them.
+ * 1. {@link notShownReason}, when feedback hides cards now or the run suppressed some;
+ * 2. the leading withheld line's reason ({@link withheldReason}), for example "No search term
+ *    met the K1 minimum of 70 clicks";
+ * 3. the data-gap sentence of its `incomplete_dataset` findings ({@link incompleteDataReason}),
+ *    for example "Data does not fully cover this window: google.entities, google.metrics_daily
+ *    (no active Google dataset)";
+ * 4. the first finding that explains the absence ({@link findingReason}), such as a
+ *    `k1_no_baseline` finding, or an `incomplete_dataset` finding whose evidence names no
+ *    dataset;
+ * 5. {@link NO_RULE_FIRED_REASON}.
  *
- * Empty only when the section has none of these, which is when no rule fired for the window.
+ * The section's findings, withheld list and "Not shown" counts render in full around the empty
+ * state, so the reason states one cause and never repeats those lists: the data-gap sentence
+ * names each dataset once per cause, and is never the text of one finding's banner.
  *
  * @param section - the section, as the API returned it
  * @param hiddenTotal - how many of the section's items feedback hides now
  * @param suppressions - the section's {@link reportedSuppressions}
- * @returns the lines, possibly none
+ * @returns the reason
  */
-function emptyReasonLines(
+function emptyReason(
   section: Section,
   hiddenTotal: number,
   suppressions: readonly [string, number][],
-): string[] {
-  const hidden = hiddenTotal > 0 ? [`${formatCount(hiddenTotal)} ${EMPTY_HIDDEN_REASON}`] : [];
-  const suppressed = suppressions.map(([reason, count]) => suppressionLine(reason, count));
-  const withheld = section.withheld.slice(0, EMPTY_REASON_WITHHELD_LINES).map(withheldLine);
-  const findings = section.findings
-    .map((finding) => textOr(finding.message, ''))
-    .filter((message) => message !== '');
-  return [...hidden, ...suppressed, ...withheld, ...findings];
+): string {
+  return (
+    notShownReason(hiddenTotal, suppressions) ??
+    withheldReason(section.withheld) ??
+    incompleteDataReason(section.findings) ??
+    findingReason(section.findings) ??
+    NO_RULE_FIRED_REASON
+  );
 }
 
 /**
@@ -1404,10 +1604,14 @@ function emptyReasonLines(
  *    its card stood ({@link placeConfirmations}), and a group whose items were all hidden here
  *    keeps its region with the confirmations while the run still lists them;
  * 4. when no group has a visible, historical or held item or a confirmation, an `EmptyState`
- *    "No actions in this section" whose reason states why: "{n} hidden by feedback since this
- *    run (dismissed, snoozed or done)" when feedback hides items now, one "{count} {label}" line
- *    per suppression reason in API order, the first three withheld lines and the finding
- *    messages. "No rule fired for this window" appears only when there are none of these;
+ *    whose title is the one sentence that says why ({@link emptyReason}): "No actions to show:
+ *    {n} hidden by feedback since this run (dismissed, snoozed or done); {count} {label}" when
+ *    feedback hides items now or the run suppressed some, else the leading withheld line's
+ *    reason, else "Data does not fully cover this window: {datasets} ({cause}); …" from the
+ *    section's `incomplete_dataset` findings, else the first finding that explains the absence,
+ *    else "No rule fired for this window". Its long identifiers wrap at their underscores
+ *    (`withIdentifierBreaks`), as they do in a finding's banner. It has no reason body: the
+ *    finding banners above and the lists below are not repeated in it;
  * 5. the `WithheldList` of the section's withheld patterns;
  * 6. a list named "Not shown": one "{count} {label}" line per suppression reason, in API order,
  *    and "{n} hidden since this run" for items feedback hides now, confirmed ones included.
@@ -1496,7 +1700,6 @@ export function SectionFrame({
   }
 
   const suppressed = reportedSuppressions(section);
-  const reasonLines = anyShown ? [] : emptyReasonLines(section, hiddenTotal, suppressed);
 
   return (
     <PageShell.Section id={sectionAnchorId(section.key)} title={textOr(section.title, section.key)}>
@@ -1511,17 +1714,11 @@ export function SectionFrame({
         {beforeGroups}
         {groupsArea}
         {anyShown ? null : (
-          <EmptyState title={EMPTY_TITLE}>
-            {reasonLines.length === 0 ? (
-              EMPTY_NO_REASON
-            ) : (
-              <Stack gap={1}>
-                {reasonLines.map((line, index) => (
-                  <span key={`${index}-${line}`}>{line}</span>
-                ))}
-              </Stack>
-            )}
-          </EmptyState>
+          <EmptyState
+            // The sentence can quote a finding message or a dataset name, whose long identifiers
+            // wrap at their underscores, as they do in the finding's banner.
+            title={withIdentifierBreaks(emptyReason(section, hiddenTotal, suppressed))}
+          />
         )}
         {withheldTitle === undefined ? (
           <WithheldList withheld={section.withheld} />

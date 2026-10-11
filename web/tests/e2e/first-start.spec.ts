@@ -20,7 +20,7 @@
  * 4. **Five populated sections**: the sections render in the user's order (`section-keywords`,
  *    `section-campaigns`, `section-budget`, `section-creative`, `section-white_papers`), titled as
  *    the API titles them, and every one shows at least one action: its "Sections" navigation
- *    link counts one or more items, it shows no "No actions in this section" notice, and it
+ *    link counts one or more items, it shows no empty-state notice (`.ds-emptystate`), and it
  *    renders an action that matches the same `GET /recommendations` read. Where only held
  *    actions exist, the "Held until discrepancies are resolved" list is opened first.
  *    - Keywords, Campaigns, Budget and Copy/creative: the first visible card
@@ -175,8 +175,14 @@ const FIRST_RUN_NOTICE = 'No analysis run yet';
 /** The `/actions` section navigation landmark (`SectionNav.tsx`). */
 const SECTION_NAV_LABEL = 'Sections';
 
-/** The empty-state title of a section with no card to show (`SectionFrame.tsx`). */
-const EMPTY_SECTION_TITLE = 'No actions in this section';
+/**
+ * The empty state a section shows in place of its cards (`SectionFrame.tsx`), the root of the
+ * design-system `EmptyState`. Its title is the reason the section is empty, read from the run,
+ * so the spec finds it by the wrapper's class rather than by a fixed text. An empty Keywords
+ * sub-list's own empty state mounts only once its tab is selected, and a populated section opens
+ * on a tab with cards, so in a populated section none is present.
+ */
+const EMPTY_STATE_SELECTOR = '.ds-emptystate';
 
 /** The status bar's list of source chips (`SourceChips.tsx`). */
 const SOURCE_CHIPS_LABEL = 'Data sources';
@@ -852,7 +858,7 @@ test('first start: sign in and see five populated sections on simulated data', a
           `the "${title}" link in the "${SECTION_NAV_LABEL}" navigation counts at least one item`,
         ).toBeGreaterThanOrEqual(1);
         await expect(
-          region.getByText(EMPTY_SECTION_TITLE, { exact: true }),
+          region.locator(EMPTY_STATE_SELECTOR),
           `the "${title}" section is not empty`,
         ).toHaveCount(0, { timeout: READ_TIMEOUT_MS });
         // The counts above come from the API; the section must also render one of its actions.

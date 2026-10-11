@@ -531,7 +531,16 @@ export interface Metric {
   unavailable: boolean | null;
 }
 
-/** A value an item's metrics were compared against (`schemas.Baseline`). */
+/**
+ * A value an item's metrics were compared against (`schemas.Baseline`). A baseline that no
+ * metric of its item shares a unit with carries its own `unit` and, for money, `currency`, so
+ * it is formatted in the account currency (AAP 0.5.5), as C1's account cost per outcome is.
+ *
+ * `unit` and `currency` are optional although the API always sends them, `null` when unset:
+ * unlike the module's other response fields, they extend a shape that callers, test fixtures
+ * included, already build as `{ key, label, value }`, and a missing key reads exactly as
+ * `null` does.
+ */
 export interface Baseline {
   /** Stable machine key, for example `account_cost_per_outcome`. */
   key: string;
@@ -539,6 +548,14 @@ export interface Baseline {
   label: string;
   /** The baseline; `null` when unavailable. */
   value: MetricValue;
+  /**
+   * The unit, for example `currency` or `ratio`; `null` or absent for a baseline shown in the
+   * unit of the metric it pairs with, a unitless one such as K1's conversions per click, and
+   * one frozen by a run that predates this key.
+   */
+  unit?: string | null;
+  /** ISO currency code for a money value; `null` or absent otherwise. */
+  currency?: string | null;
 }
 
 /**
@@ -583,7 +600,14 @@ export interface StatTest {
 
 /**
  * A dataset an item read, with its completeness and coverage at compute time
- * (`schemas.DatasetCoverage`).
+ * (`schemas.DatasetCoverage`). The coverage date travels with its day boundary, so it is
+ * labelled with its source's day boundary (AAP 0.5.5), HubSpot's included, which
+ * {@link EvidenceWindow.source_days} does not list.
+ *
+ * `boundary` is optional although the API always sends it, `null` when unset: like
+ * {@link Baseline.unit}, it extends a shape that callers, test fixtures included, already build
+ * as `{ dataset, completeness, covered_through }`, and a missing key reads exactly as `null`
+ * does.
  */
 export interface DatasetCoverage {
   /** The dataset name, one of {@link DatasetName}. */
@@ -592,6 +616,13 @@ export interface DatasetCoverage {
   completeness: Completeness;
   /** The last native date the dataset covered; `null` when unknown. */
   covered_through: IsoDate | null;
+  /**
+   * The IANA zone whose midnight ends `covered_through`, for example `America/New_York` for
+   * Google or `UTC` for LinkedIn and HubSpot; `null` or absent without a `covered_through`,
+   * and on evidence frozen by a run that predates this key, whose Google and LinkedIn dates
+   * take their boundary from {@link EvidenceWindow.source_days}.
+   */
+  boundary?: string | null;
 }
 
 /**

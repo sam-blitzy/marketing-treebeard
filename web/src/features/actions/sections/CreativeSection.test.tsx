@@ -6,7 +6,8 @@
  * - **One block per campaign**, in API order, each a region headed by the campaign name and
  *   anchored at `groupAnchorId('creative', key)` (`campaign:1` → `group-creative-campaign-1`),
  *   holding its own variants table ("Variants in {campaign}": Creative, Impressions, Click rate,
- *   Open rate, Completion rate, Leads; rates as `formatPercent` renders them at two digits, "n/a"
+ *   Open rate, Completion rate, Leads; rates as `formatPercent` renders them at one fixed
+ *   precision per column, at least two digits and more where different rates would read alike, "n/a"
  *   only for a stage the campaign's objective does not use, "not estimable" for a missing rate
  *   over a zero denominator, "unavailable" for any other missing rate and for an absent count),
  *   then the cards in API order: the CR3 next test with the CR2 weak stage as its reason, then
@@ -205,7 +206,7 @@ describe('CreativeSection', () => {
       expect(headers(table)).toEqual(VARIANT_HEADERS);
       expect(bodyRows(table)).toEqual([
         ['Variant A', '13,250', '0.44%', '1.22%', '39.51%', '64'],
-        ['Variant B', '12,400', '0.4%', '1.19%', '33.11%', '49'],
+        ['Variant B', '12,400', '0.40%', '1.19%', '33.11%', '49'],
       ]);
 
       // CR3 carries the CR2 weak stage as its reason and the single variable as its action.
@@ -321,14 +322,16 @@ describe('CreativeSection', () => {
         const table = within(block).getByRole('table', { name: `Variants in ${name}` });
         expect(tables[0]).toBe(table);
         expect(headers(table)).toEqual(VARIANT_HEADERS);
-        // Every rate is formatPercent's output at the table's precision, every count formatCount's.
+        // Every rate is formatPercent's output at its column's fixed precision (two places for
+        // these rates, which read apart at two), every count formatCount's.
+        const fixed = { fixed: true };
         expect(bodyRows(table)).toEqual(
           rows.map((row) => [
             row.name,
             formatCount(row.impressions),
-            formatPercent(row.click_rate, VARIANT_RATE_DIGITS),
-            formatPercent(row.open_rate, VARIANT_RATE_DIGITS),
-            formatPercent(row.completion_rate, VARIANT_RATE_DIGITS),
+            formatPercent(row.click_rate, VARIANT_RATE_DIGITS, fixed),
+            formatPercent(row.open_rate, VARIANT_RATE_DIGITS, fixed),
+            formatPercent(row.completion_rate, VARIANT_RATE_DIGITS, fixed),
             formatCount(row.leads),
           ]),
         );
@@ -345,7 +348,8 @@ describe('CreativeSection', () => {
         expect(precedes(cr3Heading, cr1Heading)).toBe(true);
       }
       // Pinned once in literal form, so a change in the formatter itself shows up here too.
-      expect(bodyRows(firstTable)[0]).toEqual(['A1', '4,000', '0.44%', '1.25%', '24%', '12']);
+      expect(bodyRows(firstTable)[0]).toEqual(['A1', '4,000', '0.44%', '1.25%', '24.00%', '12']);
+      expect(bodyRows(firstTable)[1]).toEqual(['A2', '3,800', '0.41%', '1.18%', '20.00%', '9']);
     });
 
     it('shows the historical CR1 pair openly with its API wording, badge and disabled actions', async () => {
@@ -442,9 +446,11 @@ describe('CreativeSection', () => {
       const table = within(benchmarks).getByRole('table', {
         name: 'Variants in Lead Gen — Benchmarks EMEA',
       });
+      // Open rates of 0.012000 and 0.012041 would both read "1.20%" at two places, so that
+      // column takes three; the other rate columns keep two, trailing zeros included.
       expect(bodyRows(table)).toEqual([
-        ['Benchmarks Variant A', '42,000', '0.63%', '1.2%', '25%', '126'],
-        ['Benchmarks Variant B', '39,200', '0.6%', '1.2%', '23.31%', '110'],
+        ['Benchmarks Variant A', '42,000', '0.63%', '1.200%', '25.00%', '126'],
+        ['Benchmarks Variant B', '39,200', '0.60%', '1.204%', '23.31%', '110'],
       ]);
     });
 
@@ -593,8 +599,11 @@ describe('CreativeSection', () => {
 
       const section = screen.getByRole('region', { name: 'Copy/creative changes' });
       expect(within(section).queryByRole('table')).toBeNull();
-      expect(within(section).getByText('No actions in this section')).toBeTruthy();
-      expect(within(section).getByText('No rule fired for this window')).toBeTruthy();
+      const empty = section.querySelector('.ds-emptystate');
+      expect(empty?.querySelector('.ds-emptystate__title')?.textContent).toBe(
+        'No rule fired for this window',
+      );
+      expect(empty?.querySelector('.ds-emptystate__reason')).toBeNull();
     });
   });
 
@@ -633,7 +642,7 @@ describe('CreativeSection', () => {
       expect(bodyRows(table)).toEqual([
         ['Visit A', '20,000', '1.05%', 'n/a', 'n/a', 'unavailable'],
         // A variant without a name is shown by its URN; a number rate is read as its decimal.
-        ['urn:li:sponsoredCreative:9102', 'unavailable', '0.9%', 'n/a', 'n/a', 'unavailable'],
+        ['urn:li:sponsoredCreative:9102', 'unavailable', '0.90%', 'n/a', 'n/a', 'unavailable'],
       ]);
     });
 
@@ -694,9 +703,9 @@ describe('CreativeSection', () => {
 
       const table = screen.getByRole('table', { name: 'Variants in Lead Gen — Guide' });
       expect(bodyRows(table)).toEqual([
-        ['Opens unreported', '5,000', '0.4%', 'unavailable', 'unavailable', '10'],
-        ['Form never opened', '4,200', '0.5%', '0%', 'not estimable', '0'],
-        ['Inconsistent clicks', '1,200', 'unavailable', '2.5%', '20%', '6'],
+        ['Opens unreported', '5,000', '0.40%', 'unavailable', 'unavailable', '10'],
+        ['Form never opened', '4,200', '0.50%', '0.00%', 'not estimable', '0'],
+        ['Inconsistent clicks', '1,200', 'unavailable', '2.50%', '20.00%', '6'],
       ]);
       expect(within(table).queryByText('n/a')).toBeNull();
     });
@@ -735,7 +744,7 @@ describe('CreativeSection', () => {
 
       const table = screen.getByRole('table', { name: 'Variants in Objective unknown' });
       expect(bodyRows(table)).toEqual([
-        ['Unknown A', '3,000', '1%', 'unavailable', 'unavailable', 'unavailable'],
+        ['Unknown A', '3,000', '1.00%', 'unavailable', 'unavailable', 'unavailable'],
         ['Unknown B', '2,800', '1.25%', 'unavailable', 'not estimable', '0'],
       ]);
       expect(within(table).queryByText('n/a')).toBeNull();
@@ -762,13 +771,19 @@ describe('CreativeSection', () => {
       expect(rows.map((row) => row[0])).toEqual(['First', 'Second', 'Third']);
     });
 
-    it('formats a stage rate at two digits, "n/a" only where the stage does not apply, and a missing rate as "not estimable" or "unavailable"', () => {
+    it('formats a stage rate at fixed digits, two by default, "n/a" only where the stage does not apply, and a missing rate as "not estimable" or "unavailable"', () => {
       expect(VARIANT_RATE_DIGITS).toBe(2);
       expect(NOT_ESTIMABLE).toBe('not estimable');
-      // A rate, whether its stage is known to apply or its applicability is unknown.
+      // A rate, whether its stage is known to apply or its applicability is unknown, at exactly
+      // its column's digits, trailing zeros included.
       expect(formatVariantRate('0.395062', true, 162)).toBe('39.51%');
       expect(formatVariantRate('0.004377', null, 13250)).toBe('0.44%');
-      expect(formatVariantRate('0.000000', true, 4200)).toBe('0%');
+      expect(formatVariantRate('0.000000', true, 4200)).toBe('0.00%');
+      expect(formatVariantRate('0.01', true, 3000)).toBe('1.00%');
+      expect(formatVariantRate('0.008', true, 3000)).toBe('0.80%');
+      expect(formatVariantRate('0.007994', true, 13250, 3)).toBe('0.799%');
+      expect(formatVariantRate('0.000004', true, 250000, 3)).toBe('< 0.001%');
+      expect(formatVariantRate(null, false, null, 3)).toBe('n/a');
       // A stage the campaign does not use is "n/a", checked before anything else.
       expect(formatVariantRate(null, false, null)).toBe('n/a');
       expect(formatVariantRate(null, false, 0)).toBe('n/a');
@@ -787,6 +802,97 @@ describe('CreativeSection', () => {
 
       expect(container.childElementCount).toBe(0);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Variants table precision: one fixed precision per rate column
+// ---------------------------------------------------------------------------------------------
+
+describe('variants table precision', () => {
+  /** A lead-gen variant row in the backend's shape, with the given rates. */
+  function rateRow(
+    id: number,
+    clickRate: string | null,
+    openRate: string | null,
+    completionRate: string | null,
+  ): Record<string, unknown> {
+    return {
+      creative_id: id,
+      name: `Creative ${String(id)}`,
+      impressions: 5000,
+      form_opens: 40,
+      leads: 4,
+      click_rate: clickRate,
+      open_rate: openRate,
+      completion_rate: completionRate,
+    };
+  }
+
+  /** Renders one lead-gen campaign block holding a CR3 item with `rows`; returns its table. */
+  async function tableOf(rows: Record<string, unknown>[]): Promise<HTMLElement> {
+    await renderCreative(
+      creativeWith(
+        makeGroup({
+          key: 'campaign:790',
+          title: 'Precision',
+          items: [
+            testItemWith(90, rows, {
+              id: 790,
+              name: 'Precision',
+              objective_group: 'linkedin_lead_gen',
+            }),
+          ],
+        }),
+      ),
+    );
+    return screen.getByRole('table', { name: 'Variants in Precision' });
+  }
+
+  /** The text of column `index` (row header 0) over every shown row. */
+  function column(table: HTMLElement, index: number): (string | null)[] {
+    return bodyRows(table).map((row) => row[index] ?? null);
+  }
+
+  it('shows a column of mixed magnitudes at one precision, never mixing "0.8%" and "0.58%"', async () => {
+    const table = await tableOf([
+      rateRow(1, '0.008', '0.0058', '0.1239'),
+      rateRow(2, '0.0058', '0.01', '0.5'),
+      rateRow(3, '0.1239', '0.008', '0.25'),
+      rateRow(4, '0.01', '0.1239', '1'),
+    ]);
+
+    expect(column(table, 2)).toEqual(['0.80%', '0.58%', '12.39%', '1.00%']);
+    expect(column(table, 3)).toEqual(['0.58%', '1.00%', '0.80%', '12.39%']);
+    expect(column(table, 4)).toEqual(['12.39%', '50.00%', '25.00%', '100.00%']);
+  });
+
+  it('adds places to a column until different rates read apart, and only to that column', async () => {
+    const table = await tableOf([
+      rateRow(1, '0.007994', '0.004377', '0.25'),
+      rateRow(2, '0.008014', '0.004381', '0.2'),
+    ]);
+
+    // 0.7994% and 0.8014% both read "0.80%" at two places; 0.4377% and 0.4381% agree to three.
+    expect(column(table, 2)).toEqual(['0.799%', '0.801%']);
+    expect(column(table, 3)).toEqual(['0.4377%', '0.4381%']);
+    expect(column(table, 4)).toEqual(['25.00%', '20.00%']);
+  });
+
+  it('takes a column’s precision from every variant, not only the rows shown', async () => {
+    // 51 variants: the first batch shows 50, all at 0.004377; the 51st, at 0.004381, is hidden
+    // until revealed, yet both read apart only at four places.
+    const rows = Array.from({ length: 51 }, (_, index) =>
+      rateRow(index + 1, index === 50 ? '0.004381' : '0.004377', '0.01', '0.1'),
+    );
+    const table = await tableOf(rows);
+
+    expect(new Set(column(table, 2))).toEqual(new Set(['0.4377%']));
+    fireEvent.click(screen.getByRole('button', { name: 'Show 1 more variant' }));
+    const clickRates = column(table, 2);
+    expect(clickRates).toHaveLength(51);
+    expect(clickRates.at(-1)).toBe('0.4381%');
+    expect(new Set(column(table, 3))).toEqual(new Set(['1.00%']));
   });
 });
 
@@ -982,7 +1088,7 @@ describe('CreativeSection rendered again', () => {
     expect(reads).toHaveBeenCalledTimes(2);
     expect(bodyRows(screen.getByRole('table', { name: caption }))).toEqual([
       ['Variant A', '13,250', '0.44%', '1.22%', '39.51%', '70'],
-      ['Variant B', '12,400', '0.4%', '1.19%', '33.11%', '49'],
+      ['Variant B', '12,400', '0.40%', '1.19%', '33.11%', '49'],
     ]);
   });
 

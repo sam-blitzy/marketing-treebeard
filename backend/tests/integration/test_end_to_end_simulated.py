@@ -129,6 +129,9 @@ it the HubSpot throttle; the ceiling reports a hang as a failure before pytest's
 LINKEDIN_BOUNDARY: Final = "UTC"
 """LinkedIn reports daily buckets on UTC days (AAP 0.3.3)."""
 
+HUBSPOT_COVERAGE_BOUNDARY: Final = "UTC"
+"""HubSpot holds instants, and its sync jobs record coverage as UTC dates."""
+
 DAY_SOURCES: Final[tuple[str, ...]] = ("google", "linkedin")
 """The sources with native daily rows; HubSpot holds instants only, so it has no day boundary."""
 
@@ -310,7 +313,8 @@ def _check_evidence_window_and_boundaries(
     each day source (Google on the account's zone, LinkedIn on UTC) with the window's dates and
     covers every day source the item read, ``boundaries_differ`` and ``description`` say that
     those boundaries differ, metrics carry units (and a currency for money),
-    thresholds and datasets are present and complete, and the frozen provenance names active
+    thresholds and datasets are present and complete, each dataset's coverage date carries its
+    source's day boundary (AAP 0.5.5; UTC for HubSpot), and the frozen provenance names active
     simulated datasets. ``action`` and ``reason`` are stated.
     """
     run = page["run"]
@@ -373,9 +377,20 @@ def _check_evidence_window_and_boundaries(
         datasets = evidence.get("datasets") or []
         if not datasets:
             problems.append(f"{where}: evidence names no dataset read")
+        coverage_boundaries = {"google": google_zone, "linkedin": LINKEDIN_BOUNDARY}
         for dataset in datasets:
             if dataset.get("completeness") != "complete":
                 problems.append(f"{where}: dataset {dataset} is not complete")
+            # AAP 0.5.5: a coverage date is labelled with its source's day boundary; HubSpot's
+            # sync jobs record UTC dates, and the window lists no HubSpot day.
+            prefix = str(dataset.get("dataset") or "").split(".", 1)[0]
+            expected = (
+                None
+                if dataset.get("covered_through") is None
+                else coverage_boundaries.get(prefix, HUBSPOT_COVERAGE_BOUNDARY)
+            )
+            if dataset.get("boundary") != expected:
+                problems.append(f"{where}: dataset {dataset} boundary is not {expected!r}")
 
         provenance = evidence.get("provenance") or []
         if not provenance:

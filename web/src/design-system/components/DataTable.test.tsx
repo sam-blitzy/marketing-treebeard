@@ -58,7 +58,7 @@ const ROWS: readonly AssetRow[] = [
  */
 const COLUMNS: readonly DataTableColumn<AssetRow>[] = [
   { key: 'asset', header: 'Asset', isRowHeader: true },
-  { key: 'spend', header: 'Spend', align: 'end', render: (row) => `€${row.spend.toFixed(2)}` },
+  { key: 'spend', header: 'Spend', align: 'end', render: (row) => `EUR ${row.spend.toFixed(2)}` },
   { key: 'mql', header: 'MQL (First meeting booked)', align: 'end' },
   { key: 'ql', header: 'Qualified Lead', align: 'end' },
   { key: 'live', header: 'Live' },
@@ -405,9 +405,9 @@ describe('DataTable', () => {
       const bodyRows = screen.getAllByRole('row').slice(1);
       expect(bodyRows).toHaveLength(2);
       // asset (row header), spend (render), mql, ql, live (boolean), meta (object), missing key.
-      expect(cellTexts(at(bodyRows, 0))).toEqual(['Buyer guide', '€1200.00', '4', '2', '', '', '']);
+      expect(cellTexts(at(bodyRows, 0))).toEqual(['Buyer guide', 'EUR 1200.00', '4', '2', '', '', '']);
       // A zero renders as 0; null and an absent property render as empty cells.
-      expect(cellTexts(at(bodyRows, 1))).toEqual(['State report', '€0.00', '', '', '', '', '']);
+      expect(cellTexts(at(bodyRows, 1))).toEqual(['State report', 'EUR 0.00', '', '', '', '', '']);
     });
 
     it('aligns numeric body cells to the end and text cells to the start', () => {
@@ -855,7 +855,7 @@ describe('DataTable', () => {
       ]);
       expect(cellTexts(at(screen.getAllByRole('row'), 1))).toEqual([
         'Buyer guide',
-        '€1200.00',
+        'EUR 1200.00',
         '4',
         '2',
         '',

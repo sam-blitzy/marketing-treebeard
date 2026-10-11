@@ -49,6 +49,8 @@ from ads_engine.analysis.discrepancy import (
     NO_DECISION_TEXT,
     NOT_RETURNED_TEXT,
     RESOLUTION_ORDER,
+    STATUS_LABELS,
+    STATUS_NOT_REPORTED_TEXT,
     TOMBSTONE_TEXT,
     UNAVAILABLE_TEXT,
     evaluate,
@@ -334,17 +336,21 @@ def test_offered_resolutions_rejects_a_pair_without_resolutions(kind: str, shape
     ("kind", "shape", "value", "currency", "expected"),
     [
         # status
-        pytest.param("status", "own_budget", {"status": "paused"}, "USD", "paused", id="status"),
+        pytest.param("status", "own_budget", {"status": "paused"}, "USD", "Paused", id="status"),
+        pytest.param("status", "own_budget", {"status": "active"}, "USD", "Active", id="active"),
         pytest.param(
-            "status", "shared_member", {"status": " ended "}, None, "ended", id="status-stripped"
+            "status", "shared_member", {"status": " ended "}, None, "Ended", id="status-stripped"
         ),
         pytest.param(
-            "status", "own_budget", {"status": None}, None, "status unavailable", id="status-none"
+            "status", "own_budget", {"status": "archived"}, None, "archived", id="status-as-sent"
         ),
         pytest.param(
-            "status", "own_budget", {"status": "  "}, None, "status unavailable", id="status-blank"
+            "status", "own_budget", {"status": None}, None, "status not reported", id="status-none"
         ),
-        pytest.param("status", "own_budget", {}, None, "status unavailable", id="status-absent"),
+        pytest.param(
+            "status", "own_budget", {"status": "  "}, None, "status not reported", id="status-blank"
+        ),
+        pytest.param("status", "own_budget", {}, None, "status not reported", id="status-absent"),
         # own_budget and budget amounts, LinkedIn decimal text
         pytest.param(
             "budget",
@@ -359,7 +365,7 @@ def test_offered_resolutions_rejects_a_pair_without_resolutions(kind: str, shape
             "own_budget",
             _linkedin_money("50.00", "1000.00"),
             None,
-            "daily budget EUR 50.00, total budget EUR 1,000.00",
+            "daily budget EUR 50.00 · total budget EUR 1,000.00",
             id="daily-and-total",
         ),
         pytest.param(
@@ -666,7 +672,7 @@ def test_offered_resolutions_rejects_a_pair_without_resolutions(kind: str, shape
             "own_budget",
             {"status": "active", **_google_money("50.000000")},
             None,
-            "active; daily budget USD 50.00",
+            "Active · daily budget USD 50.00",
             id="untracked-own-budget",
         ),
         pytest.param(
@@ -674,7 +680,7 @@ def test_offered_resolutions_rejects_a_pair_without_resolutions(kind: str, shape
             "shared_member",
             {"status": "paused", "budget_id": 7, "budget_external_id": "123"},
             None,
-            "paused; shared budget 123",
+            "Paused · shared budget 123",
             id="untracked-shared-member",
         ),
         pytest.param(
@@ -690,15 +696,23 @@ def test_offered_resolutions_rejects_a_pair_without_resolutions(kind: str, shape
             "own_budget",
             {"status": "active", **_linkedin_money(None, "900.00")},
             None,
-            "active; total budget EUR 900.00",
+            "Active · total budget EUR 900.00",
             id="missing-own-budget",
+        ),
+        pytest.param(
+            "untracked",
+            "own_budget",
+            {"status": "active", **_linkedin_money("50.00", "1000.00")},
+            None,
+            "Active · daily budget EUR 50.00 · total budget EUR 1,000.00",
+            id="untracked-own-budget-daily-and-total",
         ),
         pytest.param(
             "missing",
             "shared_member",
             {"status": None, "budget_id": None},
             None,
-            "status unavailable; own budget (not shared)",
+            "status not reported · own budget (not shared)",
             id="missing-shared-member-unknown",
         ),
         pytest.param(
@@ -706,7 +720,7 @@ def test_offered_resolutions_rejects_a_pair_without_resolutions(kind: str, shape
             "own_budget",
             {"status": "ended", "tombstone": False},
             "USD",
-            "ended; budget unavailable",
+            "Ended · budget unavailable",
             id="tombstone-false-is-a-state",
         ),
         # tombstones and unknown values
@@ -715,8 +729,32 @@ def test_offered_resolutions_rejects_a_pair_without_resolutions(kind: str, shape
             "own_budget",
             {"status": "ended", "tombstone": True},
             "USD",
-            TOMBSTONE_TEXT,
+            "Removal acknowledged · Ended",
             id="tombstone",
+        ),
+        pytest.param(
+            "status",
+            "shared_member",
+            {"status": "paused", "tombstone": True},
+            None,
+            "Removal acknowledged · Paused",
+            id="tombstone-own-status",
+        ),
+        pytest.param(
+            "status",
+            "own_budget",
+            {"status": " ", "tombstone": True},
+            None,
+            "Removal acknowledged · Ended",
+            id="tombstone-blank-status-is-ended",
+        ),
+        pytest.param(
+            "missing",
+            "shared_member",
+            {"tombstone": True},
+            None,
+            "Removal acknowledged · Ended",
+            id="tombstone-no-status-is-ended",
         ),
         pytest.param(
             "budget",
@@ -755,11 +793,55 @@ def test_render_value_keeps_a_one_micro_difference_visible() -> None:
     assert decided != platform
 
 
+# The web client renders these amounts on /decisions with formatExactMoney: the same literal
+# strings are asserted by web/src/lib/format.test.ts and DiscrepancyResolver.test.tsx, with a
+# no-break space (U+00A0) where these have a plain space. Change both sides together. The
+# places come from ads_engine.decisions.minor_unit_exponent (ISO 4217), never CLDR: IQD has 3
+# and AFN and ALL 2, where CLDR gives 0.
+MONEY_PARITY: tuple[tuple[str, str, str], ...] = (
+    ("400.000000", "USD", "USD 400.00"),
+    ("50.00", "EUR", "EUR 50.00"),
+    ("5000", "JPY", "JPY 5,000"),
+    ("5000.5", "JPY", "JPY 5,000.5"),
+    ("1.5", "KWD", "KWD 1.500"),
+    ("50.00", "IQD", "IQD 50.000"),
+    ("1234.5", "IQD", "IQD 1,234.500"),
+    ("50.000001", "IQD", "IQD 50.000001"),
+    ("50.00", "AFN", "AFN 50.00"),
+    ("50", "ALL", "ALL 50.00"),
+    ("5", "XYZ", "XYZ 5.00"),
+)
+"""``(stored amount, currency, rendered amount)``: common currencies, those whose ISO 4217 minor
+unit differs from CLDR's, and a well-formed unknown code, which has two places."""
+
+
+@pytest.mark.parametrize(
+    ("amount", "currency", "expected"),
+    MONEY_PARITY,
+    ids=[f"{currency}-{amount}" for amount, currency, _ in MONEY_PARITY],
+)
+def test_render_value_words_amounts_as_the_web_resolver(
+    amount: str, currency: str, expected: str
+) -> None:
+    linkedin = _linkedin_money(amount, currency=currency)
+    assert render_value("budget", "own_budget", linkedin, None) == f"daily budget {expected}"
+    # The subject's currency words a side that names none, at the same places.
+    bare = {"daily_budget": amount, "total_budget": None}
+    assert render_value("budget", "own_budget", bare, f" {currency.lower()} ") == (
+        f"daily budget {expected}"
+    )
+    # A Google side is read from its micros, converted exactly, at the same places.
+    google = _google_money(amount, currency=currency)
+    assert render_value("budget", "budget", google, None) == f"daily budget {expected}"
+
+
 def test_text_constants() -> None:
     assert UNAVAILABLE_TEXT == "unavailable"
     assert NOT_RETURNED_TEXT == "not returned by the platform"
     assert NO_DECISION_TEXT == "no decision recorded"
-    assert TOMBSTONE_TEXT == "removed (acknowledged)"
+    assert TOMBSTONE_TEXT == "Removal acknowledged"
+    assert STATUS_NOT_REPORTED_TEXT == "status not reported"
+    assert dict(STATUS_LABELS) == {"active": "Active", "paused": "Paused", "ended": "Ended"}
 
 
 # ---------------------------------------------------------------------------
@@ -781,12 +863,16 @@ def test_module_docstring_examples() -> None:
         "acknowledge_removal",
     )
     assert offered_resolutions("untracked", "budget") == ("adopt_platform", "record_intended")
-    assert render_value("status", "own_budget", {"status": "paused"}, "USD") == "paused"
+    assert render_value("status", "own_budget", {"status": "paused"}, "USD") == "Paused"
     value = {"daily_budget": "50.000001", "currency": "USD", "amount_micros": 50000001}
     assert render_value("budget", "budget", value, "USD") == "daily budget USD 50.000001"
+    value = {"status": "active", "daily_budget": "400.000000", "currency": "USD"}
+    assert render_value("untracked", "own_budget", value, "USD") == (
+        "Active · daily budget USD 400.00"
+    )
     assert (
         render_value("missing", "own_budget", {"status": "ended", "tombstone": True}, "USD")
-        == "removed (acknowledged)"
+        == "Removal acknowledged · Ended"
     )
 
 
@@ -996,7 +1082,7 @@ def test_c0_items_carry_no_crm_link_on_no_source_once_the_link_is_verified(
     [
         pytest.param(
             {},
-            "Resolve: platform shows paused, last decided active",
+            "Resolve: platform shows Paused, last decided Active",
             "Platform status differs from the last decided status.",
             "status",
             (None, None),
@@ -1005,7 +1091,7 @@ def test_c0_items_carry_no_crm_link_on_no_source_once_the_link_is_verified(
         ),
         pytest.param(
             {"subject_id": MEMBER_CAMPAIGN, "shape": "shared_member", "state": "awaiting_platform"},
-            "Resolve: platform shows paused, last decided active",
+            "Resolve: platform shows Paused, last decided Active",
             "Platform status differs from the last decided status."
             " Awaiting a matching platform snapshot.",
             "status",
@@ -1105,7 +1191,7 @@ def test_c0_items_carry_no_crm_link_on_no_source_once_the_link_is_verified(
                 "decided_value": None,
                 "platform_value": {"status": "active", **_google_money("25.000000")},
             },
-            "Resolve: platform shows active; daily budget USD 25.00, "
+            "Resolve: platform shows Active · daily budget USD 25.00, "
             f"last decided {NO_DECISION_TEXT}",
             "Entity first seen after this dataset's baseline, with no decision.",
             "state",
@@ -1121,7 +1207,7 @@ def test_c0_items_carry_no_crm_link_on_no_source_once_the_link_is_verified(
                 "decided_value": None,
                 "platform_value": {"status": "active", "budget_id": SHARED_BUDGET},
             },
-            f"Resolve: platform shows active; shared budget 123, last decided {NO_DECISION_TEXT}",
+            f"Resolve: platform shows Active · shared budget 123, last decided {NO_DECISION_TEXT}",
             "Entity first seen after this dataset's baseline, with no decision.",
             "state",
             (None, None),
@@ -1152,7 +1238,7 @@ def test_c0_items_carry_no_crm_link_on_no_source_once_the_link_is_verified(
                 "decided_value": {"status": "active", **_google_money("50.000000")},
                 "platform_value": None,
             },
-            f"Resolve: platform shows {NOT_RETURNED_TEXT}, last decided active; "
+            f"Resolve: platform shows {NOT_RETURNED_TEXT}, last decided Active · "
             "daily budget USD 50.00",
             "A tracked entity was not returned by a complete enumeration.",
             "state",
@@ -1190,7 +1276,7 @@ def test_c0_items_carry_no_crm_link_on_no_source_once_the_link_is_verified(
                 },
                 "platform_value": None,
             },
-            f"Resolve: platform shows {NOT_RETURNED_TEXT}, last decided active; shared budget 123",
+            f"Resolve: platform shows {NOT_RETURNED_TEXT}, last decided Active · shared budget 123",
             "A tracked entity was not returned by a complete enumeration.",
             "state",
             (None, None),
@@ -1199,7 +1285,7 @@ def test_c0_items_carry_no_crm_link_on_no_source_once_the_link_is_verified(
         ),
         pytest.param(
             {"decided_value": {"status": "ended", "tombstone": True}},
-            f"Resolve: platform shows paused, last decided {TOMBSTONE_TEXT}",
+            f"Resolve: platform shows Paused, last decided {TOMBSTONE_TEXT} · Ended",
             "An entity whose removal was acknowledged was returned by a complete enumeration.",
             "status",
             (None, None),
@@ -1281,7 +1367,11 @@ def test_evidence_records_the_entity_dataset_and_frozen_values(
 
     assert json_value(evidence.window) == window.to_json()
     assert evidence.thresholds == {}
-    assert evidence.datasets == (DatasetStatus("google.entities", "complete", COVERED_THROUGH),)
+    # The coverage date carries the Google day boundary the window records (AAP 0.5.5).
+    assert evidence.datasets == (
+        DatasetStatus("google.entities", "complete", COVERED_THROUGH, window.boundary("google")),
+    )
+    assert window.boundary("google") == "America/New_York"
     assert evidence.provenance == (ProvenanceEntry("google", 11, "live", "primary"),)
     assert evidence.baselines == ()
     assert evidence.sample is None

@@ -134,6 +134,7 @@ __all__ = [
     "PIPELINE_PAUSE_ACTION",
     "SCALE_ACTION",
     "SCALE_CACHE_KEY",
+    "SECTION_DATASETS",
     "VETO_THRESHOLD_KEYS",
     "ScaleEntry",
     "ScaleOutcome",
@@ -1454,8 +1455,16 @@ def _c2_candidate(
                 "baseline_cost_per_outcome",
                 f"Account cost per {_singular(label)} (same source and objective)",
                 baseline,
+                "currency",
+                currency,
             ),
-            Baseline("max_cost_per_outcome", "Highest cost per outcome allowed to scale", ceiling),
+            Baseline(
+                "max_cost_per_outcome",
+                "Highest cost per outcome allowed to scale",
+                ceiling,
+                "currency",
+                currency,
+            ),
         ),
         sample=Sample(history.known_active, history.config.min_known_days, history.known_label),
         threshold_keys=(
@@ -1678,8 +1687,10 @@ def _c1_candidate(
     """The C1 "Pause" item of one campaign.
 
     Shows spend, days with spend, outcomes, expected outcomes and the baseline, plus the
-    linked CRM QL. A LinkedIn campaign's card also names its campaign group in
-    ``extra.campaign_group`` (:func:`_campaign_group_extra`); a Google card has none.
+    linked CRM QL. The card has no cost-per-outcome metric for the baseline to pair with, so
+    the baseline carries its own ``currency`` unit and the account currency. A LinkedIn
+    campaign's card also names its campaign group in ``extra.campaign_group``
+    (:func:`_campaign_group_extra`); a Google card has none.
 
     Rule C1 Pause (AAP 0.5.4.4), for a campaign that passed :func:`_c1`'s gates: a window of
     at least ``c1.min_window_days`` (14) and the sustained minimum, spend on at least
@@ -1736,6 +1747,8 @@ def _c1_candidate(
                 "baseline_cost_per_outcome",
                 f"Account cost per {_singular(label)} (same source and objective)",
                 _q(baseline),
+                "currency",
+                currency,
             ),
         ),
         sample=Sample(expected, settings.c1_min_expected, f"expected {label}"),
@@ -1902,9 +1915,10 @@ def _c1b_candidate(
     baseline), and records that baseline (AAP 0.5.5: "Pause and scale cards show spend,
     outcomes, expected outcomes and CRM QL"). The baseline reads "—" when the account's known
     outcomes are 0, a zero denominator, and is ``None``, unavailable, only when they are
-    unreported (:func:`cost_per_outcome_value`). The veto counts follow as their own metrics,
-    never blended with the platform outcomes, and ``extra.campaign_group`` names the
-    campaign's campaign group (:func:`_campaign_group_extra`).
+    unreported (:func:`cost_per_outcome_value`). With no cost-per-outcome metric to pair with,
+    the baseline carries its own ``currency`` unit and the account currency. The veto counts
+    follow as their own metrics, never blended with the platform outcomes, and
+    ``extra.campaign_group`` names the campaign's campaign group (:func:`_campaign_group_extra`).
 
     Rule C1b Pipeline pause (AAP 0.5.4.4), for a campaign that passed :func:`_c1b` and
     :func:`_c1b_shortfall`: a window of at least ``c1b.min_window_days`` (28) and the
@@ -1952,6 +1966,8 @@ def _c1b_candidate(
                 cost_per_outcome_value(
                     baseline, subject_baseline_outcomes(ctx, ("campaign", campaign.id))
                 ),
+                "currency",
+                currency,
             ),
         ),
         sample=Sample(veto.eligible_contacts, settings.veto_min, "contacts"),
@@ -2259,6 +2275,28 @@ def _c3a_candidate(
 
 _C3B_DATASETS: Final[tuple[str, ...]] = ("google.search_terms", "google.entities")
 """C3b's datasets: the window search terms and the keyword, ad group and campaign names."""
+
+SECTION_DATASETS: Final[tuple[str, ...]] = tuple(
+    dict.fromkeys(
+        (
+            *_ad_datasets("google"),
+            *_ad_datasets("linkedin"),
+            *_CRM_DATASETS["linkedin"],
+            *_C1B_DATASETS,
+            *_C3A_DATASETS,
+            *_C3B_DATASETS,
+        )
+    )
+)
+"""Every dataset the Campaigns section reads, first-seen order.
+
+C0 (``discrepancy.py``) reads each ad source's entities; C1 and C2 read each ad source's
+entities and daily metrics plus the LinkedIn pipeline population; C1b, C3a and C3b read their
+own datasets. ``hubspot.google_contacts`` is left out: it is read only once the Google-to-CRM
+link is verified, so it never gates the section. Precedence judges these over the run's window
+when the section stores no item, so an empty section says which of its datasets do not cover
+the window (AAP 0.5.5 "Each section shows an EmptyState with the reason").
+"""
 
 
 @dataclass(slots=True)

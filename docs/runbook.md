@@ -250,8 +250,18 @@ what each command needs.
   variable, in `docker-compose.yml` or in a commit.
 - **How they are protected**: secret settings are pydantic `SecretStr` values, so they never print.
   Logs are structured JSON with redaction: `Authorization` values, the n8n secret header, every
-  configured secret and email addresses are stripped. Lead emails are stored only as SHA-256
-  hashes.
+  configured secret and email addresses are stripped. The `web` (nginx) access log logs each
+  request's path without its query string (`?[REDACTED]`), never a Basic-auth user, the referer
+  without its query, and `[REDACTED_EMAIL]` for a path, referer or user agent holding an email.
+  nginx's error log cannot be redacted, so `web` writes no error-log line for any request or
+  connection, at any level (`error_log /dev/null` on its one server, which every location
+  inherits): a request nginx rejects, cannot serve or cannot pass to the API (for example 400,
+  413, 500, 502 or 504), a web-root directory nginx may not search and a full disk under a
+  temporary file all leave only the redacted access line and its status. nginx's main-level
+  log on stderr still shows startup, reload, worker-process and resolver messages, which name
+  no request. The alerts nginx writes when it cannot accept a connection ("worker_connections
+  are not enough" with none left to reuse, `accept4()` out of file descriptors) are not logged.
+  Lead emails are stored only as SHA-256 hashes.
 - **Rotating a source credential**: replace the value in `.env`, then recreate the processes that
   read it ([General procedure](#general-procedure)):
 

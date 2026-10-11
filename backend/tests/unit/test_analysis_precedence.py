@@ -67,6 +67,7 @@ from ads_engine.analysis.context import (
     FLAG_SIMULATED,
     FLAG_STALE,
     FLAG_UNVERIFIED_DISCREPANCIES,
+    FULL_STATE_DATASETS,
     GROUP_CHANGES,
     HELD_DISCREPANCY_REASON,
     K1,
@@ -1924,3 +1925,345 @@ def test_incomplete_dataset_findings_without_feedback_are_unchanged(
 
     monkeypatch.setattr(precedence, "_recount_incomplete_datasets", as_built)
     assert dict(apply_precedence(results, ctx).findings) == dict(out.findings)
+
+
+# ---------------------------------------------------------------------------
+# A section left with no item says which of its datasets do not cover the window (AAP 0.5.5)
+# ---------------------------------------------------------------------------
+
+EXPECTED_SECTION_DATASETS: Mapping[str, tuple[str, ...]] = {
+    KEYWORDS: ("google.search_terms", "google.metrics_daily", "google.entities"),
+    CAMPAIGNS: (
+        "google.entities",
+        "google.metrics_daily",
+        "linkedin.entities",
+        "linkedin.analytics_daily",
+        "linkedin.leads",
+        "hubspot.contacts",
+        "hubspot.associations",
+        "linkedin.segments",
+        "google.search_terms",
+    ),
+    BUDGET: (
+        "google.entities",
+        "google.metrics_daily",
+        "linkedin.entities",
+        "linkedin.analytics_daily",
+    ),
+    CREATIVE: ("linkedin.analytics_daily", "linkedin.entities"),
+    WHITE_PAPERS: (
+        "linkedin.analytics_daily",
+        "linkedin.leads",
+        "linkedin.entities",
+        "hubspot.contacts",
+        "hubspot.associations",
+        "hubspot.deal_search",
+    ),
+}
+"""Every dataset each section's rules read, as the rule modules declare them."""
+
+DEAL_SEARCH = "hubspot.deal_search"
+CEILING = "search result ceiling reached"
+
+
+def uncovered(ctx: AnalysisContext) -> AnalysisContext:
+    """``ctx`` with every dated dataset's coverage starting 30 days after the window end.
+
+    The shape of a custom window that ends before the backfill: every dated dataset is
+    ``complete`` over what it covers, but none covers the window. Full-state entity datasets
+    record no range, so they stay complete.
+    """
+    start = ctx.window.end + timedelta(days=30)
+    freshness = {
+        key: row
+        if row.dataset in FULL_STATE_DATASETS
+        else replace(row, covered_from=start, covered_through=start + timedelta(days=60))
+        for key, row in ctx.freshness.items()
+    }
+    return replace(ctx, freshness=freshness, cache={})
+
+
+def section_level(out: PrecedenceOutput, section: str) -> list[tuple[str, int | None]]:
+    """A section's ``incomplete_dataset`` findings as ``(dataset, dataset_id)``, stored order."""
+    return [
+        (finding.evidence["dataset"], finding.evidence["dataset_id"])
+        for finding in incomplete_dataset_findings(out)[section]
+    ]
+
+
+def test_section_datasets_are_the_union_each_rule_module_declares() -> None:
+    assert EXPECTED_SECTION_DATASETS[KEYWORDS] == keywords.SECTION_DATASETS
+    assert EXPECTED_SECTION_DATASETS[CAMPAIGNS] == campaigns.SECTION_DATASETS
+    assert EXPECTED_SECTION_DATASETS[BUDGET] == budget.SECTION_DATASETS
+    assert creative.SECTION_DATASETS == creative.REQUIRED_DATASETS
+    assert EXPECTED_SECTION_DATASETS[CREATIVE] == creative.SECTION_DATASETS
+    assert white_papers.SECTION_DATASETS == white_papers.REQUIRED_DATASETS
+    assert EXPECTED_SECTION_DATASETS[WHITE_PAPERS] == white_papers.SECTION_DATASETS
+    assert set(keywords.SECTION_DATASETS) == {
+        *keywords.K1_DATASETS,
+        *keywords.K2_DATASETS,
+        *keywords.K3_DATASETS,
+    }
+    assert dict(precedence._SECTION_DATASETS) == dict(EXPECTED_SECTION_DATASETS)
+    assert tuple(precedence._SECTION_DATASETS) == SECTION_ORDER
+
+
+def test_an_empty_section_names_each_dataset_that_does_not_cover_the_window() -> None:
+    ctx = uncovered(build("default"))
+    window = ctx.window
+    google = ctx.datasets["google"].dataset_id
+    linkedin = ctx.datasets["linkedin"].dataset_id
+    assert ctx.linkedin_crm is not None
+    companion = ctx.linkedin_crm.dataset.dataset_id
+    assert companion != ctx.datasets["hubspot"].dataset_id
+    out = apply_precedence(RuleResult(), ctx)
+    ids = {"google": google, "linkedin": linkedin, "hubspot": companion}
+    for section in SECTION_ORDER:
+        dated = sorted(
+            name for name in EXPECTED_SECTION_DATASETS[section] if name not in FULL_STATE_DATASETS
+        )
+        assert section_level(out, section) == [(name, ids[name.split(".")[0]]) for name in dated]
+        assert not out.items[section]
+        for finding in incomplete_dataset_findings(out)[section]:
+            name = finding.evidence["dataset"]
+            row = ctx.freshness[(finding.evidence["dataset_id"], name)]
+            assert row.covered_from is not None
+            reason = (
+                f"covers from {row.covered_from.isoformat()}, "
+                f"after the window start {window.start.isoformat()}"
+            )
+            assert finding.section == section
+            assert finding.entity is None
+            assert finding.message == f"{name} is not complete over the window: {reason}"
+            assert dict(finding.evidence) == {
+                "dataset": name,
+                "dataset_id": finding.evidence["dataset_id"],
+                "completeness": "complete",
+                "covered_from": row.covered_from,
+                "covered_through": row.covered_through,
+                "reason": None,
+                "reasons": (reason,),
+                "items": 0,
+            }
+    # The findings follow every other finding of their section.
+    assert all(
+        finding.code == FINDING_INCOMPLETE_DATASET
+        for section in SECTION_ORDER
+        for finding in out.findings[section]
+    )
+
+
+def test_an_empty_section_whose_datasets_cover_the_window_has_no_finding() -> None:
+    ctx = build("default")
+    out = apply_precedence(RuleResult(), ctx)
+    assert all(not out.findings[section] for section in SECTION_ORDER)
+    assert all(not out.items[section] for section in SECTION_ORDER)
+
+
+def test_an_empty_section_judges_a_finest_partition_shortfall_by_its_days() -> None:
+    """A dated Q-G6 shortfall reaches an empty section's finding only through its window days.
+
+    With no item stored, a ``google.search_terms`` result limit on a day before the window adds
+    no finding to any section. Add a day inside the window: Keywords and Campaigns, whose rules
+    read the dataset, each get one finding with ``items`` 0 that names that day alone.
+    """
+    ctx = build("default")
+    before = (ctx.window.start - timedelta(days=1)).isoformat()
+    within = (ctx.window.start + timedelta(days=3)).isoformat()
+    readers = [
+        section for section in SECTION_ORDER if SEARCH_TERMS in EXPECTED_SECTION_DATASETS[section]
+    ]
+    assert readers == [KEYWORDS, CAMPAIGNS]
+    excluded = with_google_freshness(
+        ctx,
+        SEARCH_TERMS,
+        completeness="incomplete",
+        reason=f"{RESULT_LIMIT} ({before}, ad group 990200000000)",
+    )
+    clear = apply_precedence(RuleResult(), excluded)
+    assert all(not clear.findings[section] for section in SECTION_ORDER)
+
+    included = with_google_freshness(
+        ctx,
+        SEARCH_TERMS,
+        completeness="incomplete",
+        reason=f"{RESULT_LIMIT} ({before}, ad group 990200000000; {within}, ad group 5)",
+    )
+    out = apply_precedence(RuleResult(), included)
+    google = ctx.datasets["google"].dataset_id
+    named = f"{RESULT_LIMIT} ({within}, ad group 5)"
+    for section in SECTION_ORDER:
+        assert not out.items[section]
+        expected = [(SEARCH_TERMS, google)] if section in readers else []
+        assert section_level(out, section) == expected
+    for section in readers:
+        finding = incomplete_dataset_finding(out, section, SEARCH_TERMS)
+        assert finding.message == f"{SEARCH_TERMS} is not complete over the window: {named}"
+        assert finding.evidence["reasons"] == (named,)
+        assert finding.evidence["items"] == 0
+        assert finding.evidence["completeness"] == "incomplete"
+
+
+def test_a_section_with_items_gets_no_section_level_finding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = uncovered(build("default"))
+    results = evaluate(ctx)
+    out = apply_precedence(results, ctx)
+    occupied = [section for section in SECTION_ORDER if out.items[section]]
+    assert occupied == list(SECTION_ORDER)
+    for section in occupied:
+        for finding in incomplete_dataset_findings(out)[section]:
+            readers = incomplete_readers(out, section, finding.evidence["dataset"])
+            assert finding.evidence["items"] == len(readers) >= 1
+
+    def unchanged(
+        _ctx: AnalysisContext,
+        built: Mapping[str, tuple[Finding, ...]],
+        _candidates: Sequence[Candidate],
+    ) -> dict[str, tuple[Finding, ...]]:
+        """Step 10's recounted findings, with no section-level findings added."""
+        return dict(built)
+
+    monkeypatch.setattr(precedence, "_section_data_findings", unchanged)
+    assert dict(apply_precedence(results, ctx).findings) == dict(out.findings)
+
+
+def test_a_section_emptied_by_feedback_names_each_dataset_once() -> None:
+    ctx = incomplete_world("search_terms")
+    before = apply_precedence(evaluate(ctx), ctx)
+    readers = of_rule(before, KEYWORDS)
+    assert readers
+    dismissed = dismissing(ctx, readers)
+    out = apply_precedence(evaluate(dismissed), dismissed)
+    assert not out.items[KEYWORDS]
+    # The item-based finding stays with items 0; the section's complete datasets add none,
+    # and the dataset it already names is never repeated.
+    google = ctx.datasets["google"].dataset_id
+    assert section_level(out, KEYWORDS) == [(SEARCH_TERMS, google)]
+    stored = incomplete_dataset_finding(out, KEYWORDS, SEARCH_TERMS)
+    built = incomplete_dataset_finding(before, KEYWORDS, SEARCH_TERMS)
+    assert dict(stored.evidence) == {**built.evidence, "items": 0}
+    # With the metrics dataset short too, the emptied section names it once, through the
+    # finding its dismissed readers left (every reason they were built with kept).
+    late = with_google_freshness(
+        dismissed, METRICS, covered_from=ctx.window.start + timedelta(days=3)
+    )
+    out = apply_precedence(evaluate(late), late)
+    assert section_level(out, KEYWORDS) == [(METRICS, google), (SEARCH_TERMS, google)]
+    metrics_finding = incomplete_dataset_finding(out, KEYWORDS, METRICS)
+    assert metrics_finding.evidence["items"] == 0
+    window_reason = (
+        f"covers from {(ctx.window.start + timedelta(days=3)).isoformat()}, "
+        f"after the window start {ctx.window.start.isoformat()}"
+    )
+    assert window_reason in metrics_finding.evidence["reasons"]
+    undismissed = replace(late, feedback=(), cache={})
+    readers_before = apply_precedence(evaluate(undismissed), undismissed)
+    assert dict(metrics_finding.evidence) == {
+        **incomplete_dataset_finding(readers_before, KEYWORDS, METRICS).evidence,
+        "items": 0,
+    }
+
+
+def test_keywords_without_an_active_google_dataset_say_so() -> None:
+    ctx = build("default")
+    no_google = replace(
+        ctx,
+        datasets={source: ref for source, ref in ctx.datasets.items() if source != "google"},
+        campaigns={key: info for key, info in ctx.campaigns.items() if info.source != "google"},
+        cache={},
+    )
+    assert keywords.evaluate(no_google) == RuleResult()
+    out = apply_precedence(evaluate(no_google), no_google)
+    assert not out.items[KEYWORDS]
+    names = sorted(EXPECTED_SECTION_DATASETS[KEYWORDS])
+    assert section_level(out, KEYWORDS) == [(name, None) for name in names]
+    for finding in incomplete_dataset_findings(out)[KEYWORDS]:
+        name = finding.evidence["dataset"]
+        assert (
+            finding.message == f"{name} is not complete over the window: no active Google dataset"
+        )
+        assert dict(finding.evidence) == {
+            "dataset": name,
+            "dataset_id": None,
+            "completeness": "unknown",
+            "covered_from": None,
+            "covered_through": None,
+            "reason": None,
+            "reasons": ("no active Google dataset",),
+            "items": 0,
+        }
+
+
+def test_hubspot_section_datasets_resolve_to_the_effective_crm_dataset() -> None:
+    ctx = build("default")
+    assert ctx.linkedin_crm is not None
+    companion = ctx.linkedin_crm.dataset.dataset_id
+    primary = ctx.datasets["hubspot"].dataset_id
+
+    def with_row(target: int, **changes: Any) -> AnalysisContext:
+        key = (target, DEAL_SEARCH)
+        return replace(
+            ctx, freshness={**ctx.freshness, key: replace(ctx.freshness[key], **changes)}, cache={}
+        )
+
+    # The companion's row is the one White papers reads while LinkedIn is simulated.
+    capped = with_row(companion, completeness="incomplete", reason=CEILING)
+    out = apply_precedence(RuleResult(), capped)
+    assert section_level(out, WHITE_PAPERS) == [(DEAL_SEARCH, companion)]
+    finding = incomplete_dataset_finding(out, WHITE_PAPERS, DEAL_SEARCH)
+    assert finding.message == f"{DEAL_SEARCH} is not complete over the window: {CEILING}"
+    assert finding.evidence["reasons"] == (CEILING,)
+    assert finding.evidence["reason"] == CEILING
+    assert finding.evidence["completeness"] == "incomplete"
+    assert all(not section_level(out, section) for section in SECTION_ORDER[:-1])
+    # HubSpot's primary row is not the effective CRM dataset, so it gates nothing here.
+    out = apply_precedence(RuleResult(), with_row(primary, completeness="incomplete"))
+    assert all(not out.findings[section] for section in SECTION_ORDER)
+    # A dataset id with no freshness row keeps "no freshness record".
+    freshness = dict(ctx.freshness)
+    freshness.pop((companion, DEAL_SEARCH))
+    out = apply_precedence(RuleResult(), replace(ctx, freshness=freshness, cache={}))
+    finding = incomplete_dataset_finding(out, WHITE_PAPERS, DEAL_SEARCH)
+    assert finding.evidence["dataset_id"] == companion
+    assert finding.evidence["completeness"] == "unknown"
+    assert finding.evidence["reasons"] == ("no freshness record",)
+    # Without an active LinkedIn dataset there is no effective CRM dataset: LinkedIn is named.
+    no_linkedin = replace(
+        ctx,
+        datasets={source: ref for source, ref in ctx.datasets.items() if source != "linkedin"},
+        linkedin_crm=None,
+        cache={},
+    )
+    out = apply_precedence(RuleResult(), no_linkedin)
+    names = sorted(EXPECTED_SECTION_DATASETS[WHITE_PAPERS])
+    assert section_level(out, WHITE_PAPERS) == [(name, None) for name in names]
+    for finding in incomplete_dataset_findings(out)[WHITE_PAPERS]:
+        assert finding.evidence["reasons"] == ("no active LinkedIn dataset",)
+    # Without HubSpot's effective CRM dataset alone, HubSpot is named.
+    no_crm = replace(ctx, linkedin_crm=None, cache={})
+    out = apply_precedence(RuleResult(), no_crm)
+    hubspot = [name for name in names if name.startswith("hubspot.")]
+    assert section_level(out, WHITE_PAPERS) == [(name, None) for name in hubspot]
+    for finding in incomplete_dataset_findings(out)[WHITE_PAPERS]:
+        assert finding.evidence["reasons"] == ("no active HubSpot dataset",)
+
+
+def test_section_level_findings_are_identical_for_any_input_order() -> None:
+    ctx = incomplete_world("search_terms")
+    before = apply_precedence(evaluate(ctx), ctx)
+    dismissed = dismissing(ctx, [*of_rule(before, KEYWORDS), *of_rule(before, CREATIVE)])
+    late = uncovered(dismissed)
+    results = evaluate(late)
+    out = apply_precedence(results, late)
+    assert not out.items[KEYWORDS]
+    assert not out.items[CREATIVE]
+    assert section_level(out, CREATIVE)
+    reordered = apply_precedence(list(reversed(results)), late)
+    assert dict(reordered.findings) == dict(out.findings)
+    built = incomplete_dataset_findings(out)
+    survivors = [item.candidate for item in out.all_items()]
+    forward = precedence._section_data_findings(late, built, survivors)
+    assert forward == precedence._section_data_findings(late, built, survivors[::-1])
+    assert forward == built

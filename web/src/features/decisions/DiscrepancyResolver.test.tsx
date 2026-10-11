@@ -44,9 +44,9 @@ import { act, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import { useState } from 'react';
 
 import { CURRENT_STATE_POLL_MS, DISCREPANCY_PAGE_SIZE, queryKeys } from '../../api/queries';
-import type { Discrepancy, SubjectView } from '../../api/types';
+import type { CampaignStatus, Discrepancy, SubjectView } from '../../api/types';
 import { Button } from '../../design-system';
-import { formatInstant } from '../../lib/format';
+import { MONEY_SEPARATOR, formatInstant } from '../../lib/format';
 import {
   FIXTURE_BUDGET_IDS,
   FIXTURE_CAMPAIGN_IDS,
@@ -431,7 +431,7 @@ describe('DiscrepancyResolver list', () => {
     expect(within(missing).getByText('Awaiting platform')).toBeTruthy();
     expect(
       within(missing).getByText(
-        'Platform shows not returned by the platform, last decided daily budget $500.00',
+        'Platform shows not returned by the platform, last decided daily budget USD 500.00',
       ),
     ).toBeTruthy();
   });
@@ -803,6 +803,310 @@ describe('DiscrepancyResolver list', () => {
 });
 
 // ---------------------------------------------------------------------------------------------
+// Focus after a closing resolution (WCAG 2.2 SC 2.4.3)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Three discrepancies in the API's order, each offering "Platform is correct": "Brand Search —
+ * US", "Search Partners — US" and "Search Shared Budget".
+ */
+function threeCards(): Discrepancy[] {
+  return [
+    makeDiscrepancy('status'),
+    makeDiscrepancy('budget', {
+      id: 52,
+      shape: 'shared_member',
+      detected_at: '2026-10-06T03:10:00Z',
+    }),
+    makeDiscrepancy('budget', { id: 53, shape: 'budget', detected_at: '2026-10-06T04:00:00Z' }),
+  ];
+}
+
+/** `discrepancy` as the API answers a resolution that closed it. */
+function closedBy(discrepancy: Discrepancy): Discrepancy {
+  return { ...discrepancy, state: 'resolved', resolution: 'platform_correct' };
+}
+
+/**
+ * The resolver's handlers for `cards`, where every resolution closes the discrepancy it names:
+ * the API answers it `resolved`, and every later read leaves it out.
+ */
+function closingHandlers(cards: readonly Discrepancy[]): MockHandlers {
+  const closed = new Set<string>();
+  return {
+    'GET /runs/latest': json(200, makeRun()),
+    [LIST_KEY]: () => json(200, cards.filter((card) => !closed.has(String(card.id)))),
+    [RESOLVE_KEY]: (call) => {
+      const card = cards.find((candidate) => String(candidate.id) === call.params.id);
+      if (card === undefined) {
+        return apiError(404, 'not_found', 'Discrepancy not found');
+      }
+      closed.add(String(card.id));
+      return json(200, closedBy(card));
+    },
+  };
+}
+
+/** The list item that holds a subject's resolver card. */
+async function findCardItem(name: string): Promise<HTMLElement> {
+  const item = (await findCard(name)).closest('li');
+  if (item === null) {
+    throw new Error(`The card of "${name}" is not in a list item`);
+  }
+  return item;
+}
+
+describe('DiscrepancyResolver focus after a closing resolution', () => {
+  it('moves focus to the next card when a resolution closes the first one', async () => {
+    mockApi(closingHandlers(threeCards()));
+    await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions' });
+    const closing = await findCard('Brand Search — US');
+    const next = await findCardItem('Search Partners — US');
+    const last = await findCardItem('Search Shared Budget');
+    // As in a browser, where the loading (disabled) button drops focus to the body.
+    expect(document.activeElement).toBe(document.body);
+
+    fireEvent.click(buttonNamed('Platform is correct', closing));
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(next);
+    });
+    expect(closing.isConnected).toBe(false);
+    expect(next.getAttribute('tabindex')).toBe('-1');
+    expect(last.hasAttribute('tabindex')).toBe(false);
+    expect(listRegion().hasAttribute('tabindex')).toBe(false);
+    expect(within(listRegion()).getByText('Brand Search — US resolved')).toBeTruthy();
+  });
+
+  it('moves focus to the previous card when a resolution closes the last one', async () => {
+    mockApi(closingHandlers(threeCards()));
+    await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions' });
+    const first = await findCardItem('Brand Search — US');
+    const previous = await findCardItem('Search Partners — US');
+    const closing = await findCard('Search Shared Budget');
+
+    fireEvent.click(buttonNamed('Platform is correct', closing));
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(previous);
+    });
+    expect(closing.isConnected).toBe(false);
+    expect(screen.getAllByRole('article')).toHaveLength(2);
+    expect(first.hasAttribute('tabindex')).toBe(false);
+  });
+
+  it('moves focus to the status region when a resolution closes the only card', async () => {
+    mockApi(closingHandlers([makeDiscrepancy('status')]));
+    await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions' });
+    const closing = await findCard('Brand Search — US');
+    const region = listRegion();
+    expect(region.hasAttribute('tabindex')).toBe(false);
+
+    fireEvent.click(buttonNamed('Platform is correct', closing));
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(region);
+    });
+    expect(region.getAttribute('tabindex')).toBe('-1');
+    expect(listRegion()).toBe(region);
+    expect(within(region).getByText('No open discrepancies')).toBeTruthy();
+    expect(within(region).getByText('Brand Search — US resolved')).toBeTruthy();
+    expect(screen.queryByRole('list')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('keeps the focused status region focusable when a later read lists a new card', async () => {
+    const [first, second] = threeCards();
+    if (first === undefined || second === undefined) {
+      throw new Error('threeCards() returned fewer than two discrepancies');
+    }
+    let read = json(200, [first]);
+    mockApi({
+      'GET /runs/latest': json(200, makeRun()),
+      [LIST_KEY]: () => read,
+      [RESOLVE_KEY]: () => {
+        read = json(200, []);
+        return json(200, closedBy(first));
+      },
+    });
+    const { queryClient } = await renderWithProviders(<DiscrepancyResolver />, {
+      path: '/decisions',
+    });
+    const closing = await findCard('Brand Search — US');
+    const region = listRegion();
+    fireEvent.click(buttonNamed('Platform is correct', closing));
+    await waitFor(() => {
+      expect(document.activeElement).toBe(region);
+    });
+
+    // The worker raises another discrepancy; the next poll lists it.
+    read = json(200, [second]);
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: queryKeys.discrepanciesAll });
+    });
+
+    const raised = await findCardItem('Search Partners — US');
+    await settle(queryClient);
+    expect(region.getAttribute('tabindex')).toBe('-1');
+    expect(document.activeElement).toBe(region);
+    expect(raised.contains(document.activeElement)).toBe(false);
+  });
+
+  it('moves focus to a card listed since when the closed card had no neighbour', async () => {
+    const [first, second] = threeCards();
+    if (first === undefined || second === undefined) {
+      throw new Error('threeCards() returned fewer than two discrepancies');
+    }
+    let closed = false;
+    mockApi({
+      'GET /runs/latest': json(200, makeRun()),
+      // The worker raised another discrepancy while the only listed one was being resolved.
+      [LIST_KEY]: () => json(200, closed ? [second] : [first]),
+      [RESOLVE_KEY]: () => {
+        closed = true;
+        return json(200, closedBy(first));
+      },
+    });
+    await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions' });
+    const closing = await findCard('Brand Search — US');
+    const region = listRegion();
+
+    fireEvent.click(buttonNamed('Platform is correct', closing));
+
+    const raised = await findCardItem('Search Partners — US');
+    await waitFor(() => {
+      expect(document.activeElement).toBe(raised);
+    });
+    expect(closing.isConnected).toBe(false);
+    expect(raised.getAttribute('tabindex')).toBe('-1');
+    expect(region.hasAttribute('tabindex')).toBe(false);
+  });
+
+  it('leaves focus the user moved while the resolution ran where it is', async () => {
+    const [first, second] = threeCards();
+    if (first === undefined || second === undefined) {
+      throw new Error('threeCards() returned fewer than two discrepancies');
+    }
+    const response = deferred<MockResponse>();
+    let closed = false;
+    mockApi({
+      'GET /runs/latest': json(200, makeRun()),
+      [LIST_KEY]: () => json(200, closed ? [second] : [first, second]),
+      [RESOLVE_KEY]: () => response.promise,
+    });
+    const { queryClient } = await renderWithProviders(<DiscrepancyResolver />, {
+      path: '/decisions',
+    });
+    const closing = await findCard('Brand Search — US');
+    const other = await findCard('Search Partners — US');
+
+    fireEvent.click(buttonNamed('Platform is correct', closing));
+    // The loading button stays focusable (aria-disabled) while its request runs.
+    await waitFor(() => {
+      expect(buttonNamed('Platform is correct', closing).getAttribute('aria-busy')).toBe('true');
+    });
+    const moved = buttonNamed('Decision is correct', other);
+    moved.focus();
+    closed = true;
+    response.resolve(json(200, closedBy(first)));
+
+    await waitFor(() => {
+      expect(closing.isConnected).toBe(false);
+    });
+    await settle(queryClient);
+    expect(document.activeElement).toBe(moved);
+  });
+
+  it('keeps focus on the clicked button when the discrepancy waits for the platform', async () => {
+    const [, second] = threeCards();
+    if (second === undefined) {
+      throw new Error('threeCards() returned fewer than two discrepancies');
+    }
+    let awaiting = false;
+    mockApi({
+      'GET /runs/latest': json(200, makeRun()),
+      [LIST_KEY]: () =>
+        json(200, [
+          makeDiscrepancy('status', awaiting ? { state: 'awaiting_platform' } : {}),
+          second,
+        ]),
+      [RESOLVE_KEY]: () => {
+        awaiting = true;
+        return json(
+          200,
+          makeDiscrepancy('status', {
+            state: 'awaiting_platform',
+            resolution: 'decision_correct',
+          }),
+        );
+      },
+    });
+    const { queryClient } = await renderWithProviders(<DiscrepancyResolver />, {
+      path: '/decisions',
+    });
+    const card = await findCard('Brand Search — US');
+
+    fireEvent.click(buttonNamed('Decision is correct', card));
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(buttonNamed('Decision is correct', card));
+    });
+    await settle(queryClient);
+    expect(document.activeElement).toBe(buttonNamed('Decision is correct', card));
+    expect(within(card).getByText('Awaiting platform')).toBeTruthy();
+    const focusable = screen
+      .getAllByRole('listitem')
+      .filter((item) => item.hasAttribute('tabindex'));
+    expect(focusable).toEqual([]);
+    expect(listRegion().hasAttribute('tabindex')).toBe(false);
+    expect(within(listRegion()).queryByText(/resolved$/)).toBeNull();
+  });
+
+  it('focuses the closed card a failed refresh keeps, then the next card once it leaves', async () => {
+    const [first, second] = threeCards();
+    if (first === undefined || second === undefined) {
+      throw new Error('threeCards() returned fewer than two discrepancies');
+    }
+    let read = json(200, [first, second]);
+    mockApi({
+      'GET /runs/latest': json(200, makeRun()),
+      [LIST_KEY]: () => read,
+      [RESOLVE_KEY]: () => {
+        read = apiError(503, 'unavailable', 'The database is restarting');
+        return json(200, closedBy(first));
+      },
+    });
+    const { queryClient } = await renderWithProviders(<DiscrepancyResolver />, {
+      path: '/decisions',
+    });
+    const closing = await findCardItem('Brand Search — US');
+    const next = await findCardItem('Search Partners — US');
+
+    fireEvent.click(buttonNamed('Platform is correct', closing));
+
+    const region = listRegion();
+    expect(await within(region).findByText('Discrepancies could not be refreshed')).toBeTruthy();
+    await waitFor(() => {
+      expect(document.activeElement).toBe(closing);
+    });
+    expect(closing.getAttribute('tabindex')).toBe('-1');
+    expect(outcomeRegion(closing).textContent).toBe('Resolved');
+    expect(next.hasAttribute('tabindex')).toBe(false);
+
+    read = json(200, [second]);
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: queryKeys.discrepanciesAll });
+    });
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(next);
+    });
+    expect(closing.isConnected).toBe(false);
+    expect(within(region).queryByText('Discrepancies could not be refreshed')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
 // The linked discrepancy (`/decisions#discrepancy-{id}`)
 // ---------------------------------------------------------------------------------------------
 
@@ -1151,7 +1455,7 @@ const COMPARISONS: readonly ComparisonCase[] = [
   [
     'an own budget amount',
     makeDiscrepancy('budget'),
-    'Platform shows daily budget $250.00, last decided daily budget $200.00',
+    'Platform shows daily budget USD 250.00, last decided daily budget USD 200.00',
   ],
   [
     "a shared member's budget assignment",
@@ -1161,27 +1465,27 @@ const COMPARISONS: readonly ComparisonCase[] = [
   [
     "a shared budget's amount",
     makeDiscrepancy('budget', { shape: 'budget' }),
-    'Platform shows daily budget $550.00, last decided daily budget $500.00',
+    'Platform shows daily budget USD 550.00, last decided daily budget USD 500.00',
   ],
   [
     'an untracked own-budget campaign',
     makeDiscrepancy('untracked'),
-    'Platform shows Active · daily budget $200.00, last decided nothing decided yet',
+    'Platform shows Active · daily budget USD 200.00, last decided no decision recorded',
   ],
   [
     'an untracked shared member',
     makeDiscrepancy('untracked', { shape: 'shared_member' }),
-    'Platform shows Active · shared budget 31000402, last decided nothing decided yet',
+    'Platform shows Active · shared budget 31000402, last decided no decision recorded',
   ],
   [
     'an untracked shared budget, which has no status',
     makeDiscrepancy('untracked', { shape: 'budget' }),
-    'Platform shows daily budget $500.00, last decided nothing decided yet',
+    'Platform shows daily budget USD 500.00, last decided no decision recorded',
   ],
   [
     'a missing campaign',
     makeDiscrepancy('missing'),
-    'Platform shows not returned by the platform, last decided Active · daily budget $200.00',
+    'Platform shows not returned by the platform, last decided Active · daily budget USD 200.00',
   ],
   [
     'a campaign returned after its acknowledged removal',
@@ -1199,7 +1503,7 @@ const COMPARISONS: readonly ComparisonCase[] = [
   [
     'a shared budget returned after its acknowledged removal',
     makeDiscrepancy('budget', { shape: 'budget', decided_value: { tombstone: true } }),
-    'Platform shows daily budget $550.00, last decided Removal acknowledged',
+    'Platform shows daily budget USD 550.00, last decided Removal acknowledged',
   ],
   [
     'a Google amount one micro finer than the minor unit',
@@ -1211,12 +1515,12 @@ const COMPARISONS: readonly ComparisonCase[] = [
         amount_micros: 200_000_001,
       },
     }),
-    'Platform shows daily budget $200.00 (exactly 200.000001), last decided daily budget $200.00',
+    'Platform shows daily budget USD 200.000001, last decided daily budget USD 200.00',
   ],
   [
     'an amount known only in micros',
     makeDiscrepancy('budget', { platform_value: { currency: 'USD', amount_micros: 200_000_001 } }),
-    'Platform shows budget $200.00 (exactly 200.000001), last decided daily budget $200.00',
+    'Platform shows budget USD 200.000001, last decided daily budget USD 200.00',
   ],
   [
     'a lifetime budget',
@@ -1224,31 +1528,31 @@ const COMPARISONS: readonly ComparisonCase[] = [
       decided_value: { status: 'active', daily_budget: null, total_budget: '5000.00' },
       platform_value: { daily_budget: null, total_budget: '4500.00' },
     }),
-    'Platform shows total budget $4,500.00, last decided total budget $5,000.00',
+    'Platform shows total budget USD 4,500.00, last decided total budget USD 5,000.00',
   ],
   [
     'a micro amount beyond exact integer precision',
     makeDiscrepancy('budget', {
       platform_value: { currency: 'USD', amount_micros: Number.MAX_SAFE_INTEGER + 2 },
     }),
-    'Platform shows budget unavailable, last decided daily budget $200.00',
+    'Platform shows budget unavailable, last decided daily budget USD 200.00',
   ],
   [
     'a side that reports no budget',
     makeDiscrepancy('budget', { platform_value: { daily_budget: null, total_budget: null } }),
-    'Platform shows no budget set, last decided daily budget $200.00',
+    'Platform shows no budget set, last decided daily budget USD 200.00',
   ],
   [
     'a side whose reported amount is unknown',
     makeDiscrepancy('budget', {
       platform_value: { daily_budget: null, total_budget: null, amount_micros: null },
     }),
-    'Platform shows budget unavailable, last decided daily budget $200.00',
+    'Platform shows budget unavailable, last decided daily budget USD 200.00',
   ],
   [
     'a side with no budget key at all',
     makeDiscrepancy('budget', { platform_value: {} }),
-    'Platform shows budget unavailable, last decided daily budget $200.00',
+    'Platform shows budget unavailable, last decided daily budget USD 200.00',
   ],
   [
     'a status the platform did not report',
@@ -1279,13 +1583,94 @@ const COMPARISONS: readonly ComparisonCase[] = [
     'Platform shows budget assignment unavailable, last decided shared budget 31000402',
   ],
   [
-    "amounts in a side's currency when the subject names none",
+    // Each side names its own currency, else the subject's; with neither, the amount implies
+    // none, as the backend's render_value words it.
+    "amounts in each side's own currency when the subject names none",
     makeDiscrepancy('budget', {
       subject: subjectWithCurrency(null),
       decided_value: { status: 'active', daily_budget: '200.00' },
       platform_value: { daily_budget: '250.00', currency: 'EUR' },
     }),
-    'Platform shows daily budget €250.00, last decided daily budget €200.00',
+    'Platform shows daily budget EUR 250.00, last decided daily budget 200.00',
+  ],
+  [
+    "a side's own currency ahead of the subject's",
+    makeDiscrepancy('budget', {
+      platform_value: { daily_budget: '250.00', currency: 'eur' },
+    }),
+    'Platform shows daily budget EUR 250.00, last decided daily budget USD 200.00',
+  ],
+  [
+    'a daily and a total budget, joined as the parts of one state',
+    makeDiscrepancy('untracked', {
+      subject: subjectWithCurrency('EUR'),
+      platform_value: { status: 'active', daily_budget: '50.00', total_budget: '1000.00' },
+    }),
+    'Platform shows Active · daily budget EUR 50.00 · total budget EUR 1,000.00, ' +
+      'last decided no decision recorded',
+  ],
+  [
+    'a Google amount whose micros differ from its decimal text, read from the micros',
+    makeDiscrepancy('budget', {
+      platform_value: {
+        daily_budget: '999.00',
+        total_budget: null,
+        currency: 'USD',
+        amount_micros: 12_345_678,
+      },
+    }),
+    'Platform shows daily budget USD 12.345678, last decided daily budget USD 200.00',
+  ],
+  [
+    'an amount in a currency without a minor unit, keeping a significant fraction',
+    makeDiscrepancy('budget', {
+      subject: subjectWithCurrency('JPY'),
+      decided_value: { status: 'active', daily_budget: '5000', total_budget: null },
+      platform_value: { daily_budget: '5000.5', total_budget: null },
+    }),
+    'Platform shows daily budget JPY 5,000.5, last decided daily budget JPY 5,000',
+  ],
+  [
+    // ISO 4217, and so the backend that validates decisions, gives IQD three places and AFN
+    // two; CLDR gives both none. The resolver follows the backend.
+    'an amount in a thousandth currency, at the ISO minor unit',
+    makeDiscrepancy('budget', {
+      subject: subjectWithCurrency('IQD'),
+      decided_value: { status: 'active', daily_budget: '60.00', total_budget: null },
+      platform_value: { daily_budget: '50.00', total_budget: null },
+    }),
+    'Platform shows daily budget IQD 50.000, last decided daily budget IQD 60.000',
+  ],
+  [
+    'an amount in a two-place currency that CLDR gives none',
+    makeDiscrepancy('budget', {
+      subject: subjectWithCurrency('AFN'),
+      decided_value: { status: 'active', daily_budget: '60', total_budget: null },
+      platform_value: { daily_budget: '50', total_budget: null },
+    }),
+    'Platform shows daily budget AFN 50.00, last decided daily budget AFN 60.00',
+  ],
+  [
+    'a reported amount that is not a number',
+    makeDiscrepancy('budget', { platform_value: { daily_budget: 'fifty', total_budget: null } }),
+    'Platform shows budget unavailable, last decided daily budget USD 200.00',
+  ],
+  [
+    'a status outside the contract, shown as sent',
+    makeDiscrepancy('status', {
+      platform_value: { status: ' archived ' as unknown as CampaignStatus },
+    }),
+    'Platform shows archived, last decided Active',
+  ],
+  [
+    'a tombstone recording another status',
+    makeDiscrepancy('status', { decided_value: { status: 'paused', tombstone: true } }),
+    'Platform shows Paused, last decided Removal acknowledged · Paused',
+  ],
+  [
+    'a side the API sent no value for, outside missing and untracked',
+    makeDiscrepancy('status', { platform_value: null }),
+    'Platform shows unavailable, last decided Active',
   ],
 ];
 
@@ -1297,6 +1682,32 @@ describe('DiscrepancyResolver values', () => {
 
     const list = await screen.findByRole('list', { name: 'Discrepancies to resolve' });
     expect(within(list).getByText(line)).toBeTruthy();
+  });
+
+  it('words an IQD amount exactly as the C0 card on /actions does', async () => {
+    mockApi(
+      listHandlers([
+        makeDiscrepancy('budget', {
+          subject: subjectWithCurrency('IQD'),
+          decided_value: { status: 'active', daily_budget: '60.00', total_budget: null },
+          platform_value: { daily_budget: '50.00', total_budget: null, currency: 'IQD' },
+        }),
+      ]),
+    );
+
+    await renderWithProviders(<DiscrepancyResolver />, { path: '/decisions' });
+
+    const list = await screen.findByRole('list', { name: 'Discrepancies to resolve' });
+    const line = within(list).getByText(/^Platform shows /u);
+    // backend/tests/unit/test_analysis_discrepancy.py (MONEY_PARITY) asserts render_value words
+    // the platform side "daily budget IQD 50.000", with a plain space where the resolver puts
+    // MONEY_SEPARATOR (U+00A0). Change both sides together.
+    expect(line.textContent).toBe(
+      'Platform shows daily budget IQD\u00a050.000, last decided daily budget IQD\u00a060.000',
+    );
+    expect(line.textContent.replaceAll(MONEY_SEPARATOR, ' ')).toBe(
+      'Platform shows daily budget IQD 50.000, last decided daily budget IQD 60.000',
+    );
   });
 });
 

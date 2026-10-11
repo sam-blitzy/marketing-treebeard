@@ -10,7 +10,7 @@
  *       <h3|h4 class="ds-card__title">          the action as the headline
  *       <p class="ds-card__figure">             optional: the headline number, outside the heading
  *         <span class="ds-card__figure-label">  what the number is, e.g. "Wasted spend"
- *         <span class="ds-card__figure-value">  the formatted number, e.g. "$186.40"
+ *         <span class="ds-card__figure-value">  the formatted number, e.g. "USD 186.40"
  *       <div class="ds-card__meta">             optional: entity name and its source
  *     <div class="ds-card__body">               reason, evidence table, window chip, flags row
  *     <div class="ds-card__footer">             actions (Record decision, Mark done, Dismiss...)
@@ -25,9 +25,9 @@
  * resolves to a token, and the hairline follows the spacing scale when Blitzy OS rebinds it, so
  * this file uses no literal px border width.
  *
- * Reflow (WCAG 2.2 SC 1.4.10): the header and footer wrap onto further lines instead of
- * overflowing a narrow viewport, and overflow-wrap lets long unbroken strings such as search
- * terms, URNs or campaign names break inside the card rather than widen it.
+ * Reflow (WCAG 2.2 SC 1.4.10): the header's content column and the footer wrap onto further
+ * lines instead of overflowing a narrow viewport, and overflow-wrap lets long unbroken strings
+ * such as search terms, URNs or campaign names break inside the card rather than widen it.
  */
 
 /*
@@ -50,45 +50,74 @@
 }
 
 /*
- * Header row: rank, headline, headline figure and entity line share one baseline while they
- * fit, and wrap onto further lines when they do not. The row gap is tighter than the column gap,
- * so wrapped header lines still read as one block.
+ * Header: a leading rank column and one content column. The rank sits in the first column of the
+ * first row, sharing a baseline with the headline's first line; the headline, the headline figure
+ * and the entity line stack in the second column, one row each. So the headline starts at the
+ * same offset beside the rank whatever its length or the viewport width, and wraps inside its
+ * own column instead of dropping below the rank. The content track's minimum of 0 lets it shrink
+ * below its longest word, so long strings wrap inside the card (Reflow). The rank column is sized
+ * by the rank alone and the rank carries its own trailing margin, so a card without a rank has an
+ * empty, zero-width first column and its headline starts at the card padding. The row gap is
+ * tighter than the card's gap, so the header rows read as one block.
  */
 .ds-card__header {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
   align-items: baseline;
-  gap: var(--space-2) var(--space-3);
+  row-gap: var(--space-2);
 }
 
-/* Rank: a quiet number ahead of the headline. Its "Rank " prefix is visually hidden. */
+/*
+ * Rank: a quiet number ahead of the headline. Its "Rank " prefix is visually hidden. Its minimum
+ * width holds two digits and the number is right-aligned in it, so ranks 1 to 99 give every
+ * ranked card's headline the same offset, as the markers of a numbered list do.
+ */
 .ds-card__rank {
+  grid-column: 1;
+  grid-row: 1;
+  min-inline-size: var(--space-5);
+  margin-inline-end: var(--space-3);
+  text-align: end;
   font-size: var(--font-size-sm);
   font-weight: var(--font-weight-semibold);
   color: var(--color-text-muted);
 }
 
 /*
- * Headline: the action. It takes the free space on its line and, through min-inline-size: 0,
- * may shrink below its longest word, so a long headline wraps inside the card. The user-agent
- * heading margin is cleared so the header gap alone spaces it.
+ * Headline: the action, in the content column beside the rank. Its size follows its heading
+ * level, as every heading's size follows its depth: the page's <h1> at --font-size-xl, a
+ * section's <h2> at --font-size-lg, a group's <h3> at --font-size-md, an <h4> at --font-size-sm.
+ * So the headline sits one step below the heading directly above its card: an <h3> headline, on
+ * a card directly under a section's <h2>, at --font-size-md, and an <h4> headline, on a card
+ * inside a group headed by an <h3>, at --font-size-sm. The semibold weight sets it apart from
+ * the body text. min-inline-size: 0 lets it shrink below its longest word, so a long headline
+ * wraps inside the card. The user-agent heading margin is cleared so the header's row gap alone
+ * spaces it.
  */
 .ds-card__title {
-  flex: 1 1 auto;
+  grid-column: 2;
   min-inline-size: 0;
   margin: 0;
-  font-size: var(--font-size-lg);
+  font-size: var(--font-size-md);
   font-weight: var(--font-weight-semibold);
   line-height: var(--line-height-tight);
 }
 
+h4.ds-card__title {
+  font-size: var(--font-size-sm);
+}
+
 /*
- * Headline figure: the number that justifies the action, read as "{label} {value}". The value
- * is as prominent as the headline; the label is quiet, like the entity line. The paragraph's
- * user-agent margin is cleared so the header gap alone spaces it, and min-inline-size: 0 lets a
- * long label wrap inside the card at narrow widths instead of widening it.
+ * Headline figure: the number that justifies the action, read as "{label} {value}", in the
+ * content column under the headline. The value is as prominent as the headline and never more,
+ * so the card still leads with its action: it takes the headline's weight and size, and follows
+ * an <h4> headline down to --font-size-sm (the figure is the headline's following sibling in the
+ * header). The label is quiet, like the entity line. The paragraph's user-agent margin is
+ * cleared so the header's row gap alone spaces it, and min-inline-size: 0 lets a long label wrap
+ * inside the card at narrow widths instead of widening it.
  */
 .ds-card__figure {
+  grid-column: 2;
   min-inline-size: 0;
   margin: 0;
 }
@@ -99,13 +128,21 @@
 }
 
 .ds-card__figure-value {
-  font-size: var(--font-size-lg);
+  font-size: var(--font-size-md);
   font-weight: var(--font-weight-semibold);
   line-height: var(--line-height-tight);
 }
 
-/* Entity line: the entity name and its source, secondary to the headline. */
+h4.ds-card__title ~ .ds-card__figure .ds-card__figure-value {
+  font-size: var(--font-size-sm);
+}
+
+/*
+ * Entity line: the entity name and its source, secondary to the headline, in the content column
+ * under the headline and figure.
+ */
 .ds-card__meta {
+  grid-column: 2;
   min-inline-size: 0;
   font-size: var(--font-size-sm);
   color: var(--color-text-muted);

@@ -53,7 +53,8 @@ attempt with sanitized diagnostics (:class:`IntegrityFailure`) on its unsettled 
 and ``sync_run`` rows, and returns a failed result. Every other non-connector error propagates.
 For an **active** dataset, every transaction that records
 a success, or a failed attempt together with data it wrote or deleted, queues one
-``analysis_request`` with its freshness write, so the job's last write is always followed by a
+``analysis_request`` with its freshness write, and so does every Google metrics flush that
+wrote rows (below), so the job's last write is always followed by a
 pending request (AAP 0.3.2; the worker coalesces requests within 60 s), and a stand-alone
 matching pass that attempted rows queues one after it; a building dataset queues nothing, its
 activation does.
@@ -64,7 +65,23 @@ checkpoint, the freshness outcome, the ``sync_run`` close and the ``analysis_req
 transaction is held open across a connector call, and a cancellation, a database error or a
 bug before that commit leaves the dataset's stored rows and its checkpoint as they were and
 queues no request; its freshness stands too, but for the failed attempt an integrity
-violation records (above).
+violation records (above). A Google metrics dataset is the one bounded exception: its fetches
+hand their accepted rows to a write buffer partition by partition instead of keeping them,
+and once a read holds ``_GOOGLE_WRITE_BUFFER_ROWS`` (20,000) of them they are upserted, with
+the stand-ins they need, in a short transaction of their own, between connector calls and
+with no deletion, so a backfill or a restatement of any size keeps at most one buffer and one
+partition in memory. For an active dataset that flush queues the ``analysis_request`` its
+upserts need in the same transaction, and its rows count toward the job as soon as it
+commits (``sync.job.finish``, ``sync.job.cancelled`` and every ``sync_run`` row closed after
+it). A dataset whose reads fit the buffer is still published in its one transaction exactly
+as above. For a larger read, the recording transaction writes what is still buffered,
+removes what each proven-complete fetch no longer returned, and records the checkpoint, the
+outcome, the ``sync_run`` close (its rows including the flushed ones) and the request. A
+cancellation, a database error, a bug or a killed worker after a flush therefore leaves
+those upserts (restated platform values, which a later run overwrites the same way)
+followed by their pending request, while the deletions, the checkpoint and the freshness
+outcome stay unpublished and the unfinished sync's ``sync_run`` rows close failed (or stay
+``running`` after a kill), never succeeded.
 
 Interruptions. Connectors return what they read when a ``TransientError`` survives their
 retries, with the error in the result's ``interrupted_by``. A Google call-budget deferral is
@@ -210,6 +227,7 @@ from ads_engine.connectors.google_n8n.partition import (
     EnumerationProgress,
     FetchOutcome,
     PartitionedFetcher,
+    RowSink,
     enumerate_campaigns,
     enumerate_entities,
     interruption_reason,
@@ -257,7 +275,7 @@ from ads_engine.connectors.linkedin.parser import (
 from ads_engine.connectors.linkedin.parser import CampaignGroupRow as LinkedInGroupRow
 from ads_engine.connectors.linkedin.parser import CampaignRow as LinkedInCampaignRow
 from ads_engine.db import repositories
-from ads_engine.db.base import Base
+from ads_engine.db.base import Base, utcnow
 from ads_engine.db.models.accounts import (
     AdAccount,
     AdGroup,
@@ -501,6 +519,12 @@ _FAILURE_CANCELLATIONS: Final[tuple[str, ...]] = (CANCEL_LOCK_LOST, CANCEL_WRITE
 # PartitionedFetcher.partitioned_fetch's scope argument.
 _SCOPE_START: Final = "start"
 _SCOPE_END: Final = "end"
+
+# Accepted Google metrics rows one dataset holds before they are upserted in a transaction of
+# their own (:class:`_DatasetWrites`). It bounds what a backfill or restatement of any size
+# keeps in memory: the held rows plus the one partition (at most 10,000 rows) that reaches the
+# bound. A dataset whose reads stay below it is written by the transaction recording it.
+_GOOGLE_WRITE_BUFFER_ROWS: Final = 20_000
 
 # Minimal stand-ins for entities that facts or leads reference before any entity sync has
 # stored them (a campaign removed before tracking still has spend; metrics carry no status
@@ -1224,9 +1248,14 @@ class _JobBase(ABC):
     ``_execute`` they read a dataset's scope with no transaction open, then write it in one
     short transaction that records its outcome with :meth:`_complete`: a success, or the
     failed attempt of an interrupted read together with the rows it did read (module
-    docstring, "Publication"). Transient interruptions are noted with :meth:`_interrupted`
-    once that transaction committed and handed to :meth:`SourceModeController.on_error` once
-    no transaction is open.
+    docstring, "Publication"). A Google metrics read that outgrows its write buffer upserts
+    its rows in short transactions of their own while it reads, between connector calls:
+    for an active dataset each queues the analysis request its rows need, and its rows count
+    toward the job once it commits, but none publishes an outcome, so the freshness,
+    checkpoint and deletions wait for that recording transaction and a sync cut short before
+    it closes its ``sync_run`` rows failed. Transient
+    interruptions are noted with :meth:`_interrupted` once that transaction committed and
+    handed to :meth:`SourceModeController.on_error` once no transaction is open.
     """
 
     job: str = ""
@@ -1731,6 +1760,8 @@ class _JobBase(ABC):
         commit. A rollback of the transaction (a failed statement after the completion, a
         failed enqueue or commit) discards them, and a later transaction of the same session
         never publishes them. A savepoint released inside the transaction is not its commit.
+        A Google metrics flush (:meth:`MetricsSyncJob._flush_google`) publishes its rows alone
+        this way, with no outcome, no closed dataset and no failure text.
 
         Args:
             session: The transaction the completion was written in.
@@ -3990,7 +4021,7 @@ class _Written:
     Attributes:
         rows: Fact rows upserted.
         removed: Stored rows deleted because the proven-complete fetch no longer returned them
-            (:func:`_remove_absent`).
+            (:func:`_remove_absent`; for Google metrics, :func:`_sweep_unreturned`).
         skipped: Rows read but not stored, because the entity they name is not stored.
     """
 
@@ -4012,11 +4043,9 @@ class _Written:
         )
 
 
-# Writes one fetch's rows in the dataset's transaction; the range is the scope's
-# :func:`_date_range`.
-type _FetchWrite = Callable[
-    [AsyncSession, FetchOutcome, tuple[date, date] | None], Awaitable[_Written]
-]
+# Upserts accepted rows of one Google metrics query, with the stand-ins they need, in the
+# caller's transaction; nothing is deleted (:class:`_DatasetWrites`).
+type _RowsWrite = Callable[[AsyncSession, Sequence[GoogleAdsRow]], Awaitable[_Written]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -4025,14 +4054,22 @@ class _Fetched:
 
     Attributes:
         query_id: The query the fetch read.
-        outcome: What the fetch returned.
+        outcome: What the fetch returned. Its rows went to the dataset's
+            :class:`_DatasetWrites` as they were accepted, so :attr:`FetchOutcome.rows` is
+            empty and only its counts, completeness and deferrals are kept.
         covered: The scope's :func:`_date_range`: the native days it read in full, or
             ``None`` for a scope narrowed inside its days.
+        floor: :func:`~ads_engine.db.base.utcnow` right before the fetch started. Every row
+            it returned was upserted after it (``upsert_facts`` stamps ``fetched_at`` with the
+            same clock and rewrites it on conflict), so a stored row dated inside
+            :attr:`covered` with an older ``fetched_at`` is one the fetch did not return
+            (:func:`_sweep_unreturned`).
     """
 
     query_id: str
     outcome: FetchOutcome
     covered: tuple[date, date] | None
+    floor: datetime
 
 
 def _date_range(scope: Mapping[str, object]) -> tuple[date, date] | None:
@@ -4051,6 +4088,105 @@ def _date_range(scope: Mapping[str, object]) -> tuple[date, date] | None:
     return (start, end)
 
 
+def _scope_days(scope: Mapping[str, object]) -> tuple[date, date] | None:
+    """Return the native ``[start, end]`` a dated scope reads in, narrowed or not; else ``None``."""
+    start, end = scope.get(_SCOPE_START), scope.get(_SCOPE_END)
+    if not isinstance(start, date) or not isinstance(end, date):
+        return None
+    return (start, end)
+
+
+class _DatasetWrites:
+    """The bounded fact writes of one Google metrics dataset while its fetches are read.
+
+    Every fetch of the dataset hands the rows it accepted here partition by partition,
+    through the ``sink`` :meth:`sink` returns for it, so no fetch keeps its rows. They are
+    held in reading order, tagged with their query and its writer, and once
+    :data:`_GOOGLE_WRITE_BUFFER_ROWS` are held the job's ``flush`` upserts them, with the
+    stand-ins they need, in a short transaction of its own (:meth:`MetricsSyncJob._flush_google`),
+    which for an active dataset queues their analysis request and, once committed, counts them
+    toward the job; nothing is deleted there. The sink runs between connector calls, so no
+    transaction is open across a call. What is still held once the
+    dataset's reads are done is written by the transaction that records the dataset
+    (:meth:`MetricsSyncJob._record_google`), which also removes what each proven-complete
+    fetch no longer returned, so a dataset whose reads fit the buffer is written and published
+    in that one transaction.
+
+    Attributes:
+        name: The freshness dataset written.
+        held: Rows held, not written yet.
+        flushes: Flush transactions committed so far.
+    """
+
+    __slots__ = ("_batches", "_days", "_flush", "flushes", "held", "name")
+
+    def __init__(self, name: str, flush: Callable[[_DatasetWrites], Awaitable[None]]) -> None:
+        """Start with nothing held; ``flush`` writes and lets go of the held rows."""
+        self.name = name
+        self._flush = flush
+        self._batches: list[tuple[str, _RowsWrite, tuple[GoogleAdsRow, ...]]] = []
+        # The query and native days of each fetch whose rows are held, in reading order.
+        self._days: list[tuple[str, tuple[date, date] | None]] = []
+        self.held = 0
+        self.flushes = 0
+
+    def sink(self, query_id: str, write: _RowsWrite, scope: Mapping[str, object]) -> RowSink:
+        """Return the sink of one fetch of ``query_id`` over ``scope``; ``write`` upserts its rows.
+
+        Each batch the fetch accepts is held; the batch that brings the held rows to
+        :data:`_GOOGLE_WRITE_BUFFER_ROWS` flushes them all. An error of the flush propagates
+        through the fetch unchanged.
+        """
+        days = (query_id, _scope_days(scope))
+
+        async def hold(rows: tuple[GoogleAdsRow, ...]) -> None:
+            if not self._days or self._days[-1] is not days:
+                self._days.append(days)
+            self._batches.append((query_id, write, rows))
+            self.held += len(rows)
+            if self.held >= _GOOGLE_WRITE_BUFFER_ROWS:
+                await self._flush(self)
+
+        return hold
+
+    def overlaps(self, query_id: str, covered: tuple[date, date]) -> bool:
+        """Whether rows held for an earlier fetch of ``query_id`` may lie inside ``covered``."""
+        first, last = covered
+        return any(
+            held == query_id and (days is None or (days[0] <= last and first <= days[1]))
+            for held, days in self._days
+        )
+
+    async def flush(self) -> None:
+        """Write the held rows now, in a transaction of their own; nothing when none are held."""
+        if self._batches:
+            await self._flush(self)
+
+    async def write(self, session: AsyncSession) -> _Written:
+        """Upsert every held row in ``session``'s transaction, in reading order, then drop them.
+
+        Consecutive batches of one query are upserted by one call of its writer, which counts
+        and logs the rows it skips as it always has.
+
+        Returns:
+            What the writers upserted and skipped.
+        """
+        written = _Written()
+        start = 0
+        while start < len(self._batches):
+            query_id, upsert, _rows = self._batches[start]
+            stop = start
+            while stop < len(self._batches) and self._batches[stop][0] == query_id:
+                stop += 1
+            run = [row for _query, _upsert, rows in self._batches[start:stop] for row in rows]
+            written += await upsert(session, run)
+            start = stop
+        self._batches.clear()
+        self._days.clear()
+        self.held = 0
+        return written
+
+
 class _QueryReads:
     """What one query's fetches in one metrics run established, in reading order.
 
@@ -4060,9 +4196,10 @@ class _QueryReads:
 
     Attributes:
         query_id: The query read.
-        write: Writes one of the query's fetches in its dataset's transaction.
+        write: Upserts a batch of the query's accepted rows (:data:`_RowsWrite`).
         fetched: The run's fetches of every query, in reading order, shared by the run's
             reads; each read appends its own.
+        writes: The bounded writes of the query's dataset, which every fetch streams into.
         pending: The query's unread scopes, in reading order.
         interrupted_by: The transient error that stopped the query, or ``None``.
         shortfalls: Permanent shortfalls (result limits) of the fetches read.
@@ -4077,13 +4214,21 @@ class _QueryReads:
         "query_id",
         "shortfalls",
         "write",
+        "writes",
     )
 
-    def __init__(self, query_id: str, write: _FetchWrite, fetched: list[_Fetched]) -> None:
-        """Start with nothing read; each fetch is kept in ``fetched`` for ``write`` later."""
+    def __init__(
+        self,
+        query_id: str,
+        write: _RowsWrite,
+        fetched: list[_Fetched],
+        writes: _DatasetWrites,
+    ) -> None:
+        """Start with nothing read; each fetch streams into ``writes``, kept in ``fetched``."""
         self.query_id = query_id
         self.write = write
         self.fetched = fetched
+        self.writes = writes
         self.pending: list[_Deferred] = []
         self.interrupted_by: TransientError | None = None
         self.shortfalls: list[str] = []
@@ -4094,18 +4239,30 @@ class _QueryReads:
     ) -> None:
         """Read one scope, or keep it unread with ``deferred_at`` once the query is interrupted.
 
-        The fetch is kept in :attr:`fetched` with the scope's :func:`_date_range`, and nothing
-        is written yet: the transaction that records the query's dataset writes every kept
-        fetch in reading order (:meth:`MetricsSyncJob._record_google`), so rows read before an
-        interruption are stored with that dataset's outcome; upserts are idempotent, so
-        re-reading a scope later changes no row count.
+        The fetch hands its accepted rows to :attr:`writes` partition by partition (its
+        ``sink``), which upserts them only once its buffer is full, and is kept in
+        :attr:`fetched` without rows, with the scope's :func:`_date_range` and the instant the
+        fetch started. The transaction that records the query's dataset writes what is still
+        held and removes what each proven-complete fetch no longer returned
+        (:meth:`MetricsSyncJob._record_google`), so rows read before an interruption are
+        stored with that dataset's outcome; upserts are idempotent, so re-reading a scope
+        later changes no row count.
         """
         if self.interrupted_by is not None:
             self.pending.append(_Deferred(scope, deferred_at))
             return
-        outcome = await fetcher.partitioned_fetch(self.query_id, scope)
+        covered = _date_range(scope)
+        if covered is not None and self.writes.overlaps(self.query_id, covered):
+            # Rows an earlier fetch of the query read inside this range are written before
+            # this fetch's floor, so its sweep removes those it no longer returns, as writing
+            # every fetch in reading order would.
+            await self.writes.flush()
+        floor = utcnow()
+        outcome = await fetcher.partitioned_fetch(
+            self.query_id, scope, sink=self.writes.sink(self.query_id, self.write, scope)
+        )
         self.calls += outcome.calls
-        self.fetched.append(_Fetched(self.query_id, outcome, _date_range(scope)))
+        self.fetched.append(_Fetched(self.query_id, outcome, covered, floor))
         self.shortfalls.extend(_shortfall_reasons(outcome))
         if outcome.interrupted_by is not None:
             self.interrupted_by = outcome.interrupted_by
@@ -4221,6 +4378,75 @@ async def _remove_absent(
     return len(obsolete)
 
 
+# The fact table each Google metrics query writes and its proven-complete fetches sweep.
+type _GoogleFact = FactCampaignDaily | FactKeywordDaily | FactSearchTermDaily
+_GOOGLE_FACT_TABLES: Final[Mapping[str, type[_GoogleFact]]] = MappingProxyType(
+    {"Q-G3": FactCampaignDaily, "Q-G5": FactKeywordDaily, "Q-G6": FactSearchTermDaily}
+)
+
+
+async def _sweep_unreturned(
+    session: AsyncSession,
+    dataset_id: int,
+    query_id: str,
+    covered: tuple[date, date],
+    floor: datetime,
+) -> int:
+    """Delete a dataset's Google facts in a proven-complete fetch's range it did not return.
+
+    :func:`_remove_absent`'s rule without holding the fetch's keys: every row the
+    :func:`_proven_complete` fetch returned was upserted after ``floor``, the instant it
+    started (``upsert_facts`` stamps ``fetched_at`` with the same :func:`utcnow` and its
+    ``DO UPDATE`` rewrites a stored row's), so a stored row of ``query_id``'s table dated
+    inside ``covered`` whose ``fetched_at`` is older than ``floor`` holds values the platform
+    no longer reports for that range. One bounded ``DELETE`` removes them all, an empty
+    complete answer emptying the range; rows outside the range or the dataset are neither read
+    nor touched. A clock that reads earlier than ``floor`` (it moved back) makes the
+    comparison unsafe, so the sweep is then skipped with a warning and the rows stand until a
+    later complete read.
+
+    The caller's transaction holds the dataset guard (:func:`repositories.ensure_writable`).
+
+    Args:
+        session: The transaction that records the dataset.
+        dataset_id: The dataset written; the delete is limited to it.
+        query_id: ``Q-G3``, ``Q-G5`` or ``Q-G6``, naming the fact table.
+        covered: The native ``[start, end]`` the fetch read in full.
+        floor: The instant the fetch started (:attr:`_Fetched.floor`).
+
+    Returns:
+        The number of rows removed.
+    """
+    model = _GOOGLE_FACT_TABLES[query_id]
+    if utcnow() < floor:
+        _log.warning(
+            "sync.metrics.sweep_skipped",
+            source="google",
+            dataset_id=dataset_id,
+            query_id=query_id,
+            reason="the clock moved back since the fetch started",
+        )
+        return 0
+    connection = await session.connection()
+    result = await connection.execute(
+        delete(model).where(
+            model.dataset_id == dataset_id,
+            model.date.between(*covered),
+            model.fetched_at < floor,
+        )
+    )
+    removed = result.rowcount
+    if removed:
+        _log.info(
+            "sync.metrics.rows_removed",
+            dataset_id=dataset_id,
+            rows=removed,
+            source="google",
+            query_id=query_id,
+        )
+    return removed
+
+
 class MetricsSyncJob(_JobBase):
     """Daily facts of one Google or LinkedIn dataset over a native date range.
 
@@ -4232,16 +4458,26 @@ class MetricsSyncJob(_JobBase):
 
     Restatement also withdraws rows (AAP 0.1.1, 0.3.2). When a fetch is
     :func:`_proven_complete`, the rows stored inside its scope whose key it no longer
-    returned are deleted in the transaction that upserts it (:func:`_remove_absent`), an
-    empty answer included, so the scope holds exactly what the platform now reports. An
-    incomplete, deferred or interrupted fetch only upserts, and every other stored row stands
-    ("last good data is kept", AAP 0.3.3).
+    returned are deleted in the transaction that records its dataset (LinkedIn:
+    :func:`_remove_absent`, with the upsert; Google: :func:`_sweep_unreturned`, the rows of
+    its range it did not rewrite), an empty answer included, so the scope holds exactly what
+    the platform now reports. An incomplete, deferred or interrupted fetch only upserts, and
+    every other stored row stands ("last good data is kept", AAP 0.3.3).
 
     * **Google**: Q-G3 to ``fact_campaign_daily`` and Q-G5 to ``fact_keyword_daily``
       (``google.metrics_daily``), Q-G6 to ``fact_search_term_daily``
-      (``google.search_terms``). Every fetch is kept until its dataset's last read is done,
-      then the dataset's fetches are written in reading order in the one transaction that
-      records its checkpoint and freshness (:meth:`_record_google`). A campaign or ad group no
+      (``google.search_terms``). Every fetch streams its accepted rows, partition by
+      partition, into its dataset's bounded write buffer (:class:`_DatasetWrites`) and is
+      kept, without rows, until the dataset's last read is done. A buffer holding
+      ``_GOOGLE_WRITE_BUFFER_ROWS`` rows is upserted at once in a short transaction of its
+      own, with no deletion, which for an active dataset queues the ``analysis_request``
+      those upserts need and whose rows count toward the job once it commits
+      (:meth:`_flush_google`); the one transaction that records the
+      dataset's checkpoint and freshness then writes what is still held, in reading order,
+      and sweeps each proven-complete fetch's range (:meth:`_record_google`). A dataset whose
+      reads fit the buffer is thus written and published in that one transaction, and one of
+      any size never holds more than a buffer and a partition (module docstring,
+      "Publication"). A campaign or ad group no
       entity sync stored (removed before tracking) gets a stand-in so its spend counts; a
       keyword row of an unknown keyword is skipped and counted (campaign spend is covered
       by Q-G3, and K3 reviews current keywords only). The unread scopes both datasets'
@@ -4334,10 +4570,12 @@ class MetricsSyncJob(_JobBase):
         3. The own ranges are read in the order Q-G3, Q-G5, Q-G6, each without the days a
            stored scope of its query covers (:func:`_own_segments`).
         4. Each dataset is recorded (:meth:`_record_google`) as soon as its last read is
-           done: one transaction writes its fetches in reading order with its checkpoint and
-           outcome, so a defect raised by a later dataset's own range leaves
-           ``google.metrics_daily`` recorded, and an error or a cancellation before a
-           dataset's transaction commits leaves that dataset as it was.
+           done: one transaction writes the rows its write buffer still holds, sweeps its
+           proven-complete ranges and records its checkpoint and outcome, so a defect raised
+           by a later dataset's own range leaves ``google.metrics_daily`` recorded, and an
+           error or a cancellation before a dataset's transaction commits leaves that dataset
+           as it was but for the rows a full buffer already upserted and the request queued
+           with them (:meth:`_flush_google`).
 
         Each query stops at its first interruption; its later scopes stay unread.
         """
@@ -4349,25 +4587,22 @@ class MetricsSyncJob(_JobBase):
         account_id = None if account is None else account.id
         today = ctx.now.astimezone(_zone(None if account is None else account.timezone)).date()
 
-        async def campaign_daily(
-            session: AsyncSession, outcome: FetchOutcome, covered: tuple[date, date] | None
-        ) -> _Written:
-            return await self._store_campaign_daily(session, outcome, account_id, covered)
+        async def campaign_daily(session: AsyncSession, batch: Sequence[GoogleAdsRow]) -> _Written:
+            return await self._store_campaign_daily(session, batch, account_id)
 
-        async def search_terms(
-            session: AsyncSession, outcome: FetchOutcome, covered: tuple[date, date] | None
-        ) -> _Written:
-            return await self._store_search_terms(session, outcome, account_id, covered)
+        async def search_terms(session: AsyncSession, batch: Sequence[GoogleAdsRow]) -> _Written:
+            return await self._store_search_terms(session, batch, account_id)
 
-        writes: Mapping[str, _FetchWrite] = {
+        writes: Mapping[str, _RowsWrite] = {
             "Q-G3": campaign_daily,
             "Q-G5": self._store_keyword_daily,
             "Q-G6": search_terms,
         }
         plans = [self._google_plan(name, today, rows.get(name)) for name in _GOOGLE_METRICS_QUERIES]
+        buffers = {plan.name: _DatasetWrites(plan.name, self._flush_google) for plan in plans}
         fetched: list[_Fetched] = []
         reads = {
-            query_id: _QueryReads(query_id, writes[query_id], fetched)
+            query_id: _QueryReads(query_id, writes[query_id], fetched, buffers[plan.name])
             for plan in plans
             for query_id in plan.queries
         }
@@ -4378,9 +4613,52 @@ class MetricsSyncJob(_JobBase):
                 for segment in plan.segments[query_id]:
                     await reads[query_id].read(fetcher, segment, ctx.now)
             mine = [entry for entry in fetched if entry.query_id in plan.queries]
-            await self._record_google(plan, [reads[query_id] for query_id in plan.queries], mine)
+            await self._record_google(
+                plan, [reads[query_id] for query_id in plan.queries], mine, buffers[plan.name]
+            )
             # Recorded: the dataset's fetches are no longer needed.
             fetched[:] = [entry for entry in fetched if entry.query_id not in plan.queries]
+
+    async def _flush_google(self, writes: _DatasetWrites) -> None:
+        """Upsert a Google metrics dataset's held rows in a short transaction of their own.
+
+        Called by the dataset's write buffer once it holds ``_GOOGLE_WRITE_BUFFER_ROWS`` rows,
+        between connector calls. The dataset guard is taken first
+        (:func:`repositories.ensure_writable`), then the facts and the stand-ins they need are
+        upserted, and when that wrote any row the same transaction queues the
+        ``analysis_request`` those rows need (:meth:`_queue_analysis`: only for an active
+        dataset; a building dataset's backfill queues none, its activation does). The rows
+        count toward the job once the transaction commits (:meth:`_publish_on_commit`), so
+        ``sync.job.finish``, ``sync.job.cancelled`` and every ``sync_run`` row closed after it
+        include them whether or not the dataset is ever recorded; a rollback counts none.
+        Nothing is deleted and no outcome is recorded: the dataset's sweeps, checkpoint,
+        freshness and ``sync_run`` close wait for its recording transaction
+        (:meth:`_record_google`), so a sync cut short after a flush leaves its committed
+        upserts with their request but publishes no freshness, checkpoint or deletion, and
+        its ``sync_run`` rows close failed (a killed worker leaves them ``running``), never
+        succeeded.
+
+        Raises:
+            repositories.DatasetNotWritable: If the dataset was retired meanwhile.
+            QueryDefect: A held row breaks its row contract.
+        """
+        ctx = self.ctx
+        async with ctx.sessionmaker() as session, session.begin():
+            dataset = await repositories.ensure_writable(session, ctx.dataset_id)
+            written = await writes.write(session)
+            if written.changed:
+                await self._queue_analysis(session, dataset)
+            self._publish_on_commit(session, {}, (), {writes.name: written.rows})
+        writes.flushes += 1
+        _log.info(
+            "sync.metrics.google_flushed",
+            source="google",
+            dataset_id=ctx.dataset_id,
+            dataset=writes.name,
+            rows=written.rows,
+            skipped=written.skipped,
+            flushes=writes.flushes,
+        )
 
     def _google_plan(self, name: str, today: date, row: DatasetFreshness | None) -> _GooglePlan:
         """Decide what this run reads for one Google metrics dataset (:class:`_GooglePlan`)."""
@@ -4412,16 +4690,28 @@ class MetricsSyncJob(_JobBase):
         )
 
     async def _record_google(
-        self, plan: _GooglePlan, reads: Sequence[_QueryReads], fetched: Sequence[_Fetched]
+        self,
+        plan: _GooglePlan,
+        reads: Sequence[_QueryReads],
+        fetched: Sequence[_Fetched],
+        writes: _DatasetWrites,
     ) -> None:
         """Write and record one Google metrics dataset after its reads, in one transaction.
 
         The freshness row is locked first, so two runs publishing the same dataset queue
-        rather than interleave their fact writes. ``fetched`` (the dataset's fetches, in
-        reading order) is then written with each query's write, upserts and complete-scope
-        deletions in the order they were read. What stays unread is merged with what another
-        run stored meanwhile and written back (or the checkpoint cleared), and in the same
-        transaction:
+        rather than interleave their final writes, sweeps and checkpoints (a full buffer's
+        flush takes no such lock; its upserts are restated values, and each sweep spares
+        every row written after its own fetch began). The rows ``writes`` still holds are then
+        upserted in reading order, and for every :func:`_proven_complete` fetch of
+        ``fetched`` (the dataset's fetches, in reading order) whose scope is a date range
+        alone, the stored rows of its range it did not return are deleted
+        (:func:`_sweep_unreturned`); the dataset guard is taken first when no upsert took it.
+        Rows full buffers already upserted were counted, and their request queued, when their
+        flush committed (:meth:`_flush_google`): the ``sync_run`` close includes them, while
+        only this transaction's own upserts are added to the job's counts and only its own
+        upserts and deletions make a failed attempt queue a request. What stays unread is
+        merged with what another run stored meanwhile and written back (or the checkpoint
+        cleared), and in the same transaction:
 
         * nothing pending: a success, ``complete`` unless a result limit was met;
         * work pending after a call-budget deferral: an ``incomplete`` success, repairable
@@ -4455,9 +4745,11 @@ class MetricsSyncJob(_JobBase):
             plan: What the run read for the dataset.
             reads: The reads of the dataset's queries.
             fetched: The dataset's fetches, in reading order.
+            writes: The dataset's write buffer, holding the rows no flush wrote.
 
         Raises:
             repositories.DatasetNotWritable: If the dataset was retired meanwhile.
+            QueryDefect: A held row breaks its row contract.
         """
         ctx = self.ctx
         name, row, stored, loaded = plan.name, plan.row, plan.stored, plan.loaded
@@ -4503,13 +4795,21 @@ class MetricsSyncJob(_JobBase):
                 )
             ),
         )
-        writes = {read.query_id: read.write for read in reads}
+        sweeps = [
+            (entry.query_id, entry.covered, entry.floor)
+            for entry in fetched
+            if entry.covered is not None and _proven_complete(entry.outcome)
+        ]
 
         async with ctx.sessionmaker() as session, session.begin():
             now_stored = await freshness.lock_checkpoint(session, ctx.dataset_id, name)
-            written = _Written()
-            for entry in fetched:
-                written += await writes[entry.query_id](session, entry.outcome, entry.covered)
+            written = await writes.write(session)
+            if sweeps and not written.rows:
+                # No upsert in this transaction took the dataset guard the deletes need.
+                await repositories.ensure_writable(session, ctx.dataset_id)
+            for query_id, covered, floor in sweeps:
+                removed = await _sweep_unreturned(session, ctx.dataset_id, query_id, covered, floor)
+                written += _Written(removed=removed)
             current = (
                 loaded
                 if now_stored == stored
@@ -4554,27 +4854,26 @@ class MetricsSyncJob(_JobBase):
     async def _store_campaign_daily(
         self,
         session: AsyncSession,
-        outcome: FetchOutcome,
+        batch: Sequence[GoogleAdsRow],
         account_id: int | None,
-        covered: tuple[date, date] | None,
     ) -> _Written:
-        """Store Q-G3 over ``covered`` in ``fact_campaign_daily``, stubbing unknown campaigns.
+        """Upsert accepted Q-G3 rows in ``fact_campaign_daily``, stubbing unknown campaigns.
 
-        The rows are upserted in ``session``'s transaction, the one that records
-        ``google.metrics_daily`` (:meth:`_record_google`); nothing is committed here. When
-        the fetch is :func:`_proven_complete`, the dataset's rows dated inside ``covered``
-        whose (campaign, day) it did not return are deleted in the same transaction
-        (:func:`_remove_absent`), also when it returned no row at all. ``covered`` is
-        ``None`` for a scope narrowed inside its days (campaign bounds), which reads only
-        part of each day, so its rows are only upserted.
+        The rows are upserted in ``session``'s transaction: a flush of the dataset's write
+        buffer (:meth:`_flush_google`) or the one that records ``google.metrics_daily``
+        (:meth:`_record_google`); nothing is committed or deleted here. The rows a
+        proven-complete fetch no longer returned are removed by that recording transaction
+        (:func:`_sweep_unreturned`).
 
         Returns:
-            The facts upserted, the rows removed and the rows skipped for want of an account.
+            The facts upserted and the rows skipped for want of an account.
+
+        Raises:
+            QueryDefect: A row breaks the Q-G3 row contract.
         """
         ctx = self.ctx
-        rows = [parse_campaign_daily(row) for row in outcome.rows]
-        reconciled = covered if covered is not None and _proven_complete(outcome) else None
-        if not rows and reconciled is None:
+        rows = [parse_campaign_daily(row) for row in batch]
+        if not rows:
             return _Written()
         campaigns = await _campaign_ids(session, ctx.dataset_id)
         unknown = {str(row.campaign_id) for row in rows} - set(campaigns)
@@ -4598,19 +4897,6 @@ class MetricsSyncJob(_JobBase):
         written = await repositories.upsert_facts(
             FactCampaignDaily, facts, ctx.dataset_id, session=session
         )
-        removed = 0
-        if reconciled is not None:
-            removed = await _remove_absent(
-                session,
-                FactCampaignDaily,
-                ctx.dataset_id,
-                scope=(FactCampaignDaily.date.between(*reconciled),),
-                key=(FactCampaignDaily.campaign_id, FactCampaignDaily.date),
-                returned={(fact["campaign_id"], fact["date"]) for fact in facts},
-                guarded=bool(facts),
-                event="sync.metrics.rows_removed",
-                fields={"source": "google", "query_id": "Q-G3"},
-            )
         skipped = len(rows) - len(facts)
         if skipped:
             _log.warning(
@@ -4620,28 +4906,28 @@ class MetricsSyncJob(_JobBase):
                 rows=skipped,
                 reason="no Google account stored to attach stand-in campaigns to",
             )
-        return _Written(rows=written, removed=removed, skipped=skipped)
+        return _Written(rows=written, skipped=skipped)
 
     async def _store_keyword_daily(
-        self, session: AsyncSession, outcome: FetchOutcome, covered: tuple[date, date] | None
+        self, session: AsyncSession, batch: Sequence[GoogleAdsRow]
     ) -> _Written:
-        """Store Q-G5 over ``covered`` in ``fact_keyword_daily``; unknown keywords are skipped.
+        """Upsert accepted Q-G5 rows in ``fact_keyword_daily``; unknown keywords are skipped.
 
-        The rows are upserted in ``session``'s transaction, the one that records
-        ``google.metrics_daily`` (:meth:`_record_google`); nothing is committed here. When
-        the fetch is :func:`_proven_complete`, the dataset's rows dated inside ``covered``
-        whose (keyword, day) it did not return are deleted in the same transaction
-        (:func:`_remove_absent`), also when it returned no row at all. ``covered`` is
-        ``None`` for a scope narrowed inside its days (campaign or ad-group bounds, a
-        criterion keyset), which reads only part of each day, so its rows are only upserted.
+        The rows are upserted in ``session``'s transaction: a flush of the dataset's write
+        buffer (:meth:`_flush_google`) or the one that records ``google.metrics_daily``
+        (:meth:`_record_google`); nothing is committed or deleted here. The rows a
+        proven-complete fetch no longer returned are removed by that recording transaction
+        (:func:`_sweep_unreturned`).
 
         Returns:
-            The facts upserted, the rows removed and the rows of unknown keywords skipped.
+            The facts upserted and the rows of unknown keywords skipped.
+
+        Raises:
+            QueryDefect: A row breaks the Q-G5 row contract.
         """
         ctx = self.ctx
-        rows = [parse_keyword_view(row) for row in outcome.rows]
-        reconciled = covered if covered is not None and _proven_complete(outcome) else None
-        if not rows and reconciled is None:
+        rows = [parse_keyword_view(row) for row in batch]
+        if not rows:
             return _Written()
         groups = _by_last_key(await repositories.entity_id_map(session, AdGroup, ctx.dataset_id))
         keywords = {
@@ -4673,19 +4959,6 @@ class MetricsSyncJob(_JobBase):
         written = await repositories.upsert_facts(
             FactKeywordDaily, facts, ctx.dataset_id, session=session
         )
-        removed = 0
-        if reconciled is not None:
-            removed = await _remove_absent(
-                session,
-                FactKeywordDaily,
-                ctx.dataset_id,
-                scope=(FactKeywordDaily.date.between(*reconciled),),
-                key=(FactKeywordDaily.keyword_id, FactKeywordDaily.date),
-                returned={(fact["keyword_id"], fact["date"]) for fact in facts},
-                guarded=bool(facts),
-                event="sync.metrics.rows_removed",
-                fields={"source": "google", "query_id": "Q-G5"},
-            )
         skipped = len(rows) - len(facts)
         if skipped:
             # Campaign spend is complete through Q-G3; K3 reviews current keywords only.
@@ -4696,34 +4969,32 @@ class MetricsSyncJob(_JobBase):
                 rows=skipped,
                 reason="keyword not in the current keyword list",
             )
-        return _Written(rows=written, removed=removed, skipped=skipped)
+        return _Written(rows=written, skipped=skipped)
 
     async def _store_search_terms(
         self,
         session: AsyncSession,
-        outcome: FetchOutcome,
+        batch: Sequence[GoogleAdsRow],
         account_id: int | None,
-        covered: tuple[date, date] | None,
     ) -> _Written:
-        """Store Q-G6 over ``covered`` in ``fact_search_term_daily``, stubbing unknown parents.
+        """Upsert accepted Q-G6 rows in ``fact_search_term_daily``, stubbing unknown parents.
 
-        The rows are upserted in ``session``'s transaction, the one that records
-        ``google.search_terms`` (:meth:`_record_google`); nothing is committed here. When the
-        fetch is :func:`_proven_complete`, the dataset's rows dated inside ``covered`` whose
-        (ad group, matched criterion, term, day) it did not return are deleted in the same
-        transaction (:func:`_remove_absent`), also when it returned no row at all. A finest
-        (day, ad group) partition at the result limit makes the fetch incomplete, so its rows
-        are stored as returned and nothing is deleted. ``covered`` is ``None`` for a scope
-        narrowed inside its days (campaign or ad-group bounds), which reads only part of each
-        day, so its rows are only upserted.
+        The rows are upserted in ``session``'s transaction: a flush of the dataset's write
+        buffer (:meth:`_flush_google`) or the one that records ``google.search_terms``
+        (:meth:`_record_google`); nothing is committed or deleted here. The rows a
+        proven-complete fetch no longer returned are removed by that recording transaction
+        (:func:`_sweep_unreturned`); a finest (day, ad group) partition at the result limit
+        makes the fetch incomplete, so its rows are stored as returned and nothing is deleted.
 
         Returns:
-            The facts upserted, the rows removed and the rows skipped for want of an account.
+            The facts upserted and the rows skipped for want of an account.
+
+        Raises:
+            QueryDefect: A row breaks the Q-G6 row contract.
         """
         ctx = self.ctx
-        rows = [parse_search_term(row) for row in outcome.rows]
-        reconciled = covered if covered is not None and _proven_complete(outcome) else None
-        if not rows and reconciled is None:
+        rows = [parse_search_term(row) for row in batch]
+        if not rows:
             return _Written()
         campaigns = await _campaign_ids(session, ctx.dataset_id)
         unknown = {str(row.campaign_id) for row in rows} - set(campaigns)
@@ -4762,35 +5033,6 @@ class MetricsSyncJob(_JobBase):
         written = await repositories.upsert_facts(
             FactSearchTermDaily, facts, ctx.dataset_id, session=session
         )
-        removed = 0
-        if reconciled is not None:
-            # Keyed on every returned row whose ad group is stored, even one skipped for an
-            # unattachable campaign, so a returned key is never taken for an absent one.
-            removed = await _remove_absent(
-                session,
-                FactSearchTermDaily,
-                ctx.dataset_id,
-                scope=(FactSearchTermDaily.date.between(*reconciled),),
-                key=(
-                    FactSearchTermDaily.ad_group_id,
-                    FactSearchTermDaily.matched_criterion_id,
-                    FactSearchTermDaily.search_term,
-                    FactSearchTermDaily.date,
-                ),
-                returned={
-                    (
-                        groups[str(row.ad_group_id)],
-                        row.matched_criterion_id,
-                        row.search_term,
-                        row.date,
-                    )
-                    for row in rows
-                    if str(row.ad_group_id) in groups
-                },
-                guarded=bool(facts),
-                event="sync.metrics.rows_removed",
-                fields={"source": "google", "query_id": "Q-G6"},
-            )
         skipped = len(rows) - len(facts)
         if skipped:
             _log.warning(
@@ -4800,7 +5042,7 @@ class MetricsSyncJob(_JobBase):
                 rows=skipped,
                 reason="no Google account stored to attach stand-in campaigns to",
             )
-        return _Written(rows=written, removed=removed, skipped=skipped)
+        return _Written(rows=written, skipped=skipped)
 
     # -- LinkedIn --------------------------------------------------------------------------
 

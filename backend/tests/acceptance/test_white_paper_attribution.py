@@ -30,7 +30,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any, Protocol, is_typeddict
 
@@ -447,6 +447,16 @@ def matched_lead(run: _Run, hs_id: str) -> LeadInfo:
 def money(amount: Decimal) -> str:
     """Render an amount at two decimals, as the catalogue states money."""
     return format(amount.quantize(Decimal("0.01")), "f")
+
+
+def reason_money(amount: Decimal) -> str:
+    """Render a USD amount as a W reason words it: grouped, rounded half up to the cent.
+
+    That is the web client's ``formatMoney`` text for the same stored value in the table cell
+    (with a plain space for its no-break one): ``2766`` is ``USD 2,766.00`` and a tie such as
+    ``24.005`` rounds away from zero, ``USD 24.01``.
+    """
+    return f"USD {amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):,.2f}"
 
 
 def known(count: CountValue) -> int:
@@ -2477,8 +2487,8 @@ def test_w1_ceiling_is_inclusive_at_exactly_the_ceiling(
     assert [baseline.value for baseline in item.evidence.baselines] == [median]
     assert dict(item.evidence.extra["cohort"])["double_down_ceiling"] == ceiling
     assert not run.withheld(W1)
-    judged = f"Cost per Qualified Lead USD {money(cost_per_ql)}"
-    against = f"the double-down ceiling of USD {money(ceiling)}"
+    judged = f"Cost per Qualified Lead {reason_money(cost_per_ql)}"
+    against = f"the double-down ceiling of {reason_money(ceiling)}"
     if fires:
         assert (item.rule_id, item.action) == (
             W1,
@@ -2664,10 +2674,11 @@ def test_w2_retires_at_exactly_the_spend_multiple(
     assert not run.withheld(W2)
     assert not item.increases_spend_on
     compared = (
-        f"{spend_to_median} x the USD cohort median cost per Qualified Lead of USD {money(median)}"
+        f"{spend_to_median} x the USD cohort median cost per Qualified Lead of "
+        f"{reason_money(median)}"
     )
     multiple_text = format(multiple.normalize(), "f")
-    retire_text = f"USD {money(retire_at)}"
+    retire_text = reason_money(retire_at)
     if fires:
         assert (item.rule_id, item.action) == (W2, ACTION_RETIRE)
         assert run.items(W2) == (item,)
@@ -2683,6 +2694,51 @@ def test_w2_retires_at_exactly_the_spend_multiple(
         below = f"below the {multiple_text} x ({retire_text}) at which W2 retires"
         assert f"{compared}, {below}" in item.reason
         assert "withheld" not in item.reason
+
+
+def test_w1_reason_words_a_tie_cost_half_up_as_the_table_cell_does(
+    make_context: MakeContext,
+) -> None:
+    """A cost per QL on a rounding tie reads as its table cell does, half up at the cent.
+
+    Derived from the W1 cohort with only guide-a's window spend moved to 120.025: over its 5 QL
+    that is 24.005, half a cent above the 24.00 ceiling, so the row is "No change warranted".
+    The reason rounds the tie away from zero, "USD 24.01", as ``formatMoney`` renders the stored
+    24.005 in the cell; half to even would read "USD 24.00 is above ... USD 24.00".
+    """
+    base = run_scenario(make_context, "w1.cohort.fires")
+    run = rerun(base, with_creative_costs(base, {"cr-a": Decimal("120.025")}))
+    row = run.row("guide-a")
+    assert known(row.ql) == 5
+    assert row.cost_per_ql.value == Decimal("24.005")
+    assert cohort_of(run, row).median_cost_per_ql == Decimal(30)
+    item = run.item(row)
+    assert (item.rule_id, item.action) == (W, ACTION_NO_CHANGE)
+    assert item.evidence.metric("cost_per_ql").value == Decimal("24.005")
+    assert (
+        "Cost per Qualified Lead USD 24.01 is above the double-down ceiling of USD 24.00 "
+        "(0.8 x the USD cohort median of USD 30.00)"
+    ) in item.reason
+
+
+def test_w2_reason_groups_thousands_as_the_table_cell_does(make_context: MakeContext) -> None:
+    """A spend of 1,000 or more reads grouped in the W2 reason, as its table cell shows it.
+
+    Derived from the W2 cohort with only guide-d's window spend moved to 2,766: 92.2 x the
+    cohort median of 30, so W2 retires, and the reason cites "USD 2,766.00", never
+    "USD 2766.00".
+    """
+    base = run_scenario(make_context, "w2.cohort.fires")
+    run = rerun(base, with_creative_costs(base, {"cr-d": Decimal(2766)}))
+    row = run.row("guide-d")
+    assert row.spend == Decimal(2766)
+    assert known(row.ql) == 0
+    item = run.item(row)
+    assert (item.rule_id, item.action) == (W2, ACTION_RETIRE)
+    assert item.reason == (
+        "No Qualified Lead after USD 2,766.00 of spend over 28 days: 92.2 x the USD cohort "
+        "median cost per Qualified Lead of USD 30.00 (W2 retires at 3 x, USD 90.00)."
+    )
 
 
 def test_w2_needs_a_window_of_at_least_28_days(make_context: MakeContext) -> None:

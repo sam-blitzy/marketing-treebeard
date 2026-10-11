@@ -396,7 +396,7 @@ describe('DecisionForm', () => {
       mockApi({ [logKey(OWN_BUDGET)]: json(200, [makeDecision('own_budget')]) });
       await renderForm({ subject: OWN_BUDGET });
 
-      expect(screen.getByText('Last decided: Active · daily budget $200.00')).toBeDefined();
+      expect(screen.getByText('Last decided: Active · daily budget USD 200.00')).toBeDefined();
       expect(statusSelect()).toHaveProperty('value', 'active');
       expect(statusOptions()).toEqual(['Active', 'Paused', 'Ended']);
 
@@ -421,7 +421,7 @@ describe('DecisionForm', () => {
       await renderForm({ subject: LINKEDIN_CAMPAIGN });
 
       expect(
-        screen.getByText('Last decided: Active · daily budget €100.00 · total budget €3,000.00'),
+        screen.getByText('Last decided: Active · daily budget EUR 100.00 · total budget EUR 3,000.00'),
       ).toBeDefined();
       expect(amountInput('Daily budget')).toHaveProperty('value', '100.00');
       expect(amountInput('Total budget')).toHaveProperty('value', '3000.00');
@@ -528,7 +528,7 @@ describe('DecisionForm', () => {
         onDone,
       });
 
-      expect(screen.getByText('Last decided: daily budget $500.00')).toBeDefined();
+      expect(screen.getByText('Last decided: daily budget USD 500.00')).toBeDefined();
       expect(
         screen.getByText(
           'Applies to the shared budget used by: Display Prospecting — US, Display Retargeting — US',
@@ -575,7 +575,7 @@ describe('DecisionForm', () => {
       mockApi({ [logKey(OWN_BUDGET)]: json(200, [makeDecision('own_budget')]) });
       await renderForm({ subject: OWN_BUDGET, currency: 'EUR' });
       expect(screen.getByText('In EUR')).toBeDefined();
-      expect(screen.getByText('Last decided: Active · daily budget €200.00')).toBeDefined();
+      expect(screen.getByText('Last decided: Active · daily budget EUR 200.00')).toBeDefined();
     });
   });
 
@@ -661,7 +661,7 @@ describe('DecisionForm', () => {
       });
 
       expect(
-        screen.getByText('No decision recorded yet · platform shows Active · daily budget $200.00'),
+        screen.getByText('No decision recorded yet · platform shows Active · daily budget USD 200.00'),
       ).toBeDefined();
       expect(screen.getByText('In USD')).toBeDefined();
       expect(saveButton()).toHaveProperty('disabled', true);
@@ -736,6 +736,45 @@ describe('DecisionForm', () => {
       expect(screen.getByText('Use a whole amount, with no decimal places')).toBeDefined();
       expect(saveButton()).toHaveProperty('disabled', true);
     });
+
+    // The places are the ISO 4217 minor unit the API validates against (`minor_unit_exponent`
+    // in the backend's decisions.py), never CLDR's: IQD has 3 and AFN 2, where CLDR gives 0.
+    it.each([
+      ['USD', '50.00', '0.01', '50.001', 'Use at most 2 decimal places', '50.01'],
+      ['JPY', '50', '1', '50.5', 'Use a whole amount, with no decimal places', '51'],
+      ['KWD', '50.000', '0.001', '50.0001', 'Use at most 3 decimal places', '50.001'],
+      ['IQD', '50.000', '0.001', '50.0001', 'Use at most 3 decimal places', '50.001'],
+      ['AFN', '50.00', '0.01', '50.001', 'Use at most 2 decimal places', '50.01'],
+    ])(
+      'steps, shows and validates a %s LinkedIn amount at its ISO minor unit',
+      async (currency, shown, step, finer, message, accepted) => {
+        mockApi({
+          [logKey(LINKEDIN_CAMPAIGN)]: json(200, [
+            linkedinDecision({
+              subject: linkedinSubject(currency),
+              daily_budget: '50',
+              total_budget: null,
+            }),
+          ]),
+        });
+        await renderForm({ subject: LINKEDIN_CAMPAIGN });
+
+        expect(
+          screen.getByText(`Last decided: Active · daily budget ${currency} ${shown}`),
+        ).toBeDefined();
+        expect(amountInput('Daily budget')).toHaveProperty('value', shown);
+        expect(amountInput('Daily budget').getAttribute('step')).toBe(step);
+
+        typeInto(amountInput('Daily budget'), finer);
+        expect(screen.getByText(message)).toBeDefined();
+        expect(saveButton()).toHaveProperty('disabled', true);
+
+        typeInto(amountInput('Daily budget'), accepted);
+        expect(screen.queryByText(message)).toBeNull();
+        expect(amountInput('Daily budget').getAttribute('aria-invalid')).toBeNull();
+        expect(saveButton()).toHaveProperty('disabled', false);
+      },
+    );
 
     it('accepts whole micros on Google and refuses anything finer', async () => {
       mockApi({ [logKey(OWN_BUDGET)]: json(200, [makeDecision('own_budget')]) });
@@ -1005,7 +1044,7 @@ describe('DecisionForm', () => {
 
       // The refreshed log is the new last decided state, so the form shows no change again.
       expect(
-        await screen.findByText('Last decided: Active · daily budget $240.00'),
+        await screen.findByText('Last decided: Active · daily budget USD 240.00'),
       ).toBeDefined();
       expect(callsTo(api, 'GET', '/decisions')).toHaveLength(2);
       expect(saveButton()).toHaveProperty('disabled', true);
@@ -1114,7 +1153,7 @@ describe('DecisionForm', () => {
         onDone,
       });
 
-      expect(screen.getByText('Last decided: total budget $9,000.00')).toBeDefined();
+      expect(screen.getByText('Last decided: total budget USD 9,000.00')).toBeDefined();
       expect(
         screen.getByText('Applies to the shared budget used by: Display Prospecting — US'),
       ).toBeDefined();
@@ -1156,7 +1195,7 @@ describe('DecisionForm', () => {
       // A lifetime campaign has no daily budget, so a proposed one is dropped, never posted.
       await renderForm({ subject: LINKEDIN_CAMPAIGN, prefill: { daily_budget: '240.00' }, onDone });
 
-      expect(screen.getByText('Last decided: Active · total budget €3,000.00')).toBeDefined();
+      expect(screen.getByText('Last decided: Active · total budget EUR 3,000.00')).toBeDefined();
       expect(screen.queryByRole('spinbutton', { name: 'Daily budget' })).toBeNull();
       expect(amountInput('Total budget').getAttribute('step')).toBe('0.01');
       typeInto(amountInput('Total budget'), '3600.00');
@@ -1197,7 +1236,7 @@ describe('DecisionForm', () => {
       });
       await renderForm({ subject: OWN_BUDGET, onDone });
 
-      expect(screen.getByText('Last decided: Active · total budget $6,000.00')).toBeDefined();
+      expect(screen.getByText('Last decided: Active · total budget USD 6,000.00')).toBeDefined();
       expect(screen.queryByRole('spinbutton', { name: 'Daily budget' })).toBeNull();
       const total = amountInput('Total budget');
       expect(total).toHaveProperty('value', '6000.00');
@@ -1484,7 +1523,7 @@ describe('DecisionForm', () => {
 
       expect(
         screen.getByText(
-          'No decision recorded yet · platform shows status not reported · daily budget $200.00',
+          'No decision recorded yet · platform shows status not reported · daily budget USD 200.00',
         ),
       ).toBeDefined();
       expect(statusSelect()).toHaveProperty('value', '');
@@ -1554,7 +1593,7 @@ describe('DecisionForm', () => {
       });
 
       expect(
-        screen.getByText('No decision recorded yet · platform shows Active · total budget €3,000.00'),
+        screen.getByText('No decision recorded yet · platform shows Active · total budget EUR 3,000.00'),
       ).toBeDefined();
       expect(screen.queryByRole('spinbutton', { name: 'Daily budget' })).toBeNull();
       expect(amountInput('Total budget')).toHaveProperty('value', '3000.00');
@@ -1651,7 +1690,7 @@ describe('DecisionForm', () => {
       });
 
       expect(
-        screen.getByText('No decision recorded yet · platform shows total budget $9,000.00'),
+        screen.getByText('No decision recorded yet · platform shows total budget USD 9,000.00'),
       ).toBeDefined();
       expect(screen.queryByRole('combobox')).toBeNull();
       expect(screen.queryByRole('spinbutton', { name: 'Daily budget' })).toBeNull();
@@ -2047,14 +2086,14 @@ describe('DecisionForm', () => {
         );
       }
       await renderWithProviders(<SubjectSwitch />, { path: '/decisions' });
-      await screen.findByText('Last decided: Active · daily budget $200.00');
+      await screen.findByText('Last decided: Active · daily budget USD 200.00');
 
       typeInto(amountInput('Daily budget'), '260.00');
       expect(saveButton()).toHaveProperty('disabled', false);
 
       fireEvent.click(screen.getByRole('button', { name: 'Switch subject' }));
 
-      expect(await screen.findByText('Last decided: Active · daily budget $150.00')).toBeDefined();
+      expect(await screen.findByText('Last decided: Active · daily budget USD 150.00')).toBeDefined();
       expect(amountInput('Daily budget')).toHaveProperty('value', '150.00');
       expect(saveButton()).toHaveProperty('disabled', true);
     });

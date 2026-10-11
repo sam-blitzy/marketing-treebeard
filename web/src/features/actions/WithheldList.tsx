@@ -14,6 +14,10 @@
  *   the client (AAP 0.5.4.1).
  * - The reason is the backend's own sentence, frozen with the run, and is never re-derived.
  * - Lines keep the order the API returns them in.
+ * - {@link withheldReason} turns the leading line into the one-sentence reason an empty section
+ *   or sub-list shows (AAP 0.5.5: "No search term met the K1 minimum of 37 clicks"), with the
+ *   minimum taken from the recorded `sample.required`, stated only when every line of the
+ *   leading line's rule and entity type records an observed size below it.
  *
  * Built only on the design-system index (AAP 0.4.4): `Stack` for layout and the list, with no
  * styles of its own, no raw headings and no inline styles.
@@ -24,7 +28,7 @@ import type { ReactElement } from 'react';
 
 import type { EntityView, Withheld } from '../../api/types';
 import { Stack } from '../../design-system';
-import { formatSample } from '../../lib/format';
+import { formatCount, formatSample, isDecimalString } from '../../lib/format';
 
 /** The list title when the caller passes none, or a blank one. */
 const DEFAULT_TITLE = 'Withheld for sample size';
@@ -37,6 +41,12 @@ const RULE_SEPARATOR = ' · ';
 
 /** Separator between the statement and its sample line: an em dash (U+2014) with spaces. */
 const SAMPLE_SEPARATOR = ' — ';
+
+/**
+ * The entity type of an account-level withholding. Its minimum applies to the whole account,
+ * not to entities of a kind, so it never reads "No account met the … minimum".
+ */
+const ACCOUNT_TYPE = 'account';
 
 /** Returns `text` trimmed, or `null` when it is not a string or holds only whitespace. */
 function textOrNull(text: unknown): string | null {
@@ -114,6 +124,238 @@ export function withheldLine(w: Withheld): string {
   const statement = reason === null ? head : `${head}: ${reason}`;
   const sample = formatSample(w.sample);
   return sample === '' ? statement : `${statement}${SAMPLE_SEPARATOR}${sample}`;
+}
+
+/**
+ * The entity type of a withheld pattern, trimmed, or `null` when the pattern is account-wide
+ * (`entity: null`), its entity is recorded as plain text, or the entity carries no type.
+ */
+function entityType(entity: Withheld['entity'] | string | undefined): string | null {
+  if (entity === null || entity === undefined || typeof entity === 'string') {
+    return null;
+  }
+  return textOrNull(entity.type);
+}
+
+/**
+ * A recorded sample size as text two sizes are compared by: a finite number as `String` writes
+ * it, or a decimal string trimmed (`"2.900000"`); `null` for a missing or unreadable size. The
+ * raw text is compared rather than a rounded rendering, so two minimums that differ only past
+ * the displayed precision never pass as one.
+ */
+function sizeKey(size: unknown): string | null {
+  if (typeof size === 'number') {
+    return Number.isFinite(size) ? String(size) : null;
+  }
+  if (typeof size === 'string') {
+    const trimmed = size.trim();
+    return isDecimalString(trimmed) ? trimmed : null;
+  }
+  return null;
+}
+
+/**
+ * A recorded sample size in the form two sizes are ordered by exactly: its sign and, for a
+ * non-zero size, the fraction `0.{digits} × 10^scale`, with `digits` free of leading and trailing
+ * zeros (`"12.50"` → digits "125", scale 2; `0.0025` → "25", -2). Zero in any form is sign 0.
+ */
+interface ExactSize {
+  readonly sign: -1 | 0 | 1;
+  readonly scale: number;
+  readonly digits: string;
+}
+
+/**
+ * Reads a recorded sample size as an {@link ExactSize}, with no binary float and no rounding: a
+ * decimal string (`"2.500000"`) digit by digit, and a finite number as `String` writes it, the
+ * shortest decimal that round-trips it, so a JSON number compares as the decimal it was written
+ * as. Digit text is compared instead of `Number()` values so that two sizes differing only past
+ * a double's precision never pass as equal or misordered.
+ *
+ * @param size - the recorded size
+ * @returns the exact size, or `null` for a missing or unreadable size (text such as "n/a", a
+ *   non-finite number, `null`) or one whose exponent or scale is not a safe integer
+ */
+function exactSize(size: unknown): ExactSize | null {
+  let text: string;
+  if (typeof size === 'number' && Number.isFinite(size)) {
+    text = String(size);
+  } else if (typeof size === 'string' && isDecimalString(size)) {
+    text = size.trim();
+  } else {
+    return null;
+  }
+  const unsigned = text.replace(/^[+-]/, '');
+  const exponentAt = unsigned.search(/[eE]/);
+  const mantissa = exponentAt === -1 ? unsigned : unsigned.slice(0, exponentAt);
+  const exponent = exponentAt === -1 ? 0 : Number(unsigned.slice(exponentAt + 1));
+  const allDigits = mantissa.replace('.', '');
+  const significant = allDigits.replace(/^0+/, '');
+  const digits = significant.replace(/0+$/, '');
+  if (digits === '') {
+    return { sign: 0, scale: 0, digits: '' };
+  }
+  const pointAt = mantissa.indexOf('.');
+  const wholeDigits = pointAt === -1 ? mantissa.length : pointAt;
+  const scale = wholeDigits - (allDigits.length - significant.length) + exponent;
+  if (!Number.isSafeInteger(exponent) || !Number.isSafeInteger(scale)) {
+    return null;
+  }
+  return { sign: text.startsWith('-') ? -1 : 1, scale, digits };
+}
+
+/** Orders two non-zero exact sizes of one sign by magnitude: -1, 0 or 1. */
+function compareMagnitude(a: ExactSize, b: ExactSize): -1 | 0 | 1 {
+  if (a.scale !== b.scale) {
+    return a.scale < b.scale ? -1 : 1;
+  }
+  // At one scale each size is the fraction 0.{digits} with no trailing zero, so the digit
+  // strings order as text: "25" < "251" < "3".
+  if (a.digits === b.digits) {
+    return 0;
+  }
+  return a.digits < b.digits ? -1 : 1;
+}
+
+/**
+ * Whether a withheld line's sample records a shortfall: its `observed` and `required` sizes are
+ * both readable ({@link exactSize}) and observed is strictly below required. A line at or above
+ * its minimum, such as a B4 pattern withheld because its rate test failed at 264 of 10 outcomes,
+ * or one with a missing or unreadable size, records none.
+ */
+function fallsShort(sample: Withheld['sample']): boolean {
+  const observed = exactSize(sample.observed);
+  const required = exactSize(sample.required);
+  if (observed === null || required === null) {
+    return false;
+  }
+  if (observed.sign !== required.sign) {
+    return observed.sign < required.sign;
+  }
+  if (observed.sign === 0) {
+    return false;
+  }
+  const order = compareMagnitude(observed, required);
+  return observed.sign > 0 ? order < 0 : order > 0;
+}
+
+/**
+ * The minimum every withheld line of the leading line's rule and entity type falls short of, as
+ * the parts of "No {noun} met the {rule} minimum of {size} {unit}". It is `null` when the leading
+ * line names no entity type, names the account, or records no readable `required` size or no
+ * unit; when another line of the same rule and type records a different size or unit; and when
+ * any line of that rule and type, the leading one included, does not fall short of its minimum
+ * ({@link fallsShort}): its observed size is missing, unreadable, or at or above the required
+ * one. The sentence then would claim a shortfall the lines do not record.
+ */
+function uniformMinimum(
+  lead: Withheld,
+  rule: string,
+  withheld: readonly Withheld[],
+): { noun: string; size: string; unit: string } | null {
+  const type = entityType(lead.entity);
+  if (type === null || type === ACCOUNT_TYPE) {
+    return null;
+  }
+  const required = sizeKey(lead.sample.required);
+  const unit = textOrNull(lead.sample.unit);
+  if (required === null || unit === null) {
+    return null;
+  }
+  for (const w of withheld) {
+    if (textOrNull(w.rule_id) !== rule || entityType(w.entity) !== type) {
+      continue;
+    }
+    if (
+      sizeKey(w.sample.required) !== required ||
+      textOrNull(w.sample.unit) !== unit ||
+      !fallsShort(w.sample)
+    ) {
+      return null;
+    }
+  }
+  return { noun: type.replaceAll('_', ' '), size: formatCount(required), unit };
+}
+
+/**
+ * The one-sentence reason an empty section or sub-list gives (AAP 0.5.5: "Each section shows an
+ * `EmptyState` with the reason when it has no items, for example 'No search term met the K1
+ * minimum of 37 clicks'"), read from its leading withheld line `withheld[0]`, in API order:
+ *
+ * 1. "No {entity type} met the {rule_id} minimum of {required} {unit}" when the leading line
+ *    names an entity type other than `account` and every line of the same rule and entity type
+ *    records the same `sample.required` and the same unit, and falls short of it: its
+ *    `sample.observed` and `sample.required` are both readable sizes and observed is strictly
+ *    below required, compared exactly (decimal strings digit by digit, never rounded). A line
+ *    at or above its minimum, such as a B4 pattern withheld because the weekend and weekday
+ *    rates are not distinguishable at 264 of 10 outcomes, or one with no readable observed
+ *    size, does not substantiate the sentence, and the reason comes from step 2 instead. The
+ *    type is written with spaces for underscores (`search_term` → "search term"), and the size
+ *    is counted as the sample line counts it (`formatCount`: `1234` → "1,234", `"2.900000"` →
+ *    "2.9");
+ * 2. otherwise, when the leading line has a reason, "{rule_id} withheld: {reason}" for an
+ *    account-wide line and "{rule_id} withheld for {entity}: {reason}" for any other, the entity
+ *    named as in {@link withheldLine};
+ * 3. otherwise the leading line itself, {@link withheldLine}.
+ *
+ * Every number is the API's own recorded size; no threshold or minimum is written into the
+ * client (AAP 0.5.4.1). The function is pure: it reads only `withheld`.
+ *
+ * @param withheld - the withheld patterns to explain, as the API returned them
+ * @returns the reason, or `null` when nothing is withheld
+ *
+ * @example
+ * ```ts
+ * const term = (name: string, observed: number): Withheld => ({
+ *   rule_id: 'K1',
+ *   entity: { source: 'google', type: 'search_term', id: name, name },
+ *   reason: `clicks ${String(observed)} of 37 required`,
+ *   sample: { observed, required: 37, unit: 'clicks' },
+ * });
+ * withheldReason([term('crm pricing', 30), term('crm demo', 12)]);
+ * // "No search term met the K1 minimum of 37 clicks"
+ * withheldReason([
+ *   {
+ *     rule_id: 'K3',
+ *     entity: null,
+ *     reason: 'window 7 days of 14 required',
+ *     sample: { observed: 7, required: 14, unit: 'days' },
+ *   },
+ * ]);
+ * // "K3 withheld: window 7 days of 14 required"
+ * withheldReason([
+ *   {
+ *     rule_id: 'B4',
+ *     entity: { source: 'linkedin', type: 'campaign', id: '1', name: 'Capped - Lead gen' },
+ *     reason: 'weekend and weekday rates not distinguishable',
+ *     sample: { observed: 264, required: 10, unit: 'outcomes' },
+ *   },
+ * ]);
+ * // "B4 withheld for Capped - Lead gen: weekend and weekday rates not distinguishable"
+ * withheldReason([]); // null
+ * ```
+ */
+export function withheldReason(withheld: readonly Withheld[]): string | null {
+  const lead = withheld[0];
+  if (lead === undefined) {
+    return null;
+  }
+  const rule = textOrNull(lead.rule_id);
+  const reason = textOrNull(lead.reason);
+  if (rule === null) {
+    return withheldLine(lead);
+  }
+  const minimum = uniformMinimum(lead, rule, withheld);
+  if (minimum !== null) {
+    return `No ${minimum.noun} met the ${rule} minimum of ${minimum.size} ${minimum.unit}`;
+  }
+  if (reason === null) {
+    return withheldLine(lead);
+  }
+  const entity = entityLabel(lead.entity);
+  return entity === ACCOUNT_WIDE
+    ? `${rule} withheld: ${reason}`
+    : `${rule} withheld for ${entity}: ${reason}`;
 }
 
 /** Props of {@link WithheldList}. */

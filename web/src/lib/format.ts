@@ -3,7 +3,7 @@
  * account currency, counts, percentages, evidence metrics, sample and test lines,
  * source-labelled daily dates, and instants in `DISPLAY_TIMEZONE`.
  *
- * Three rules hold for every function here:
+ * Four rules hold for every function here:
  *
  * - **No cross-currency aggregation.** Each money function formats one amount in one currency.
  *   The module offers nothing that adds, compares, converts or takes a median of amounts across
@@ -11,10 +11,18 @@
  *   (AAP 0.1.1).
  * - **Money from strings, never through `Number()`.** Amounts arrive as fixed-point decimal
  *   strings ({@link Money}) and are handed to `Intl.NumberFormat` as strings, which rounds the
- *   exact decimal: `"999999999999.994999"` USD renders `$999,999,999,999.99`, while a `Number`
- *   round trip would render `$1,000,000,000,000.00`. Money is never converted to a binary
- *   float, with no exception: the quotient of {@link formatCost} is exact decimal arithmetic on
- *   `BigInt`, handed to `Intl` as a decimal string.
+ *   exact decimal: `"999999999999.994999"` USD renders `USD 999,999,999,999.99`, while a
+ *   `Number` round trip would render `USD 1,000,000,000,000.00`. Money is never converted to a
+ *   binary float, with no exception: the quotient of {@link formatCost} is exact decimal
+ *   arithmetic on `BigInt`, handed to `Intl` as a decimal string.
+ * - **One money style, the backend's.** Every amount reads as its ISO 4217 code, a space and
+ *   the figure (`USD 400.00`), the style the backend's reason and C0 texts use, so a card's
+ *   fields and its reason sentence word the same amount identically. The space is a no-break
+ *   space ({@link MONEY_SEPARATOR}), whichever space the runtime's ICU emits, so a code never
+ *   ends a line apart from its figure; it renders exactly as the backend's plain space. The
+ *   figure's minor digits are the backend's too: the ISO 4217 table of its
+ *   `decisions.minor_unit_exponent` ({@link currencyMinorDigits}: `IQD 50.000`, `AFN 50.00`),
+ *   which the API validates decided amounts against, never the CLDR defaults of `Intl`.
  * - **Dates as stored.** A daily date is the source's native calendar date (Google in the
  *   account's time zone, LinkedIn in UTC). It is printed exactly as stored and labelled with its
  *   source's day boundary, and is never parsed into a `Date`, which would shift it in other
@@ -30,7 +38,7 @@
  * ```ts
  * import { formatCost, formatInstant, formatMoney, formatWindowChip } from '../lib/format';
  *
- * formatMoney('1234.567891', 'EUR'); // "€1,234.57"
+ * formatMoney('1234.567891', 'EUR'); // "EUR 1,234.57"
  * formatCost('300.000000', 0, 'USD', 'no QL yet'); // "— (no QL yet)"
  * formatWindowChip(item.evidence.window);
  * // "2026-09-04 – 2026-10-01 · 28 days · Google days: America/New_York · LinkedIn days: UTC"
@@ -79,6 +87,22 @@ export const EM_DASH = '—';
  */
 export const NOT_APPLICABLE = 'n/a';
 
+/**
+ * The separator between the two figures of an "N / M" value: observed against required in a
+ * sample line or a day count ("37 / 300", "0 / —"), or a first half against a second half. It
+ * is a slash between two no-break spaces (U+00A0), so a line wraps before or after the figure,
+ * never inside it, and the figure is never left as "0 /" on one line and "—" on the next.
+ */
+export const FIGURE_SEPARATOR = '\u00A0/\u00A0';
+
+/**
+ * The separator between a currency code and its figure in every amount this module formats:
+ * a no-break space (U+00A0), so wrapping text never ends a line with a bare code and starts
+ * the next with its figure. It looks exactly like the plain space of the backend's reason and
+ * C0 texts.
+ */
+export const MONEY_SEPARATOR = '\u00a0';
+
 /** The zone an instant falls back to when the display time zone is not a valid IANA id. */
 const FALLBACK_TIMEZONE = 'UTC';
 
@@ -87,6 +111,48 @@ const MAX_FRACTION_DIGITS = 20;
 
 /** Minor-unit digits assumed for an amount whose currency is missing or not recognised. */
 const DEFAULT_MINOR_DIGITS = 2;
+
+/**
+ * The ISO 4217 currencies with no minor unit, whose amounts are whole (`JPY 5,000`). It mirrors
+ * `_ZERO_EXPONENT_CURRENCIES`, read by `minor_unit_exponent` in the backend's `decisions.py`:
+ * the API refuses a decided amount finer than that minor unit with 422 (AAP 0.5.2), and every
+ * reason and C0 text renders amounts at it, so this module must neither add nor drop a place.
+ * `format.test.ts` reads `decisions.py` and fails when the two tables differ.
+ */
+const ZERO_MINOR_DIGIT_CURRENCIES: ReadonlySet<string> = new Set([
+  'BIF',
+  'CLP',
+  'DJF',
+  'GNF',
+  'ISK',
+  'JPY',
+  'KMF',
+  'KRW',
+  'PYG',
+  'RWF',
+  'UGX',
+  'UYI',
+  'VND',
+  'VUV',
+  'XAF',
+  'XOF',
+  'XPF',
+]);
+
+/**
+ * The ISO 4217 currencies whose minor unit is a thousandth (`KWD 1.500`). It mirrors
+ * `_THREE_EXPONENT_CURRENCIES` in the backend's `decisions.py`, as
+ * {@link ZERO_MINOR_DIGIT_CURRENCIES} mirrors the zero-digit set.
+ */
+const THREE_MINOR_DIGIT_CURRENCIES: ReadonlySet<string> = new Set([
+  'BHD',
+  'IQD',
+  'JOD',
+  'KWD',
+  'LYD',
+  'OMR',
+  'TND',
+]);
 
 /**
  * The highest power-of-ten place, and the negated lowest, that a non-zero digit of a
@@ -101,6 +167,29 @@ const MAX_EXACT_PLACE = 307;
 
 /** Fraction digits of a per-unit-of-spend rate: the six places the backend records it at. */
 const RATE_DIGITS = 6;
+
+/**
+ * Fraction digits of a percentage when the caller names none: {@link formatPercent}'s default,
+ * and the fewest {@link percentDigits} returns unless told otherwise.
+ */
+const PERCENT_DIGITS = 1;
+
+/**
+ * The most fraction digits {@link percentDigits} returns unless told otherwise. The backend
+ * records a ratio at four places (budget and campaign shares) or six (creative stage rates), and
+ * a percentage moves the point two places, so four percent digits show every recorded ratio
+ * exactly.
+ */
+const MAX_PERCENT_DIGITS = 4;
+
+/** The fewest significant digits {@link percentDigits} lets a non-zero ratio show. */
+const MIN_PERCENT_SIGNIFICANT_DIGITS = 2;
+
+/**
+ * The most fraction digits {@link formatExactMoney} shows: one Google micro, the scale of the
+ * `numeric(18,6)` money columns (AAP 0.5.2).
+ */
+const MAX_EXACT_MONEY_DIGITS = 6;
 
 /** Below this a p-value renders as "< 0.001". */
 const P_VALUE_FLOOR = 0.001;
@@ -130,6 +219,9 @@ const BOUND_PREFIX = /^[≥≤<>≈]/;
 /** Spaces some ICU versions emit inside formatted output: U+202F and U+00A0. */
 const SPECIAL_SPACES = /[\u202F\u00A0]/g;
 
+/** A format part made only of spaces, of any kind ICU may emit: U+0020, U+00A0 or U+202F. */
+const SPACE_RUN = /^\s+$/u;
+
 // ---------------------------------------------------------------------------------------------
 // Input types
 // ---------------------------------------------------------------------------------------------
@@ -152,6 +244,17 @@ type Formattable = number | `${number}`;
 export type MetricInput = { value: MetricValue | undefined } & Partial<
   Pick<Metric, 'unit' | 'currency' | 'floor' | 'unavailable'>
 >;
+
+/** Options of {@link formatMetric}. */
+export interface MetricFormatOptions {
+  /**
+   * The fixed fraction digits of a {@link RATIO_UNITS} value, shared by every percentage of one
+   * column or compared set and picked by {@link ratioMetricDigits}: `"0.000698"` at 3 →
+   * `"0.070%"`, `"0.5"` at 1 → `"50.0%"`. Clamped to 0–20. Omitted, a ratio renders at
+   * {@link formatPercent}'s default, at most one digit without padding. Other units ignore it.
+   */
+  readonly ratioDigits?: number;
+}
 
 /**
  * The fields of a sample line that {@link formatSample} reads: an evidence {@link Sample}, or a
@@ -209,6 +312,31 @@ function asNumeric(value: MetricValue | undefined): NumericInput {
 /** Replaces the narrow no-break space (U+202F) and no-break space (U+00A0) with a plain space. */
 function normalizeSpaces(text: string): string {
   return text.replace(SPECIAL_SPACES, ' ');
+}
+
+/**
+ * Composes a currency-formatted amount from its `formatToParts` parts as code,
+ * {@link MONEY_SEPARATOR}, sign and figure (`"USD -40.00"`), whichever space ICU emits beside the
+ * code (U+00A0, U+202F, U+0020, or none, as before `"∞"`), so the code never ends a line apart
+ * from its figure. The sign belongs to the figure, after the code, where the backend's reason
+ * and C0 texts and {@link formatExactMoney} put it, rather than before the code, where ICU's
+ * English pattern puts it; the figure keeps ICU's digits, grouping and rounding, with
+ * {@link normalizeSpaces} applied.
+ */
+function joinMoneyParts(parts: readonly Intl.NumberFormatPart[]): string {
+  let sign = '';
+  let code = '';
+  let figure = '';
+  for (const part of parts) {
+    if (part.type === 'currency') {
+      code = part.value;
+    } else if (part.type === 'minusSign' || part.type === 'plusSign') {
+      sign += part.value;
+    } else if (part.type !== 'literal' || !SPACE_RUN.test(part.value)) {
+      figure += normalizeSpaces(part.value);
+    }
+  }
+  return `${code}${MONEY_SEPARATOR}${sign}${figure}`;
 }
 
 /** Returns the trimmed text, or `null` when it is missing or blank. */
@@ -406,10 +534,18 @@ function numberFormat(
 }
 
 /**
- * The currency formatter for an ISO 4217 code, which fixes the currency's own minor digits
- * (JPY 0, USD 2, KWD 3). Returns `null` when `Intl` refuses the code: a malformed code such as
- * `"EURO"` makes the constructor throw `RangeError`. A well-formed but unknown code such as
- * `"XYZ"` is accepted and printed as its code.
+ * The currency formatter for an ISO 4217 code, which prints exactly the currency's minor digits
+ * from {@link currencyMinorDigits} (JPY 0, USD 2, KWD 3, IQD 3, AFN 2), the backend's table,
+ * after its code: `"USD 400.00"`. Both fraction-digit bounds are set to that count, so the
+ * CLDR defaults `Intl` would otherwise apply (IQD 0, AFN 0) never reach a figure. It rounds half
+ * away from zero (`halfExpand`) on the exact decimal string, the rounding of the backend's
+ * `decisions.round_to_minor_unit` (`ROUND_HALF_UP`), with which its reason texts word the same
+ * stored amount: `"89.225"` USD is `89.23` and `"-89.225"` is `-89.23` on both sides. Its output
+ * is read through `formatToParts` and {@link joinMoneyParts}, which joins code and figure with the
+ * no-break {@link MONEY_SEPARATOR}, so a code never ends a line apart from its figure. Returns
+ * `null` when `Intl` refuses the code: a malformed code such as `"EURO"` makes the constructor
+ * throw `RangeError`. A well-formed but unknown code such as `"XYZ"` is accepted and printed as
+ * its code too, at the default two digits.
  */
 function currencyFormat(code: string): Intl.NumberFormat | null {
   const key = code.toUpperCase();
@@ -417,12 +553,21 @@ function currencyFormat(code: string): Intl.NumberFormat | null {
   if (cached !== undefined) {
     return cached;
   }
+  const digits = currencyMinorDigits(key);
   let created: Intl.NumberFormat | null;
   try {
     created = new Intl.NumberFormat(LOCALE, {
       style: 'currency',
       currency: key,
-      currencyDisplay: 'symbol',
+      // The ISO code, not a symbol, by design: it is the one money style the backend's reason
+      // and C0 texts share with every amount formatted here, and it never confuses the many
+      // currencies a "$" or "¥" names.
+      currencyDisplay: 'code',
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+      // Explicit, not left to the Intl default: a tie must round as the backend's reason texts
+      // round it, half up, away from zero.
+      roundingMode: 'halfExpand',
       signDisplay: 'negative',
     });
   } catch {
@@ -430,6 +575,29 @@ function currencyFormat(code: string): Intl.NumberFormat | null {
     created = null;
   }
   currencyFormats.set(key, created);
+  return created;
+}
+
+const exactMoneyFormats = new Map<number, Intl.NumberFormat>();
+
+/**
+ * The grouped decimal formatter of {@link formatExactMoney} at exactly `places` fraction digits,
+ * rounding half to even as the backend's `Decimal` context does, with no minus sign on a value
+ * that rounds to zero.
+ */
+function exactMoneyFormat(places: number): Intl.NumberFormat {
+  const cached = exactMoneyFormats.get(places);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const created = new Intl.NumberFormat(LOCALE, {
+    style: 'decimal',
+    minimumFractionDigits: places,
+    maximumFractionDigits: places,
+    roundingMode: 'halfEven',
+    signDisplay: 'negative',
+  });
+  exactMoneyFormats.set(places, created);
   return created;
 }
 
@@ -487,14 +655,28 @@ export function sourceLabel(source: SourceName): string {
 
 /**
  * Formats one amount in one account currency (AAP 0.5.5 Behaviour: "Numbers are formatted in
- * the account currency"), rounded to the currency's minor unit from the exact decimal string.
+ * the account currency"), rounded to the currency's minor unit from the exact decimal string
+ * and shown with exactly that many fraction digits: the backend's ISO 4217 table
+ * ({@link currencyMinorDigits}), so the figure has the places the API accepts and the reason
+ * texts print. A tie rounds half away from zero (`halfExpand`), as the backend's reason texts
+ * round it (`decisions.round_to_minor_unit`, `ROUND_HALF_UP`): `("89.225", "USD")` →
+ * `"USD 89.23"` in the cell and in the reason.
  *
- * - `formatMoney("1234.567891", "EUR")` → `"€1,234.57"`; `("40", "GBP")` → `"£40.00"`;
- *   `("1234.5", "JPY")` → `"¥1,235"`; `("-40", "EUR")` → `"-€40.00"`.
- * - A missing or blank currency renders the plain decimal with no symbol, so no currency is
+ * The amount follows its ISO 4217 code, never a currency symbol: the backend words every
+ * amount in its reason and C0 texts this way ("Spent USD 517.85"), so a card's fields and its
+ * reason sentence show one style. Code and figure are joined by the no-break
+ * {@link MONEY_SEPARATOR} whichever space the runtime's ICU emits, so a code never ends a line
+ * apart from its figure; it renders exactly as the backend's plain space. A minus sign is part
+ * of the figure, after the code, as the backend writes it.
+ *
+ * - `formatMoney("1234.567891", "EUR")` → `"EUR 1,234.57"`; `("40", "GBP")` → `"GBP 40.00"`;
+ *   `("1234.5", "JPY")` → `"JPY 1,235"`; `("-40", "EUR")` → `"EUR -40.00"`; `("50", "IQD")` →
+ *   `"IQD 50.000"`; `("50", "AFN")` → `"AFN 50.00"`.
+ * - A missing or blank currency renders the plain decimal with no code, so no currency is
  *   ever implied: `("40.5", null)` → `"40.5"`.
- * - A code `Intl` refuses renders the decimal followed by the code: `("5", "EURO")` →
- *   `"5 EURO"`. A well-formed unknown code formats normally: `("5", "XYZ")` → `"XYZ 5.00"`.
+ * - A code `Intl` refuses renders the decimal followed by the same separator and the code:
+ *   `("5", "EURO")` → `"5 EURO"`. A well-formed unknown code formats normally: `("5", "XYZ")`
+ *   → `"XYZ 5.00"`.
  * - An absent or non-numeric value renders {@link UNAVAILABLE}.
  *
  * Each call formats a single amount; nothing in this module sums, compares or converts amounts
@@ -518,39 +700,96 @@ export function formatMoney(
   }
   const formatter = currencyFormat(code);
   if (formatter === null) {
-    return `${formatDecimal(amount, DEFAULT_MINOR_DIGITS)} ${code}`;
+    return `${formatDecimal(amount, DEFAULT_MINOR_DIGITS)}${MONEY_SEPARATOR}${code}`;
   }
-  return normalizeSpaces(formatter.format(amount));
+  return joinMoneyParts(formatter.formatToParts(amount));
 }
 
 /**
- * The number of minor-unit digits of a currency: USD 2, EUR 2, JPY 0, KWD 3, BHD 3. The
- * decision form uses it for the amount input's step and its minor-unit hint, because the API
- * rejects an amount finer than the currency's minor unit with 422 (AAP 0.5.2). A missing or
- * refused code returns 2.
+ * The number of minor-unit digits of a currency, from the ISO 4217 table the backend's
+ * `decisions.minor_unit_exponent` holds: 0 for the currencies without a minor unit
+ * ({@link ZERO_MINOR_DIGIT_CURRENCIES}: JPY, KRW, CLP …), 3 for the thousandth currencies
+ * ({@link THREE_MINOR_DIGIT_CURRENCIES}: KWD, BHD, IQD …) and 2 for every other code, so
+ * `IQD` is 3 and `AFN` 2 even where CLDR, and so `Intl`, says 0. The API validates a decided
+ * amount to exactly this unit and rejects a finer one with 422 (AAP 0.5.2), and the backend's
+ * reason and C0 texts render amounts at it, so every money figure here, the decision form's
+ * step and its client-side validation use it too.
+ *
+ * The code is trimmed and compared case-insensitively, as the backend compares it. A missing
+ * or blank code, a code `Intl` refuses such as `"EURO"`, and a well-formed unknown code such as
+ * `"XYZ"` all return 2.
  *
  * @param currency - The ISO 4217 currency code.
  * @returns The currency's fraction digits.
  */
 export function currencyMinorDigits(currency: string | null | undefined): number {
-  const code = textOrNull(currency);
-  const formatter = code === null ? null : currencyFormat(code);
-  if (formatter === null) {
+  const code = textOrNull(currency)?.toUpperCase() ?? null;
+  if (code === null) {
     return DEFAULT_MINOR_DIGITS;
   }
-  return formatter.resolvedOptions().maximumFractionDigits ?? DEFAULT_MINOR_DIGITS;
+  if (ZERO_MINOR_DIGIT_CURRENCIES.has(code)) {
+    return 0;
+  }
+  if (THREE_MINOR_DIGIT_CURRENCIES.has(code)) {
+    return 3;
+  }
+  return DEFAULT_MINOR_DIGITS;
 }
 
 /**
  * The currency's minor unit as an `<input step>` value, built from
- * {@link currencyMinorDigits}: `"0.01"` for 2 digits, `"1"` for 0 and `"0.001"` for 3
- * (AAP 0.5.2: amounts are validated to the currency's minor unit).
+ * {@link currencyMinorDigits}: `"0.01"` for 2 digits (USD, AFN), `"1"` for 0 (JPY) and
+ * `"0.001"` for 3 (KWD, IQD) (AAP 0.5.2: amounts are validated to the currency's minor unit).
  *
  * @param currency - The ISO 4217 currency code.
  * @returns The step text.
  */
 export function currencyStep(currency: string | null | undefined): string {
   return stepText(currencyMinorDigits(currency));
+}
+
+/**
+ * Formats one stored amount exactly, hiding no digit: the C0 discrepancy values, where a
+ * one-micro difference is the mismatch being reported (AAP 0.5.4.4: no tolerance). It words the
+ * amount as the backend's `render_value` does (`_format_amount` in `analysis/discrepancy.py`),
+ * so `/decisions` and the C0 card on `/actions` read the same: the two texts differ only in the
+ * no-break separator below, which renders as the backend's plain space.
+ *
+ * - The figure keeps at least the currency's minor digits from the backend's ISO 4217 table
+ *   ({@link currencyMinorDigits}, the places `_format_amount` pads to) and every further
+ *   significant digit, up to six places, one Google micro:
+ *   `("200.000001", "USD")` → `"USD 200.000001"`, `("50.000000", "USD")` → `"USD 50.00"`,
+ *   `("1.5", "KWD")` → `"KWD 1.500"`, `("50.00", "IQD")` → `"IQD 50.000"`, `("50", "AFN")` →
+ *   `"AFN 50.00"`, `("5000.5", "JPY")` → `"JPY 5,000.5"`. A digit beyond the sixth place, which
+ *   no stored amount has, is rounded half to even, as the backend rounds it.
+ * - The code is upper-cased and precedes the figure after the no-break
+ *   {@link MONEY_SEPARATOR}, so it never ends a line apart from its figure; a negative figure
+ *   keeps its sign after the code (`("-40", "USD")` → `"USD -40.00"`). A code `Intl` refuses
+ *   still prints, at two minor digits: `("5", "EURO")` → `"EURO 5.00"`.
+ * - A missing or blank currency renders the figure alone, at two minor digits:
+ *   `("40.5", null)` → `"40.50"`.
+ * - An absent, non-numeric or out-of-range value renders {@link UNAVAILABLE}.
+ *
+ * @param value - The amount: a {@link Money} decimal string, or a number read as its shortest
+ *   decimal.
+ * @param currency - The account's ISO 4217 currency code.
+ * @returns The formatted amount.
+ */
+export function formatExactMoney(
+  value: Money | NumericInput,
+  currency: string | null | undefined,
+): string {
+  const amount = toFormattable(value);
+  const exact = amount === null ? null : toExactDecimal(amount);
+  if (amount === null || exact === null) {
+    return UNAVAILABLE;
+  }
+  const code = textOrNull(currency)?.toUpperCase() ?? null;
+  const minor = code === null ? DEFAULT_MINOR_DIGITS : currencyMinorDigits(code);
+  const significant = exact.exponent < 0 ? -exact.exponent : 0;
+  const places = Math.max(minor, Math.min(significant, MAX_EXACT_MONEY_DIGITS));
+  const text = normalizeSpaces(exactMoneyFormat(places).format(amount));
+  return code === null ? text : `${code}${MONEY_SEPARATOR}${text}`;
 }
 
 /**
@@ -608,30 +847,151 @@ export function formatCount(value: NumericInput): string {
   return normalizeSpaces(numberFormat('decimal', 2, 2).format(amount));
 }
 
+/** Options of {@link formatPercent}. */
+export interface PercentFormatOptions {
+  /**
+   * Whether the percentage always shows exactly `digits` fraction digits, trailing zeros
+   * included (`0.008` at 2 → `"0.80%"`), so every figure of a column or compared set reads at
+   * one precision. Defaults to `false`: at most `digits`, without padding.
+   */
+  readonly fixed?: boolean;
+}
+
 /**
  * Formats a 0–1 ratio as a percentage with at most `digits` fraction digits: `0.123` →
  * `"12.3%"`, `"0.5"` → `"50%"`, `1.4` → `"140%"`. Utilization, shares and stage rates use it
  * (AAP 0.5.4.1, 0.5.4.6). Decimal strings are formatted exactly, without a float conversion.
  *
- * A non-zero ratio that would round to `"0%"` renders as a bound: `0.0002` → `"< 0.1%"`,
- * `-0.0002` → `"> -0.1%"`. An absent or non-numeric value renders {@link UNAVAILABLE}.
+ * With `{ fixed: true }` the percentage shows exactly `digits` fraction digits:
+ * `("0.008", 2, { fixed: true })` → `"0.80%"`, `("0.000698", 3, { fixed: true })` → `"0.070%"`.
+ * {@link percentDigits} picks the one count a set of compared ratios shares.
+ *
+ * A non-zero ratio that would round to `"0%"` (fixed: `"0.0%"`) renders as a bound at the same
+ * digits: `0.0002` → `"< 0.1%"`, `-0.0002` → `"> -0.1%"`, `(0.000004, 3, { fixed: true })` →
+ * `"< 0.001%"`. An absent or non-numeric value renders {@link UNAVAILABLE}.
  *
  * @param ratio - The ratio, where 1 is 100%.
- * @param digits - The maximum fraction digits of the percentage, clamped to 0–20. Defaults to 1.
+ * @param digits - The fraction digits of the percentage, clamped to 0–20: the most shown, or
+ *   with `fixed` the exact count. Defaults to 1.
+ * @param options - See {@link PercentFormatOptions}.
  * @returns The formatted percentage.
  */
-export function formatPercent(ratio: NumericInput, digits = 1): string {
+export function formatPercent(
+  ratio: NumericInput,
+  digits = PERCENT_DIGITS,
+  options: PercentFormatOptions = {},
+): string {
   const amount = toFormattable(ratio);
   if (amount === null) {
     return UNAVAILABLE;
   }
   const places = fractionDigits(digits);
-  const text = normalizeSpaces(numberFormat('percent', 0, places).format(amount));
+  const minimum = options.fixed === true ? places : 0;
+  const text = normalizeSpaces(numberFormat('percent', minimum, places).format(amount));
   if (!isZero(amount) && !/[1-9]/.test(text)) {
     const step = stepText(places);
     return isNegative(amount) ? `> -${step}%` : `< ${step}%`;
   }
   return text;
+}
+
+/** Options of {@link percentDigits}. */
+export interface PercentDigitsOptions {
+  /** The fewest fraction digits returned, clamped to 0–20. Defaults to 1. */
+  readonly min?: number;
+  /**
+   * The most fraction digits returned, clamped to 0–20 and never below `min`. Defaults to 4, at
+   * which every ratio the backend records (at four or six places) reads exactly.
+   */
+  readonly max?: number;
+}
+
+/**
+ * The significant digits a formatted percentage shows, counted from its first non-zero digit:
+ * `"0.070%"` → 2, `"12.39%"` → 4, `"1,234.0%"` → 5. A bound such as `"< 0.1%"` shows none.
+ */
+function significantDigits(text: string): number {
+  if (BOUND_PREFIX.test(text)) {
+    return 0;
+  }
+  return text.replace(/\D/g, '').replace(/^0+/, '').length;
+}
+
+/**
+ * A key equal for equal values and different for different ones: the exact decimal's
+ * coefficient and exponent, so `"0.0800"`, `".08"` and `0.08` share one key without a float
+ * conversion. A value outside the exact range keys by its own text.
+ */
+function valueKey(value: Formattable): string {
+  const exact = toExactDecimal(value);
+  return exact === null
+    ? String(value)
+    : `${exact.coefficient.toString()}e${String(exact.exponent)}`;
+}
+
+/**
+ * Whether the distinct ratios all read as intended at `digits` fixed fraction digits: every
+ * non-zero ratio shows at least {@link MIN_PERCENT_SIGNIFICANT_DIGITS} significant digits, and
+ * no two of them render the same text.
+ */
+function readsApartAt(ratios: ReadonlyMap<string, Formattable>, digits: number): boolean {
+  const texts = new Set<string>();
+  for (const ratio of ratios.values()) {
+    const text = formatPercent(ratio, digits, { fixed: true });
+    if (!isZero(ratio) && significantDigits(text) < MIN_PERCENT_SIGNIFICANT_DIGITS) {
+      return false;
+    }
+    texts.add(text);
+  }
+  return texts.size === ratios.size;
+}
+
+/**
+ * Picks the one fixed fraction-digit count a set of compared ratios is shown at, such as one
+ * table column, or a metric with its baselines and interval bounds (AAP 0.5.4.8: every cited
+ * number shown faithfully). It returns the smallest count from `min` to `max` at which both
+ * hold, and `max` when none does:
+ *
+ * - every non-zero ratio shows at least two significant digits, so a small rate never reads
+ *   as `"0.1%"` or `"< 0.1%"`;
+ * - ratios that differ in value never render the same text.
+ *
+ * Pass the result to {@link formatPercent} with `{ fixed: true }`, or to {@link formatMetric}
+ * as `ratioDigits`, for every figure of the set, so the set reads at one precision. Absent and
+ * non-numeric inputs are ignored. Decimal strings are compared and rendered exactly, without a
+ * float conversion.
+ *
+ * @param ratios - The ratios of the set, where 1 is 100%.
+ * @param options - See {@link PercentDigitsOptions}.
+ * @returns The fraction digits.
+ *
+ * @example
+ * ```ts
+ * percentDigits(['0.000722', '0.000698']); // 3: "0.072%" and "0.070%"
+ * percentDigits(['0.007501', '0.008120']); // 2: "0.75%" and "0.81%"
+ * percentDigits(['0.008', '0.0058', '0.1239', '0.01'], { min: 2 }); // 2: "0.80%" … "1.00%"
+ * percentDigits([]); // 1
+ * ```
+ */
+export function percentDigits(
+  ratios: readonly NumericInput[],
+  options: PercentDigitsOptions = {},
+): number {
+  const min = fractionDigits(options.min ?? PERCENT_DIGITS);
+  const max = Math.max(fractionDigits(options.max ?? MAX_PERCENT_DIGITS), min);
+  const distinct = new Map<string, Formattable>();
+  for (const ratio of ratios) {
+    const amount = toFormattable(ratio);
+    if (amount !== null) {
+      distinct.set(valueKey(amount), amount);
+    }
+  }
+  for (let digits = min; digits < max; digits += 1) {
+    if (readsApartAt(distinct, digits)) {
+      return digits;
+    }
+  }
+  return max;
 }
 
 /**
@@ -649,9 +1009,10 @@ export function formatPercent(ratio: NumericInput, digits = 1): string {
  *   when conversions are 0, AAP 0.5.4.3).
  * - Otherwise the quotient spend / denominator is computed exactly in decimal arithmetic, never
  *   through a binary float, and formatted in the currency, rounded once at the currency's minor
- *   digits as {@link formatMoney} rounds a stored amount: `("300", 4, "USD")` → `"$75.00"`,
- *   `("0.075", 3, "USD")` → `"$0.03"`, `("999999999999.994999", 1, "USD")` →
- *   `"$999,999,999,999.99"`. A cost the backend already computed, as evidence carries it,
+ *   digits as {@link formatMoney} rounds a stored amount, its code and figure joined by the
+ *   no-break {@link MONEY_SEPARATOR}: `("300", 4, "USD")` →
+ *   `"USD 75.00"`, `("0.075", 3, "USD")` → `"USD 0.03"`, `("999999999999.994999", 1, "USD")` →
+ *   `"USD 999,999,999,999.99"`. A cost the backend already computed, as evidence carries it,
  *   renders through {@link formatMoney} or {@link formatMetric} instead.
  * - A spend that is absent, non-numeric, non-finite or out of range renders
  *   {@link UNAVAILABLE}, and so does a quotient of 10^308 or more, which no finite figure shows.
@@ -786,10 +1147,15 @@ function withSuffix(text: string, suffix: string): string {
   return text === UNAVAILABLE ? text : `${text}${suffix}`;
 }
 
-/** Formats a numeric metric value that is not money, by its unit. */
-function formatByUnit(value: number | string, unit: string): string {
+/**
+ * Formats a numeric metric value that is not money, by its unit. A ratio renders at
+ * `ratioDigits` fixed fraction digits when given, else at {@link formatPercent}'s default.
+ */
+function formatByUnit(value: number | string, unit: string, ratioDigits?: number): string {
   if (RATIO_UNITS.has(unit)) {
-    return formatPercent(value);
+    return ratioDigits === undefined
+      ? formatPercent(value)
+      : formatPercent(value, ratioDigits, { fixed: true });
   }
   if (RATE_UNITS.has(unit)) {
     return formatDecimal(value, RATE_DIGITS);
@@ -820,7 +1186,8 @@ function formatByUnit(value: number | string, unit: string): string {
  *    search terms, and text the backend rendered itself such as `"n/a"`, `"—"`, `"≥ 12"` or
  *    `"unknown (3 deals not assessed)"`, which is never re-parsed.
  * 4. Money (a `currency` code, or a {@link MONEY_UNITS} unit) → {@link formatMoney}.
- * 5. {@link RATIO_UNITS} → {@link formatPercent}; {@link RATE_UNITS} → a six-place decimal;
+ * 5. {@link RATIO_UNITS} → {@link formatPercent}, at `options.ratioDigits` fixed fraction
+ *    digits when given; {@link RATE_UNITS} → a six-place decimal;
  *    {@link PERCENT_POINT_UNITS} → the decimal plus `%`; {@link DAY_UNITS} →
  *    {@link formatDays}; {@link P_VALUE_UNITS} → {@link formatPValue};
  *    {@link MULTIPLE_UNITS} → the decimal plus `×`.
@@ -833,9 +1200,11 @@ function formatByUnit(value: number | string, unit: string): string {
  * marked.
  *
  * @param metric - The metric, or any value paired with a unit and currency.
+ * @param options - See {@link MetricFormatOptions}; omitted, a ratio renders at
+ *   {@link formatPercent}'s default.
  * @returns The display text.
  */
-export function formatMetric(metric: MetricInput): string {
+export function formatMetric(metric: MetricInput, options: MetricFormatOptions = {}): string {
   const { value } = metric;
   if (metric.unavailable === true || value === null || value === undefined) {
     return UNAVAILABLE;
@@ -849,8 +1218,48 @@ export function formatMetric(metric: MetricInput): string {
   }
   const currency = textOrNull(metric.currency);
   const isMoney = currency !== null || MONEY_UNITS.has(unit);
-  const text = isMoney ? formatMoney(value, currency) : formatByUnit(value, unit);
+  const text = isMoney
+    ? formatMoney(value, currency)
+    : formatByUnit(value, unit, options.ratioDigits);
   return metric.floor === true ? formatFloor(text, isMoney ? 'max' : 'min') : text;
+}
+
+/**
+ * The value of a metric that {@link formatMetric} renders as a percentage: a numeric
+ * {@link RATIO_UNITS} value with no currency that is not marked unavailable. Every other metric
+ * gives `null`.
+ */
+function percentValueOf(metric: MetricInput): NumericInput {
+  const { value } = metric;
+  if (metric.unavailable === true || value === undefined || typeof value === 'boolean') {
+    return null;
+  }
+  const isRatio = RATIO_UNITS.has(normalizeUnit(metric.unit));
+  return isRatio && textOrNull(metric.currency) === null ? value : null;
+}
+
+/**
+ * The fixed fraction digits the percentages among a set of metrics share: {@link percentDigits}
+ * over the values {@link formatMetric} renders as percentages ({@link RATIO_UNITS}, no
+ * currency, not unavailable). Every other metric of the set is ignored, so a table of mixed
+ * units can pass all its rows. Pass the result to {@link formatMetric} as `ratioDigits` for
+ * each metric of the set.
+ *
+ * @param metrics - The metrics of the set, such as an evidence table's metrics and baselines.
+ * @param options - See {@link PercentDigitsOptions}.
+ * @returns The fraction digits.
+ *
+ * @example
+ * ```ts
+ * const digits = ratioMetricDigits([rateA, rateB, leadsA]); // 3 for rates 0.000722, 0.000698
+ * formatMetric(rateB, { ratioDigits: digits }); // "0.070%"
+ * ```
+ */
+export function ratioMetricDigits(
+  metrics: readonly MetricInput[],
+  options?: PercentDigitsOptions,
+): number {
+  return percentDigits(metrics.map(percentValueOf), options);
 }
 
 /**
@@ -904,6 +1313,10 @@ function formatProjection(projected: Projection | null | undefined): string {
  * Formats the sample line "observed / required" with its unit (AAP 0.5.5 card body; AAP 0.5.4.2
  * P6 withheld patterns carry their sample sizes): `"37 / 300 clicks"`, `"3 / 5 spending days"`.
  *
+ * - The two figures are joined by {@link FIGURE_SEPARATOR}, whose spaces are no-break spaces
+ *   (U+00A0), so the figure "37 / 300" never wraps across lines; the line may still wrap before
+ *   it or before its unit. The result is deliberately not passed through `normalizeSpaces`,
+ *   which only replaces the spaces ICU emits inside `Intl` output.
  * - Counts render through {@link formatCount}; the unit is appended when present.
  * - A projection is labelled as one (AAP 0.5.4.6 CR3): `"3,100 / 4,200 form opens ·
  *   ≈ 52,000 impressions (projected through the observed open rate)"`.
@@ -921,7 +1334,7 @@ export function formatSample(sample: SampleInput): string {
   if (noObserved && noRequired) {
     return '';
   }
-  let line = `${formatSampleValue(observed)} / ${formatSampleValue(required)}`;
+  let line = `${formatSampleValue(observed)}${FIGURE_SEPARATOR}${formatSampleValue(required)}`;
   const unit = textOrNull(sample.unit);
   if (unit !== null) {
     line += ` ${unit}`;

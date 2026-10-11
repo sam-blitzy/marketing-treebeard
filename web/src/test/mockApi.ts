@@ -153,7 +153,8 @@ export function apiError(
 }
 
 /**
- * An HTML response, `Content-Type: text/html`, such as nginx's 502 page. `apiFetch` rejects an
+ * An HTML response, `Content-Type: text/html`, such as a 502 page from a proxy in front of
+ * nginx (whose own errors under `/api/` are JSON envelopes). `apiFetch` rejects an
  * error status without the API's envelope as `http_<status>`, and a 2xx with an unparsable body
  * as `invalid_response`.
  *

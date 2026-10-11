@@ -1106,7 +1106,7 @@ test('records a decision and resolves the discrepancy it creates', async ({ page
       await expect(newest).toContainText(CAMPAIGN_STATUS_LABELS.paused, {
         timeout: ELEMENT_TIMEOUT_MS,
       });
-      await expect(newest).toContainText('status: paused');
+      await expect(newest).toContainText(`status: ${CAMPAIGN_STATUS_LABELS.paused}`);
       await expect(newest).toContainText('Recommendation');
     }).toPass({ timeout: DECISION_LOG_TIMEOUT_MS, intervals: PAGE_CHECK_INTERVALS_MS });
   });

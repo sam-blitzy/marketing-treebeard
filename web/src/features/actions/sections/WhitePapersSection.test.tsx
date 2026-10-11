@@ -81,6 +81,7 @@ import {
 } from '../../../test/fixtures';
 import { LiveSection, feedbackConfirmationText, feedbackFlow } from '../../../test/feedbackFlow';
 import { renderWithProviders } from '../../../test/render';
+import { textWithoutTooltips } from '../../../test/text';
 import { LARGE_RENDER_TEST_TIMEOUT_MS } from '../../../test/timeouts';
 import { formatMetric } from '../../../lib/format';
 import { flagText } from '../FlagList';
@@ -165,15 +166,16 @@ function headers(table: HTMLElement): (string | null)[] {
     .map((cell) => cell.textContent);
 }
 
-/** The visible body rows of a table, each as its cells' text (expand toggle first, if any). */
+/**
+ * The visible body rows of a table, each as its cells' text (expand toggle first, if any), as a
+ * browser shows it: an evidence metric label reads without its closed `Tooltip` help text.
+ */
 function bodyRows(table: HTMLElement): (string | null)[][] {
   return within(table)
     .getAllByRole('row')
     .slice(1)
     .filter((row) => row.closest('table') === table)
-    .map((row) =>
-      Array.from(row.children, (cell) => cell.textContent).filter((text) => text !== null),
-    );
+    .map((row) => Array.from(row.children, textWithoutTooltips));
 }
 
 /** The table named `caption`. */
@@ -433,29 +435,29 @@ describe('WhitePapersSection', () => {
         [
           'Details for The 2026 B2B Pipeline Report',
           PIPELINE_EUR_ASSET,
-          '€2,840.00',
+          'EUR\u00a02,840.00',
           '116',
           '≥ 14',
           '≥ 6',
           '≥ 3',
           '≥ 1',
           '≥ 1',
-          '≤ €473.33',
-          '≤ €946.67',
+          '≤ EUR\u00a0473.33',
+          '≤ EUR\u00a0946.67',
           'Double down: increase spend on Lead Gen — Pipeline Report EMEA',
         ],
         [
           'Details for The Attribution Playbook',
           simulatedAsset('The Attribution Playbook'),
-          '€1,500.00',
+          'EUR\u00a01,500.00',
           '31',
           '5',
           '2',
           '1',
           '0',
           '0',
-          '€750.00',
-          '€1,500.00',
+          'EUR\u00a0750.00',
+          'EUR\u00a01,500.00',
           'No change warranted',
         ],
       ]);
@@ -471,10 +473,10 @@ describe('WhitePapersSection', () => {
       expect(row?.slice(cellIndex('spend'), cellIndex('cost_per_meeting') + 1)).toEqual(expected);
       expect(row?.[cellIndex('mql')]).toBe('≥ 14');
       expect(row?.[cellIndex('ql')]).toBe('≥ 6');
-      expect(row?.[cellIndex('cost_per_ql')]).toMatch(/^≤ €/u);
-      expect(row?.[cellIndex('cost_per_meeting')]).toMatch(/^≤ €/u);
+      expect(row?.[cellIndex('cost_per_ql')]).toMatch(/^≤ EUR\u00a0/u);
+      expect(row?.[cellIndex('cost_per_meeting')]).toMatch(/^≤ EUR\u00a0/u);
       // Spend and platform leads are not attribution counts, so they carry no floor mark.
-      expect(row?.[cellIndex('spend')]).toBe('€2,840.00');
+      expect(row?.[cellIndex('spend')]).toBe('EUR\u00a02,840.00');
       expect(row?.[cellIndex('linkedin_leads')]).toBe('116');
     });
 
@@ -515,8 +517,8 @@ describe('WhitePapersSection', () => {
           .map((each) => each.querySelector('caption')?.textContent),
       ).toEqual(['White papers (EUR)', 'White papers (USD)']);
       expect(within(section).queryAllByText(/total/iu).map((node) => node.textContent)).toEqual([
-        'Spend total (EUR): €4,340.00',
-        'Spend total (USD): $1,210.00',
+        'Spend total (EUR): EUR\u00a04,340.00',
+        'Spend total (USD): USD\u00a01,210.00',
       ]);
       // EUR 4,340.00 + USD 1,210.00 would be 5,550.00; MQL + QL of the first row would be 20.
       expect(section.textContent).not.toContain('5,550');
@@ -529,7 +531,8 @@ describe('WhitePapersSection', () => {
       if (eur === undefined) {
         throw new Error('the default page has no EUR cohort');
       }
-      // The API sends the €750.00 row ahead of the ≤ €473.33 one; the section never re-sorts.
+      // The API sends the EUR 750.00 row ahead of the ≤ EUR 473.33 one; the section never
+      // re-sorts.
       eur.items = [...eur.items].reverse().map((item, index) => ({ ...item, rank: index + 1 }));
       await renderWhitePapers(section);
       await screen.findAllByRole('columnheader', { name: MQL_BOUND });
@@ -537,8 +540,8 @@ describe('WhitePapersSection', () => {
       expect(
         bodyRows(table('White papers (EUR)')).map((row) => [row[1], row[cellIndex('cost_per_ql')]]),
       ).toEqual([
-        [simulatedAsset('The Attribution Playbook'), '€750.00'],
-        [PIPELINE_EUR_ASSET, '≤ €473.33'],
+        [simulatedAsset('The Attribution Playbook'), 'EUR\u00a0750.00'],
+        [PIPELINE_EUR_ASSET, '≤ EUR\u00a0473.33'],
       ]);
     });
 
@@ -629,7 +632,7 @@ describe('WhitePapersSection', () => {
       expect(row).toEqual([
         'Details for Unbound QL Report',
         'Unbound QL Report',
-        '$600.00',
+        'USD\u00a0600.00',
         '18',
         '4',
         'unavailable',
@@ -637,13 +640,13 @@ describe('WhitePapersSection', () => {
         '0',
         '0',
         'unavailable',
-        '$600.00',
+        'USD\u00a0600.00',
         'No change warranted',
       ]);
 
       fireEvent.click(screen.getByRole('button', { name: 'Details for Unbound QL Report' }));
       expect(bodyRows(table('Per creative: Unbound QL Report'))).toEqual([
-        ['Variant Q', '$600.00', '18', '4', 'unavailable', '1', '0', '0', 'unavailable', '$600.00'],
+        ['Variant Q', 'USD\u00a0600.00', '18', '4', 'unavailable', '1', '0', '0', 'unavailable', 'USD\u00a0600.00'],
       ]);
     });
 
@@ -654,7 +657,7 @@ describe('WhitePapersSection', () => {
         [
           'Details for Paid Media Benchmarks 2026',
           simulatedAsset('Paid Media Benchmarks 2026'),
-          '$1,210.00',
+          'USD\u00a01,210.00',
           '41',
           'unavailable',
           '0',
@@ -672,13 +675,13 @@ describe('WhitePapersSection', () => {
       await renderDefault();
 
       expect(listEntries(document.body, 'Notes on the EUR white papers')).toEqual([
-        'Spend total (EUR): €4,340.00',
+        'Spend total (EUR): EUR\u00a04,340.00',
         'counts overlap across assets',
         LINKEDIN_LEADS_NOTE,
         MEETINGS_BOOKED_NOTE,
       ]);
       expect(listEntries(document.body, 'Notes on the USD white papers')).toEqual([
-        'Spend total (USD): $1,210.00',
+        'Spend total (USD): USD\u00a01,210.00',
         'counts overlap across assets',
         LINKEDIN_LEADS_NOTE,
         MEETINGS_BOOKED_NOTE,
@@ -717,11 +720,11 @@ describe('WhitePapersSection', () => {
       const perCreative = table('Per creative: The 2026 B2B Pipeline Report');
       expect(headers(perCreative)).toEqual(['Creative', ...metricHeaders(MQL_BOUND)]);
       expect(bodyRows(perCreative)).toEqual([
-        ['Variant A', '€1,480.00', '64', '≥ 8', '≥ 4', '≥ 2', '≥ 1', '≥ 1', '≤ €370.00', '≤ €740.00'],
-        ['Variant B', '€1,360.00', '49', '≥ 5', '≥ 2', '≥ 1', '≥ 0', '≥ 0', '≤ €680.00', '≤ €1,360.00'],
+        ['Variant A', 'EUR\u00a01,480.00', '64', '≥ 8', '≥ 4', '≥ 2', '≥ 1', '≥ 1', '≤ EUR\u00a0370.00', '≤ EUR\u00a0740.00'],
+        ['Variant B', 'EUR\u00a01,360.00', '49', '≥ 5', '≥ 2', '≥ 1', '≥ 0', '≥ 0', '≤ EUR\u00a0680.00', '≤ EUR\u00a01,360.00'],
         [
           'unknown creative',
-          '€0.00',
+          'EUR\u00a00.00',
           '3',
           '≥ 1',
           '≥ 0',
@@ -750,8 +753,8 @@ describe('WhitePapersSection', () => {
       );
       expect(evidenceRows.find((row) => row[0] === 'Cost per Qualified Lead')).toEqual([
         'Cost per Qualified Lead',
-        '≤ €473.33',
-        'Cohort median cost per Qualified Lead (EUR): €611.67',
+        '≤ EUR\u00a0473.33',
+        'Cohort median cost per Qualified Lead (EUR): EUR\u00a0611.67',
       ]);
       expect(evidenceRows.find((row) => row[0] === MQL_BOUND)?.[1]).toBe('≥ 14');
       expect(within(details).getByText('Sample: 6 / 3 Qualified Leads')).toBeTruthy();
@@ -759,12 +762,16 @@ describe('WhitePapersSection', () => {
       expect(thresholds).toHaveLength(Object.keys(wEur.evidence.thresholds).length);
       expect(thresholds).toContain('w.min_ql = 3');
       expect(thresholds).toContain('w.double_down_ratio = 0.8');
-      expect(listEntries(details, 'Data used')).toEqual(
-        wEur.evidence.datasets.map(
-          (entry) => `${entry.dataset}: complete, covered through ${String(entry.covered_through)}`,
-        ),
-      );
-      expect(listEntries(details, 'Data used')).toHaveLength(6);
+      // Each date carries its source's day boundary, as /sources labels it: LinkedIn's UTC, and
+      // HubSpot's UTC, which each HubSpot entry records since the window lists no HubSpot day.
+      expect(listEntries(details, 'Data used')).toEqual([
+        'linkedin.analytics_daily: complete, covered through 2026-10-05 (LinkedIn day, UTC)',
+        'linkedin.entities: complete, covered through 2026-10-05 (LinkedIn day, UTC)',
+        'linkedin.leads: complete, covered through 2026-10-05 (LinkedIn day, UTC)',
+        'hubspot.contacts: complete, covered through 2026-10-05 (HubSpot day, UTC)',
+        'hubspot.associations: complete, covered through 2026-10-05 (HubSpot day, UTC)',
+        'hubspot.deal_search: complete, covered through 2026-10-05 (HubSpot day, UTC)',
+      ]);
       expect(within(details).getByText('Floor: 12% of leads unmatched in HubSpot')).toBeTruthy();
       expect(
         within(details).getByText(
@@ -1297,8 +1304,8 @@ describe('WhitePapersSection', () => {
         '≥ 1',
         '≥ 1',
       ]);
-      expect(row?.[cellIndex('cost_per_ql')]).toBe('≤ $1,216.24');
-      expect(row?.[cellIndex('cost_per_meeting')]).toBe('≤ $2,432.47');
+      expect(row?.[cellIndex('cost_per_ql')]).toBe('≤ USD\u00a01,216.24');
+      expect(row?.[cellIndex('cost_per_meeting')]).toBe('≤ USD\u00a02,432.47');
       const toggle = within(usd).getByRole('button', { name: `Details for ${name}` });
       expect(toggle.getAttribute('aria-expanded')).toBe('false');
       expect(screen.queryByRole('table', { name: `Per creative: ${name}` })).toBeNull();
@@ -1993,7 +2000,7 @@ describe('WhitePapersSection', () => {
       ]);
       // A blank overlap note falls back to the backend's wording.
       expect(listEntries(document.body, 'Notes on the EUR white papers').slice(0, 2)).toEqual([
-        'Spend total (EUR): €10.00',
+        'Spend total (EUR): EUR\u00a010.00',
         'counts overlap across assets',
       ]);
 
@@ -2019,7 +2026,7 @@ describe('WhitePapersSection', () => {
       }
       expect(within(sparse).queryByRole('list', { name: 'Baselines' })).toBeNull();
       expect(listEntries(sparse, 'Data used')).toEqual([
-        'google.metrics_daily: complete, covered through 2026-10-05',
+        'google.metrics_daily: complete, covered through 2026-10-05 (Google day, America/New_York)',
       ]);
     });
 
@@ -2028,7 +2035,9 @@ describe('WhitePapersSection', () => {
 
       const section = screen.getByRole('region', { name: 'White papers' });
       expect(within(section).queryByRole('table')).toBeNull();
-      expect(within(section).getByText('No actions in this section')).toBeTruthy();
+      expect(section.querySelector('.ds-emptystate__title')?.textContent).toBe(
+        'No rule fired for this window',
+      );
     });
   });
 });
@@ -2138,7 +2147,7 @@ describe('long white-paper tables', () => {
       'Showing 50 of 60 white papers',
     ]);
     // USD amounts stay in USD: no row is converted or summed across cohorts.
-    expect(bodyRows(usdTable)[0]?.[2]?.startsWith('$')).toBe(true);
+    expect(bodyRows(usdTable)[0]?.[2]?.startsWith('USD\u00a0')).toBe(true);
 
     fireEvent.click(screen.getByRole('button', { name: 'Show 50 more white papers' }));
     expect(rowHeaders(eurTable)).toEqual(assetCells('EUR', 100));
@@ -2250,7 +2259,9 @@ describe('WhitePapersSection rendered again', () => {
 
     show(sameItems(section));
     expect(costNotes).toHaveBeenCalledTimes(3);
-    expect(bodyRows(table('White papers (EUR)'))[0]?.[cellIndex('spend')]).toBe('€2,840.00');
+    expect(bodyRows(table('White papers (EUR)'))[0]?.[cellIndex('spend')]).toBe(
+      'EUR\u00a02,840.00',
+    );
 
     show(
       withItem(section, FIXTURE_ITEM_IDS.wEur, (item) => ({
@@ -2264,7 +2275,7 @@ describe('WhitePapersSection rendered again', () => {
     expect(costNotes).toHaveBeenCalledTimes(4);
     const [first, second] = bodyRows(table('White papers (EUR)'));
     expect(first?.[cellIndex('spend')]).toBe(formatMetric(newSpend));
-    expect(second?.[cellIndex('spend')]).toBe('€1,500.00');
+    expect(second?.[cellIndex('spend')]).toBe('EUR\u00a01,500.00');
   });
 
   /** `section` as a newer run recomputes it: every asset the same, every item under a new id. */
