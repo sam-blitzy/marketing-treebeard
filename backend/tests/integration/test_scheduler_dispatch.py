@@ -40,8 +40,11 @@ source, requested_at, picked_at). ``sync/scheduler.py`` is driven through its re
   exactly 30 min: one), whatever that row's status; a source not in fallback is never probed,
   and neither another source's ``probe`` row nor another Google job spaces Google's probe; the
   row ends ``succeeded`` only when a live dataset was activated, ``failed`` otherwise with the
-  outcome's reason, ``live dataset was not activated`` without one, or ``recovery probe did
-  not pass`` without an outcome.
+  outcome's reason (for a probe that did not pass, its deciding check's), ``live dataset was
+  not activated`` without one, or ``source is no longer in automatic fallback; nothing was
+  probed`` without an outcome; each probe logs one ``sync.job.start`` and one
+  ``sync.job.finish`` (AAP 0.11.1) with its source, job, dataset, status, rows, checks,
+  calls, duration and error.
 
 How. Real PostgreSQL through ``conftest.db`` (emptied per test); rows of ``source_dataset``,
 ``sync_run`` and ``sync_request`` are inserted directly. Every scheduler runs on a fixed clock
@@ -57,16 +60,17 @@ sleeps.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Final, Protocol
+from typing import Any, Final, Protocol
 
 import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from structlog.testing import capture_logs
 
 from ads_engine.connectors.http import RetryPolicy
 from ads_engine.connectors.hubspot.client import RateLimiter
@@ -78,6 +82,9 @@ from ads_engine.sync.mode import (
     REASON_NO_CREDENTIALS,
     REASON_RECOVERED,
     BuildOutcome,
+    ProbeCheck,
+    ProbeReport,
+    ProbeRunLog,
     SourceModeController,
     bootstrap_sources,
 )
@@ -827,6 +834,33 @@ async def test_source_lanes_claim_only_their_own_requests(
 # tick: the nightly purge
 # ---------------------------------------------------------------------------------------------
 
+PURGE_FINISH: Final = (
+    "event",
+    "log_level",
+    "source",
+    "status",
+    "rows",
+    "by_source",
+    "calls",
+    "error",
+    "error_type",
+)
+"""The fields of the purge's ``sync.job.finish`` compared exactly (the duration varies)."""
+
+
+def _job_lines(entries: Sequence[MutableMapping[str, Any]], job: str) -> list[dict[str, Any]]:
+    """The captured ``sync.job.start`` and ``sync.job.finish`` records of ``job``, in order."""
+    return [
+        dict(entry)
+        for entry in entries
+        if entry.get("event") in {"sync.job.start", "sync.job.finish"} and entry.get("job") == job
+    ]
+
+
+def _fields(record: Mapping[str, Any], *names: str) -> dict[str, Any]:
+    """``record`` restricted to ``names``; a missing field reads as the sentinel ``"<absent>"``."""
+    return {name: record.get(name, "<absent>") for name in names}
+
 
 @pytest.mark.usefixtures("new_york")
 async def test_purge_deletes_only_primaries_retired_more_than_30_days_ago(
@@ -855,11 +889,35 @@ async def test_purge_deletes_only_primaries_retired_more_than_30_days_ago(
         db, "hubspot", "retired", retired_at=NY_PURGE - RETENTION - ONE_SECOND
     )
 
-    report = await _tick(scheduler, clock, NY_PURGE)
+    with capture_logs() as entries:
+        report = await _tick(scheduler, clock, NY_PURGE)
 
     assert report.errors == ()
     assert "purge" in report.steps
     assert report.purged == (google_old, linkedin_old, hubspot_old)
+    # AAP 0.11.1: the purge logs its start and one finish as every sync job does.
+    start, finish = _job_lines(entries, JOB_PURGE)
+    assert _fields(start, "event", "log_level", "source", "rows", "calls", "duration_ms") == {
+        "event": "sync.job.start",
+        "log_level": "info",
+        "source": "all",
+        "rows": 0,
+        "calls": 0,
+        "duration_ms": 0,
+    }
+    assert _fields(finish, *PURGE_FINISH) == {
+        "event": "sync.job.finish",
+        "log_level": "info",
+        "source": "all",
+        "status": "succeeded",
+        "rows": 3,
+        "by_source": {"google": 1, "linkedin": 1, "hubspot": 1},
+        "calls": 0,
+        "error": None,
+        "error_type": None,
+    }
+    assert isinstance(finish["duration_ms"], int)
+    assert finish["duration_ms"] >= 0
     assert await _dataset_ids(db) == [exactly_30, days_29, active, building]
     assert companion not in await _dataset_ids(db)
     rows = await _sync_runs(db, JOB_PURGE)
@@ -872,11 +930,13 @@ async def test_purge_deletes_only_primaries_retired_more_than_30_days_ago(
         (NY_PURGE, NY_PURGE, None)
     }
 
-    again = await _tick(scheduler, clock, NY_PURGE + timedelta(minutes=10))
+    with capture_logs() as quiet:
+        again = await _tick(scheduler, clock, NY_PURGE + timedelta(minutes=10))
 
     assert again.purged == ()
     assert "purge" not in again.steps
     assert len(await _sync_runs(db, JOB_PURGE)) == len(rows)
+    assert _job_lines(quiet, JOB_PURGE) == [], "a purge not due logs no job lines"
 
 
 @pytest.mark.usefixtures("new_york")
@@ -1000,11 +1060,25 @@ async def test_failed_purge_is_recorded_and_not_retried_before_the_next_slot(
     await _run(db, "google", JOB_PURGE, NY_PURGE - timedelta(days=1), rows=0)
     purgeable = await _dataset(db, "google", "retired", retired_at=NY_PURGE - timedelta(days=31))
 
-    report = await _tick(scheduler, clock, NY_PURGE)
+    with capture_logs() as entries:
+        report = await _tick(scheduler, clock, NY_PURGE)
 
     assert report.errors == ("purge",)
     assert report.purged == ()
     assert calls == [RETENTION]
+    start, finish = _job_lines(entries, JOB_PURGE)
+    assert (start["event"], start["source"]) == ("sync.job.start", "all")
+    assert _fields(finish, *PURGE_FINISH) == {
+        "event": "sync.job.finish",
+        "log_level": "error",
+        "source": "all",
+        "status": "failed",
+        "rows": 0,
+        "by_source": {},
+        "calls": 0,
+        "error": "OperationalError",
+        "error_type": "OperationalError",
+    }
     rows = await _sync_runs(db, JOB_PURGE)
     assert _purge_rows(rows[1:]) == [("google", "failed", None, "OperationalError")]
     assert rows[1].started_at == NY_PURGE
@@ -1028,28 +1102,48 @@ PROBE_SPACING: Final = timedelta(minutes=30)
 PROBE_TAKES: Final = timedelta(minutes=2)
 """How far the fake ``recover`` moves the clock when asked to, as a probe and build would."""
 
-NOT_PASSED: Final = "recovery probe did not pass"
+NOT_IN_FALLBACK: Final = "source is no longer in automatic fallback; nothing was probed"
 NOT_ACTIVATED: Final = "live dataset was not activated"
 """The ``probe`` row's error without an outcome, and for an outcome without a reason."""
+
+PROBE_DENIED: Final = "google search Q-G1: HTTP 403: The caller does not have permission"
+"""A Q-G1 denial as the connector words it; the reason names its query, so no prefix."""
+
+PROBE_FAILED: Final = BuildOutcome(
+    source="google",
+    mode="live",
+    dataset_id=None,
+    activated=False,
+    reason=PROBE_DENIED,
+    probe=ProbeReport.of(
+        "google", (ProbeCheck("Q-G1", False, PROBE_DENIED),), calls=1, duration_ms=12
+    ),
+)
+"""``recover``'s outcome for a recovery probe that did not pass: no dataset, its reason."""
 
 
 class Recovery:
     """Stands in for ``SourceModeController.recover``: records each source, returns an outcome.
 
-    Every call returns :attr:`outcome` (``None``: the probe did not pass). When :attr:`clock`
-    is set, each call first moves it on by :attr:`takes`, as a probe and a live build that
-    take time would, so a row's close is told apart from its start.
+    Every call returns :attr:`outcome`, by default :data:`PROBE_FAILED` (the probe did not
+    pass; ``None``: the source was no longer in fallback). The probe report an outcome
+    carries is first set on the scheduler's row log, as ``recover`` does once its probe
+    returns. When :attr:`clock` is set, each call first moves it on by :attr:`takes`, as a
+    probe and a live build that take time would, so a row's close is told apart from its
+    start.
     """
 
     def __init__(self) -> None:
         self.calls: list[Source] = []
-        self.outcome: BuildOutcome | None = None
+        self.outcome: BuildOutcome | None = PROBE_FAILED
         self.clock: _Clock | None = None
         self.takes = timedelta(0)
 
-    async def __call__(self, source: Source) -> BuildOutcome | None:
+    async def __call__(self, source: Source, run: ProbeRunLog | None = None) -> BuildOutcome | None:
         """Record ``source``, move the clock on when one is set, and return :attr:`outcome`."""
         self.calls.append(source)
+        if run is not None and self.outcome is not None and self.outcome.probe is not None:
+            run.report = self.outcome.probe
         if self.clock is not None:
             self.clock.at += self.takes
         return self.outcome
@@ -1069,9 +1163,11 @@ def recovery(monkeypatch: pytest.MonkeyPatch, source_jobs: SourceJobs) -> Recove
         del self  # Only the source decides here.
         return source == "google"
 
-    async def recover(self: SourceModeController, source: Source) -> BuildOutcome | None:
+    async def recover(
+        self: SourceModeController, source: Source, *, run: ProbeRunLog | None = None
+    ) -> BuildOutcome | None:
         del self  # The fake decides alone.
-        return await fake(source)
+        return await fake(source, run)
 
     monkeypatch.setattr(SourceModeController, "in_fallback", google_in_fallback)
     monkeypatch.setattr(SourceModeController, "recover", recover)
@@ -1089,7 +1185,8 @@ async def test_first_probe_runs_at_once_and_its_row_spaces_the_next_wake(
     """With no ``probe`` history the first tick probes Google, and Google alone, once.
 
     The ``probe`` row starts at the tick and is closed at the clock's reading once ``recover``
-    returned, two minutes on; no outcome (the probe did not pass) ends it ``failed``. The next
+    returned, two minutes on; a probe that did not pass ends it ``failed`` with the deciding
+    check's reason. The next
     wake, 30 s after that, probes nothing: the row spaces it. Today's purge has already run
     (a HubSpot ``purge`` row at 05:00 UTC), so probing is all either tick does and no
     Google ``purge`` row stands in for the ``probe`` row.
@@ -1111,7 +1208,7 @@ async def test_first_probe_runs_at_once_and_its_row_spaces_the_next_wake(
         "google",
         NOW,
         "failed",
-        NOT_PASSED,
+        PROBE_DENIED,
     )
     assert row.finished_at == clock.at == NOW + PROBE_TAKES
 
@@ -1231,7 +1328,8 @@ async def test_only_sources_in_fallback_are_probed_each_spaced_by_its_own_rows(
             ("failed", NOT_ACTIVATED),
             id="simulated_activated_without_reason",
         ),
-        pytest.param(None, ("failed", NOT_PASSED), id="probe_not_passed"),
+        pytest.param(PROBE_FAILED, ("failed", PROBE_DENIED), id="probe_not_passed"),
+        pytest.param(None, ("failed", NOT_IN_FALLBACK), id="no_longer_in_fallback"),
     ],
 )
 async def test_probe_row_succeeds_only_when_a_live_dataset_was_activated(
@@ -1243,8 +1341,10 @@ async def test_probe_row_succeeds_only_when_a_live_dataset_was_activated(
     """An activated live dataset ends the ``probe`` row ``succeeded`` with no error.
 
     A build not activated, or a simulated one, ends it ``failed`` with the outcome's reason,
-    or ``live dataset was not activated`` without one; no outcome ends it ``failed`` with
-    ``recovery probe did not pass``. The row is opened at the tick and closed at the clock.
+    or ``live dataset was not activated`` without one; a probe that did not pass ends it
+    ``failed`` with its deciding check's reason, and no outcome (the source left fallback
+    first) with ``source is no longer in automatic fallback; nothing was probed``. The row
+    is opened at the tick and closed at the clock.
     """
     clock = _Clock(NOW)
     scheduler = _scheduler(clock)
@@ -1258,3 +1358,155 @@ async def test_probe_row_succeeds_only_when_a_live_dataset_was_activated(
     (row,) = await _sync_runs(db, JOB_PROBE)
     assert (row.status, row.error) == expected
     assert (row.source, row.started_at, row.finished_at) == ("google", NOW, NOW)
+
+
+PROBE_START: Final = (
+    "event",
+    "log_level",
+    "source",
+    "job",
+    "run_id",
+    "dataset_id",
+    "mode",
+    "rows",
+    "calls",
+    "duration_ms",
+)
+PROBE_FINISH: Final = (
+    "event",
+    "log_level",
+    "source",
+    "job",
+    "run_id",
+    "dataset_id",
+    "status",
+    "rows",
+    "checks",
+    "calls",
+    "error",
+    "error_type",
+)
+"""The fields of a probe's ``sync.job`` lines compared exactly (the finish's duration varies)."""
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        pytest.param(
+            BuildOutcome(
+                source="google",
+                mode="live",
+                dataset_id=7,
+                activated=True,
+                reason=REASON_RECOVERED,
+                probe=ProbeReport.of("google", (ProbeCheck("Q-G1", True),), calls=1, duration_ms=9),
+            ),
+            ("info", "succeeded", 7, 1, 1, None),
+            id="live_activated",
+        ),
+        pytest.param(
+            PROBE_FAILED, ("error", "failed", None, 1, 1, PROBE_DENIED), id="probe_not_passed"
+        ),
+        pytest.param(
+            None, ("error", "failed", None, 0, 0, NOT_IN_FALLBACK), id="no_longer_in_fallback"
+        ),
+    ],
+)
+async def test_each_recovery_probe_logs_its_start_and_one_finish(
+    db: Sessions,
+    recovery: Recovery,
+    outcome: BuildOutcome | None,
+    expected: tuple[str, str, int | None, int, int, str | None],
+) -> None:
+    """AAP 0.11.1: a recovery probe logs ``sync.job.start`` and one ``sync.job.finish``.
+
+    The start names the source, job ``probe``, its row, no dataset, mode ``live`` and zero
+    rows, calls and duration. The finish adds the dataset built, the status the row was
+    closed with, zero rows, the probe's checks and calls (none without a probe report), the
+    duration and the row's own error: for a probe that did not pass, its deciding check's
+    reason, never a fixed text without the cause.
+    """
+    clock = _Clock(NOW)
+    scheduler = _scheduler(clock)
+    recovery.outcome = outcome
+    level, status, dataset_id, checks, calls, error = expected
+
+    with capture_logs() as entries:
+        report = await _tick(scheduler, clock, NOW)
+
+    assert report.probed == ("google",)
+    (row,) = await _sync_runs(db, JOB_PROBE)
+    assert (row.status, row.error) == (status, error)
+    start, finish = _job_lines(entries, JOB_PROBE)
+    assert _fields(start, *PROBE_START) == {
+        "event": "sync.job.start",
+        "log_level": "info",
+        "source": "google",
+        "job": JOB_PROBE,
+        "run_id": row.id,
+        "dataset_id": None,
+        "mode": "live",
+        "rows": 0,
+        "calls": 0,
+        "duration_ms": 0,
+    }
+    assert _fields(finish, *PROBE_FINISH) == {
+        "event": "sync.job.finish",
+        "log_level": level,
+        "source": "google",
+        "job": JOB_PROBE,
+        "run_id": row.id,
+        "dataset_id": dataset_id,
+        "status": status,
+        "rows": 0,
+        "checks": checks,
+        "calls": calls,
+        "error": error,
+        "error_type": None,
+    }
+    assert isinstance(finish["duration_ms"], int)
+    assert finish["duration_ms"] >= 0
+
+
+async def test_a_recovery_probe_that_raises_logs_one_failed_finish(
+    db: Sessions, recovery: Recovery, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A database error in ``recover`` closes the row with its class name and logs it once.
+
+    The step is isolated as before; the finish line is ``failed`` at error level with the
+    error's class name as error and error type, and no checks or calls (no report came back).
+    """
+    del recovery  # Requested so Google alone is in automatic fallback.
+
+    async def broken(
+        self: SourceModeController, source: Source, *, run: ProbeRunLog | None = None
+    ) -> BuildOutcome | None:
+        del self, source, run  # The failure, before any probe, depends on none of them.
+        raise OperationalError("SELECT", {}, ConnectionError("database restarting"))
+
+    monkeypatch.setattr(SourceModeController, "recover", broken)
+    clock = _Clock(NOW)
+    scheduler = _scheduler(clock)
+
+    with capture_logs() as entries:
+        report = await _tick(scheduler, clock, NOW)
+
+    assert report.errors == ("probes:google",)
+    (row,) = await _sync_runs(db, JOB_PROBE)
+    assert (row.status, row.error) == ("failed", "OperationalError")
+    start, finish = _job_lines(entries, JOB_PROBE)
+    assert (start["event"], start["run_id"]) == ("sync.job.start", row.id)
+    assert _fields(finish, *PROBE_FINISH) == {
+        "event": "sync.job.finish",
+        "log_level": "error",
+        "source": "google",
+        "job": JOB_PROBE,
+        "run_id": row.id,
+        "dataset_id": None,
+        "status": "failed",
+        "rows": 0,
+        "checks": 0,
+        "calls": 0,
+        "error": "OperationalError",
+        "error_type": "OperationalError",
+    }

@@ -164,6 +164,13 @@ live wire contract, so the same clients, parsers and rules run unchanged. Everyt
 labelled: a "Simulated" chip per source, a global banner naming each simulated source and its
 reason, and a "Simulated data" flag on every affected item.
 
+`MOCK_SCENARIO` selects the simulated world. `default` is the first-start world above.
+`edge_states` adds the card states the default world never produces: a C2 Hold, C1b, an untracked
+campaign, CR3 "not estimable", creative and deal floors, unknown CRM evidence and low search-term
+coverage. `crm_unavailable` is the same world without the MQL and QL stages. Changing
+`MOCK_SCENARIO` or `MOCK_SEED` replaces the simulated datasets, so earlier runs become historical
+([docs/runbook.md](docs/runbook.md#simulated-mode)).
+
 ## Going live
 
 Each source goes live on its own, with no code change:
@@ -211,6 +218,7 @@ Probes, failure handling, token bootstrap and HubSpot scopes:
 | Runtime | `DISPLAY_TIMEZONE` | IANA time zone name, such as `UTC` or `America/New_York` | `UTC` | Zone for the schedule and displayed instants; never moves a source's day boundary |
 | Runtime | `DATA_MODE` | `auto` or `simulated` (case-insensitive) | `auto` | `auto`: each source live with automatic simulated fallback; `simulated`: every source simulated |
 | Runtime | `MOCK_SEED` | Integer | `42` | Seed of the simulated data |
+| Runtime | `MOCK_SCENARIO` | `default`, `edge_states` or `crm_unavailable` (case-insensitive) | `default` | Simulated world the product serves ([docs/runbook.md](docs/runbook.md#simulated-mode)) |
 | Runtime | `BACKFILL_DAYS` | Positive integer | `180` | Initial backfill of every new dataset, in days, capped at 180 |
 | Resources | `DB_CPU_LIMIT` | CPU cores, fractional allowed (`0.5`) | `1` | CPU ceiling of `db`; read by Compose only |
 | Resources | `DB_MEMORY_LIMIT` | Size with `k`, `m` or `g` suffix (`1536m`) | `1g` | Memory ceiling of `db`; read by Compose only |

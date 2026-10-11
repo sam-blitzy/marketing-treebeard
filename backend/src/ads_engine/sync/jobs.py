@@ -860,8 +860,8 @@ class SourceSyncReport:
         results: Each job's result, in the order run.
         dataset_id: The dataset synced, or ``None`` when the source has no active dataset.
         mode: That dataset's mode, or ``None``.
-        reason: Why no job ran (no active dataset, or a live dataset that may not be synced
-            now); ``None`` when the jobs ran.
+        reason: Why no job ran (no active dataset, a live dataset that may not be synced now,
+            or a simulated dataset of another world); ``None`` when the jobs ran.
     """
 
     source: Source
@@ -2326,6 +2326,11 @@ _ENTITY_CHECKPOINT_KEYS: Final = frozenset(
 # The safe-absence verdict of a resumed entity sync that did not read campaigns: no absence
 # is inferred and nothing is present.
 _CAMPAIGNS_READ_EARLIER: Final = "campaign enumeration finished earlier in this entity cycle"
+# Observed budget history of a simulated world (EntitySyncJob._observed_budget_history): the
+# snapshot kinds copied, and the hours between copies, the scheduler's entity cadence, well
+# inside budget.max_observation_gap_hours so every copied day is whole-day known.
+_OBSERVED_HISTORY_ENTITIES: Final = frozenset({"campaign", "campaign_group", "budget"})
+_OBSERVED_HISTORY_HOURS: Final = 3
 
 _CHECKPOINT_DATE_RE: Final = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
@@ -3233,9 +3238,19 @@ class EntitySyncJob(_JobBase):
         """
         ctx = self.ctx
         distinct = list({row.key: row for row in rows}.values())
+        history = await self._observed_budget_history(session, distinct)
         snapshot_ids = await snapshots.write_snapshots(
             session, ctx.dataset_id, distinct, captured_at=ctx.now
         )
+        if history:
+            await repositories.append_snapshots(history, session=session)
+            _log.info(
+                "sync.entities.observed_history",
+                source=ctx.source,
+                dataset_id=ctx.dataset_id,
+                snapshots=len(history),
+                earliest=min(row["captured_at"] for row in history).isoformat(),
+            )
         baselined = await snapshots.ensure_baseline(
             session, ctx.dataset_id, captured_at=ctx.now, sealed=sealed
         )
@@ -3259,6 +3274,48 @@ class EntitySyncJob(_JobBase):
             {name: _success(ctx.now, covered=None, reasons=reasons, cut_short=cut_short)},
             failures=None if failure is None else {name: _failure_text(failure)},
         )
+
+    async def _observed_budget_history(
+        self, session: AsyncSession, rows: Sequence[SnapshotRow]
+    ) -> list[dict[str, Any]]:
+        """The budget observations a simulated world has the product hold before its first sync.
+
+        A simulated world may declare days of budget observations
+        (:attr:`~ads_engine.simulation.generator.SimulatedWorld.observed_history_days`), so
+        the budget rules (C2, B1, B2, B3) can judge a new simulated dataset at once instead
+        of after a week of real entity syncs. At the dataset's first entity sync (it has no
+        snapshot yet) this returns copies of the sync's campaign, campaign group and budget
+        rows every 3 hours back over those days, and only at instants strictly after the
+        world's last change to those entities, before which their values differed. Keyword,
+        creative and conversion action rows are never copied: their values vary over time.
+        Every other sync, a live dataset and a world declaring no history get none.
+
+        Called before this sync's own rows are written, which is how a first sync is told.
+
+        Returns:
+            The rows to append (``entity_snapshot`` columns), oldest observations last.
+        """
+        ctx = self.ctx
+        if ctx.mode != "simulated":
+            return []
+        world = ctx.controller.world
+        days = world.observed_history_days
+        if days <= 0:
+            return []
+        seen = await session.scalar(
+            select(EntitySnapshot.id).where(EntitySnapshot.dataset_id == ctx.dataset_id).limit(1)
+        )
+        if seen is not None:
+            return []
+        copied = [row for row in rows if row.entity_type in _OBSERVED_HISTORY_ENTITIES]
+        last_change = world.last_platform_change(ctx.source, ctx.now)
+        history: list[dict[str, Any]] = []
+        for step in range(1, days * 24 // _OBSERVED_HISTORY_HOURS + 1):
+            instant = ctx.now - timedelta(hours=_OBSERVED_HISTORY_HOURS * step)
+            if last_change is not None and instant <= last_change:
+                break
+            history.extend(row.to_row(ctx.dataset_id, instant) for row in copied)
+        return history
 
     # -- LinkedIn --------------------------------------------------------------------------
 
@@ -6846,8 +6903,10 @@ async def run_source_jobs(
             fetched and recorded are the presets it detected.
 
     Returns:
-        The report. With no active dataset (the scheduler's ``ensure_dataset`` builds it), or
-        a live dataset that may not be synced now, no job runs and ``reason`` says why.
+        The report. With no active dataset (the scheduler's ``ensure_dataset`` builds it), a
+        live dataset that may not be synced now, or a simulated dataset generated from
+        another world than the configured one (``ensure_dataset`` replaces it), no job runs
+        and ``reason`` says why.
 
     Raises:
         ValueError: If ``source`` or a job name is unknown.
@@ -6866,7 +6925,7 @@ async def run_source_jobs(
         )
     dataset = await ctl.datasets.get(dataset_id)
     mode = _as_mode(dataset.mode)
-    blocked = _live_blocked(ctl.settings, checked, mode)
+    blocked = _live_blocked(ctl.settings, checked, mode) or ctl.world_mismatch(dataset)
     if blocked is not None:
         return _log_report(
             SourceSyncReport(checked, trigger, dataset_id=dataset_id, mode=mode, reason=blocked)
@@ -6981,7 +7040,8 @@ async def _linkedin_crm_backfill(
     context runs on the backfill's configuration snapshot (``ctx.thresholds``).
 
     Returns:
-        The results of the jobs run, in order; empty when there is no CRM dataset to use.
+        The results of the jobs run, in order; empty when there is no CRM dataset to use
+        (none active, or one that may not be synced now).
     """
     if ctx.mode == "simulated":
         companion_id = await controller.datasets.companion_of(ctx.dataset_id)
@@ -7004,7 +7064,9 @@ async def _linkedin_crm_backfill(
         return ()
     crm = await controller.datasets.get(crm_id)
     crm_mode = _as_mode(crm.mode)
-    blocked = _live_blocked(controller.settings, "hubspot", crm_mode)
+    blocked = _live_blocked(controller.settings, "hubspot", crm_mode) or controller.world_mismatch(
+        crm
+    )
     if blocked is not None:
         _log.warning("sync.backfill.matching_skipped", crm_dataset_id=crm_id, reason=blocked)
         return ()
@@ -7055,7 +7117,8 @@ async def refresh_crm_dataset(
     Returns:
         The CRM sync's result, or ``None`` when no client of the dataset's mode may be
         opened now (a live dataset under ``DATA_MODE=simulated`` or without HubSpot
-        credentials), in which case nothing ran.
+        credentials, or a simulated one generated from another world than the configured
+        one), in which case nothing ran.
 
     Raises:
         ValueError: If the dataset is not a HubSpot dataset.
@@ -7070,7 +7133,9 @@ async def refresh_crm_dataset(
             "HubSpot dataset"
         )
     mode = _as_mode(dataset.mode)
-    blocked = _live_blocked(controller.settings, "hubspot", mode)
+    blocked = _live_blocked(controller.settings, "hubspot", mode) or controller.world_mismatch(
+        dataset
+    )
     if blocked is not None:
         _log.warning("sync.crm_refresh.skipped", crm_dataset_id=crm_dataset_id, reason=blocked)
         return None

@@ -212,6 +212,7 @@ from `.env.example`.
 | `DISPLAY_TIMEZONE` | Runtime | `UTC` | No | `api`, `worker` | IANA zone for the schedule's wall-clock slots and for displayed instants. Never moves a source's day boundary |
 | `DATA_MODE` | Runtime | `auto` | No | `migrate`, `api`, `worker` | `auto`: each source live, with automatic simulated fallback. `simulated`: every source simulated, never probed |
 | `MOCK_SEED` | Runtime | `42` | No | `worker` | Seed of the simulated world, so simulated data reproduces exactly |
+| `MOCK_SCENARIO` | Runtime | `default` | No | `worker` | Simulated world: `default`, `edge_states` or `crm_unavailable` ([Simulated mode](#simulated-mode)) |
 | `BACKFILL_DAYS` | Runtime | `180` | No | `worker` | Initial backfill of every new dataset, in days; capped at 180 for every source (LinkedIn's 6-month daily retention) |
 | `DB_CPU_LIMIT` | Resources | `1` | No | Compose (`deploy.resources.limits`) | CPU ceiling of `db`, in cores ([Resource limits](#resource-limits)) |
 | `DB_MEMORY_LIMIT` | Resources | `1g` | No | Compose (`deploy.resources.limits`) | Memory ceiling of `db` |
@@ -420,8 +421,14 @@ When the probe fails, the classification of the failed checks decides what happe
 | Probe result | What the worker does | What to do |
 |--------------|----------------------|------------|
 | A denial on any check: 401, 403, or a Google denial inside an n8n 200 | Automatic fallback: the source stays on simulated data, with the platform code and failing endpoint as reason. A recovery probe runs every 30 minutes | Fix the access, then wait for the next probe, or fix `.env` and recreate the processes |
-| A defect: 400, GAQL `QueryError`, validation | Status `error`, no simulated fallback, the defect logged with its query id | Inspect `docker compose logs worker` for the query id |
+| A defect: 400, GAQL `QueryError`, validation | Status `error`, no simulated fallback, the defect logged with its query id. The running worker does not probe the source again | Inspect `docker compose logs worker` for the query id, fix the cause, then restart `worker` |
 | Transient failures only: 429, 5xx, timeout, `RESOURCE_EXHAUSTED`, call budget | Status `stale`; the active dataset is kept; probed again after the interval | Usually nothing; retries are automatic |
+
+The same table applies when every check passes but the live build that follows fails. The reason
+then starts with "live build failed". A defect in a backfill job names the job and its query id,
+for example `live build failed: metrics job: google search Q-G3: INVALID_ARGUMENT: …`. A denial
+during the build keeps automatic fallback. Every other failure leaves the source `stale`, and it
+is built again after the interval. Only a denial ever replaces live data with simulated data.
 
 The dataset lifecycle (build, activation, retirement and the 30-day purge) is described in
 [architecture](architecture.md#dataset-lifecycle), and recovery in
@@ -593,13 +600,44 @@ live or entirely simulated.
 
 - **`MOCK_SEED`** (default 42) seeds the simulated world, so every run of the same seed produces
   the same data.
+- **`MOCK_SCENARIO`** (default `default`) selects the simulated world:
+  - `default`: the first-start world, with all five sections populated. Its budget rules C2, B1,
+    B2 and B3 wait for a week of real entity syncs ("known-budget days 0 of 7").
+  - `edge_states`: the default world plus the card states it never produces. These are a C2
+    "Hold" (pipeline veto, "ROI Calculator - Lead gen (NA)"), a C1b ("Analyst Brief - Lead gen
+    (NA)") and CR3 "not estimable" (target above 100%, "Copy test - Lead gen (Lab)"). They also
+    include a deal floor on every white paper row, creative floors (one lead response in five
+    carries no creative), unknown CRM evidence with "Pipeline unavailable" on a C2 Scale
+    ("Benchmarks - Retargeting (NA)") and low search-term coverage on keyword items. Its first
+    entity sync records 35 days of budget observations, so C2, B1, B2 and B3 evaluate on the
+    first run. The untracked Google campaign "Partner - Co-marketing" appears 15 minutes after
+    the world's first dataset was created. The next Google entity sync raises it as a C0 card
+    offering "Adopt platform state" and "Record intended state". That sync is the scheduled one,
+    or "Sync now" on `/sources`.
+  - `crm_unavailable`: `edge_states` without the MQL and QL stages. MQL and QL read
+    "unavailable" on every white paper row, C1b is withheld as pipeline unavailable, and every
+    LinkedIn lead-gen C2 is a Scale flagged "Pipeline unavailable".
+
+  Changing `MOCK_SCENARIO` or `MOCK_SEED` replaces every simulated dataset at the worker's next
+  dataset check, startup included. A new dataset is built from the configured world and the old
+  one is retired, so earlier runs and their items become historical: their C0 resolver is
+  disabled and a write from a screen that still shows them returns 409 `subject_retired`. Sync
+  jobs skip a dataset of another world until it is replaced. Unlike `DATA_MODE`, Compose reads it
+  from `.env` only: set it there, then recreate the worker.
+
+  ```bash
+  sed -i 's/^MOCK_SCENARIO=.*/MOCK_SCENARIO=edge_states/' .env
+  docker compose up -d --force-recreate worker
+  ```
+
 - **`make seed-simulated`** runs `ads-engine migrate && ads-engine seed-simulated` in a one-shot
   `migrate` container. It builds, backfills and activates a simulated dataset for every source,
-  keeping one that is already simulated and active, then computes the default-window run. It needs
-  no credentials, whatever `DATA_MODE` says. Run it only on a stack without live sources: a source
-  that would otherwise be live gets a simulated dataset with the reason "simulated data seeded on
-  request", which retires its live dataset, decisions included, until the worker's probe and build
-  replace it with a new live dataset and fresh baseline decisions.
+  keeping one that is already simulated and active when it was generated from the configured
+  `MOCK_SCENARIO` and `MOCK_SEED` (else it is replaced), then computes the default-window run. It
+  needs no credentials, whatever `DATA_MODE` says. Run it only on a stack without live sources: a
+  source that would otherwise be live gets a simulated dataset with the reason "simulated data
+  seeded on request", which retires its live dataset, decisions included, until the worker's probe
+  and build replace it with a new live dataset and fresh baseline decisions.
 
   ```bash
   make seed-simulated
@@ -691,6 +729,7 @@ How the freshness rows turn into item flags:
 | Datasets are stale | Transient errors (429, 5xx, timeouts, `RESOURCE_EXHAUSTED`) or the Google call budget exhausted | Nothing to do at first: the last good data is kept and retries are automatic. Deferred Google pages resume in a later 24 h window. Check the call count on `/sources` |
 | Google stays stale while other n8n workflows run normally | n8n answers an invalid query with HTTP 500 "Error in workflow", which is indistinguishable from a transient 5xx | Find the failing query id in `docker compose logs worker`, and the execution in n8n's Executions tab |
 | A job failed with a defect | HTTP 400, GAQL `QueryError` or a validation error. Never retried | `docker compose logs worker`: the structured JSON names the job and the query id |
+| A source shows status `error` with "live build failed: …" and stays on its previous data | A backfill job of its live build met a defect. The running worker does not retry it | Find the job and query id in the reason and in `docker compose logs worker`, fix the cause, then `docker compose restart worker`. The restarted worker probes and builds it once more |
 | A dataset is incomplete | A Google search-term partition (Q-G6) returned 10,000 rows at its finest split, a HubSpot deal-search hour exceeded 10,000 results, or pages were deferred | Affected items carry `incomplete`. Deferred work completes later; the two platform limits stay flagged |
 | A discrepancy banner sits above everything | A platform status or budget differs from the last recorded decision | Resolve it on `/decisions`. The valid resolutions per kind are in [C0 resolutions](recommendation-rules.md#c0-resolutions) |
 | MQL or QL shows "unavailable" | The stage label in `config/hubspot_mapping.yaml` is not among the portal's `lifecyclestage` options, or its date property is missing | Read the reason on `/settings`. Fix the label, or bind a date property with `mode: property`, then restart `api` and `worker` |

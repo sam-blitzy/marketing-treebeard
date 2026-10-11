@@ -215,6 +215,13 @@ _ROLE_SHAPE_SQL: Final[str] = (
     "(role = 'companion' AND source = 'hubspot' AND mode = 'simulated' "
     "AND parent_dataset_id IS NOT NULL)"
 )
+# The CHECK text the migration repeats verbatim. A live dataset names no simulated world; a
+# simulated one names its world and seed together, or neither (rows written before worlds
+# were recorded).
+_SIMULATED_WORLD_SQL: Final[str] = (
+    "(mode = 'live' AND simulated_world IS NULL AND simulated_seed IS NULL) OR "
+    "(mode = 'simulated' AND (simulated_world IS NULL) = (simulated_seed IS NULL))"
+)
 
 
 class SourceDataset(IdPkMixin, Base):
@@ -232,6 +239,12 @@ class SourceDataset(IdPkMixin, Base):
     flips parent and companion in the same transaction, and ``parent_dataset_id`` is
     ``ON DELETE CASCADE``, so the companion is purged with its parent. The ``role_shape``
     check keeps the role, source, mode and parent columns consistent.
+
+    A simulated dataset records the world it was generated from (``MOCK_SCENARIO`` and
+    ``MOCK_SEED``), and a companion its parent's, so one dataset never mixes two worlds: a
+    changed setting builds and activates a new dataset through the normal transition, and
+    the old one becomes historical. The ``simulated_world`` check keeps both columns empty on
+    live datasets and set together on simulated ones.
 
     Retired datasets are read-only and purged by deleting their row; every ``dataset_id``
     reference cascades. This table is not itself dataset-scoped and is never upserted.
@@ -252,6 +265,11 @@ class SourceDataset(IdPkMixin, Base):
             and stage ids, their availability with the reason when unavailable, the Google
             campaign and touch-date property verification, and ``verified_at``. Attribution
             and ``GET /config`` read it. ``None`` for every other dataset.
+        simulated_world: For simulated datasets, the runtime world (``MOCK_SCENARIO``) it was
+            generated from; ``None`` for live datasets and for simulated rows written without
+            one, which are never replaced for it.
+        simulated_seed: For simulated datasets, the world's seed (``MOCK_SEED``); set exactly
+            when ``simulated_world`` is.
     """
 
     __tablename__ = "source_dataset"
@@ -272,6 +290,8 @@ class SourceDataset(IdPkMixin, Base):
     # dataset was read from, so they are stored per dataset: a live and a simulated portal
     # resolve different stage ids, and the bindings retire with their dataset.
     crm_bindings: Mapped[dict[str, Any] | None]
+    simulated_world: Mapped[str | None]
+    simulated_seed: Mapped[int | None]
 
     __table_args__ = (
         check_in("source", SOURCES),
@@ -279,6 +299,7 @@ class SourceDataset(IdPkMixin, Base):
         check_in("state", DATASET_STATES),
         check_in("role", DATASET_ROLES),
         sa.CheckConstraint(_ROLE_SHAPE_SQL, name="role_shape"),
+        sa.CheckConstraint(_SIMULATED_WORLD_SQL, name="simulated_world"),
         sa.Index(
             "uq_source_dataset_active_primary",
             "source",

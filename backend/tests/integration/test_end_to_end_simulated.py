@@ -24,6 +24,11 @@ live wire shape, and the conftest guard refuses any real transport.
 * :func:`test_seed_simulated_cli` runs the first-start command ``ads-engine seed-simulated``
   in a subprocess on an empty database and checks the page its default run serves with the
   same helpers.
+* :func:`test_runtime_worlds_reach_their_states_through_the_pipeline` seeds the
+  ``MOCK_SCENARIO=edge_states`` world (the catalogue's ``runtime.edge_states.case``), checks
+  its seeded budget history and the states its first run stores, raises its untracked
+  campaign with a later entity sync, then switches to ``crm_unavailable`` and checks the
+  replacement, the historical old run and the 409 ``subject_retired`` of a stale screen.
 
 What the default world must produce comes from the scenario catalogue's ``default`` entry
 (``SCENARIOS[DEFAULT_SCENARIO]``, whose module is this file), so a regression in
@@ -37,12 +42,12 @@ from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from subprocess import CompletedProcess
 from time import perf_counter
-from typing import Any, Final
+from typing import Any, Final, cast
 
 import anyio
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ads_engine.analysis.context import (
@@ -52,7 +57,9 @@ from ads_engine.analysis.context import (
     BANNER_OPEN_DISCREPANCIES,
     BANNER_SIMULATED_SOURCES,
     BUDGET,
+    C0,
     C1,
+    C1B,
     C2,
     C3A,
     C3B,
@@ -63,7 +70,10 @@ from ads_engine.analysis.context import (
     CREATIVE,
     CREATIVE_GROUP_PREFIX,
     DATA_SIMULATED,
+    FLAG_DEAL_FLOOR,
+    FLAG_PIPELINE_UNAVAILABLE,
     FLAG_SIMULATED,
+    FLAG_UNKNOWN_CRM_EVIDENCE,
     FULL_STATE_DATASETS,
     GROUP_BLOCK,
     GROUP_EXPAND,
@@ -78,12 +88,20 @@ from ads_engine.analysis.context import (
     WHITE_PAPERS,
 )
 from ads_engine.analysis.runner import default_window, run_analysis
+from ads_engine.connectors.hubspot.client import RateLimiter
 from ads_engine.db.models.analysis import AnalysisRun
 from ads_engine.db.models.ops import DatasetFreshness, SourceDataset, SyncRun
+from ads_engine.db.models.snapshots import EntitySnapshot
 from ads_engine.settings import SOURCES, Settings, get_settings
 from ads_engine.simulation.scenarios import DEFAULT_SCENARIO, MODULE_END_TO_END, SCENARIOS
 from ads_engine.sync.freshness import SOURCE_DATASETS
-from ads_engine.sync.jobs import JOB_CRM_COMPANION, SOURCE_JOBS, run_source_jobs
+from ads_engine.sync.jobs import (
+    JOB_CRM_COMPANION,
+    JOB_ENTITIES,
+    SOURCE_JOBS,
+    refresh_crm_dataset,
+    run_source_jobs,
+)
 from ads_engine.sync.mode import REASON_FORCED, SourceModeController, bootstrap_sources
 
 pytestmark = pytest.mark.anyio
@@ -900,3 +918,346 @@ async def test_seed_simulated_cli(
         _check_labelled_simulated(page)
     with subtests.test(msg="simulated_banner_and_modes"):
         _check_banner_and_modes(page, google_zone=google_zone, reason=REASON_FORCED)
+
+
+# ---------------------------------------------------------------------------------------------
+# The runtime edge worlds: MOCK_SCENARIO=edge_states, then crm_unavailable
+# ---------------------------------------------------------------------------------------------
+
+EDGE_STATES: Final = SCENARIOS["runtime.edge_states.case"]
+"""The catalogue's ``edge_states`` runtime world and the states it promises."""
+
+CRM_UNAVAILABLE: Final = SCENARIOS["runtime.crm_unavailable.case"]
+"""The catalogue's ``crm_unavailable`` runtime world and the states it promises."""
+
+EDGE_BACKFILL_DAYS: Final = "35"
+"""``BACKFILL_DAYS`` of the runtime-world seeds: the 28-day window plus a week of margin."""
+
+EDGE_START_LEAD: Final = timedelta(minutes=40)
+"""How long before the real instant the runtime-world seed starts. Its later steps (the
+untracked campaign 15 minutes after the epoch, the world switch) then still lie in the past of
+the API's real clock, so no dataset reads stale or from the future."""
+
+OBSERVED_KINDS: Final = frozenset({"campaign", "campaign_group", "budget"})
+"""The snapshot kinds a first simulated entity sync copies into observed budget history."""
+
+
+class _Clock:
+    """A settable clock shared by a controller, its dataset manager and its world."""
+
+    def __init__(self, at: datetime) -> None:
+        self.at = at
+
+    def __call__(self) -> datetime:
+        """Return the current instant."""
+        return self.at
+
+    def move(self, delta: timedelta) -> datetime:
+        """Advance by ``delta`` and return the new instant."""
+        self.at += delta
+        return self.at
+
+
+class _VirtualSeconds:
+    """Monotonic seconds for the HubSpot throttle that a sleep advances at once.
+
+    The product's own 4 requests/second limiter keeps its spacing on these seconds, so the
+    simulated CRM backfills of two world seeds take no real time waiting on it.
+    """
+
+    def __init__(self) -> None:
+        self.seconds = 0.0
+
+    def __call__(self) -> float:
+        """Return the current virtual second."""
+        return self.seconds
+
+    async def sleep(self, seconds: float) -> None:
+        """Advance the virtual seconds instead of sleeping."""
+        self.seconds += max(seconds, 0.0)
+
+
+def _runtime_controller(settings: Settings, clock: _Clock) -> SourceModeController:
+    """A controller on ``settings`` (its world from ``MOCK_SCENARIO``) and ``clock``."""
+    pace = _VirtualSeconds()
+    return SourceModeController(
+        settings, clock=clock, hubspot_limiter=RateLimiter(clock=pace, sleep=pace.sleep)
+    )
+
+
+def _named_items(page: Json, rule_id: str, name: str) -> list[Json]:
+    """The page's items of ``rule_id`` on the entity called ``name``."""
+    return [
+        item
+        for _section, _group, item in _items(page)
+        if item["rule_id"] == rule_id and (item.get("entity") or {}).get("name") == name
+    ]
+
+
+def _one(items: Sequence[Json], what: str) -> Json:
+    """The single item of ``items``, failing with ``what`` otherwise."""
+    assert len(items) == 1, f"{what}: {len(items)} items"
+    return items[0]
+
+
+def _metric_value(item: Json, key: str) -> object:
+    """An item's evidence metric value, failing when the metric is absent."""
+    for metric in item["evidence"].get("metrics") or []:
+        if metric.get("key") == key:
+            return metric.get("value")
+    raise AssertionError(f"{item['rule_id']} {item['entity'].get('name')!r}: no metric {key}")
+
+
+def _flag_codes(item: Json) -> set[str]:
+    """The codes of an item's stored flags."""
+    return {flag["code"] for flag in item.get("flags") or []}
+
+
+def _section(page: Json, key: str) -> Json:
+    """One section of the page."""
+    return next(section for section in page["sections"] if section["key"] == key)
+
+
+async def _dataset_rows(db: Sessions) -> list[SourceDataset]:
+    """Every ``source_dataset`` row, in id order."""
+    async with db() as session:
+        return list((await session.scalars(select(SourceDataset).order_by(SourceDataset.id))).all())
+
+
+def _shape(rows: Sequence[SourceDataset]) -> list[tuple[Any, ...]]:
+    """Each dataset's source, role, state and recorded world, in id order."""
+    return [
+        (row.source, row.role, row.state, row.simulated_world, row.simulated_seed) for row in rows
+    ]
+
+
+@pytest.fixture
+def edge_states_env(set_env: SetEnv) -> None:
+    """``MOCK_SCENARIO=edge_states`` with forced simulated data and no credentials."""
+    set_env(
+        DATA_MODE="simulated",
+        MOCK_SEED=MOCK_SEED,
+        MOCK_SCENARIO="edge_states",
+        BACKFILL_DAYS=EDGE_BACKFILL_DAYS,
+    )
+    settings = get_settings()
+    assert not [source for source in SOURCES if settings.has_credentials(source)]
+
+
+def test_the_runtime_worlds_are_this_modules_worlds() -> None:
+    """The catalogue's runtime worlds run in this module, on the real clock."""
+    for scenario in (EDGE_STATES, CRM_UNAVAILABLE):
+        assert scenario.module == MODULE_END_TO_END
+        assert not scenario.fixed_time
+        assert tuple(scenario.expect.values["populated_sections"]) == SECTION_ORDER
+        assert FLAG_SIMULATED in scenario.expect.flags
+
+
+@pytest.mark.usefixtures("edge_states_env")
+async def test_runtime_worlds_reach_their_states_through_the_pipeline(
+    authed_client: httpx.AsyncClient,
+    db: Sessions,
+    set_env: SetEnv,
+) -> None:
+    """``MOCK_SCENARIO`` worlds reach every promised state through sync, analysis and API.
+
+    1. ``edge_states`` first start: every dataset records the world and seed, and each first
+       entity sync seeds 35 days of campaign, campaign group and budget observations (every
+       3 h), so the first default run already holds the C2 Hold and C1b items, beside the C2
+       Scale flagged ``pipeline_unavailable`` and ``unknown_crm_evidence``, CR3 "not
+       estimable", the white paper floors and low search-term coverage.
+    2. 20 minutes later (past the epoch plus 15 minutes) a Google entity sync raises the
+       untracked own-budget campaign: one open ``untracked`` discrepancy offering
+       ``adopt_platform`` and ``record_intended``, and a C0 item in the next run.
+    3. Switching to ``crm_unavailable``: sync jobs skip the old world's datasets, the
+       bootstrap replaces and retires them, the new run shows MQL and QL unavailable and C1b
+       withheld, the old run's items are historical, and writes from that stale screen (item
+       feedback, a C0 resolution) are refused with 409 ``subject_retired``.
+    """
+    settings = get_settings()
+    assert (settings.mock_scenario, settings.mock_seed) == ("edge_states", int(MOCK_SEED))
+    start = datetime.now(UTC).replace(microsecond=0) - EDGE_START_LEAD
+    clock = _Clock(start)
+    controller = _runtime_controller(settings, clock)
+    report = await bootstrap_sources(settings, controller=controller)
+    assert not report.failures, f"bootstrap failed: {dict(report.failures)}"
+
+    edge_rows = await _dataset_rows(db)
+    assert sorted(_shape(edge_rows)) == sorted(
+        [
+            ("google", "primary", "active", "edge_states", 42),
+            ("linkedin", "primary", "active", "edge_states", 42),
+            ("hubspot", "primary", "active", "edge_states", 42),
+            ("hubspot", "companion", "active", "edge_states", 42),
+        ]
+    )
+    edge_ids = {row.source if row.role == "primary" else "companion": row.id for row in edge_rows}
+
+    # Observed budget history, seeded once, by each source's first entity sync.
+    days = int(cast(int, EDGE_STATES.expect.values["observed_history_days"]))
+    seeded_counts: dict[str, int] = {}
+    for source in DAY_SOURCES:
+        async with db() as session:
+            rows = (
+                await session.execute(
+                    select(EntitySnapshot.entity_type, EntitySnapshot.captured_at).where(
+                        EntitySnapshot.dataset_id == edge_ids[source]
+                    )
+                )
+            ).all()
+        current = [kind for kind, at in rows if at == start]
+        seeded = [(kind, at) for kind, at in rows if at < start]
+        copied = [kind for kind in current if kind in OBSERVED_KINDS]
+        assert copied, f"{source}: the first entity sync wrote no budget-bearing snapshot"
+        assert {kind for kind, _at in seeded} == set(copied), source
+        instants = {at for _kind, at in seeded}
+        assert len(instants) == days * 8, source
+        assert min(instants) == start - timedelta(days=days), source
+        assert len(seeded) == len(instants) * len(copied), source
+        assert all(at <= start for _kind, at in rows), source
+        seeded_counts[source] = len(seeded)
+
+    first = await run_analysis(await default_window(now=start), "default", "scheduled", now=start)
+    assert first.status == "succeeded", f"default run {first.id} is {first.status}"
+    page, _ = await _get_page(authed_client)
+    assert page["run"]["id"] == first.id
+    values = EDGE_STATES.expect.values
+    assert [s["key"] for s in page["sections"] if not any(g["items"] for g in s["groups"])] == []
+
+    hold_name = cast(str, values["c2_hold"])
+    hold = _one(_named_items(page, C2, hold_name), "C2 Hold")
+    assert hold["action"].startswith("Hold"), hold["action"]
+    assert _metric_value(hold, "ql") == 0
+    assert int(cast(int, _metric_value(hold, "known_days"))) >= 7
+    assert _named_items(page, B1, hold_name) == []
+    c1b = _one(_named_items(page, C1B, cast(str, values["c1b"])), "C1b")
+    assert (_metric_value(c1b, "ql"), _metric_value(c1b, "meetings")) == (0, 0)
+    scale = _one(_named_items(page, C2, cast(str, values["c2_scale_unknown_crm_evidence"])), "C2")
+    assert scale["action"].startswith("Scale"), scale["action"]
+    assert {FLAG_PIPELINE_UNAVAILABLE, FLAG_UNKNOWN_CRM_EVIDENCE} <= _flag_codes(scale)
+    cr3 = _one(_named_items(page, CR3, cast(str, values["cr3_not_estimable"])), "CR3")
+    assert _metric_value(cr3, "sample_per_variant") == "not estimable"
+    rows_w = [item for key, _g, item in _items(page) if key == WHITE_PAPERS]
+    assert rows_w
+    assert all(FLAG_DEAL_FLOOR in _flag_codes(row) for row in rows_w)
+    benchmarks = _one(
+        [row for row in rows_w if row["entity"]["name"] == "Paid Media Benchmarks 2026"], "W row"
+    )
+    assert set(cast(Sequence[str], values["white_paper_flags"])) <= _flag_codes(benchmarks)
+    keyword_findings = {finding["code"] for finding in _section(page, KEYWORDS)["findings"]}
+    assert values["low_search_term_coverage"] in keyword_findings
+    assert _named_items(page, C0, cast(str, values["c0_untracked"])) == []
+
+    # The untracked campaign is listed from 15 minutes after the epoch (the first dataset's
+    # creation); the next Google entity sync finds it after the baseline.
+    clock.move(timedelta(minutes=20))
+    synced = await run_source_jobs(
+        "google", trigger="manual", jobs=[JOB_ENTITIES], controller=controller, now=clock.at
+    )
+    assert synced.ok, synced.to_json()
+    response = await authed_client.get("/api/v1/discrepancies")
+    assert response.status_code == 200, response.text
+    untracked = [entry for entry in response.json() if entry["kind"] == "untracked"]
+    discrepancy = _one(untracked, "untracked discrepancy")
+    assert discrepancy["subject"]["name"] == values["c0_untracked"]
+    assert (discrepancy["shape"], discrepancy["state"]) == ("own_budget", "open")
+    assert discrepancy["resolutions"] == ["adopt_platform", "record_intended"]
+    async with db() as session:
+        history_after = await session.scalar(
+            select(func.count())
+            .select_from(EntitySnapshot)
+            .where(
+                EntitySnapshot.dataset_id == edge_ids["google"],
+                EntitySnapshot.captured_at < start,
+            )
+        )
+    assert history_after == seeded_counts["google"], "a later entity sync seeded history again"
+
+    second = await run_analysis(
+        await default_window(now=clock.at), "default", "scheduled", now=clock.at
+    )
+    assert second.status == "succeeded"
+    page, _ = await _get_page(authed_client)
+    c0 = _one(_named_items(page, C0, cast(str, values["c0_untracked"])), "C0 untracked")
+    assert _extra(c0)["kind"] == "untracked"
+    assert _extra(c0)["resolutions"] == ["adopt_platform", "record_intended"]
+    old_hold = _one(_named_items(page, C2, hold_name), "C2 Hold of the second run")
+
+    # Switch the world: nothing syncs the old world's datasets, the bootstrap replaces them.
+    set_env(MOCK_SCENARIO="crm_unavailable")
+    switched = get_settings()
+    clock.move(timedelta(minutes=5))
+    controller = _runtime_controller(switched, clock)
+    reason = (
+        "simulated dataset not synced: generated from world edge_states (seed 42), "
+        "configured crm_unavailable (seed 42)"
+    )
+    for source in SOURCES:
+        skipped = await run_source_jobs(
+            source, trigger="manual", controller=controller, now=clock.at
+        )
+        assert (skipped.results, skipped.reason) == ((), reason), source
+    assert await refresh_crm_dataset(controller, edge_ids["hubspot"], now=clock.at) is None
+
+    report = await bootstrap_sources(switched, controller=controller)
+    assert not report.failures, f"bootstrap failed: {dict(report.failures)}"
+    rows_after = await _dataset_rows(db)
+    retired = [row for row in rows_after if row.id in set(edge_ids.values())]
+    assert {row.state for row in retired} == {"retired"}
+    assert sorted(shape for shape in _shape(rows_after) if shape[2] == "active") == sorted(
+        [
+            ("google", "primary", "active", "crm_unavailable", 42),
+            ("linkedin", "primary", "active", "crm_unavailable", 42),
+            ("hubspot", "primary", "active", "crm_unavailable", 42),
+            ("hubspot", "companion", "active", "crm_unavailable", 42),
+        ]
+    )
+
+    third = await run_analysis(
+        await default_window(now=clock.at), "default", "scheduled", now=clock.at
+    )
+    assert third.status == "succeeded"
+    page, _ = await _get_page(authed_client)
+    assert page["run"]["id"] == third.id
+    unavailable = CRM_UNAVAILABLE.expect.values
+    rows_w = [item for key, _g, item in _items(page) if key == WHITE_PAPERS]
+    assert rows_w
+    for row in rows_w:
+        for count in cast(Sequence[str], unavailable["unavailable_counts"]):
+            assert _metric_value(row, count) is None, (row["entity"]["name"], count)
+    withheld = [
+        line
+        for line in _section(page, CAMPAIGNS)["withheld"]
+        if line["rule_id"] == C1B
+        and (line.get("entity") or {}).get("name") == unavailable["c1b_withheld"]
+    ]
+    assert _one(withheld, "withheld C1b")["reason"].startswith("pipeline unavailable")
+    for name in cast(Sequence[str], unavailable["c2_scale_pipeline_unavailable"]):
+        item = _one(_named_items(page, C2, name), f"C2 {name}")
+        assert item["action"].startswith("Scale"), name
+        assert FLAG_PIPELINE_UNAVAILABLE in _flag_codes(item), name
+
+    # The old world's run is historical, and a stale screen's writes are refused.
+    old_page, _ = await _get_page(authed_client, second.id)
+    old_items = [item for _s, _g, item in _items(old_page)]
+    assert old_items
+    assert all(item["current"]["historical"] is True for item in old_items)
+    old_c0 = _one(_named_items(old_page, C0, cast(str, values["c0_untracked"])), "old C0")
+    assert old_c0["current"]["historical"] is True
+    refused = await authed_client.post(
+        f"/api/v1/recommendations/{old_hold['id']}/feedback", json={"kind": "dismiss"}
+    )
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["error"]["code"] == "subject_retired"
+    for body in (
+        {"resolution": "adopt_platform"},
+        {
+            "resolution": "record_intended",
+            "intended_state": {"status": "paused", "daily_budget": "75.00"},
+        },
+    ):
+        refused = await authed_client.post(
+            f"/api/v1/discrepancies/{discrepancy['id']}/resolve", json=body
+        )
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["error"]["code"] == "subject_retired"

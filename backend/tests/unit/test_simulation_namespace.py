@@ -38,6 +38,7 @@ from ads_engine.simulation import (
     LINKEDIN_FORM_IDS,
     LINKEDIN_ID_RANGE,
     LINKEDIN_POST_IDS,
+    RUNTIME_SCENARIOS,
     SIM_EMAIL_DOMAIN,
     SIM_GOOGLE_CUSTOMER_ID,
     IdRange,
@@ -136,6 +137,7 @@ def test_public_interface_lists_each_documented_name_once() -> None:
         "LINKEDIN_FORM_IDS",
         "LINKEDIN_ID_RANGE",
         "LINKEDIN_POST_IDS",
+        "RUNTIME_SCENARIOS",
         "SIM_EMAIL_DOMAIN",
         "SIM_GOOGLE_CUSTOMER_ID",
         "IdRange",
@@ -161,6 +163,11 @@ def test_default_seed_mirrors_the_mock_seed_default() -> None:
 
 def test_default_scenario_name() -> None:
     assert DEFAULT_SCENARIO == "default"
+
+
+def test_runtime_scenarios_start_with_the_default_world() -> None:
+    assert RUNTIME_SCENARIOS == (DEFAULT_SCENARIO, "edge_states", "crm_unavailable")
+    assert len(set(RUNTIME_SCENARIOS)) == len(RUNTIME_SCENARIOS)
 
 
 def test_simulated_google_customer_id_has_the_webhook_shape() -> None:

@@ -97,9 +97,11 @@ from ads_engine.simulation import (
     GOOGLE_CAMPAIGN_IDS,
     HUBSPOT_STAGE_IDS,
     LINKEDIN_CAMPAIGN_IDS,
+    RUNTIME_SCENARIOS,
     scenarios,
 )
 from ads_engine.simulation.generator import (
+    RUNTIME_SPECS,
     ContactRecord,
     GoogleSearchTermSpec,
     PlatformChange,
@@ -143,6 +145,10 @@ CONFIG_DIR = Path(__file__).resolve().parents[3] / "config"
 MIDNIGHT = datetime.combine(FIXED_ANCHOR, time(0), tzinfo=UTC)
 CONFLICT = "wp.override_conflict.case"
 BUILDABLE = tuple(name for name in SCENARIOS if name != CONFLICT)
+REAL_CLOCK_SCENARIOS = (
+    DEFAULT_SCENARIO,
+    *(f"runtime.{world}.case" for world in RUNTIME_SCENARIOS[1:]),
+)
 PAIRS = tuple(pairs())
 # B1 is emitted exactly with C2's "Scale" outcome and never under a veto "Hold" (its not-firing
 # half is the C2 Hold case), and CR3 always proposes a next test, "exploratory" when no stage
@@ -556,7 +562,8 @@ def test_every_scenario_builds_its_context(name: str) -> None:
         assert scenario.spec.anchor == FIXED_ANCHOR
         assert ctx.now == FIXED_NOW
     else:
-        assert name == DEFAULT_SCENARIO
+        # Only the worlds the running product serves (MOCK_SCENARIO) run on the real clock.
+        assert name in REAL_CLOCK_SCENARIOS
         assert before <= ctx.now <= after
     assert ctx.run_kind == scenario.context.kind
     assert ctx.thresholds.config_hash == scenario.thresholds().config_hash
@@ -585,6 +592,19 @@ def test_default_scenario_runs_on_the_given_instant_and_seed() -> None:
     assert ctx.now == FIXED_NOW
     assert (ctx.window.start, ctx.window.end) == (date(2026, 9, 4), date(2026, 10, 1))
     assert scenario.build_context(seed=7, now=FIXED_NOW) != ctx
+
+
+@pytest.mark.parametrize("world", RUNTIME_SCENARIOS[1:])
+def test_runtime_scenarios_run_the_worlds_mock_scenario_selects(world: str) -> None:
+    scenario = _scenario(f"runtime.{world}.case")
+    assert scenario.spec is RUNTIME_SPECS[world]
+    assert scenario.spec.name == world
+    assert (scenario.module, scenario.variant, scenario.pair) == (MODULE_END_TO_END, "case", None)
+    assert not scenario.fixed_time
+    assert scenario.context == ContextSpec()
+    ctx = scenario.build_context(now=FIXED_NOW)
+    assert ctx.now == FIXED_NOW
+    assert (ctx.window.start, ctx.window.end) == (date(2026, 9, 4), date(2026, 10, 1))
 
 
 def test_build_context_normalises_the_instant_to_utc() -> None:

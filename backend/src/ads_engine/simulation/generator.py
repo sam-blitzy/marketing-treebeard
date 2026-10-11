@@ -83,8 +83,9 @@ from ads_engine.analysis.thresholds import (
 )
 from ads_engine.db.models.ops import SOURCES
 from ads_engine.logging import get_logger
-from ads_engine.settings import Settings, Source
+from ads_engine.settings import MOCK_SCENARIOS, Settings, Source
 from ads_engine.simulation import (
+    DEFAULT_SCENARIO,
     GOOGLE_AD_GROUP_IDS,
     GOOGLE_BUDGET_IDS,
     GOOGLE_CAMPAIGN_IDS,
@@ -101,6 +102,7 @@ from ads_engine.simulation import (
     LINKEDIN_CREATIVE_IDS,
     LINKEDIN_FORM_IDS,
     LINKEDIN_POST_IDS,
+    RUNTIME_SCENARIOS,
     SIM_EMAIL_DOMAIN,
     SIM_GOOGLE_CUSTOMER_ID,
     IdRange,
@@ -108,13 +110,16 @@ from ads_engine.simulation import (
 )
 
 __all__ = [
+    "CRM_UNAVAILABLE_SPEC",
     "DEFAULT_HISTORY_DAYS",
     "DEFAULT_LIFECYCLE_STAGES",
     "DEFAULT_SPEC",
+    "EDGE_STATES_SPEC",
     "FAULT_KINDS",
     "FAULT_SURFACES",
     "LEADS_PER_CREATIVE_DAY",
     "PERSON_CREATIVE_POSITIONS",
+    "RUNTIME_SPECS",
     "SEGMENT_PIVOTS",
     "BulkDealSpec",
     "ContactRecord",
@@ -1584,6 +1589,9 @@ class LinkedInCampaignSpec(_Replaceable):
             ``WEBSITE_CONVERSION``.
         daily_budget: Daily budget in the account currency (minor units), or ``None``.
         total_budget: Lifetime budget in the account currency, or ``None``.
+        funnel: The CRM funnel of the simulated people whose first lead came from one of this
+            campaign's creatives, instead of the portal's (``HubSpotSpec.funnel``); ``None``
+            keeps the portal's. Repeat leads follow the portal's ``repeat_person_share``.
     """
 
     key: str
@@ -1594,9 +1602,10 @@ class LinkedInCampaignSpec(_Replaceable):
     objective: str = "LEAD_GENERATION"
     daily_budget: Decimal | None = None
     total_budget: Decimal | None = None
+    funnel: FunnelSpec | None = None
 
     def __post_init__(self) -> None:
-        """Validate the key, status, objective and budgets."""
+        """Validate the key, status, objective, budgets and funnel."""
         _check_text("LinkedInCampaignSpec.key", self.key)
         _check_text(f"campaign {self.key} name", self.name)
         _check_choice("status", self.status, _LINKEDIN_CAMPAIGN_STATUSES)
@@ -1605,6 +1614,10 @@ class LinkedInCampaignSpec(_Replaceable):
             value = getattr(self, name)
             if value is not None:
                 _check_decimal(f"campaign {self.key} {name}", value, places=2)
+        _require(
+            self.funnel is None or isinstance(self.funnel, FunnelSpec),
+            f"campaign {self.key} funnel must be a FunnelSpec",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2210,6 +2223,10 @@ class Fault(_Replaceable):
         message: Error message; a platform-style default when ``None``.
         retry_after: ``Retry-After`` seconds for ``http_status``.
         ids: Affected ids (batch, omission, continuation and decoration kinds).
+        person_creatives: Instead of ``ids``, for a HubSpot ``batch_errors`` or ``omit_ids``
+            fault: the creative keys whose simulated people's contacts are affected (the
+            people whose first lead came from one of these creatives). Only
+            :meth:`SimulatedWorld.fault_targets` resolves it, so every reader agrees.
         category: Error category of ``batch_errors``, for example ``OBJECT_NOT_FOUND``.
         sub_category: Error sub-category of ``batch_errors``.
         batch_status: Batch status of ``non_complete_status``.
@@ -2232,6 +2249,7 @@ class Fault(_Replaceable):
     batch_status: str | None = None
     match: Mapping[str, str] = field(default_factory=dict)
     times: int | None = None
+    person_creatives: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Validate the source, surface, kind and the fields each kind needs.
@@ -2244,11 +2262,21 @@ class Fault(_Replaceable):
         _check_choice("Fault.kind", self.kind, FAULT_KINDS)
         object.__setattr__(self, "match", _frozen({str(k): str(v) for k, v in self.match.items()}))
         object.__setattr__(self, "ids", tuple(str(value) for value in self.ids))
+        object.__setattr__(self, "person_creatives", tuple(self.person_creatives))
         if self.times is not None:
             _check_int("Fault.times", self.times, minimum=1)
         if self.retry_after is not None:
             _check_int("Fault.retry_after", self.retry_after)
         kind = self.kind
+        if self.person_creatives:
+            _require(
+                self.source == "hubspot" and kind in ("batch_errors", "omit_ids"),
+                "person_creatives applies to HubSpot batch_errors and omit_ids faults",
+            )
+            _require(not self.ids, "a fault takes ids or person_creatives, not both")
+            for key in self.person_creatives:
+                _check_text("person_creatives key", key)
+        targeted = bool(self.ids) or bool(self.person_creatives)
         if kind == "http_status":
             _require(
                 self.status is not None and 400 <= self.status <= 599,
@@ -2258,9 +2286,11 @@ class Fault(_Replaceable):
             _require(self.source == "google", "body_error faults are Google (n8n) faults")
             _require(self.code is not None, "a body_error fault needs a Google error code")
         elif kind == "batch_errors":
-            _require(bool(self.ids), "a batch_errors fault needs ids")
+            _require(targeted, "a batch_errors fault needs ids")
             _require(self.category is not None, "a batch_errors fault needs a category")
-        elif kind in ("omit_ids", "continuation_failure", "decoration_mismatch", "no_decoration"):
+        elif kind == "omit_ids":
+            _require(targeted, "a omit_ids fault needs ids")
+        elif kind in ("continuation_failure", "decoration_mismatch", "no_decoration"):
             _require(bool(self.ids), f"a {kind} fault needs ids")
         elif kind == "non_complete_status":
             _check_choice("batch_status", self.batch_status, ("CANCELED", "PENDING", "PROCESSING"))
@@ -2297,6 +2327,9 @@ _CHANGE_FIELDS: Final[Mapping[tuple[str, str], tuple[str, ...]]] = MappingProxyT
         ("linkedin", "creative"): ("status",),
     }
 )
+# The entities whose snapshots carry a budget day's observation (status and budget values),
+# which observed budget history copies and SimulatedWorld.last_platform_change bounds.
+_BUDGET_HISTORY_ENTITIES: Final = ("campaign", "budget", "campaign_group")
 
 
 @dataclass(frozen=True, slots=True)
@@ -2324,6 +2357,9 @@ class PlatformChange(_Replaceable):
         disappear: The entity is no longer returned by any listing from this instant.
         reappear_at: Absolute instant at which a disappeared entity is listed again.
         reappear_at_offset_hours: Hours after the anchor's UTC midnight of the reappearance.
+        reappear_after_epoch: Time after the world's epoch (:attr:`SimulatedWorld.epoch`, the
+            instant the running product started simulating it) of the reappearance, so an
+            entity absent at a dataset's first entity sync is listed by a later one.
     """
 
     source: Source
@@ -2336,6 +2372,7 @@ class PlatformChange(_Replaceable):
     disappear: bool = False
     reappear_at: datetime | None = None
     reappear_at_offset_hours: int | None = None
+    reappear_after_epoch: timedelta | None = None
 
     def __post_init__(self) -> None:
         """Validate the instant, the entity and field pairing and the value type.
@@ -2365,7 +2402,9 @@ class PlatformChange(_Replaceable):
                 f"{self.source} {self.entity} changes accept {', '.join(allowed or ())}",
             )
             _require(
-                self.reappear_at is None and self.reappear_at_offset_hours is None,
+                self.reappear_at is None
+                and self.reappear_at_offset_hours is None
+                and self.reappear_after_epoch is None,
                 "only a disappearance can reappear",
             )
             if self.field in ("status", "budget_key"):
@@ -2380,6 +2419,15 @@ class PlatformChange(_Replaceable):
         )
         if self.reappear_at is not None:
             object.__setattr__(self, "reappear_at", _require_aware("reappear_at", self.reappear_at))
+        if self.reappear_after_epoch is not None:
+            _require(
+                isinstance(self.reappear_after_epoch, timedelta),
+                "reappear_after_epoch must be a timedelta",
+            )
+            _require(
+                self.reappear_at is None and self.reappear_at_offset_hours is None,
+                "reappear_after_epoch excludes reappear_at and reappear_at_offset_hours",
+            )
 
     def instant(self, anchor: date) -> datetime:
         """Return the change's UTC instant for a world anchored at ``anchor``."""
@@ -2387,12 +2435,20 @@ class PlatformChange(_Replaceable):
             return self.at
         return _midnight(anchor) + timedelta(hours=cast(int, self.at_offset_hours))
 
-    def reappear_instant(self, anchor: date) -> datetime | None:
-        """Return the reappearance instant, or ``None`` when the entity stays absent."""
+    def reappear_instant(self, anchor: date, epoch: datetime | None = None) -> datetime | None:
+        """Return the reappearance instant, or ``None`` when the entity stays absent.
+
+        Raises:
+            ValueError: When the reappearance is relative to the epoch and ``epoch`` is
+                ``None``.
+        """
         if self.reappear_at is not None:
             return self.reappear_at
         if self.reappear_at_offset_hours is not None:
             return _midnight(anchor) + timedelta(hours=self.reappear_at_offset_hours)
+        if self.reappear_after_epoch is not None:
+            _require(epoch is not None, f"the reappearance of {self.key} needs the world's epoch")
+            return cast(datetime, epoch) + self.reappear_after_epoch
         return None
 
 
@@ -2416,6 +2472,10 @@ class WorldSpec(_Replaceable):
         hubspot: The HubSpot portal.
         faults: Deliberate misbehaviours.
         platform_changes: Changes made on the platforms over time.
+        observed_history_days: Days of budget observations (campaign, campaign group and budget
+            entity snapshots) the product is taken to have recorded before a simulated
+            dataset's first entity sync, which writes them with that sync's values (0..
+            ``history_days``; 0 = none, so budget rules wait for real observations).
     """
 
     name: str
@@ -2426,6 +2486,7 @@ class WorldSpec(_Replaceable):
     hubspot: HubSpotSpec | None = None
     faults: tuple[Fault, ...] = ()
     platform_changes: tuple[PlatformChange, ...] = ()
+    observed_history_days: int = 0
 
     def __post_init__(self) -> None:
         """Validate the name, history and part types.
@@ -2436,6 +2497,11 @@ class WorldSpec(_Replaceable):
         _check_text("WorldSpec.name", self.name)
         _check_int("history_days", self.history_days, minimum=1)
         _require(self.history_days <= 3650, "history_days must be at most 3650")
+        _check_int("observed_history_days", self.observed_history_days)
+        _require(
+            self.observed_history_days <= self.history_days,
+            "observed_history_days must be at most history_days",
+        )
         _require(
             self.anchor is None
             or (isinstance(self.anchor, date) and not isinstance(self.anchor, datetime)),
@@ -3795,6 +3861,339 @@ it. No Google CRM properties are configured, so Google items carry ``no_crm_link
 
 
 # ---------------------------------------------------------------------------
+# Runtime edge worlds: MOCK_SCENARIO=edge_states and MOCK_SCENARIO=crm_unavailable
+# ---------------------------------------------------------------------------
+
+_NA_ACCOUNT: Final = 990_000_001
+_LAB_ACCOUNT: Final = 990_000_003
+_EDGE_C1B_FORM: Final = 990_000_401
+_EDGE_HOLD_FORM: Final = 990_000_402
+_EDGE_LAB_FORM: Final = 990_000_403
+_BENCHMARKS_FORM: Final = 990_000_201
+_EDGE_UNTRACKED_CAMPAIGN: Final = "g_edge_untracked"
+_EDGE_SCALE_CREATIVE: Final = "cr_edge_scale"
+# The untracked campaign is listed from this long after the world's epoch, so the first entity
+# sync of the world's datasets baselines without it and a later one raises it as untracked.
+_EDGE_UNTRACKED_REAPPEARS: Final = timedelta(minutes=15)
+# Days of budget observations the edge worlds' first entity sync records, so C2, B1, B2 and B3
+# evaluate on the first run (sustained-pattern gates need 7 known days; a 28-day window 28).
+_EDGE_OBSERVED_HISTORY_DAYS: Final = 35
+
+
+def _edge_funnel(
+    *,
+    mql: str,
+    meetings: str,
+) -> FunnelSpec:
+    """A campaign funnel whose people all match, promptly, and never reach QL or a deal.
+
+    Every person has a contact created minutes after the touch (no late or pre-touch contacts,
+    so the unresolved share is 0 and no outcome predates the touch); ``mql`` of them reach the
+    MQL stage and ``meetings`` book a meeting; none reaches Qualified Lead or a deal.
+    """
+    return FunnelSpec(
+        match_share=Decimal(1),
+        late_contact_share=Decimal(0),
+        mql_share=Decimal(mql),
+        ql_share=Decimal(0),
+        skipped_stage_share=Decimal(0),
+        pre_touch_share=Decimal(0),
+        meeting_share=Decimal(meetings),
+        canceled_share=Decimal(0),
+        meeting_created_after_start_share=Decimal(0),
+        two_contact_meeting_share=Decimal(0),
+        deal_share=Decimal(0),
+        pre_touch_deal_share=Decimal(0),
+        repeat_person_share=Decimal(0),
+    )
+
+
+def _edge_form(form_id: int, account_id: int, name: str, base: int) -> LinkedInLeadFormSpec:
+    """An email lead form with no white paper asset (absent from ``content_assets.yaml``)."""
+    return LinkedInLeadFormSpec(
+        form_id,
+        account_id,
+        name,
+        (
+            FormVersionSpec(
+                1,
+                (
+                    _q(base + 1, "firstName", "FIRST_NAME", "First name"),
+                    _q(base + 2, "lastName", "LAST_NAME", "Last name"),
+                    _q(base + 3, "workEmail", "WORK_EMAIL", "Work email"),
+                    _q(base + 4, "company", "COMPANY_NAME", "Company name"),
+                ),
+            ),
+        ),
+    )
+
+
+def _edge_google(base: GoogleSpec) -> GoogleSpec:
+    """The default Google customer plus an untracked campaign and an uncovered keyword.
+
+    * "Partner - Co-marketing" has its own daily budget, no delivery and is absent from every
+      listing until :data:`_EDGE_UNTRACKED_REAPPEARS` after the world's epoch (the platform
+      change in :func:`_edge_states_spec`): a later entity sync finds it after the baseline,
+      a C0 ``untracked`` discrepancy whose "Record intended state" takes ``{status,
+      daily_budget}`` (an ``own_budget`` campaign).
+    * "Generic - Long tail" spends about 100 a day through one broad keyword whose traffic
+      the search terms report never itemises (a residual profile and no search term), at the
+      account's conversion rate and about 70% of its budget, so account search-term coverage
+      falls below the 80% ``keywords.min_search_term_coverage`` and keyword items carry
+      ``search_term_coverage``.
+    """
+    return base.with_(
+        budgets=(
+            *base.budgets,
+            GoogleBudgetSpec("b_edge_partner", Decimal("75"), name="Partner - Co-marketing budget"),
+            GoogleBudgetSpec("b_edge_long_tail", Decimal("140"), name="Generic - Long tail budget"),
+        ),
+        campaigns=(
+            *base.campaigns,
+            GoogleCampaignSpec(
+                _EDGE_UNTRACKED_CAMPAIGN, "Partner - Co-marketing", "b_edge_partner"
+            ),
+            GoogleCampaignSpec("g_edge_long_tail", "Generic - Long tail", "b_edge_long_tail"),
+        ),
+        ad_groups=(
+            *base.ad_groups,
+            GoogleAdGroupSpec("ag_edge_long_tail", "g_edge_long_tail", "Long-tail attribution"),
+        ),
+        keywords=(
+            *base.keywords,
+            GoogleKeywordSpec(
+                "kw_edge_long_tail",
+                "ag_edge_long_tail",
+                "attribution tools",
+                match_type="BROAD",
+                quality_score=6,
+                profile=_dp(1000, "0.04", "2.50", "0.045"),
+            ),
+        ),
+    )
+
+
+def _edge_linkedin(base: LinkedInSpec) -> LinkedInSpec:
+    """The default LinkedIn advertiser plus pipeline, copy-test and attribution edge cases.
+
+    New entities follow the default ones, so every default id is unchanged:
+
+    * "Analyst Brief - Lead gen (NA)" (C1b): about 2.5 leads a day at about 74% of its budget
+      (neither capped nor under-utilised); its people all match and reach MQL but never QL or
+      a meeting, so a 28-day window holds well over 20 eligible matured contacts with QL = 0
+      and meetings = 0.
+    * "ROI Calculator - Lead gen (NA)" (C2 Hold): demand above its daily budget every day
+      (capped), a cost per lead well below the NA lead-gen baseline and more than 5 leads a
+      window; its people book meetings but never reach QL, so the pipeline veto fires.
+    * "Benchmarks - Retargeting (NA)" (C2 Scale flagged ``pipeline_unavailable`` and
+      ``unknown_crm_evidence``): capped and efficient on the Paid Media Benchmarks form; every
+      contact-to-deal association read of its people fails (a ``person_creatives`` fault in
+      :func:`_edge_states_spec`), so their CRM evidence is unknown, on the campaign and on
+      the white paper row.
+    * Account "Simulated Ads - Copy Lab" (USD): a two-variant lead-gen test whose variants
+      complete fewer forms than the account's always-on campaign, which completes about 97%.
+      The account's completion baseline is then above 1 / 1.2, so the CR3 completion test
+      needs a target above 100%: "not estimable" (as ``cr3.not_estimable_target_over_100``).
+    * One response in five carries no creative, so a white paper row's per-creative breakdown
+      is a floor (``creative_floor``) once its share of leads without a creative reaches the
+      10% floor share: always on the busy Paid Media Benchmarks row, by chance on small rows.
+    """
+    lab = _LAB_ACCOUNT
+    campaigns = (
+        LinkedInCampaignSpec(
+            "li_edge_c1b",
+            _NA_ACCOUNT,
+            "grp_na_leadgen",
+            "Analyst Brief - Lead gen (NA)",
+            daily_budget=Decimal("65.00"),
+            funnel=_edge_funnel(mql="0.35", meetings="0"),
+        ),
+        LinkedInCampaignSpec(
+            "li_edge_hold",
+            _NA_ACCOUNT,
+            "grp_na_leadgen",
+            "ROI Calculator - Lead gen (NA)",
+            daily_budget=Decimal("30.00"),
+            funnel=_edge_funnel(mql="0.40", meetings="0.30"),
+        ),
+        LinkedInCampaignSpec(
+            "li_edge_scale",
+            _NA_ACCOUNT,
+            "grp_na_leadgen",
+            "Benchmarks - Retargeting (NA)",
+            daily_budget=Decimal("25.00"),
+        ),
+        LinkedInCampaignSpec("li_lab_test", lab, "grp_lab_tests", "Copy test - Lead gen (Lab)"),
+        LinkedInCampaignSpec(
+            "li_lab_always_on", lab, "grp_lab_tests", "Always-on - Lead gen (Lab)"
+        ),
+    )
+    creatives = (
+        LinkedInCreativeSpec(
+            "cr_edge_c1b",
+            "li_edge_c1b",
+            "What analysts say about attribution in 2026",
+            "Read the analyst brief on B2B attribution platforms.",
+            lead_form_id=_EDGE_C1B_FORM,
+            profile=_dp(1500, "0.008", "4.00", form_open_rate="0.006", form_completion_rate="0.28"),
+        ),
+        LinkedInCreativeSpec(
+            "cr_edge_hold",
+            "li_edge_hold",
+            "Calculate the ROI of your paid media",
+            "A two-minute calculator for B2B paid media returns.",
+            lead_form_id=_EDGE_HOLD_FORM,
+            profile=_dp(2500, "0.010", "1.60", form_open_rate="0.008", form_completion_rate="0.15"),
+        ),
+        LinkedInCreativeSpec(
+            _EDGE_SCALE_CREATIVE,
+            "li_edge_scale",
+            "Still benchmarking your CPL by hand?",
+            "Paid Media Benchmarks 2026: CPL, CTR and CPC by channel and industry.",
+            lead_form_id=_BENCHMARKS_FORM,
+            profile=_dp(2000, "0.010", "1.50", form_open_rate="0.008", form_completion_rate="0.20"),
+        ),
+        LinkedInCreativeSpec(
+            "cr_lab_a",
+            "li_lab_test",
+            "The attribution checklist for 2026",
+            "Twelve questions to ask before you trust a dashboard.",
+            lead_form_id=_EDGE_LAB_FORM,
+            profile=_dp(120, "0.020", "2.00", form_open_rate="0.018", form_completion_rate="0.70"),
+        ),
+        LinkedInCreativeSpec(
+            "cr_lab_b",
+            "li_lab_test",
+            "Twelve questions before you trust a dashboard",
+            "Twelve questions to ask before you trust a dashboard.",
+            lead_form_id=_EDGE_LAB_FORM,
+            profile=_dp(120, "0.020", "2.00", form_open_rate="0.018", form_completion_rate="0.70"),
+        ),
+        LinkedInCreativeSpec(
+            "cr_lab_always_on",
+            "li_lab_always_on",
+            "Get the attribution checklist",
+            "Twelve questions to ask before you trust a dashboard.",
+            lead_form_id=_EDGE_LAB_FORM,
+            profile=_dp(1500, "0.010", "2.00", form_open_rate="0.006", form_completion_rate="0.97"),
+        ),
+    )
+    return base.with_(
+        accounts=(*base.accounts, LinkedInAccountSpec(lab, "Simulated Ads - Copy Lab", "USD")),
+        campaign_groups=(
+            *base.campaign_groups,
+            LinkedInCampaignGroupSpec("grp_lab_tests", lab, "Lab - Creative tests"),
+        ),
+        campaigns=(*base.campaigns, *campaigns),
+        creatives=(*base.creatives, *creatives),
+        lead_forms=(
+            *base.lead_forms,
+            _edge_form(_EDGE_C1B_FORM, _NA_ACCOUNT, "Analyst Brief 2026", 5000),
+            _edge_form(_EDGE_HOLD_FORM, _NA_ACCOUNT, "Paid Media ROI Calculator", 6000),
+            _edge_form(_EDGE_LAB_FORM, lab, "Attribution Checklist", 7000),
+        ),
+        unknown_creative_share=Decimal("0.20"),
+    )
+
+
+def _edge_states_spec() -> WorldSpec:
+    """The ``edge_states`` runtime world: :data:`DEFAULT_SPEC` plus the card states it lacks.
+
+    It adds :func:`_edge_google` and :func:`_edge_linkedin`, 80 orphan deals (about 25 created
+    in any 28-day window, a deal floor on every white paper row), and neither repeat people nor
+    meetings shared with a second contact, so no other campaign's QL or meeting reaches the C1b
+    and Hold campaigns' contacts. It records :data:`_EDGE_OBSERVED_HISTORY_DAYS` days of budget
+    observations at each dataset's first entity sync, and fails the contact-to-deal
+    association reads of the retargeting campaign's people (``VALIDATION_ERROR``, an
+    ``error`` fetch rather than a genuine zero).
+    """
+    default_google = cast(GoogleSpec, DEFAULT_SPEC.google)
+    default_linkedin = cast(LinkedInSpec, DEFAULT_SPEC.linkedin)
+    default_hubspot = cast(HubSpotSpec, DEFAULT_SPEC.hubspot)
+    return DEFAULT_SPEC.with_(
+        name="edge_states",
+        google=_edge_google(default_google),
+        linkedin=_edge_linkedin(default_linkedin),
+        hubspot=default_hubspot.with_(
+            # 80 rather than about 40: with 40 the orphan share fell to 9.2% (below the 10%
+            # floor share) for some seeds. No meetings shared with a second contact either, so
+            # a C1b campaign's contacts never inherit another campaign's meeting.
+            orphan_deals=80,
+            funnel=default_hubspot.funnel.with_(
+                repeat_person_share=Decimal(0), two_contact_meeting_share=Decimal(0)
+            ),
+        ),
+        faults=(
+            Fault(
+                "hubspot",
+                "associations_batch_read",
+                "batch_errors",
+                category="VALIDATION_ERROR",
+                message="The associations of this contact could not be read.",
+                match={"object_type": "contacts", "to_object_type": "deals"},
+                person_creatives=(_EDGE_SCALE_CREATIVE,),
+            ),
+        ),
+        platform_changes=(
+            PlatformChange(
+                "google",
+                "campaign",
+                _EDGE_UNTRACKED_CAMPAIGN,
+                disappear=True,
+                at_offset_hours=-24 * (DEFAULT_HISTORY_DAYS + 190),
+                reappear_after_epoch=_EDGE_UNTRACKED_REAPPEARS,
+            ),
+        ),
+        observed_history_days=_EDGE_OBSERVED_HISTORY_DAYS,
+    )
+
+
+EDGE_STATES_SPEC: Final[WorldSpec] = _edge_states_spec()
+"""``MOCK_SCENARIO=edge_states``: every section of :data:`DEFAULT_SPEC` plus the states it lacks.
+
+C2 Hold (pipeline veto), C1b, a C0 ``untracked`` own-budget campaign 15 minutes after the
+world's epoch, CR3 "not estimable" (target above 100%), creative and deal floors, unknown CRM
+evidence with ``pipeline_unavailable`` on a C2 Scale and its B1, and low search-term
+coverage; C2, B1, B2 and B3 evaluate on the first run from the recorded budget observations.
+"""
+
+CRM_UNAVAILABLE_SPEC: Final[WorldSpec] = EDGE_STATES_SPEC.with_(
+    name="crm_unavailable",
+    hubspot=cast(HubSpotSpec, EDGE_STATES_SPEC.hubspot).with_(
+        removed_stage_labels=("First meeting booked", "Qualified Lead", "Sales Qualified Lead")
+    ),
+)
+"""``MOCK_SCENARIO=crm_unavailable``: :data:`EDGE_STATES_SPEC` without the MQL and QL stages.
+
+The portal lacks every stage the MQL and QL bindings name, so both counts are "unavailable"
+(never 0) on every white paper row, the pipeline is unavailable everywhere (C1b withheld, the
+Hold campaign's C2 becomes a Scale flagged ``pipeline_unavailable``) and a finding names the
+stage.
+"""
+
+RUNTIME_SPECS: Final[Mapping[str, WorldSpec]] = MappingProxyType(
+    {
+        DEFAULT_SCENARIO: DEFAULT_SPEC,
+        EDGE_STATES_SPEC.name: EDGE_STATES_SPEC,
+        CRM_UNAVAILABLE_SPEC.name: CRM_UNAVAILABLE_SPEC,
+    }
+)
+"""The worlds ``MOCK_SCENARIO`` selects, keyed exactly, in order, by ``RUNTIME_SCENARIOS``.
+
+``RUNTIME_SCENARIOS`` must equal :data:`ads_engine.settings.MOCK_SCENARIOS`, the names the
+setting accepts; this module refuses to import when either check below fails.
+"""
+
+if RUNTIME_SCENARIOS != MOCK_SCENARIOS:  # pragma: no cover - both list the same worlds
+    raise RuntimeError(
+        "ads_engine.simulation.RUNTIME_SCENARIOS must equal "
+        "ads_engine.settings.MOCK_SCENARIOS, in order"
+    )
+if tuple(RUNTIME_SPECS) != RUNTIME_SCENARIOS:  # pragma: no cover - the mapping above matches
+    raise RuntimeError("RUNTIME_SPECS must be keyed exactly by RUNTIME_SCENARIOS, in order")
+
+
+# ---------------------------------------------------------------------------
 # The shared core: time, platform state and deterministic draws
 # ---------------------------------------------------------------------------
 
@@ -3855,11 +4254,26 @@ class _Core:
     every cached value is a pure function of its key, so a race only recomputes it.
     """
 
-    def __init__(self, seed: int, spec: WorldSpec, clock: Callable[[], datetime]) -> None:
+    def __init__(
+        self,
+        seed: int,
+        spec: WorldSpec,
+        clock: Callable[[], datetime],
+        epoch: datetime | None = None,
+    ) -> None:
         self.seed = seed
         self.spec = spec
         self._clock = clock
-        self.anchor: date = spec.anchor if spec.anchor is not None else self.now().date()
+        # The clock is read at construction only when the anchor needs it, as before epochs
+        # existed; a fixed-anchor world reads its epoch on first use instead, so worlds that
+        # never use one see the same clock readings.
+        reading = self.now() if spec.anchor is None else None
+        self.anchor: date = (
+            spec.anchor if spec.anchor is not None else cast(datetime, reading).date()
+        )
+        self._epoch: datetime | None = (
+            _require_aware("epoch", epoch) if epoch is not None else reading
+        )
         self.history_start: date = self.anchor - timedelta(days=spec.history_days)
         self.history_start_offset = -spec.history_days
         self._lock = threading.Lock()
@@ -3870,7 +4284,12 @@ class _Core:
         )
         self.changes: tuple[PlatformChange, ...] = tuple(change for _index, change in ordered)
         self._instants = [change.instant(self.anchor) for change in self.changes]
-        self._reappear = [change.reappear_instant(self.anchor) for change in self.changes]
+        self._reappear = [
+            change.reappear_instant(
+                self.anchor, self.epoch if change.reappear_after_epoch is not None else None
+            )
+            for change in self.changes
+        ]
         prefixes: list[Mapping[tuple[str, str, str, str], object]] = [MappingProxyType({})]
         running: dict[tuple[str, str, str, str], object] = {}
         for change in self.changes:
@@ -3889,6 +4308,32 @@ class _Core:
             ValueError: When the clock returns a naive datetime.
         """
         return _require_aware("clock()", self._clock())
+
+    @property
+    def epoch(self) -> datetime:
+        """The instant the world's simulation started (:attr:`SimulatedWorld.epoch`)."""
+        if self._epoch is None:
+            reading = self.now()
+            with self._lock:
+                if self._epoch is None:
+                    self._epoch = reading
+        return self._epoch
+
+    def last_platform_change(
+        self, source: str, entities: Sequence[str], at: datetime
+    ) -> datetime | None:
+        """The latest change or reappearance instant at or before ``at`` of the entities."""
+        instant = _require_aware("at", at)
+        latest: datetime | None = None
+        for change, changed, reappear in zip(
+            self.changes, self._instants, self._reappear, strict=True
+        ):
+            if change.source != source or change.entity not in entities:
+                continue
+            for candidate in (changed, reappear):
+                if candidate is not None and candidate <= instant:
+                    latest = candidate if latest is None else max(latest, candidate)
+        return latest
 
     def offset(self, day: date) -> int:
         """Return the day offset of ``day`` from the anchor."""
@@ -6317,8 +6762,8 @@ class _CrmModel:
     def _span(self, rng: random.Random, window: tuple[int, int]) -> timedelta:
         return timedelta(days=rng.uniform(window[0], window[1]))
 
-    def _source(self, rng: random.Random) -> str:
-        weights = self.funnel.meeting_sources
+    def _source(self, rng: random.Random, funnel: FunnelSpec) -> str:
+        weights = funnel.meeting_sources
         total = float(sum((weight for _source, weight in weights), Decimal(0)))
         pick = rng.random() * total
         for source, weight in weights:
@@ -6327,9 +6772,20 @@ class _CrmModel:
                 return source
         return weights[-1][0]
 
-    def _draw(self, rng: random.Random, touch: datetime, *, max_meetings: int = 2) -> _FunnelDraw:
-        """Draw one contact's CRM history relative to its first touch."""
-        funnel = self.funnel
+    def _draw(
+        self,
+        rng: random.Random,
+        touch: datetime,
+        *,
+        max_meetings: int = 2,
+        funnel: FunnelSpec | None = None,
+    ) -> _FunnelDraw:
+        """Draw one contact's CRM history relative to its first touch.
+
+        ``funnel`` replaces the portal's funnel (a campaign's own); the draws are taken in the
+        same order whichever funnel applies.
+        """
+        funnel = self.funnel if funnel is None else funnel
         pre = rng.random() < float(funnel.pre_touch_share)
         late = rng.random() < float(funnel.late_contact_share)
         mql = rng.random() < float(funnel.mql_share)
@@ -6352,7 +6808,7 @@ class _CrmModel:
         if rng.random() < float(funnel.meeting_share):
             count = min(max_meetings, 2 if rng.random() < 0.2 else 1)
             for _index in range(count):
-                source = self._source(rng)
+                source = self._source(rng, funnel)
                 canceled = rng.random() < float(funnel.canceled_share)
                 after_start = rng.random() < float(funnel.meeting_created_after_start_share)
                 shared = rng.random() < float(funnel.two_contact_meeting_share)
@@ -6397,12 +6853,21 @@ class _CrmModel:
                     self._people_done += 1
             self._ensure_google()
 
+    def _person_funnel(self, person: _Person) -> FunnelSpec:
+        """The funnel of a person: their first lead's campaign's own, else the portal's."""
+        if self.linkedin is None:
+            return self.funnel
+        creative = self.linkedin.spec.creatives[person.creative_position]
+        campaign = self.linkedin.campaigns[creative.campaign_key]
+        return self.funnel if campaign.funnel is None else campaign.funnel
+
     def _build_person(self, person: _Person) -> None:
         rng = _rng(self.core.seed, "crm", person.key)
-        if rng.random() >= float(self.funnel.match_share):
+        funnel = self._person_funnel(person)
+        if rng.random() >= float(funnel.match_share):
             return
         contact_id = person_contact_id(person.creative_position, person.day, person.ordinal)
-        draw = self._draw(rng, person.first_touch, max_meetings=_OBJECTS_PER_CONTACT)
+        draw = self._draw(rng, person.first_touch, max_meetings=_OBJECTS_PER_CONTACT, funnel=funnel)
         self._register(
             contact_id,
             draw,
@@ -7022,11 +7487,16 @@ class SimulatedWorld:
         mapping: The HubSpot MQL/QL mapping; loaded with :meth:`Thresholds.load` when ``None``.
         google_crm_properties: ``(campaign property, touch-date property)``; overrides the
             spec's Google CRM link when given.
+        epoch: The tz-aware instant the running product started simulating this world (its
+            first simulated dataset's creation), which ``reappear_after_epoch`` changes count
+            from; ``None`` = the clock's reading at construction (on first use for a world
+            with a fixed anchor).
 
     Raises:
         ValueError: When an explicitly passed content asset lies outside the reserved LinkedIn
-            ranges, an asset form or override creative is missing from the spec, or a platform
-            change names an unknown entity; and, in a world with LinkedIn and HubSpot parts,
+            ranges, an asset form or override creative is missing from the spec, a platform
+            change names an unknown entity, a fault's ``person_creatives`` names a creative the
+            spec lacks, or ``epoch`` is naive; and, in a world with LinkedIn and HubSpot parts,
             when a lead creative (one with a lead form and a profile) sits at position
             :data:`PERSON_CREATIVE_POSITIONS` or beyond in
             ``linkedin.creatives``, or an ``ExplicitDays`` day of a lead creative states
@@ -7043,13 +7513,14 @@ class SimulatedWorld:
         content_assets: Sequence[ContentAsset] | None = None,
         mapping: HubSpotMapping | None = None,
         google_crm_properties: tuple[str, str] | None = None,
+        epoch: datetime | None = None,
     ) -> None:
         _check_int("seed", seed, minimum=None)
         spec = scenario if isinstance(scenario, WorldSpec) else scenario.spec
         _require(isinstance(spec, WorldSpec), "scenario must be a WorldSpec or carry one as .spec")
         self._seed = seed
         self._spec = spec
-        self._core = _Core(seed, spec, clock if clock is not None else _utc_now)
+        self._core = _Core(seed, spec, clock if clock is not None else _utc_now, epoch)
         loaded: Thresholds | None = None
         if content_assets is None or mapping is None:
             loaded = Thresholds.load()
@@ -7065,6 +7536,7 @@ class SimulatedWorld:
                 cast(Thresholds, loaded).content_assets, explicit=False
             )
         self._validate_changes()
+        self._validate_fault_creatives()
         if google_crm_properties is None and spec.hubspot is not None:
             google_crm_properties = spec.hubspot.google_crm_properties
         self._google_properties = google_crm_properties
@@ -7107,22 +7579,37 @@ class SimulatedWorld:
     def from_settings(
         cls,
         settings: Settings,
-        scenario: WorldSpec | ScenarioLike = DEFAULT_SPEC,
+        scenario: WorldSpec | ScenarioLike | None = None,
         *,
         clock: Callable[[], datetime] | None = None,
+        epoch: datetime | None = None,
     ) -> SimulatedWorld:
         """Build the world the running product simulates from its settings.
 
-        ``MOCK_SEED`` seeds it; the Google CRM link follows
+        ``MOCK_SCENARIO`` selects the world (:data:`RUNTIME_SPECS`) unless ``scenario`` is
+        given, and ``MOCK_SEED`` seeds it; the Google CRM link follows
         ``HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY``/``HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY`` when both
         are set, so a configured link is simulated with the portal's own property names.
+
+        Args:
+            settings: The process settings.
+            scenario: The world; ``RUNTIME_SPECS[settings.mock_scenario]`` when ``None``.
+            clock: The world clock; ``datetime.now(UTC)`` when ``None``.
+            epoch: The instant the product started simulating the world (see
+                :class:`SimulatedWorld`).
+
+        Returns:
+            The seeded world.
         """
         properties: tuple[str, str] | None = None
         campaign_property = settings.hubspot_google_campaign_property
         touch_property = settings.hubspot_google_touch_date_property
         if campaign_property and touch_property:
             properties = (campaign_property, touch_property)
-        return cls(settings.mock_seed, scenario, clock=clock, google_crm_properties=properties)
+        world = RUNTIME_SPECS[settings.mock_scenario] if scenario is None else scenario
+        return cls(
+            settings.mock_seed, world, clock=clock, google_crm_properties=properties, epoch=epoch
+        )
 
     # -- validation ------------------------------------------------------------------------------
 
@@ -7213,6 +7700,19 @@ class SimulatedWorld:
                 f"platform change names unknown {change.source} {change.entity} {change.key!r}",
             )
 
+    def _validate_fault_creatives(self) -> None:
+        """Check that every fault's ``person_creatives`` names a lead creative of the spec.
+
+        Raises:
+            ValueError: Naming the first unknown creative.
+        """
+        for fault in self._spec.faults:
+            for key in fault.person_creatives:
+                _require(
+                    self._linkedin is not None and key in self._linkedin.lead_creatives,
+                    f"fault person_creatives names unknown lead creative {key!r}",
+                )
+
     # -- identity and time ------------------------------------------------------------------------
 
     @property
@@ -7258,6 +7758,40 @@ class SimulatedWorld:
     def now(self) -> datetime:
         """The current instant (UTC) from the injected clock."""
         return self._core.now()
+
+    @property
+    def epoch(self) -> datetime:
+        """The instant (UTC) the product started simulating this world.
+
+        ``reappear_after_epoch`` changes count from it. It is the ``epoch`` passed in, else
+        the clock's reading at construction (on first use for a world with a fixed anchor).
+        """
+        return self._core.epoch
+
+    @property
+    def observed_history_days(self) -> int:
+        """Days of budget observations a simulated dataset's first entity sync records."""
+        return self._spec.observed_history_days
+
+    def last_platform_change(self, source: Source, at: datetime) -> datetime | None:
+        """The latest platform change to a source's budget-bearing entities at or before ``at``.
+
+        Budget-bearing entities are campaigns, campaign groups and budgets; a change counts at
+        its instant and, for a disappearance, again at its reappearance. Observed budget
+        history recorded at a first entity sync never reaches back to or before this instant,
+        because the entities' values before it differ from the sync's.
+
+        Args:
+            source: ``google`` or ``linkedin``.
+            at: A tz-aware instant.
+
+        Returns:
+            The instant (UTC), or ``None`` when no such change happened by ``at``.
+
+        Raises:
+            ValueError: When ``at`` is naive.
+        """
+        return self._core.last_platform_change(source, _BUDGET_HISTORY_ENTITIES, at)
 
     @property
     def google_customer_id(self) -> str:
@@ -7315,6 +7849,26 @@ class SimulatedWorld:
                 and fault.surface == surface
                 and (remaining is None or remaining > 0)
             )
+
+    def fault_targets(self, fault: Fault, identifier: str) -> bool:
+        """Whether an id-level ``fault`` affects ``identifier``.
+
+        A fault naming ``ids`` affects exactly those. One naming ``person_creatives`` affects
+        the contact of every simulated person whose first lead came from one of those
+        creatives, read back from the contact id's layout (:func:`person_contact_id`). The
+        renderer and the scenario converter both ask this, so the wire and an in-memory
+        context agree on every affected id.
+        """
+        if not fault.person_creatives:
+            return identifier in fault.ids
+        if self._linkedin is None or not identifier.isdecimal():
+            return False
+        slot = int(identifier) - HUBSPOT_CONTACT_IDS.start - _PERSON_BLOCK
+        if not 0 <= slot < _PERSON_SLOTS:
+            return False
+        position = (slot // LEADS_PER_CREATIVE_DAY) % PERSON_CREATIVE_POSITIONS
+        creatives = self._linkedin.spec.creatives
+        return position < len(creatives) and creatives[position].key in fault.person_creatives
 
     def consume_fault(self, fault: Fault) -> bool:
         """Claim one application of ``fault``; ``False`` once its ``times`` are used up.

@@ -18,11 +18,12 @@ Submodules, each imported explicitly by its callers:
   one case and not fire in its twin.
 
 This module holds only constants and pure predicates: the reserved ``sim.invalid`` email
-domain, the default seed and scenario name, and the reserved id ranges from which every
-simulated entity is allocated. Any layer can therefore recognise a simulated id or email
-without importing the world. Provenance itself is decided by the dataset a row belongs to
-(``source_dataset.mode``); the predicates here only say whether a value lies in a reserved
-block.
+domain, the default seed and scenario name, the runtime world names (``RUNTIME_SCENARIOS``,
+equal to ``ads_engine.settings.MOCK_SCENARIOS``, which owns the names ``MOCK_SCENARIO``
+accepts), and the reserved id ranges from which every simulated entity is allocated. Any layer can
+therefore recognise a simulated id or email without importing the world. Provenance itself
+is decided by the dataset a row belongs to (``source_dataset.mode``); the predicates here
+only say whether a value lies in a reserved block.
 
 Boundaries:
 
@@ -72,6 +73,7 @@ __all__ = [
     "LINKEDIN_FORM_IDS",
     "LINKEDIN_ID_RANGE",
     "LINKEDIN_POST_IDS",
+    "RUNTIME_SCENARIOS",
     "SIM_EMAIL_DOMAIN",
     "SIM_GOOGLE_CUSTOMER_ID",
     "IdRange",
@@ -92,6 +94,13 @@ DEFAULT_SEED: Final = 42
 
 # Name under which `scenarios.SCENARIOS` holds the end-to-end world that populates every section.
 DEFAULT_SCENARIO: Final = "default"
+
+# The worlds the running product can simulate, selected by `MOCK_SCENARIO`: the first-start
+# `default` world, and two seeded worlds that also reach the card states the default world
+# never produces (a C2 Hold, C1b, an untracked campaign, unavailable MQL/QL, attribution floors).
+# Must equal `ads_engine.settings.MOCK_SCENARIOS`, which owns the accepted names; this module
+# imports nothing from `ads_engine`, so `generator.py` checks the equality when it is imported.
+RUNTIME_SCENARIOS: Final = (DEFAULT_SCENARIO, "edge_states", "crm_unavailable")
 
 
 # ---------------------------------------------------------------------------

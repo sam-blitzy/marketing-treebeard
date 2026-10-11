@@ -107,7 +107,7 @@ Backend modules, relative to `backend/src/ads_engine/`:
 | `decisions.py` | Decision patches per decision shape, discrepancy resolutions, rejection of writes on retired subjects |
 | `db/` | `base.py` (column conventions), `session.py` (engine, sessions, dedicated lock connections), `models/` (seven model files, [Data model](#data-model)), `repositories.py` (idempotent upserts, snapshot appends, active and effective dataset lookups, analysis requests) |
 | `connectors/` | `errors.py` (classification into `AccessDenied`, `TransientError`, `QueryDefect`), `http.py` (shared httpx client, retry, timeouts, redaction), `google_n8n/` (`client`, `queries` Q-G1 to Q-G8 and Q-G2b, `parser`, `partition`), `linkedin/` (`auth`, `client`, `parser`), `hubspot/` (`client`, `parser`, `search`) |
-| `simulation/` | `generator.py` (seeded world), `scenarios.py` (scenario catalogue), `payloads.py` (live wire shapes, request validation), `transport.py` (httpx `MockTransport`) |
+| `simulation/` | `generator.py` (seeded world and the runtime worlds `MOCK_SCENARIO` selects: `default`, `edge_states`, `crm_unavailable`), `scenarios.py` (scenario catalogue), `payloads.py` (live wire shapes, request validation), `transport.py` (httpx `MockTransport`) |
 | `sync/` | `mode.py` (source modes, probes, fallback, builds), `datasets.py` (dataset lifecycle), `jobs.py` (sync jobs), `snapshots.py` (snapshots, baseline, discrepancy detection), `lead_match.py`, `freshness.py`, `scheduler.py`, `budget_guard.py` |
 | `analysis/` | `window.py`, `thresholds.py`, `context.py`, `metrics.py`, `stats.py`, `text.py`, the rule modules (`keywords`, `campaigns`, `budget`, `creative`, `white_papers`, `discrepancy`), `attribution.py`, `precedence.py`, `runner.py`, `lock.py`, `overlay.py` |
 | `api/` | `app.py` (application factory), `deps.py` (session and CSRF dependencies), `security.py`, `schemas.py`, `routes/` (`auth`, `runs`, `recommendations`, `decisions`, `discrepancies`, `sources`, `config`, `health`) |
@@ -509,6 +509,7 @@ join within one source. `sync/datasets.py` (`DatasetManager`) owns every state c
 | `reason` | Why the dataset exists, for example "credentials not configured" or the access-denied code that caused a switch |
 | `created_at`, `activated_at`, `retired_at` | Lifecycle timestamps |
 | `crm_bindings` | HubSpot datasets only: the MQL and QL stage properties and stage ids resolved against that portal, their availability, and the verification of the Google CRM properties. Attribution and `GET /api/v1/config` read it without calling HubSpot |
+| `simulated_world`, `simulated_seed` | Simulated datasets only: the runtime world (`MOCK_SCENARIO`) and seed (`MOCK_SEED`) the dataset was generated from; a companion records its parent's. The `simulated_world` check keeps both null on live datasets and set together on simulated ones. When either setting changes, `ensure_dataset` builds and activates a new simulated dataset through the normal transition and the sync jobs skip the old one, so one dataset never mixes two worlds |
 
 - The partial unique index `uq_source_dataset_active_primary` allows at most one `active`
   primary per source.
@@ -690,7 +691,10 @@ backfilling and atomically activating a new dataset ([Dataset lifecycle](#datase
 
 While a source is in automatic fallback, the worker probes its full capability set at most every
 30 min (`PROBE_INTERVAL`). Every probe is recorded as a `probe` `sync_run`, whose start spaces the
-next one.
+next one. A fallback entered by a sync job's denial has no probe of its own, so its first probe
+waits 30 min from that denial (`source_connection.last_failure_at`). A probe that does not pass
+ends its row `failed` with the deciding check's reason, which names the endpoint (for Google, the
+query id) and the platform code.
 
 - **Google**: Q-G1 through the webhook.
 - **LinkedIn**, per configured ad account: `adAccounts/{id}`, a one-day `adAnalytics` request
@@ -703,20 +707,29 @@ Outcomes:
 - **Every check passes**: the worker builds and backfills a live dataset and activates it only
   once the backfill completes. For HubSpot, the build must also pass the staged-matching readiness
   test.
-- **A build fails**: the building dataset is discarded and the simulated one stays active.
+- **A build fails**: the building dataset is discarded and the simulated one stays active. A
+  denial during the build keeps the source in automatic fallback. A defect in any backfill job
+  ends the fallback with status `error` and the reason `live build failed: <job> job: <error>`,
+  which names the query id. The build stops as soon as that job returns, so no settle round
+  reruns it. A denial recorded during the same backfill still decides. Any other failure, such
+  as transient errors or a call-budget deferral, ends it with status `stale`.
 - **Partial success** (for example LinkedIn ads readable while Lead Sync still returns 403) is a
   failed probe and changes nothing, so a source never flips back and forth.
 
 A probe that meets only transient errors marks the source `stale` and keeps its active dataset; a
-probe that meets a defect marks it `error`. Neither causes a fallback. Credentials added before a
-restart go live through the same probe-then-build path at startup, with no code change.
+probe that meets a defect marks it `error`. A live build that fails after a passing probe is
+treated the same way, at first start or later: only a denial causes a fallback. A `stale` source
+is probed and built again 30 minutes after its last probe. A source in the `error` state is not
+retried by the running worker, because a defect is never retried. The next worker start, after
+a fix, probes it once more. Credentials added before a restart go live through the same
+probe-then-build path at startup, with no code change.
 
 ### Contract fidelity
 
-- `simulation/payloads.py` renders the seeded world (`MOCK_SEED`, default 42) in the exact live
-  wire shapes: camelCase Google rows without a page token; LinkedIn URNs, `count`/`start` paging
-  and versioned form URNs with form decoration; HubSpot `paging.next.after`, per-input association
-  paging and CRM Search `total`.
+- `simulation/payloads.py` renders the seeded world (`MOCK_SCENARIO`, default `default`;
+  `MOCK_SEED`, default 42) in the exact live wire shapes: camelCase Google rows without a page
+  token; LinkedIn URNs, `count`/`start` paging and versioned form URNs with form decoration;
+  HubSpot `paging.next.after`, per-input association paging and CRM Search `total`.
 - Requests are validated against the same contracts, so a request missing a required selector
   fails in simulated mode too.
 - The contracts are files in `backend/tests/contracts/{google,linkedin,hubspot}/`, one per surface,
@@ -934,7 +947,8 @@ Monitoring is structured JSON logs and one health endpoint; nothing else is ship
 
 - The `api` and `worker` processes write one redacted JSON line per event to stdout, collected
   by Docker's default `json-file` driver (`docker compose logs -f worker`). Logged events include
-  sync job start and finish (source, job, dataset, rows, calls, completeness, duration), every
+  sync job start and finish (source, job, dataset, rows, calls, completeness, duration; the
+  `probe` and `purge` jobs too, a probe with its checks and the purge as source `all`), every
   classification and mode change with its reason, Google call-budget usage, each analysis run's
   summary with its `config_hash`, scheduler lock events and authentication failures. Logs never
   contain emails, secrets, tokens, the webhook URL or the n8n header value.

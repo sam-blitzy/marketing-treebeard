@@ -1006,13 +1006,14 @@ async def test_a_failed_crm_rerun_leaves_the_evidence_unknown_and_the_build_unac
     assert backfill.calls == [building, building]
     rerun = backfill.seen[building][1]
     assert rerun["hubspot.contacts"] == ("unknown", CRM_RERUN.format("2 lead matches"))
-    # Discarded; the simulated dataset stays active and recovery probes take over.
+    # Discarded; the simulated dataset stays active. A shortfall that is neither a denial nor
+    # a defect leaves HubSpot stale, outside automatic fallback, to be probed and built again.
     assert await _state(sessions, building) is None
     assert await _state(sessions, previous) == "active"
     connection = await _connection(sessions, "hubspot")
     assert (connection.mode, connection.status, connection.active_dataset_id) == (
         "simulated",
-        "denied",
+        "stale",
         previous,
     )
     assert connection.reason == f"live build failed: {not_ready}"
@@ -1184,10 +1185,11 @@ async def test_contacts_still_without_association_reads_after_every_round_fail_t
     assert backfill.calls == [building, building, building]
     assert await _state(sessions, building) is None
     assert await _state(sessions, previous) == "active"
+    # Neither a denial nor a defect: stale, no automatic fallback.
     connection = await _connection(sessions, "hubspot")
     assert (connection.mode, connection.status, connection.active_dataset_id) == (
         "simulated",
-        "denied",
+        "stale",
         previous,
     )
     assert connection.reason == f"live build failed: {lacking}"
@@ -1457,10 +1459,11 @@ async def test_live_linkedin_matches_never_hydrated_in_the_hubspot_primary_fail_
     assert await _state(sessions, building) is None
     assert await _state(sessions, previous) == "active"
     assert await _state(sessions, crm) == "active"
+    # Neither a denial nor a defect: stale, no automatic fallback.
     connection = await _connection(sessions, "linkedin")
     assert (connection.mode, connection.status, connection.active_dataset_id) == (
         "simulated",
-        "denied",
+        "stale",
         previous,
     )
     assert connection.reason == f"live build failed: {lacking}"
@@ -1604,8 +1607,8 @@ async def test_recovery_is_void_when_a_fallback_entry_lands_during_its_probe(
     assert fallback.activated
 
     async def probe_while_other_fails(self: SourceModeController, source: str) -> ProbeReport:
-        """Pass the probe while controller B's own live build fails into fallback."""
-        await other._enter_fallback("hubspot", "live build failed: HTTP 503")
+        """Pass the probe while controller B's own probe is denied and enters fallback."""
+        await other._enter_fallback("hubspot", f"crm: {_denial().reason}")
         return ProbeReport.of("hubspot", (ProbeCheck("crm", True),))
 
     monkeypatch.setattr(SourceModeController, "probe", probe_while_other_fails)
@@ -1739,11 +1742,12 @@ async def test_live_linkedin_leads_without_a_hubspot_primary_hold_the_build(
     assert [entry["dataset_id"] for entry in _events(entries, "sync.build.no_crm")] == [building]
     assert await _state(sessions, building) is None
     assert await _state(sessions, previous) == "active"
-    # Automatic fallback: the 30-minute recovery probe retries once HubSpot is ready.
+    # Stale, not automatic fallback: LinkedIn's access was not denied, so it still resolves
+    # live and is probed and built again one probe interval later, once HubSpot is ready.
     connection = await _connection(sessions, "linkedin")
     assert (connection.mode, connection.status, connection.active_dataset_id) == (
         "simulated",
-        "denied",
+        "stale",
         previous,
     )
     assert connection.reason == f"live build failed: {no_crm}"

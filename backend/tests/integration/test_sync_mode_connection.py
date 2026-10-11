@@ -59,7 +59,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Final, cast
 
 import httpx
 import pytest
@@ -956,16 +956,16 @@ async def test_an_activation_that_changes_the_mode_logs_its_level_and_no_endpoin
 @pytest.mark.anyio
 @pytest.mark.db
 @pytest.mark.parametrize(
-    ("established", "from_mode"),
+    "established",
     [
         # The first live build: resolve's live path left a placeholder that never verified
-        # live access, so the fallback is a change from no mode.
-        pytest.param(False, None, id="first-live-build"),
-        pytest.param(True, "live", id="established-live"),
+        # live access.
+        pytest.param(False, id="first-live-build"),
+        pytest.param(True, id="established-live"),
     ],
 )
-async def test_a_failed_live_build_logs_its_failing_endpoint_on_the_fallback(
-    sessions: Sessions, backfill: _Backfill, established: bool, from_mode: str | None
+async def test_a_failed_live_build_logs_its_failing_endpoint_and_never_falls_back(
+    sessions: Sessions, backfill: _Backfill, established: bool
 ) -> None:
     if established:
         await _store_live_connection(sessions, "google")
@@ -980,25 +980,28 @@ async def test_a_failed_live_build_logs_its_failing_endpoint_on_the_fallback(
             "google", "live", reason=REASON_RECOVERED
         )
 
-    # The live build was discarded and the simulated build that followed activated.
-    assert (outcome.activated, outcome.mode) == (True, "simulated")
+    # The live build was discarded and nothing followed it: never mock (AAP 0.3.3, row 3).
+    assert (outcome.activated, outcome.mode) == (False, "live")
+    assert outcome.reason is not None
+    assert outcome.reason.startswith("google search Q-G2: HTTP 503")
+    # The error's classification, then the build's verdict, both naming the endpoint.
     assert [
         (entry["log_level"], entry["from_status"], entry["status"], entry["endpoint"])
         for entry in _events(entries, "sync.connection")
-    ] == [("warning", "ok", "stale", "search Q-G2")]
-    [change] = _events(entries, "sync.mode.change")
-    assert (
-        change["log_level"],
-        change["from_mode"],
-        change["to_mode"],
-        change["status"],
-        change["endpoint"],
-    ) == ("warning", from_mode, "simulated", "denied", "search Q-G2")
-    # Only a source established live has a mode change to rerun for.
-    assert await _mode_changes(sessions, "google") == (1 if established else 0)
-    [fallback] = _events(entries, "sync.fallback")
-    assert (fallback["log_level"], fallback["endpoint"]) == ("warning", "search Q-G2")
-    assert fallback["reason"].startswith("live build failed: ")
+    ] == [("warning", "ok", "stale", "search Q-G2"), ("warning", "stale", "stale", "search Q-G2")]
+    assert _events(entries, "sync.connection")[-1]["reason"] == (
+        f"live build failed: {outcome.reason}"
+    )
+    assert _events(entries, "sync.mode.change") == []
+    assert await _mode_changes(sessions, "google") == 0
+    assert _events(entries, "sync.fallback") == []
+    connection = await _connection(sessions, "google")
+    assert connection is not None
+    assert (connection.mode, connection.status, connection.access_generation) == (
+        "live",
+        "stale",
+        0,
+    )
 
 
 # ---------------------------------------------------------------------------------------
@@ -1099,6 +1102,69 @@ def test_the_probe_report_endpoint_is_the_first_failing_checks() -> None:
     assert passing.endpoint is None
     assert partial.endpoint == "leadForms"
     assert unconfigured.endpoint is None
+
+
+GOOGLE_401: Final = "google search Q-G1: HTTP 401: Authorization data is wrong!"
+"""A Google probe denial's reason: the query id is already part of its endpoint."""
+
+
+@pytest.mark.parametrize(
+    ("check", "expected"),
+    [
+        pytest.param(
+            ProbeCheck("Q-G1", False, GOOGLE_401, "search Q-G1"),
+            GOOGLE_401,
+            id="google-reason-names-its-query",
+        ),
+        pytest.param(
+            ProbeCheck("search Q-G1", False, GOOGLE_401, "search Q-G1"),
+            GOOGLE_401,
+            id="multi-token-name-in-the-head",
+        ),
+        pytest.param(
+            ProbeCheck(
+                "adAccounts/123",
+                False,
+                "linkedin ad_accounts: HTTP 403: Not enough permissions",
+                "ad_accounts",
+            ),
+            "adAccounts/123: linkedin ad_accounts: HTTP 403: Not enough permissions",
+            id="linkedin-account-kept",
+        ),
+        pytest.param(
+            ProbeCheck(
+                "leadFormResponses 123",
+                False,
+                "linkedin lead_form_responses: ACCESS_DENIED: Not enough permissions",
+                "lead_form_responses",
+            ),
+            "leadFormResponses 123: linkedin lead_form_responses: ACCESS_DENIED: Not enough "
+            "permissions",
+            id="linkedin-multi-token-name-kept",
+        ),
+        pytest.param(
+            ProbeCheck("crm", False, "hubspot contacts_batch_read: HTTP 401: Unauthorized"),
+            "crm: hubspot contacts_batch_read: HTTP 401: Unauthorized",
+            id="hubspot-crm-kept",
+        ),
+        pytest.param(
+            ProbeCheck("Q-G1", False, "google search: HTTP 500: Q-G1 failed"),
+            "Q-G1: google search: HTTP 500: Q-G1 failed",
+            id="named-only-after-the-head",
+        ),
+        pytest.param(
+            ProbeCheck("Q-G1", False, "google search Q-G10: HTTP 400: bad query"),
+            "Q-G1: google search Q-G10: HTTP 400: bad query",
+            id="partial-token-kept",
+        ),
+        pytest.param(ProbeCheck("probe", False), "probe", id="no-reason"),
+    ],
+)
+def test_the_probe_reason_names_the_failing_check_once(check: ProbeCheck, expected: str) -> None:
+    """A failed check whose reason already names it is not prefixed with its name again."""
+    report = ProbeReport.of("google", (ProbeCheck("first", True), check))
+
+    assert report.reason == expected
 
 
 # ---------------------------------------------------------------------------------------

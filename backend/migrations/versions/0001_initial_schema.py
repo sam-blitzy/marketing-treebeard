@@ -172,6 +172,12 @@ ROLE_SHAPE_SQL: str = (
     "(role = 'companion' AND source = 'hubspot' AND mode = 'simulated' "
     "AND parent_dataset_id IS NOT NULL)"
 )
+# mirrors ads_engine.db.models.ops._SIMULATED_WORLD_SQL: a live dataset names no simulated
+# world; a simulated one names its world and seed together, or neither.
+SIMULATED_WORLD_SQL: str = (
+    "(mode = 'live' AND simulated_world IS NULL AND simulated_seed IS NULL) OR "
+    "(mode = 'simulated' AND (simulated_world IS NULL) = (simulated_seed IS NULL))"
+)
 # mirrors ads_engine.db.models.accounts._AMOUNT_PAIR_SQL: a budget amount is known in both
 # units or in neither.
 AMOUNT_PAIR_SQL: str = "(amount IS NULL) = (amount_micros IS NULL)"
@@ -508,12 +514,16 @@ def _create_ops_tables() -> None:
         sa.Column("retired_at", sa.DateTime(timezone=True), nullable=True),
         # Resolved CRM stage bindings of a HubSpot dataset's portal; NULL for other sources.
         sa.Column("crm_bindings", postgresql.JSONB(), nullable=True),
+        # The simulated world (MOCK_SCENARIO) and seed (MOCK_SEED) of a simulated dataset.
+        sa.Column("simulated_world", sa.Text(), nullable=True),
+        sa.Column("simulated_seed", sa.BigInteger(), nullable=True),
         _pk("source_dataset"),
         _source_check("source_dataset"),
         _in_check("source_dataset", "mode", MODES),
         _in_check("source_dataset", "state", DATASET_STATES),
         _in_check("source_dataset", "role", DATASET_ROLES),
         _check("source_dataset", "role_shape", ROLE_SHAPE_SQL),
+        _check("source_dataset", "simulated_world", SIMULATED_WORLD_SQL),
         # A companion is purged with its LinkedIn parent.
         _fk("source_dataset", ["parent_dataset_id"], "source_dataset", ondelete="CASCADE"),
     )

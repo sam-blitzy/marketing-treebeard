@@ -109,6 +109,7 @@ __all__ = [
     "Mode",
     "Readiness",
     "Role",
+    "WorldIdentity",
 ]
 
 _log = get_logger(__name__)
@@ -121,6 +122,35 @@ Mode = Literal["live", "simulated"]
 
 Role = Literal["primary", "companion"]
 """A dataset's role; equals :data:`ads_engine.db.models.ops.DATASET_ROLES`."""
+
+
+@dataclass(frozen=True, slots=True)
+class WorldIdentity:
+    """The simulated world a simulated dataset is generated from.
+
+    Recorded on the dataset (``source_dataset.simulated_world`` and ``simulated_seed``), so a
+    changed ``MOCK_SCENARIO`` or ``MOCK_SEED`` replaces the dataset instead of mixing two
+    worlds in it.
+
+    Attributes:
+        scenario: The runtime world, ``MOCK_SCENARIO``.
+        seed: The world seed, ``MOCK_SEED``.
+    """
+
+    scenario: str
+    seed: int
+
+    @classmethod
+    def of(cls, row: SourceDataset) -> WorldIdentity | None:
+        """The identity a dataset row records; ``None`` for live rows and unrecorded ones."""
+        if row.simulated_world is None or row.simulated_seed is None:
+            return None
+        return cls(row.simulated_world, row.simulated_seed)
+
+    def describe(self) -> str:
+        """``{scenario} (seed {seed})``, for reasons and log lines."""
+        return f"{self.scenario} (seed {self.seed})"
+
 
 # The lifecycle and matching vocabulary, spelled once. The import-time check below ties
 # every value to the tuples the schema's CHECK constraints are built from, so a renamed
@@ -554,6 +584,7 @@ class DatasetManager:
         *,
         reason: str | None = None,
         session: AsyncSession | None = None,
+        world: WorldIdentity | None = None,
     ) -> int:
         """Insert a ``building`` dataset and return its id.
 
@@ -561,7 +592,7 @@ class DatasetManager:
         simulated LinkedIn dataset that is still ``building``: it is created after its
         parent, activates and retires with it, and a parent has at most one. The parent's
         row is locked while the companion is created, so two concurrent begins cannot both
-        attach one.
+        attach one. A companion records its parent's simulated world.
 
         Args:
             source: ``google``, ``linkedin`` or ``hubspot``.
@@ -572,14 +603,17 @@ class DatasetManager:
                 a switch to simulated data, ``credentials not configured`` or
                 ``recovered``. A companion without one records its parent instead.
             session: Join the caller's transaction instead of committing one here.
+            world: The simulated world of a simulated primary; ``None`` records none. A
+                companion takes its parent's, so a different one is rejected.
 
         Returns:
             The new dataset's id.
 
         Raises:
             ValueError: On an unknown source, mode or role, a blank reason, a primary with
-                a parent, a companion that is not simulated HubSpot or has no parent, or a
-                parent that is not a simulated LinkedIn primary.
+                a parent, a companion that is not simulated HubSpot or has no parent, a
+                parent that is not a simulated LinkedIn primary, a world on a live dataset,
+                or a companion world that differs from its parent's.
             DatasetNotFoundError: If the parent does not exist.
             DatasetStateError: If the parent is not ``building`` or already has a companion.
         """
@@ -587,6 +621,8 @@ class DatasetManager:
         checked_mode = _as_mode(mode)
         checked_role = _as_role(role)
         _check_reason(reason)
+        if world is not None and checked_mode != "simulated":
+            raise ValueError("only a simulated dataset records a simulated world")
         if checked_role == _PRIMARY and parent is not None:
             raise ValueError("a primary dataset has no parent")
         if checked_role == _COMPANION:
@@ -601,7 +637,13 @@ class DatasetManager:
 
         async with self._unit(session) as unit:
             if parent is not None:
-                await self._check_companion_parent(unit, parent)
+                parent_world = await self._check_companion_parent(unit, parent)
+                if world is not None and world != parent_world:
+                    raise ValueError(
+                        f"a companion records its parent's simulated world; source_dataset "
+                        f"{parent} is not {world.describe()}"
+                    )
+                world = parent_world
                 # ``reason`` is optional so a companion can be begun as
                 # ``begin("hubspot", "simulated", role="companion", parent=id)``; its
                 # provenance is then its parent, which is what the row records.
@@ -615,6 +657,8 @@ class DatasetManager:
                 parent_dataset_id=parent,
                 reason=reason,
                 created_at=now,
+                simulated_world=None if world is None else world.scenario,
+                simulated_seed=None if world is None else world.seed,
             )
             unit.add(dataset)
             await unit.flush()
@@ -628,11 +672,15 @@ class DatasetManager:
             dataset_id=dataset_id,
             parent_dataset_id=parent,
             reason=reason,
+            simulated_world=None if world is None else world.scenario,
+            simulated_seed=None if world is None else world.seed,
         )
         return dataset_id
 
-    async def _check_companion_parent(self, session: AsyncSession, parent: int) -> None:
-        """Lock a companion's parent and check it may take one.
+    async def _check_companion_parent(
+        self, session: AsyncSession, parent: int
+    ) -> WorldIdentity | None:
+        """Lock a companion's parent, check it may take one and return its simulated world.
 
         Raises:
             DatasetNotFoundError: If the parent does not exist.
@@ -663,6 +711,7 @@ class DatasetManager:
                 f"source_dataset {parent} already has companion {existing}",
                 dataset_id=parent,
             )
+        return WorldIdentity.of(dataset)
 
     async def get(self, dataset_id: int, *, session: AsyncSession | None = None) -> SourceDataset:
         """Return one dataset as committed now.

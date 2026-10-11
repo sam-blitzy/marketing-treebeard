@@ -191,9 +191,11 @@ from ads_engine.simulation import (
     LINKEDIN_CAMPAIGN_GROUP_IDS,
     LINKEDIN_CAMPAIGN_IDS,
     LINKEDIN_CREATIVE_IDS,
+    RUNTIME_SCENARIOS,
 )
 from ads_engine.simulation.generator import (
     DEFAULT_SPEC,
+    RUNTIME_SPECS,
     BulkDealSpec,
     ChangeEntity,
     ChangeField,
@@ -1376,6 +1378,7 @@ def _context_world(world: SimulatedWorld) -> SimulatedWorld:
         content_assets=world.content_assets,
         mapping=world.mapping,
         google_crm_properties=world.google_crm_properties,
+        epoch=world.epoch,
     )
 
 
@@ -2742,7 +2745,7 @@ class _Converter:
         for fault in self._faults(
             "linkedin", "lead_form_responses", account, include_transient=True
         ):
-            if response.id not in fault.ids:
+            if not self.world.fault_targets(fault, response.id):
                 continue
             if fault.kind == "decoration_mismatch":
                 return ("no_email", _REASON_FORM_MAP_MISMATCH, None, None)
@@ -2758,7 +2761,9 @@ class _Converter:
         ):
             return ("no_email", _REASON_NO_EMAIL_ANSWER, None, None)
         for fault in self._faults("linkedin", "lead_form_responses_batch", account):
-            if fault.kind in ("omit_ids", "batch_errors") and response.id in fault.ids:
+            if fault.kind in ("omit_ids", "batch_errors") and self.world.fault_targets(
+                fault, response.id
+            ):
                 return ("error", _REASON_EMAIL_UNRETRIEVABLE, None, None)
             if fault.kind in _FAILING_KINDS:
                 return ("error", _REASON_REFETCH_FAILED, None, None)
@@ -2949,7 +2954,7 @@ class _Converter:
             if fault.kind in _FAILING_KINDS:
                 return set(ids)
             if fault.kind in ("omit_ids", "batch_errors"):
-                missing |= set(fault.ids) & set(ids)
+                missing |= {item for item in ids if self.world.fault_targets(fault, item)}
         return missing
 
     def _associate(self, state: _CrmState, from_wire: str, object_id: str, to_wire: str) -> None:
@@ -2967,7 +2972,7 @@ class _Converter:
             if fault.kind in _FAILING_KINDS:
                 status, stored = "error", ()
                 break
-            if object_id not in fault.ids:
+            if not self.world.fault_targets(fault, object_id):
                 continue
             if fault.kind == "batch_errors" and not _no_associations(fault):
                 status, stored = "error", ()
@@ -8052,6 +8057,88 @@ def _default_scenario() -> Scenario:
     )
 
 
+# What both runtime edge worlds promise beside the five sections, by subject name: the
+# entities generator._edge_google and generator._edge_linkedin add to the default world.
+_RUNTIME_SHARED_STATES: Final[Mapping[str, object]] = MappingProxyType(
+    {
+        "populated_sections": SECTION_ORDER,
+        "data_status": "simulated",
+        "observed_history_days": 35,
+        "c0_untracked": "Partner - Co-marketing",
+        "c0_untracked_after_epoch_minutes": 15,
+        "c2_scale_unknown_crm_evidence": "Benchmarks - Retargeting (NA)",
+        "cr3_not_estimable": "Copy test - Lead gen (Lab)",
+        "white_paper_flags": (FLAG_CREATIVE_FLOOR, FLAG_DEAL_FLOOR, FLAG_UNKNOWN_CRM_EVIDENCE),
+        "low_search_term_coverage": FINDING_SEARCH_TERM_COVERAGE,
+    }
+)
+
+
+def _runtime_scenarios() -> Iterator[Scenario]:
+    """The seeded worlds ``MOCK_SCENARIO`` selects beside ``default``: ``runtime.<world>.case``.
+
+    Each runs on the real clock, as the running product does, and promises the five populated
+    sections plus the card states the default world never produces, named by subject in
+    ``expect.values``. ``c0_untracked`` is listed only from ``c0_untracked_after_epoch_minutes``
+    after the world's epoch, so it is raised by an entity sync after the first one; the other
+    states hold on the world's first default run, its budget rules judging the
+    ``observed_history_days`` of budget observations the first entity sync records.
+    """
+    edge_states, crm_unavailable = RUNTIME_SCENARIOS[1:]
+    yield Scenario(
+        name=f"runtime.{edge_states}.case",
+        module=MODULE_END_TO_END,
+        guarantee=(
+            "MOCK_SCENARIO=edge_states: beside all five sections, a C2 Hold (pipeline veto), "
+            "C1b, a C0 untracked own-budget campaign, CR3 not estimable, creative and deal "
+            "floors, unknown CRM evidence with pipeline unavailable and low search-term "
+            "coverage, reachable with no credentials"
+        ),
+        variant="case",
+        pair=None,
+        spec=RUNTIME_SPECS[edge_states],
+        context=ContextSpec(),
+        expect=Expectation(
+            None,
+            True,
+            {
+                **_RUNTIME_SHARED_STATES,
+                "c2_hold": "ROI Calculator - Lead gen (NA)",
+                "c1b": "Analyst Brief - Lead gen (NA)",
+            },
+            flags=(FLAG_SIMULATED,),
+        ),
+    )
+    yield Scenario(
+        name=f"runtime.{crm_unavailable}.case",
+        module=MODULE_END_TO_END,
+        guarantee=(
+            "MOCK_SCENARIO=crm_unavailable: the edge_states world without the MQL and QL "
+            "stages, so MQL and QL are unavailable on every white paper row, C1b is withheld "
+            "and the pipeline is unavailable on every LinkedIn lead-gen C2"
+        ),
+        variant="case",
+        pair=None,
+        spec=RUNTIME_SPECS[crm_unavailable],
+        context=ContextSpec(),
+        expect=Expectation(
+            None,
+            True,
+            {
+                **_RUNTIME_SHARED_STATES,
+                "c2_scale_pipeline_unavailable": (
+                    "ROI Calculator - Lead gen (NA)",
+                    "Benchmarks - Retargeting (NA)",
+                ),
+                "c1b_withheld": "Analyst Brief - Lead gen (NA)",
+                "unavailable_counts": ("mql", "ql"),
+            },
+            finding=FINDING_PIPELINE_UNAVAILABLE,
+            flags=(FLAG_SIMULATED, FLAG_PIPELINE_UNAVAILABLE),
+        ),
+    )
+
+
 def _build_catalogue() -> Mapping[str, Scenario]:
     """Every scenario, keyed by name, in topic order.
 
@@ -8068,6 +8155,7 @@ def _build_catalogue() -> Mapping[str, Scenario]:
         _white_paper_scenarios,
         _precedence_scenarios,
         _integration_scenarios,
+        _runtime_scenarios,
     )
     for scenario in (_default_scenario(), *(item for topic in topics for item in topic())):
         if scenario.name in found:

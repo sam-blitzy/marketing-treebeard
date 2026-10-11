@@ -2685,10 +2685,18 @@ def _select_faults(
         if fault.kind not in expressible:
             continue
         pool = continuation_ids if fault.kind == "continuation_failure" else ids
-        if not pool.intersection(fault.ids):
+        targeted = frozenset(i for i in pool if world.fault_targets(fault, i))
+        if not targeted:
             continue
         if world.consume_fault(fault):
-            chosen.append(fault)
+            # A person_creatives fault names no ids of its own: the plan carries it resolved to
+            # this request's affected ids, which every renderer reads. The claim above stays on
+            # the spec's fault, so its ``times`` count once per request.
+            chosen.append(
+                fault.with_(ids=tuple(sorted(targeted)), person_creatives=())
+                if fault.person_creatives
+                else fault
+            )
     return _FaultPlan(by_id=tuple(chosen))
 
 
@@ -4631,10 +4639,11 @@ _DEFAULT_WORLD_LOCK: Final = threading.Lock()
 def _default_world(settings: Settings) -> SimulatedWorld:
     """The product's world for ``settings``: built once per ``Settings`` instance, then reused.
 
-    ``SimulatedWorld.from_settings`` seeds it from ``MOCK_SEED``. Reuse keeps the world's
-    caches and fault counters across calls. The slot is keyed on identity, never equality,
-    and holds the instance itself, so an identity cannot be recycled while it is cached;
-    another instance (such as a new ``get_settings()`` after ``cache_clear``) replaces it.
+    ``SimulatedWorld.from_settings`` builds the ``MOCK_SCENARIO`` world seeded from
+    ``MOCK_SEED``. Reuse keeps the world's caches and fault counters across calls. The slot is
+    keyed on identity, never equality, and holds the instance itself, so an identity cannot be
+    recycled while it is cached; another instance (such as a new ``get_settings()`` after
+    ``cache_clear``) replaces it.
     """
     with _DEFAULT_WORLD_LOCK:
         if _DEFAULT_WORLD and _DEFAULT_WORLD[0][0] is settings:

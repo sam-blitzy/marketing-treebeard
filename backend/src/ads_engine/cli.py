@@ -922,8 +922,10 @@ async def _seed_simulated() -> int:
     ``bootstrap_sources(settings, force_simulated=True)`` builds, backfills and activates a
     simulated primary dataset per source (with the companion CRM dataset for LinkedIn and
     the baseline decisions of the first entity sync); a source already active and simulated
-    is kept. It is safe while the worker runs, because ``DatasetManager.activate`` serialises
-    activations per source. The default-window run then reads the seeded data.
+    is kept unless its dataset records a world other than the configured ``MOCK_SCENARIO``
+    and ``MOCK_SEED``, which replaces it. It is safe while the worker runs, because
+    ``DatasetManager.activate`` serialises activations per source. The default-window run
+    then reads the seeded data.
 
     The backfills write ``sync_run`` rows without the scheduler lock, so the bootstrap runs
     inside ``sync.scheduler.sync_writer()``: a worker's recovery of orphaned ``sync_run`` rows
@@ -3502,8 +3504,10 @@ environment:
   No credentials are needed: every source is seeded with simulated data,
   whatever DATA_MODE says.
 
-A source whose active dataset is already simulated keeps it. The JSON report
-on stdout gives each source's dataset and the default-window run.
+A source whose active dataset is already simulated keeps it when it was
+generated from the configured MOCK_SCENARIO and MOCK_SEED, else it is
+replaced. The JSON report on stdout gives each source's dataset and the
+default-window run.
 
 exit codes:
   0  every source is seeded and the default-window run succeeded
@@ -3645,7 +3649,8 @@ def build_parser() -> argparse.ArgumentParser:
         "seed-simulated",
         help="seed simulated datasets for every source and run the default analysis",
         description="Build, backfill and activate a simulated dataset per source (an active\n"
-        "simulated one is kept), then compute the default-window run.",
+        "simulated one is kept when it was generated from the configured MOCK_SCENARIO\n"
+        "and MOCK_SEED, else replaced), then compute the default-window run.",
         epilog=_SEED_SIMULATED_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

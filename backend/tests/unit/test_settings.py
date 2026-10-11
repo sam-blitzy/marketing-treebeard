@@ -22,6 +22,7 @@ from ads_engine.settings import (
     GOOGLE_ADS_API_VERSION,
     HUBSPOT_API_VERSION,
     LINKEDIN_API_VERSION,
+    MOCK_SCENARIOS,
     SOURCES,
     VALIDATOR_MESSAGES,
     ConfigurationError,
@@ -30,6 +31,7 @@ from ads_engine.settings import (
     Source,
     get_settings,
 )
+from ads_engine.simulation import RUNTIME_SCENARIOS
 
 WEBHOOK_URL = "https://n8n.example.test/webhook/google-ads"
 CUSTOMER_ID = "1234567890"
@@ -192,6 +194,7 @@ def test_defaults_are_the_documented_safe_local_values() -> None:
     assert settings.display_timezone == "UTC"
     assert settings.data_mode == "auto"
     assert settings.mock_seed == 42
+    assert settings.mock_scenario == "default"
     assert settings.backfill_days == 180
     assert settings.n8n_google_ads_webhook_url is None
     assert settings.n8n_webhook_secret_header == "X-Webhook-Secret"
@@ -231,6 +234,7 @@ def test_reads_every_variable_from_the_environment(monkeypatch: pytest.MonkeyPat
             "DISPLAY_TIMEZONE": "America/New_York",
             "DATA_MODE": "simulated",
             "MOCK_SEED": "7",
+            "MOCK_SCENARIO": "edge_states",
             "BACKFILL_DAYS": "90",
             "N8N_GOOGLE_ADS_WEBHOOK_URL": WEBHOOK_URL,
             "N8N_WEBHOOK_SECRET_HEADER": "X-Webhook-Token",
@@ -261,6 +265,7 @@ def test_reads_every_variable_from_the_environment(monkeypatch: pytest.MonkeyPat
     assert settings.display_tz == ZoneInfo("America/New_York")
     assert settings.data_mode == "simulated"
     assert settings.mock_seed == 7
+    assert settings.mock_scenario == "edge_states"
     assert settings.backfill_days == 90
     assert settings.n8n_google_ads_webhook_url == WEBHOOK_URL
     assert settings.n8n_webhook_secret_header == "X-Webhook-Token"
@@ -424,6 +429,44 @@ def test_unknown_data_mode_is_rejected(monkeypatch: pytest.MonkeyPatch, raw: str
 
     with pytest.raises(ValidationError, match="data_mode"):
         Settings()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("default", "default"),
+        ("edge_states", "edge_states"),
+        ("  Edge_States ", "edge_states"),
+        ("CRM_UNAVAILABLE", "crm_unavailable"),
+    ],
+)
+def test_mock_scenario_names_a_runtime_world_case_insensitively(
+    monkeypatch: pytest.MonkeyPatch, raw: str, expected: str
+) -> None:
+    monkeypatch.setenv("MOCK_SCENARIO", raw)
+
+    assert Settings().mock_scenario == expected
+    assert expected in MOCK_SCENARIOS
+
+
+def test_mock_scenarios_are_the_simulation_runtime_worlds_in_order() -> None:
+    assert MOCK_SCENARIOS == ("default", "edge_states", "crm_unavailable")
+    assert MOCK_SCENARIOS == RUNTIME_SCENARIOS
+
+
+@pytest.mark.parametrize("raw", ["edge", "cr3.not_estimable_target_over_100", "default,edge"])
+def test_unknown_mock_scenario_is_rejected_with_the_allowed_names(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    monkeypatch.setenv("MOCK_SCENARIO", raw)
+
+    with pytest.raises(ValidationError, match="mock_scenario") as excinfo:
+        Settings()
+
+    assert _validator_messages(excinfo.value) == [
+        "MOCK_SCENARIO must be one of default, edge_states or crm_unavailable"
+    ]
+    assert "input_value" not in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
@@ -1266,6 +1309,11 @@ VALIDATOR_FAILURES = [
         "APP_ADMIN_EMAIL must be an email address such as admin@example.com",
         id="app-admin-email",
     ),
+    pytest.param(
+        {"mock_scenario": "edge"},
+        "MOCK_SCENARIO must be one of default, edge_states or crm_unavailable",
+        id="mock-scenario",
+    ),
 ]
 
 
@@ -1286,7 +1334,7 @@ def test_validator_messages_are_exactly_the_messages_the_validators_raise() -> N
     raised = {param.values[1] for param in VALIDATOR_FAILURES}
 
     assert raised == VALIDATOR_MESSAGES
-    assert len(VALIDATOR_MESSAGES) == 9
+    assert len(VALIDATOR_MESSAGES) == 10
 
 
 def test_validator_messages_carry_no_quoted_value_or_placeholder() -> None:

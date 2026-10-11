@@ -116,7 +116,8 @@ once, not once per missed slot; and the jobs a dataset backfill records (``entit
 satisfy their slots, so a fresh start does not repeat them on its first tick. Probes and the
 purge keep their own ``sync_run`` rows (jobs ``probe`` and ``purge``) for the same reason;
 ``probe`` rows record the recovery probes run here and the probes ``ensure_dataset`` runs
-alike, so one spacing of :data:`PROBE_INTERVAL` covers both.
+alike, so one spacing of :data:`PROBE_INTERVAL` covers both; a fallback that a denied job
+entered, with no ``probe`` row, is spaced from its start (``last_failure_at``) as well.
 
 Wakes and lanes. The worker wakes at once after the grace and the startup, then every
 :data:`WAKE_INTERVAL` (30 s) from that first wake on absolute deadlines of a monotonic clock,
@@ -174,8 +175,9 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from functools import partial
 from time import monotonic as system_monotonic
+from time import perf_counter
 from types import MappingProxyType
-from typing import Any, Final, NoReturn
+from typing import Any, Final, Literal, NoReturn
 
 import httpx
 from psycopg.errors import ConnectionTimeout
@@ -217,6 +219,7 @@ from ads_engine.sync.mode import (
     JOB_PROBE,
     PROBE_INTERVAL,
     BuildOutcome,
+    ProbeRunLog,
     SourceModeController,
 )
 
@@ -484,6 +487,13 @@ _RERUN_REASON: Final = "analysis_lock_lost"
 _LOCK_LOST_REASON: Final = "scheduler_lock_lost"
 # The `sync_run.error` of a row the orphaned-run recovery closes: its writer died mid-run.
 _INTERRUPTED: Final = "interrupted: the process running this job ended before it finished"
+# The `sync_run.error` of a recovery probe whose source left automatic fallback before it ran.
+_NOT_IN_FALLBACK: Final = "source is no longer in automatic fallback; nothing was probed"
+# The `sync_run.error` of a recovery probe cancelled before its row was closed.
+_PROBE_CANCELLED: Final = "recovery probe cancelled"
+# The purge's `sync.job` source (it purges every source's datasets) and its cancelled error.
+_PURGE_SOURCE: Final = "all"
+_PURGE_CANCELLED: Final = "purge cancelled"
 
 # ---------------------------------------------------------------------------------------------
 # Schedule model
@@ -902,6 +912,53 @@ def _join_reasons(reasons: Iterable[str]) -> str:
 
 def _truncate(value: str, limit: int = _ERROR_LIMIT) -> str:
     return value if len(value) <= limit else value[: limit - 1] + "…"
+
+
+def _log_purge_finish(
+    status: Literal["succeeded", "failed", "cancelled"],
+    started: float,
+    *,
+    rows: int = 0,
+    by_source: Mapping[Source, int] | None = None,
+    error: str | None = None,
+    error_type: str | None = None,
+) -> None:
+    """Log the purge's one ``sync.job.finish``, shaped like every sync job's.
+
+    Source ``all`` (the purge serves every source), job ``purge``, the status, ``rows`` (the
+    retired datasets purged), ``by_source`` (that count per source), ``calls`` 0 (the purge
+    calls no platform), the duration from ``started``, and the error and its class name. The
+    level follows the status as a job's does: ``info`` for ``succeeded``, ``error`` for
+    ``failed`` (the error is the class name its ``sync_run`` rows record), ``warning`` for
+    ``cancelled``. Nothing here is an email, a secret or a token.
+
+    Args:
+        status: How the purge ended.
+        started: ``time.perf_counter()`` when its ``sync.job.start`` was logged.
+        rows: The datasets purged; 0 when it failed.
+        by_source: The datasets purged per source; empty when it failed.
+        error: Why it failed, or ``None``.
+        error_type: The class name of the exception that ended it, or ``None``.
+    """
+    if status == "succeeded":
+        log = _log.info
+    elif status == "cancelled":
+        log = _log.warning
+    else:
+        log = _log.error
+    log(
+        "sync.job.finish",
+        source=_PURGE_SOURCE,
+        job=JOB_PURGE,
+        dataset_id=None,
+        status=status,
+        rows=rows,
+        by_source=dict(by_source or {}),
+        calls=0,
+        duration_ms=int((perf_counter() - started) * 1000),
+        error=error,
+        error_type=error_type,
+    )
 
 
 def _next_deadline(deadline: float, interval: float, now: float) -> float:
@@ -2797,18 +2854,23 @@ class Scheduler:
     async def _probe_due(self, source: Source, now: datetime) -> bool:
         """Whether ``source`` is in automatic fallback and its last probe is old enough.
 
-        Due when no ``probe`` ``sync_run`` of the source started within
-        :data:`PROBE_INTERVAL` of ``now``. Those rows record every probe: this scheduler's
-        recovery probes and the probes ``ensure_dataset`` runs (the worker's bootstrap, a wake
-        that resolves live without live data). A fallback entered by such a probe therefore
-        gets its first recovery probe 30 minutes after it, not at the next wake. A fallback
-        entered by a denial during a live job has no probe of its own: it is probed once the
-        source's latest probe, if any, is that old. Only reads.
+        Due when :data:`PROBE_INTERVAL` has passed since the later of two instants: the start
+        of the source's latest ``probe`` ``sync_run`` and the start of its fallback
+        (``SourceModeController.fallback_failure_at``). The rows record every probe: this
+        scheduler's recovery probes and the probes ``ensure_dataset`` runs (the worker's
+        bootstrap, a wake that resolves live without live data), so a fallback entered by
+        such a probe gets its first recovery probe 30 minutes after it. A fallback entered by
+        a denial during a live job or build writes no ``probe`` row; its start, the denial's
+        ``last_failure_at``, spaces it the same way, so its first recovery probe also follows
+        30 minutes later, never at the next wake. Only reads.
         """
         if not await self._controller.in_fallback(source):
             return False
         history = await self._history(now, (JOB_PROBE,))
         last = history.get((source, JOB_PROBE))
+        began = await self._controller.fallback_failure_at(source)
+        if began is not None and (last is None or began > last):
+            last = began
         return last is None or now - last >= PROBE_INTERVAL
 
     async def _probe(self, tick: _Tick, source: Source) -> None:
@@ -2816,12 +2878,23 @@ class Scheduler:
 
         The row is inserted (and committed) before the probe, so probes stay spaced even when
         one fails. It ends ``succeeded`` when the probe passed and the live dataset built
-        from it was activated, ``failed`` otherwise, with the reason.
+        from it was activated, ``failed`` otherwise, with the reason: the failed probe's own
+        (its deciding check, endpoint and platform code), the failed build's, or
+        :data:`_NOT_IN_FALLBACK` when the source left automatic fallback before the probe
+        ran. Like every sync job (AAP 0.11.1) the probe logs ``sync.job.start`` once its row
+        is open and exactly one ``sync.job.finish`` on every path
+        (``ads_engine.sync.mode.ProbeRunLog``): source, job ``probe``, the dataset built,
+        status, rows 0, the probe's checks and calls, duration, error and error type. The log
+        is handed to ``recover``, which sets the probe's report on it as soon as the probe
+        returns, so the checks and calls are logged also when the build that follows raises
+        or is cancelled.
 
         Raises:
             Exception: Any error of ``recover``, unchanged, once the row was closed as failed
                 with the error's class name (best effort: a database error doing so is
                 logged as ``scheduler.sync_run_close_failed``, never raised in its place).
+                A database error closing the row propagates unchanged too; either way
+                ``sync.job.finish`` is logged ``failed`` with the error's class name.
             asyncio.CancelledError: Unchanged, when the task running the probe is cancelled
                 (a lost scheduler lock, the worker's graceful shutdown) once the row has an
                 id, wherever the probe then was, the row's own close included
@@ -2833,27 +2906,34 @@ class Scheduler:
                 abandoned, and a further cancellation while it runs propagates at once.
         """
         run_id = await self._open_run(source, JOB_PROBE, tick.now)
+        run = ProbeRunLog.start(source, run_id)
         tick.probed.append(source)
         tick.acted("probes")
         try:
             try:
-                outcome = await self._controller.recover(source)
+                outcome = await self._controller.recover(source, run=run)
             except Exception as exc:
                 await self._close_run_quietly(run_id, error=type(exc).__name__)
                 raise
             if outcome is None:
-                await self._close_run(run_id, SYNC_RUN_FAILED, error="recovery probe did not pass")
-            elif outcome.activated and outcome.mode == "live":
+                await self._close_run(run_id, SYNC_RUN_FAILED, error=_NOT_IN_FALLBACK)
+                run.finish("failed", error=_NOT_IN_FALLBACK)
+                return
+            if outcome.activated and outcome.mode == "live":
                 await self._close_run(run_id, SYNC_RUN_SUCCEEDED)
+                run.finish("succeeded", dataset_id=outcome.dataset_id)
             else:
-                await self._close_run(
-                    run_id,
-                    SYNC_RUN_FAILED,
-                    error=outcome.reason or "live dataset was not activated",
-                )
+                error = outcome.reason or "live dataset was not activated"
+                await self._close_run(run_id, SYNC_RUN_FAILED, error=error)
+                run.finish("failed", dataset_id=outcome.dataset_id, error=error)
         except asyncio.CancelledError:
             # Also a cancellation that lands in a close above, whose transaction rolled back.
-            await self._close_cancelled_probe(source, run_id)
+            await self._close_cancelled_probe(run)
+            raise
+        except Exception as exc:
+            # recover's error, or a database error closing the row; logs nothing when a
+            # close above already logged the finish.
+            run.finish("failed", error=type(exc).__name__, error_type=type(exc).__name__)
             raise
 
     # step 3 ----------------------------------------------------------------------------------
@@ -3066,7 +3146,13 @@ class Scheduler:
     # step 6 ----------------------------------------------------------------------------------
 
     async def _purge(self, tick: _Tick) -> None:
-        """Purge retired datasets once their 05:00 slot is due."""
+        """Purge retired datasets once their 05:00 slot is due.
+
+        The purge is a sync job of every source at once, logged as every sync job is (AAP
+        0.11.1): once due, ``sync.job.start`` before anything is read or purged, and exactly
+        one ``sync.job.finish`` once its ``sync_run`` rows are written or it failed
+        (:func:`_log_purge_finish`). ``scheduler.purge`` is logged as well.
+        """
         entry = _ENTRIES[JOB_PURGE]
         async with self._step(tick, "purge"):
             history = await self._history(tick.now, (JOB_PURGE,))
@@ -3074,20 +3160,42 @@ class Scheduler:
             if not is_due(entry, tick.now, self._tz, max(starts, default=None)):
                 return
             tick.acted("purge")
-            sources_of = await self._retired_sources()
+            started = perf_counter()
+            _log.info(
+                "sync.job.start",
+                source=_PURGE_SOURCE,
+                job=JOB_PURGE,
+                dataset_id=None,
+                rows=0,
+                calls=0,
+                duration_ms=0,
+            )
             try:
-                purged = await self._datasets.purge_retired()
-            except Exception as exc:
-                await self._record_purge_quietly(tick.now, error=type(exc).__name__)
+                sources_of = await self._retired_sources()
+                try:
+                    purged = await self._datasets.purge_retired()
+                except Exception as exc:
+                    await self._record_purge_quietly(tick.now, error=type(exc).__name__)
+                    raise
+                counts: dict[Source, int] = {}
+                for dataset_id in purged:
+                    source = sources_of.get(dataset_id)
+                    if source is not None:
+                        counts[source] = counts.get(source, 0) + 1
+                await self._record_purge(tick.now, counts)
+            except asyncio.CancelledError:
+                _log_purge_finish(
+                    "cancelled", started, error=_PURGE_CANCELLED, error_type="CancelledError"
+                )
                 raise
-            counts: dict[Source, int] = {}
-            for dataset_id in purged:
-                source = sources_of.get(dataset_id)
-                if source is not None:
-                    counts[source] = counts.get(source, 0) + 1
-            await self._record_purge(tick.now, counts)
+            except Exception as exc:
+                _log_purge_finish(
+                    "failed", started, error=type(exc).__name__, error_type=type(exc).__name__
+                )
+                raise
             tick.purged.extend(purged)
             _log.info("scheduler.purge", purged=len(purged), by_source=counts)
+            _log_purge_finish("succeeded", started, rows=len(purged), by_source=counts)
 
     async def _retired_sources(self) -> dict[int, Source]:
         """Map every retired primary dataset to its source, read before the purge deletes it."""
@@ -3262,9 +3370,10 @@ class Scheduler:
         """Insert and commit a ``running`` ``sync_run`` row; return its id.
 
         Only recovery probes open their row this way. A cancellation that lands once the row
-        has its id (in the commit, which may or may not have reached the server) closes it
-        as a cancelled probe (:meth:`_close_cancelled_probe`) before it propagates; one that
-        lands earlier rolls the insert back.
+        has its id (in the commit, which may or may not have reached the server) logs the
+        row's ``sync.job.start`` and closes it as a cancelled probe
+        (:meth:`_close_cancelled_probe`) before it propagates; one that lands earlier rolls
+        the insert back and logs nothing.
         """
         run_id: int | None = None
         try:
@@ -3282,7 +3391,7 @@ class Scheduler:
                 return run_id
         except asyncio.CancelledError:
             if run_id is not None:
-                await self._close_cancelled_probe(source, run_id)
+                await self._close_cancelled_probe(ProbeRunLog.start(source, run_id))
             raise
 
     async def _close_run(self, run_id: int, status: str, *, error: str | None = None) -> None:
@@ -3310,7 +3419,7 @@ class Scheduler:
         except SQLAlchemyError as exc:
             _log.error("scheduler.sync_run_close_failed", run_id=run_id, error=type(exc).__name__)
 
-    async def _close_cancelled_probe(self, source: Source, run_id: int) -> None:
+    async def _close_cancelled_probe(self, run: ProbeRunLog) -> None:
         """Log ``scheduler.probe_cancelled`` and close the probe's row as cancelled, bounded.
 
         A lost lock cancels and awaits the lanes for at most :data:`LOCK_LOST_STOP_TIMEOUT`,
@@ -3318,16 +3427,21 @@ class Scheduler:
         import to be shorter), or at once when it fails, and logged as
         ``scheduler.sync_run_close_failed``; a further cancellation propagates at once. Only a
         row still ``running`` is closed: ``failed`` with ``recovery probe cancelled``, a fixed
-        reason that carries no error text. Nothing else is written.
+        reason that carries no error text. Nothing else is written. The row's
+        ``sync.job.finish`` is then logged ``cancelled``, even when the close was abandoned,
+        unless a close before the cancellation already logged it.
 
         Args:
-            source: The probed source.
-            run_id: The probe's ``sync_run`` row.
+            run: The probe's ``sync_run`` row and its log.
         """
-        _log.warning("scheduler.probe_cancelled", source=source, run_id=run_id)
+        _log.warning("scheduler.probe_cancelled", source=run.source, run_id=run.run_id)
         try:
             async with asyncio.timeout(jobs.CANCEL_CLOSE_TIMEOUT.total_seconds()):
-                await self._close_run_quietly(run_id, error="recovery probe cancelled")
+                await self._close_run_quietly(run.run_id, error=_PROBE_CANCELLED)
         except TimeoutError as exc:
             # Best effort: the cancellation must end the probe within the lock-loss bound.
-            _log.error("scheduler.sync_run_close_failed", run_id=run_id, error=type(exc).__name__)
+            _log.error(
+                "scheduler.sync_run_close_failed", run_id=run.run_id, error=type(exc).__name__
+            )
+        finally:
+            run.finish("cancelled", error=_PROBE_CANCELLED, error_type="CancelledError")

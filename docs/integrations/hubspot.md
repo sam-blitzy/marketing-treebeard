@@ -443,6 +443,10 @@ throughout.
   activates. The activation lock refuses a LinkedIn build whose matched contacts there still
   have no association read, and a build whose contacts still lack them after three settle
   rounds is discarded.
+- A job that fails on a defect stops the build as soon as it returns. That covers the CRM
+  backfill (for example a contacts batch read answering 400) and the CRM sync of HubSpot's
+  primary. No settle round reruns it, so the failed request is sent once. The build is
+  discarded and settled as a defect ([Errors, fallback and recovery](#errors-fallback-and-recovery)).
 - Leads ingested after activation get rows in the active dataset as usual.
 
 ## Contact refresh
@@ -866,8 +870,8 @@ platform-wide table is in [architecture.md](../architecture.md); for HubSpot:
 - **Stale**: an item is flagged stale when a dataset it reads last succeeded more than
   `sources.stale_after_hours` (24) ago or covers less than the window end.
 
-**Automatic fallback and recovery**: a HubSpot source simulated after a denial, or after a
-live build that failed, while `DATA_MODE=auto` and a token is set, is in automatic fallback.
+**Automatic fallback and recovery**: a HubSpot source simulated after a denial, while
+`DATA_MODE=auto` and a token is set, is in automatic fallback.
 The scheduler then probes it every 30 minutes (`PROBE_INTERVAL`). `HubSpotClient.probe`
 runs, in order:
 
@@ -882,7 +886,10 @@ A batch status other than `COMPLETE` fails its check.
 - **All checks pass**: the worker builds a live HubSpot dataset, backfills it, stages and
   attempts the matches, and activates it only once the staged-matching readiness test passes
   ([Staged matching](#staged-matching-on-a-crm-dataset-change)).
-- **Build fails**: the building dataset is discarded and the simulated one stays active.
+- **Build fails**: the building dataset is discarded and the simulated one stays active. A
+  denial keeps the fallback. A defect ends it with status `error`, and the running worker does
+  not retry it. Any other failure ends it with status `stale`, and the source is probed again
+  after 30 minutes ([architecture](../architecture.md#recovery)).
 - **Partial success**: nothing changes, so the source never flips back and forth.
 - **Forced simulation**: `DATA_MODE=simulated` never probes and never promotes HubSpot to
   live, even when the probes would pass.

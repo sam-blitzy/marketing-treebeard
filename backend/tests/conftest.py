@@ -147,6 +147,7 @@ _DEFAULTED_VARS: Final[tuple[str, ...]] = (
     "GOOGLE_DAILY_CALL_BUDGET",
     "BACKFILL_DAYS",
     "DISPLAY_TIMEZONE",
+    "MOCK_SCENARIO",
 )
 
 NETWORK_GUARD_MESSAGE: Final = "real network I/O attempted in a test; inject a MockTransport"

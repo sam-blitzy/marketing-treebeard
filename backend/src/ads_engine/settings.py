@@ -52,6 +52,7 @@ __all__ = [
     "GOOGLE_ADS_API_VERSION",
     "HUBSPOT_API_VERSION",
     "LINKEDIN_API_VERSION",
+    "MOCK_SCENARIOS",
     "SOURCES",
     "VALIDATOR_MESSAGES",
     "ConfigurationError",
@@ -90,6 +91,16 @@ For example ``/crm/objects/2026-09/contacts/search``.
 
 DataMode = Literal["auto", "simulated"]
 """``DATA_MODE``: ``auto`` falls back per source; ``simulated`` forces every source."""
+
+MOCK_SCENARIOS: Final[tuple[str, ...]] = ("default", "edge_states", "crm_unavailable")
+"""The ``MOCK_SCENARIO`` values, in order: the simulated worlds the running product can serve.
+
+This tuple is the source of truth for the accepted names. ``ads_engine.simulation`` keeps an
+equal ``RUNTIME_SCENARIOS``, because that module imports nothing from ``ads_engine``.
+``ads_engine.simulation.generator`` refuses to import when the two differ, and the tests
+assert they are equal. This module never imports ``ads_engine.simulation``: the API process
+loads settings, and it must never load the simulation, sync or connector packages.
+"""
 
 # Field names whose environment variables make up each source's credentials
 # (the "Access unavailable" row of the fallback table). The env name is the upper-case
@@ -153,6 +164,9 @@ _WEBHOOK_HEADER_NAME_MESSAGE: Final = (
     "token characters, such as X-Webhook-Secret"
 )
 _ADMIN_EMAIL_MESSAGE: Final = "APP_ADMIN_EMAIL must be an email address such as admin@example.com"
+_MOCK_SCENARIO_MESSAGE: Final = (
+    f"MOCK_SCENARIO must be one of {', '.join(MOCK_SCENARIOS[:-1])} or {MOCK_SCENARIOS[-1]}"
+)
 
 VALIDATOR_MESSAGES: Final[frozenset[str]] = frozenset(
     {
@@ -165,6 +179,7 @@ VALIDATOR_MESSAGES: Final[frozenset[str]] = frozenset(
         _WEBHOOK_URL_PLAIN_HTTP_MESSAGE,
         _WEBHOOK_HEADER_NAME_MESSAGE,
         _ADMIN_EMAIL_MESSAGE,
+        _MOCK_SCENARIO_MESSAGE,
     }
 )
 """The closed set of messages the :class:`Settings` validators raise.
@@ -247,6 +262,10 @@ class Settings(BaseSettings):
             instants. It never moves a source's day boundary.
         data_mode: ``DATA_MODE``, ``auto`` or ``simulated``.
         mock_seed: ``MOCK_SEED``, the seed of the simulated world.
+        mock_scenario: ``MOCK_SCENARIO``, the simulated world the running product serves,
+            one of :data:`MOCK_SCENARIOS`: ``default``, or ``edge_states`` or
+            ``crm_unavailable``, the seeded worlds that also reach the card states the
+            default world never produces. Read case-insensitively; blank means ``default``.
         backfill_days: ``BACKFILL_DAYS``, the initial backfill length per dataset; the
             sync jobs cap it at 180 days (LinkedIn's 6-month daily retention) for every
             source.
@@ -294,6 +313,7 @@ class Settings(BaseSettings):
     display_timezone: str = "UTC"
     data_mode: DataMode = "auto"
     mock_seed: int = 42
+    mock_scenario: str = "default"
     backfill_days: int = Field(default=180, ge=1)
 
     # Google Ads, reached only through the n8n webhook
@@ -359,6 +379,24 @@ class Settings(BaseSettings):
     def _normalise_data_mode(cls, value: object) -> object:
         """Accept ``DATA_MODE`` case-insensitively, for example ``Simulated``."""
         return value.strip().lower() if isinstance(value, str) else value
+
+    @field_validator("mock_scenario", mode="before")
+    @classmethod
+    def _normalise_mock_scenario(cls, value: object) -> object:
+        """Accept ``MOCK_SCENARIO`` case-insensitively, for example ``Edge_States``."""
+        return value.strip().lower() if isinstance(value, str) else value
+
+    @field_validator("mock_scenario", mode="after")
+    @classmethod
+    def _validate_mock_scenario(cls, value: str) -> str:
+        """Require ``MOCK_SCENARIO`` to name one of the runtime simulated worlds.
+
+        Raises:
+            ValueError: When the name is not in :data:`MOCK_SCENARIOS`.
+        """
+        if value not in MOCK_SCENARIOS:
+            raise ValueError(_MOCK_SCENARIO_MESSAGE)
+        return value
 
     @field_validator("linkedin_ad_account_ids", mode="before")
     @classmethod

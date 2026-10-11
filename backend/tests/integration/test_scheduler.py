@@ -158,7 +158,7 @@ from ads_engine.settings import Source, get_settings
 from ads_engine.sync import jobs
 from ads_engine.sync import scheduler as scheduler_module
 from ads_engine.sync.budget_guard import GoogleCallBudget
-from ads_engine.sync.mode import BuildOutcome, SourceModeController
+from ads_engine.sync.mode import BuildOutcome, ProbeRunLog, SourceModeController
 from ads_engine.sync.scheduler import (
     COALESCE_WINDOW,
     FENCE_PROBE_INTERVAL,
@@ -215,6 +215,8 @@ _AUTH_FAILED: Final = 'connection failed: FATAL:  password authentication failed
 
 _LOCK_LOST: Final = "scheduler_lock_lost"
 _PROBE_CANCELLED: Final = "recovery probe cancelled"
+_PROBE_DENIED: Final = "google search Q-G1: HTTP 403: The caller does not have permission"
+"""A recovery probe's deciding reason, as ``recover`` hands it over for the probe row."""
 _INTERRUPTED: Final = "interrupted: the process running this job ended before it finished"
 
 
@@ -391,7 +393,8 @@ class Recovery:
 
     While :attr:`block` is set (the default) a call sets :attr:`entered` and waits until it is
     cancelled, then sets :attr:`cancelled` and re-raises the cancellation. Otherwise it
-    returns :attr:`outcome` at once.
+    returns :attr:`outcome` at once, first setting the probe report it carries, if any, on
+    the scheduler's row log, as ``recover`` does once its probe returns.
     """
 
     def __init__(self) -> None:
@@ -401,7 +404,7 @@ class Recovery:
         self.entered = asyncio.Event()
         self.cancelled = asyncio.Event()
 
-    async def __call__(self, source: Source) -> BuildOutcome | None:
+    async def __call__(self, source: Source, run: ProbeRunLog | None = None) -> BuildOutcome | None:
         """Record the call; block until cancelled, or return :attr:`outcome`."""
         self.calls.append(source)
         if self.block:
@@ -411,6 +414,8 @@ class Recovery:
             except asyncio.CancelledError:
                 self.cancelled.set()
                 raise
+        if run is not None and self.outcome is not None and self.outcome.probe is not None:
+            run.report = self.outcome.probe
         return self.outcome
 
 
@@ -780,6 +785,15 @@ def _logged(captured_logs: Any, event: str) -> list[dict[str, Any]]:
     return [record for record in captured_logs() if record.get("event") == event]
 
 
+def _probe_job_lines(captured_logs: Any, phase: str) -> list[dict[str, Any]]:
+    """The captured ``sync.job.<phase>`` records of ``probe`` jobs, in order."""
+    return [
+        record
+        for record in _logged(captured_logs, f"sync.job.{phase}")
+        if record.get("job") == "probe"
+    ]
+
+
 def _silent_lock_check(monkeypatch: pytest.MonkeyPatch, recorder: Recorder) -> asyncio.Event:
     """Arm a lock check that goes silent, the way one against a server that stopped answering does.
 
@@ -900,9 +914,11 @@ def recovery(monkeypatch: pytest.MonkeyPatch, datasets: Datasets) -> Recovery:
         del self  # Only the source decides here.
         return source == "google"
 
-    async def recover(self: SourceModeController, source: Source) -> BuildOutcome | None:
+    async def recover(
+        self: SourceModeController, source: Source, *, run: ProbeRunLog | None = None
+    ) -> BuildOutcome | None:
         del self  # The fake decides alone.
-        return await fake(source)
+        return await fake(source, run)
 
     monkeypatch.setattr(SourceModeController, "in_fallback", google_in_fallback)
     monkeypatch.setattr(SourceModeController, "recover", recover)
@@ -2346,6 +2362,25 @@ async def test_cancelled_probe_closes_its_row_failed_and_propagates(
         row.id,
     )
     assert _logged(captured_logs, "scheduler.sync_run_close_failed") == []
+    (start,) = _probe_job_lines(captured_logs, "start")
+    assert (start["source"], start["run_id"], start["rows"], start["calls"]) == (
+        "google",
+        row.id,
+        0,
+        0,
+    )
+    (finish,) = _probe_job_lines(captured_logs, "finish")
+    assert {key: finish[key] for key in ("level", "source", "run_id", "status", "rows")} == {
+        "level": "warning",
+        "source": "google",
+        "run_id": row.id,
+        "status": "cancelled",
+        "rows": 0,
+    }
+    assert (finish["checks"], finish["calls"], finish["dataset_id"]) == (0, 0, None)
+    assert (finish["error"], finish["error_type"]) == (_PROBE_CANCELLED, "CancelledError")
+    assert isinstance(finish["duration_ms"], int)
+    assert finish["duration_ms"] >= 0
 
 
 async def test_sigterm_during_a_recovery_probe_closes_its_row_failed(
@@ -2394,7 +2429,7 @@ async def test_lock_lost_during_a_recovery_probe_closes_its_row_failed(
     ("committed", "activated", "expected"),
     [
         (False, False, ("failed", _PROBE_CANCELLED)),
-        (True, False, ("failed", "recovery probe did not pass")),
+        (True, False, ("failed", _PROBE_DENIED)),
         (True, True, ("succeeded", None)),
     ],
     ids=["rolled_back_close", "committed_failure", "committed_success"],
@@ -2409,12 +2444,19 @@ async def test_cancellation_in_the_probe_close_keeps_a_committed_outcome(
     activated: bool,
     expected: tuple[str, str | None],
 ) -> None:
-    """A close the cancellation rolled back ends ``failed``; a committed one stands."""
+    """A close the cancellation rolled back ends ``failed``; a committed one stands.
+
+    Either way the probe logs one ``sync.job.start`` and one ``sync.job.finish``, which
+    reports the cancellation that ended the task.
+    """
     recovery.block = False
-    if activated:
-        recovery.outcome = BuildOutcome(
-            source="google", mode="live", dataset_id=1, activated=True, reason="recovered"
+    recovery.outcome = (
+        BuildOutcome(source="google", mode="live", dataset_id=1, activated=True, reason="recovered")
+        if activated
+        else BuildOutcome(
+            source="google", mode="live", dataset_id=None, activated=False, reason=_PROBE_DENIED
         )
+    )
     close_run = Scheduler._close_run
     closing = asyncio.Event()
 
@@ -2451,6 +2493,14 @@ async def test_cancellation_in_the_probe_close_keeps_a_committed_outcome(
     assert row.finished_at == harness.now
     assert len(_logged(captured_logs, "scheduler.probe_cancelled")) == 1
     assert _logged(captured_logs, "scheduler.sync_run_close_failed") == []
+    assert [record["run_id"] for record in _probe_job_lines(captured_logs, "start")] == [row.id]
+    (finish,) = _probe_job_lines(captured_logs, "finish")
+    assert (finish["level"], finish["run_id"], finish["status"], finish["error"]) == (
+        "warning",
+        row.id,
+        "cancelled",
+        _PROBE_CANCELLED,
+    )
 
 
 @pytest.mark.parametrize("where", ["flush", "commit"])
@@ -2509,11 +2559,16 @@ async def test_cancellation_while_the_probe_row_opens_leaves_no_running_row(
     if where == "flush":
         assert rows == []
         assert cancelled == []
+        assert _probe_job_lines(captured_logs, "start") == []
+        assert _probe_job_lines(captured_logs, "finish") == []
     else:
         (row,) = rows
         assert (row.status, row.error) == ("failed", _PROBE_CANCELLED)
         assert row.finished_at == harness.now
         assert [record["run_id"] for record in cancelled] == [row.id]
+        assert [record["run_id"] for record in _probe_job_lines(captured_logs, "start")] == [row.id]
+        (finish,) = _probe_job_lines(captured_logs, "finish")
+        assert (finish["run_id"], finish["status"]) == (row.id, "cancelled")
 
 
 @pytest.mark.parametrize("failure", ["fails", "hangs"])
