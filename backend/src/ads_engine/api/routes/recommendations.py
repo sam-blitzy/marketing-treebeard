@@ -1,4 +1,4 @@
-"""``GET /recommendations`` and ``POST /recommendations/{id}/feedback``: the five sections.
+"""``GET /recommendations``, ``GET /recommendations/items`` and the feedback ``POST``.
 
 AAP 0.5.3 (``GET /recommendations?run_id=`` returning ``RecommendationsPage``;
 ``POST /recommendations/{id}/feedback``; "Where outputs are frozen"), 0.3.2 (the current-state
@@ -42,6 +42,13 @@ What this module adds is only the arrangement of those rows into the page:
   in. Any other key is kept, defensively, after them, titled with the key, so no stored item is
   ever dropped. Items keep their stored rank order; held items are not moved, because the UI
   collapses them.
+* **Bounded groups**: a group carries at most its first
+  :data:`~ads_engine.api.schemas.GROUP_PAGE_SIZE` items (rank, then id) with ``total`` (every
+  item the run stored in it) and ``hidden`` (how many of those feedback in force now hides,
+  under the overlay's own semantics, :func:`~ads_engine.analysis.overlay.item_hidden_state`).
+  ``GET /recommendations/items?run_id=&section=&group=&offset=&limit=`` returns the rest in the
+  same order, each item with its read-time ``current``, so every stored item stays reachable
+  while the page stays a few megabytes at most whatever the run's size.
 * **Entity**: ``{source, type, id, name}`` with ``source``, ``type`` and the platform id taken
   from the stored key ``{source}:{type}:{external_id}`` and the display name from the stored
   ``evidence.extra.entity``, where the runner keeps it (``recommendation`` has no name column).
@@ -51,10 +58,17 @@ What this module adds is only the arrangement of those rows into the page:
   (:data:`FLAG_LABELS`) stands in only when no recorded message exists. The returned
   ``evidence.extra`` leaves ``flag_messages`` out: ``Item.flags`` carries each message.
 
-Performance: the page issues exactly four set-based loads (recommendations served by
-``ix_recommendation_run_section_rank``, findings, withheld patterns and suppression counts) plus
-the run lookup and the overlay's own bounded statement set, never one statement per item, and
-groups the rows in one pass in memory.
+Performance: the page issues exactly five set-based loads (each group's first items with its
+``total`` and ``hidden``, one windowed statement served by ``ix_recommendation_run_section_rank``;
+the overlay's check representatives,
+:func:`~ads_engine.analysis.overlay.load_check_representatives`; findings, withheld patterns and
+suppression counts) plus the run lookup and the overlay's own bounded statement set, never one
+statement per group or item, and groups the rows in one pass in memory. The items materialised
+are bounded by the group count times ``GROUP_PAGE_SIZE``, not by the run's size, and the
+page-level ``Overlay`` (stale and incomplete datasets, their banners) still covers every stored
+item through the representatives: one stored item per distinct combination of the inputs the
+overlay's dataset checks read. ``GET /recommendations/items`` issues the run lookup, one count,
+one slice of at most ``GROUP_PAGE_SIZE`` items and the overlay's statements for that slice.
 
 Feedback (``POST``) writes one ``recommendation_feedback`` row copying the item's rule and
 entity key, suppressing the same rule and entity in later runs until ``until`` (``feedback.*_days``
@@ -74,8 +88,13 @@ Example::
     GET /api/v1/recommendations?run_id=42  (any run by id, for example a custom window)
     200 {"run": {...}, "overlay": {...}, "banners": [...],
          "sections": [{"key": "keywords", "title": "Keywords to adjust",
-                       "groups": [{"key": "block", "title": "...", "items": [...]}, ...],
+                       "groups": [{"key": "block", "title": "...", "items": [...],
+                                   "total": 18003, "hidden": 0}, ...],
                        "findings": [...], "withheld": [...], "suppressed": {...}}, ...]}
+
+    GET /api/v1/recommendations/items?run_id=42&section=keywords&group=block&offset=100
+    200 {"run_id": 42, "section": "keywords", "group": "block", "total": 18003, "hidden": 0,
+         "offset": 100, "items": [...]}               (at most 100 items, rank order)
 
     POST /api/v1/recommendations/7/feedback   (X-Requested-With: ads-engine)
     {"kind": "snooze", "note": "Revisit after the launch"}
@@ -84,12 +103,13 @@ Example::
 """
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from types import MappingProxyType
 from typing import Annotated, Any, Final
 
 from fastapi import APIRouter, Path, Query
-from sqlalchemy import select
+from sqlalchemy import Subquery, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ads_engine.analysis.context import (
@@ -123,8 +143,10 @@ from ads_engine.analysis.context import (
 from ads_engine.analysis.overlay import (
     ItemOverlayView,
     OverlayResult,
+    item_hidden_state,
     item_is_current,
     item_provenance,
+    load_check_representatives,
     overlay,
 )
 from ads_engine.analysis.runner import RUNNER_EXTRA_KEYS, get_run, latest_default_run
@@ -155,6 +177,8 @@ from ads_engine.logging import get_logger
 __all__ = [
     "FEEDBACK_DAYS_KEYS",
     "FLAG_LABELS",
+    "GroupCounts",
+    "get_group_items",
     "get_recommendations",
     "post_feedback",
     "router",
@@ -471,23 +495,27 @@ def _is_dynamic(key: str) -> bool:
 def _groups(
     section: str,
     rows: Sequence[Recommendation],
+    counts: Mapping[GroupKey, GroupCounts],
     current: Mapping[int, ItemOverlayView],
 ) -> list[dict[str, Any]]:
-    """Arrange one section's stored items into its groups, in display order.
+    """Arrange one section's loaded items into its groups, in display order.
 
     Order: every static group of the section (``GROUP_ORDER``), present even when empty so
     the UI has it to render; then the dynamic ``campaign:{id}`` and
     ``cohort:{CURRENCY}`` groups by their lowest item rank (the order precedence ranked them
     in); then any other key, defensively, by lowest rank, so no stored item is dropped. Ties
-    break by key. Items keep their stored rank order within each group.
+    break by key. Items keep their stored rank order within each group. Each group's first
+    item is always loaded and is its lowest-ranked, so the order is the one the whole run
+    gives; a creative block's title reads its loaded items.
 
     Args:
         section: The section key.
-        rows: The section's stored items in rank order.
-        current: The overlay's view of every item, by id.
+        rows: The section's loaded items (each group's first ones) in rank order.
+        counts: Every non-empty group's ``total`` and ``hidden``, by ``(section, group)``.
+        current: The overlay's view of every loaded item, by id.
 
     Returns:
-        The groups as ``{key, title, items}``.
+        The groups as ``{key, title, items, total, hidden}``.
 
     Raises:
         KeyError: When the overlay has no view of an item (the overlay covers every item).
@@ -513,11 +541,14 @@ def _groups(
     for key in (*static, *dynamic, *unknown):
         members = by_key.get(key, [])
         title = titles.get(key) if key in static else None
+        group_counts = counts.get((section, key), _NO_ITEMS)
         groups.append(
             {
                 "key": key,
                 "title": title or _dynamic_title(key, members),
                 "items": [_item(row, current[row.id]) for row in members],
+                "total": group_counts.total,
+                "hidden": group_counts.hidden,
             }
         )
     return groups
@@ -525,6 +556,7 @@ def _groups(
 
 def _sections(
     recommendations: Sequence[Recommendation],
+    group_counts: Mapping[GroupKey, GroupCounts],
     findings: Sequence[RunFinding],
     withheld: Sequence[RunWithheld],
     suppressions: Sequence[RunSuppression],
@@ -533,11 +565,14 @@ def _sections(
     """Build the five sections from a run's stored outputs, in one pass over each list.
 
     Args:
-        recommendations: The run's items, ordered by section and rank.
+        recommendations: The run's loaded items (each group's first ones), ordered by section
+            and rank.
+        group_counts: Every non-empty group's ``total`` and ``hidden``, by
+            ``(section, group)``.
         findings: The run's findings, in stored order.
         withheld: The run's withheld patterns, in stored order.
         suppressions: The run's suppression counts.
-        current: The overlay's view of every item, by id.
+        current: The overlay's view of every loaded item, by id.
 
     Returns:
         Exactly five sections in ``SECTION_ORDER``; a section without stored outputs is
@@ -566,7 +601,7 @@ def _sections(
             {
                 "key": key,
                 "title": SECTION_TITLES[key],
-                "groups": _groups(key, items_by_section[key], current),
+                "groups": _groups(key, items_by_section[key], group_counts, current),
                 "findings": findings_by_section[key],
                 "withheld": withheld_by_section[key],
                 "suppressed": suppressed_by_section[key],
@@ -638,12 +673,118 @@ async def _resolve_run(session: AsyncSession, run_id: int | None) -> AnalysisRun
     return run
 
 
-async def _recommendations(session: AsyncSession, run_id: int) -> list[Recommendation]:
-    """Return a run's items by section and rank (``ix_recommendation_run_section_rank``)."""
+GroupKey = tuple[str, str]
+"""A group's identity within a run: ``(section, group)``."""
+
+
+@dataclass(frozen=True, slots=True)
+class GroupCounts:
+    """How many items a run stored in one group, and how many of them feedback hides now.
+
+    Attributes:
+        total: Every item the run stored in the group (``Group.total``).
+        hidden: How many of them feedback in force now hides (``Group.hidden``).
+    """
+
+    total: int
+    hidden: int
+
+
+_NO_ITEMS: Final = GroupCounts(total=0, hidden=0)
+"""The counts of a group the run stored no item in, such as an empty static group."""
+
+
+def _ranked_items(run_id: int, now: datetime) -> Subquery:
+    """Every item of a run with its position in its group and its group's counts.
+
+    Built on :func:`~ads_engine.analysis.overlay.item_hidden_state`, so ``hidden`` counts
+    exactly the items the overlay gives a ``hidden_by``. Columns: ``id``, ``position`` (1-based,
+    in the page's order: ``rank``, then id), and the group's ``total`` and ``hidden``, all
+    computed by window functions over the item keys alone, never over the stored evidence.
+    """
+    state = item_hidden_state(run_id, now)
+    partition = (state.c.section, state.c["group"])
+    return select(
+        state.c.id,
+        func.row_number()
+        .over(partition_by=partition, order_by=(state.c.rank, state.c.id))
+        .label("position"),
+        func.count().over(partition_by=partition).label("total"),
+        func.count().filter(state.c.hidden).over(partition_by=partition).label("hidden"),
+    ).subquery("ranked_item")
+
+
+async def _first_items(
+    session: AsyncSession, run_id: int, now: datetime
+) -> tuple[list[Recommendation], dict[GroupKey, GroupCounts]]:
+    """Return each group's first :data:`~ads_engine.api.schemas.GROUP_PAGE_SIZE` items, and counts.
+
+    One set-based statement whatever the run's size: the items are numbered within their
+    group by ``row_number() OVER (PARTITION BY section, "group" ORDER BY rank, id)`` and only
+    the first ones are loaded with their evidence, together with ``count(*)`` and the hidden
+    count over the same partition (:func:`_ranked_items`). A group the run stored no item in
+    has no row, and so no counts.
+
+    Args:
+        session: The request's session.
+        run_id: The run whose page to load.
+        now: The read time feedback is judged at, the page overlay's.
+
+    Returns:
+        The loaded items by section, rank and id, and every non-empty group's counts.
+    """
+    ranked = _ranked_items(run_id, now)
+    result = await session.execute(
+        select(Recommendation, ranked.c.total, ranked.c.hidden)
+        .join(ranked, ranked.c.id == Recommendation.id)
+        .where(ranked.c.position <= schemas.GROUP_PAGE_SIZE)
+        .order_by(Recommendation.section, Recommendation.rank, Recommendation.id)
+    )
+    rows: list[Recommendation] = []
+    counts: dict[GroupKey, GroupCounts] = {}
+    for row, total, hidden in result:
+        rows.append(row)
+        counts.setdefault((row.section, row.group), GroupCounts(total=total, hidden=hidden))
+    return rows, counts
+
+
+async def _group_counts(
+    session: AsyncSession, run_id: int, section: str, group: str, now: datetime
+) -> GroupCounts:
+    """Return one group's counts, in one statement (:func:`item_hidden_state`)."""
+    state = item_hidden_state(run_id, now)
+    result = await session.execute(
+        select(func.count(), func.count().filter(state.c.hidden))
+        .select_from(state)
+        .where(state.c.section == section, state.c["group"] == group)
+    )
+    total, hidden = result.one()
+    return GroupCounts(total=total, hidden=hidden)
+
+
+async def _group_slice(
+    session: AsyncSession, run_id: int, section: str, group: str, offset: int, limit: int
+) -> list[Recommendation]:
+    """Return a group's items from position ``offset`` (0-based) on, at most ``limit``.
+
+    The order is the page's (``rank``, then id), numbered over the group's item keys alone,
+    and only the slice's rows are loaded with their evidence: one statement.
+    """
+    item = Recommendation
+    numbered = (
+        select(
+            item.id,
+            func.row_number().over(order_by=(item.rank, item.id)).label("position"),
+        )
+        .where(item.run_id == run_id, item.section == section, item.group == group)
+        .subquery("group_item")
+    )
     result = await session.scalars(
         select(Recommendation)
-        .where(Recommendation.run_id == run_id)
-        .order_by(Recommendation.section, Recommendation.rank, Recommendation.id)
+        .join(numbered, numbered.c.id == Recommendation.id)
+        .where(numbered.c.position > offset)
+        .order_by(numbered.c.position)
+        .limit(limit)
     )
     return list(result)
 
@@ -789,6 +930,13 @@ async def get_recommendations(
     The run header and its short-window banner read the window settings the run stored when
     it was computed, so they agree with the run's frozen ``short_window`` flags.
 
+    Each group carries at most its first :data:`~ads_engine.api.schemas.GROUP_PAGE_SIZE`
+    items, with its ``total`` and ``hidden`` counted over every item the run stored in it;
+    :func:`get_group_items` serves the rest. The page-level ``overlay`` and its banners still
+    cover every stored item: the dataset checks of the items not served are made on one
+    representative per distinct combination of their inputs, so a run of any size gives the
+    same stale and incomplete datasets the whole run would.
+
     Args:
         user: The signed-in user; the dependency enforces the session.
         session: The request's database session; only read.
@@ -807,7 +955,8 @@ async def get_recommendations(
             succeeded; 409 ``run_not_ready`` for a run still ``running`` or ``failed``.
     """
     run = await _resolve_run(session, run_id)
-    recommendations = await _recommendations(session, run.id)
+    recommendations, counts = await _first_items(session, run.id, now)
+    representatives = await load_check_representatives(session, run.id)
     findings = await _findings(session, run.id)
     withheld = await _withheld(session, run.id)
     suppressions = await _suppressions(session, run.id)
@@ -817,6 +966,7 @@ async def get_recommendations(
         recommendations,
         now,
         findings=findings,
+        check_items=representatives,
         thresholds=thresholds,
         display_timezone=settings.display_timezone,
     )
@@ -824,13 +974,123 @@ async def get_recommendations(
         run=schemas.Run.from_row(run, display_timezone=settings.display_timezone),
         overlay=_overlay_view(result),
         banners=_banners(result),
-        sections=_sections(recommendations, findings, withheld, suppressions, result.items),
+        sections=_sections(recommendations, counts, findings, withheld, suppressions, result.items),
     )
     _log.debug(
         "recommendations.page",
         run_id=run.id,
         kind=run.kind,
         items=len(recommendations),
+        stored=sum(group.total for group in counts.values()),
+        user_id=user.id,
+    )
+    return page
+
+
+@router.get(
+    "/recommendations/items",
+    response_model=schemas.GroupItemsPage,
+    status_code=200,
+    responses=schemas.ERROR_RESPONSES,
+)
+async def get_group_items(
+    user: UserDep,
+    session: SessionDep,
+    thresholds: ThresholdsDep,
+    settings: SettingsDep,
+    now: NowDep,
+    run_id: Annotated[
+        int,
+        Query(gt=0, le=schemas.BIGINT_MAX, description="The run the group belongs to."),
+    ],
+    section: Annotated[
+        schemas.SectionKey,
+        Query(description="The group's section: one of the five section keys."),
+    ],
+    group: Annotated[
+        schemas.StorableText,
+        Query(min_length=1, description="The group key, as the page names it (Group.key)."),
+    ],
+    offset: Annotated[
+        int,
+        Query(
+            ge=0,
+            le=schemas.BIGINT_MAX,
+            description=(
+                "The 0-based position of the first item to return, in the page's rank order; "
+                "the page itself carries the group's first positions, one per item it holds."
+            ),
+        ),
+    ] = 0,
+    limit: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=schemas.GROUP_PAGE_SIZE,
+            description=f"How many items to return, 1 to {schemas.GROUP_PAGE_SIZE}.",
+        ),
+    ] = schemas.GROUP_PAGE_SIZE,
+) -> schemas.GroupItemsPage:
+    """Return one slice of a group's items, for the items its page does not carry.
+
+    ``GET /recommendations`` carries each group's first
+    :data:`~ads_engine.api.schemas.GROUP_PAGE_SIZE` items with the group's ``total`` and
+    ``hidden``; this returns the items from position ``offset`` on, in the same order (rank,
+    then id), each exactly as the page serves it: frozen fields as stored and ``current``
+    computed now. ``total`` and ``hidden`` are counted now too, so paging with ``offset``
+    stepping by the items returned visits every stored item of the group once. An offset at or
+    past ``total``, or a group key the run does not hold, returns no item.
+
+    Args:
+        user: The signed-in user; the dependency enforces the session.
+        session: The request's database session; only read.
+        thresholds: The loaded configuration the overlay reads.
+        settings: The application's settings (``DISPLAY_TIMEZONE`` for the overlay's flags).
+        now: The read time the overlay and the hidden count are computed for.
+        run_id: The run; any kind, the latest default run included, addressed by its id.
+        section: The group's section.
+        group: The group key.
+        offset: The position of the first item to return.
+        limit: The most items to return.
+
+    Returns:
+        The ``GroupItemsPage``.
+
+    Raises:
+        ApiError: 404 ``not_found`` for an unknown run; 409 ``run_not_ready`` for a run still
+            ``running`` or ``failed``; 422 ``validation_error`` for a parameter outside its
+            bounds or an unknown section.
+    """
+    run = await _resolve_run(session, run_id)
+    counts = await _group_counts(session, run.id, section, group, now)
+    rows = await _group_slice(session, run.id, section, group, offset, limit)
+    # Only the items' own views are used. The run's findings feed nothing but the page's
+    # tracking banner, so they are not read.
+    result = await overlay(
+        session,
+        run,
+        rows,
+        now,
+        findings=(),
+        thresholds=thresholds,
+        display_timezone=settings.display_timezone,
+    )
+    page = schemas.GroupItemsPage(
+        run_id=run.id,
+        section=section,
+        group=group,
+        total=counts.total,
+        hidden=counts.hidden,
+        offset=offset,
+        items=[_item(row, result.items[row.id]) for row in rows],
+    )
+    _log.debug(
+        "recommendations.group_items",
+        run_id=run.id,
+        section=section,
+        group=group,
+        offset=offset,
+        items=len(rows),
         user_id=user.id,
     )
     return page

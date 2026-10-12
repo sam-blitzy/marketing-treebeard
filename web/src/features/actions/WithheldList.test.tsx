@@ -16,25 +16,37 @@
  *   recorded minimum when every line of its rule and entity type agrees on it and records an
  *   observed size strictly below it (compared exactly, decimal strings included), else "{rule}
  *   withheld[ for {entity}]: {reason}", else the line itself, and `null` for nothing withheld.
- * - `WithheldList` renders its title (the given one, else "Withheld for sample size") above a
- *   list it names, one line per pattern in API order, and nothing at all when nothing is
- *   withheld.
+ * - `WithheldList` renders its title above a list it names with the same text, one line per
+ *   pattern in API order, and nothing at all when nothing is withheld. The title is the given
+ *   one; without one, "Withheld for sample size" when every line records observed strictly below
+ *   required, else "Withheld".
+ * - A list longer than `ROW_BATCH_SIZE` mounts one batch at a time, followed after the list by
+ *   the polite status and a "Show {n} more withheld patterns" button; each reveal moves focus to
+ *   its first line, and every line stays reachable. A list at or under one batch renders exactly
+ *   as unbatched.
  *
  * Withheld patterns come from `makeWithheld` (K1: 30 of 37 clicks) or are built in the test in
  * the backend's shape (`schemas.Withheld`). The component makes no request, but it renders
  * through `renderWithProviders`, inside the query client and router every section that hosts it
  * runs under, so the list is checked in the tree it actually ships in.
  */
-import { screen, within } from '@testing-library/react';
+import { fireEvent, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { EntityView, Withheld } from '../../api/types';
 import { makeWithheld } from '../../test/fixtures';
 import { renderWithProviders } from '../../test/render';
 import { WithheldList, withheldLine, withheldReason } from './WithheldList';
+import { ROW_BATCH_SIZE } from './batches';
 
-/** The default title, when the caller passes none or a blank one. */
+/**
+ * The default title, when the caller passes none or a blank one and every line records observed
+ * below required.
+ */
 const DEFAULT_TITLE = 'Withheld for sample size';
+
+/** The default title when some line records no sample shortfall. */
+const NEUTRAL_TITLE = 'Withheld';
 
 /** The title the Budget section passes (AAP 0.5.5). */
 const BUDGET_TITLE = 'Patterns withheld for sample size';
@@ -52,6 +64,17 @@ function b4Withheld(overrides: Partial<Withheld> = {}): Withheld {
     reason: '3 weekend days of 4 required',
     sample: { observed: 3, required: 4, unit: 'weekend days' },
     ...overrides,
+  });
+}
+
+/**
+ * `count` K1 search terms withheld at 30 of 37 clicks, each its own term ("term 1" …), in API
+ * order.
+ */
+function k1Terms(count: number): Withheld[] {
+  return Array.from({ length: count }, (_, index) => {
+    const name = `term ${String(index + 1)}`;
+    return makeWithheld({ entity: entity({ type: 'search_term', id: name, name }) });
   });
 }
 
@@ -576,5 +599,172 @@ describe('WithheldList', () => {
     expect(screen.queryByRole('list')).toBeNull();
     expect(screen.queryAllByRole('listitem')).toHaveLength(0);
     expect(container.textContent).toBe('');
+  });
+});
+
+describe('WithheldList: bounded batches', () => {
+  it('mounts the first batch in API order, then the status and the button after the list', async () => {
+    const withheld = k1Terms(120);
+    await renderWithProviders(<WithheldList withheld={withheld} />);
+
+    const list = screen.getByRole('list', { name: DEFAULT_TITLE });
+    expect(ROW_BATCH_SIZE).toBe(50);
+    expect(lineTexts(DEFAULT_TITLE)).toEqual(withheld.slice(0, 50).map((w) => withheldLine(w)));
+    // The polite status (never an alert) and the button follow the list, outside the <ul>.
+    const status = screen.getByRole('status');
+    expect(status.textContent).toBe('Showing 50 of 120 withheld patterns');
+    expect(screen.queryByRole('alert')).toBeNull();
+    const button = screen.getByRole('button', { name: 'Show 50 more withheld patterns' });
+    expect(list.contains(status)).toBe(false);
+    expect(list.contains(button)).toBe(false);
+    expect(within(list).queryByRole('button')).toBeNull();
+    expect((list.compareDocumentPosition(status) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0).toBe(
+      true,
+    );
+    expect((status.compareDocumentPosition(button) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0).toBe(
+      true,
+    );
+    // Every child of the list is a line.
+    expect([...list.children].every((child) => child.tagName === 'LI')).toBe(true);
+  });
+
+  it('reveals the next batch on each press, moves focus to its first line and keeps every line reachable', async () => {
+    const withheld = k1Terms(120);
+    await renderWithProviders(<WithheldList withheld={withheld} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Show 50 more withheld patterns' }));
+    let lines = within(screen.getByRole('list', { name: DEFAULT_TITLE })).getAllByRole(
+      'listitem',
+    );
+    expect(lines).toHaveLength(100);
+    expect(document.activeElement).toBe(lines[50]);
+    expect(document.activeElement?.textContent).toBe(withheldLine(withheld[50] as Withheld));
+    expect(screen.getByRole('status').textContent).toBe('Showing 100 of 120 withheld patterns');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Show 20 more withheld patterns' }));
+    lines = within(screen.getByRole('list', { name: DEFAULT_TITLE })).getAllByRole('listitem');
+    expect(lines).toHaveLength(120);
+    expect(document.activeElement).toBe(lines[100]);
+    // Every line is shown, in API order, with its observed and required sizes.
+    expect(lineTexts(DEFAULT_TITLE)).toEqual(withheld.map((w) => withheldLine(w)));
+    expect(lines[119]?.textContent).toBe(
+      'K1 · term 120: clicks 30 of 37 required — 30\u00A0/\u00A037 clicks',
+    );
+    // The button is gone once every line is shown; the status stays and says so.
+    expect(screen.queryByRole('button')).toBeNull();
+    expect(screen.getByRole('status').textContent).toBe('Showing all 120 withheld patterns');
+  });
+
+  it('bounds the list one line past the batch size, with the singular noun', async () => {
+    await renderWithProviders(<WithheldList withheld={k1Terms(ROW_BATCH_SIZE + 1)} />);
+
+    expect(lineTexts(DEFAULT_TITLE)).toHaveLength(ROW_BATCH_SIZE);
+    expect(screen.getByRole('status').textContent).toBe('Showing 50 of 51 withheld patterns');
+    fireEvent.click(screen.getByRole('button', { name: 'Show 1 more withheld pattern' }));
+    expect(lineTexts(DEFAULT_TITLE)).toHaveLength(ROW_BATCH_SIZE + 1);
+    expect(document.activeElement?.textContent).toBe(
+      'K1 · term 51: clicks 30 of 37 required — 30\u00A0/\u00A037 clicks',
+    );
+  });
+
+  it('renders a list at the batch size exactly as unbatched: every line, no id, no control', async () => {
+    const withheld = k1Terms(ROW_BATCH_SIZE);
+    const { container } = await renderWithProviders(
+      <WithheldList withheld={withheld} title={BUDGET_TITLE} />,
+    );
+
+    expect(lineTexts(BUDGET_TITLE)).toEqual(withheld.map((w) => withheldLine(w)));
+    expect(container.querySelector('li[id]')).toBeNull();
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByRole('button')).toBeNull();
+  });
+});
+
+describe('WithheldList: the title chosen from the lines', () => {
+  /** C1b withheld in the crm_unavailable world: no sizes recorded. */
+  const c1bPipeline = makeWithheld({
+    rule_id: 'C1b',
+    entity: entity({ source: 'linkedin', id: '5101', name: 'Benchmarks - Lead gen (NA)' }),
+    reason: 'pipeline unavailable: Qualified Lead count unavailable',
+    sample: { observed: null, required: null, unit: 'contacts' },
+  });
+
+  /** The visible title and the list's accessible name. */
+  function titleAndName(): [string | null, string | null] {
+    return [
+      document.querySelector('strong')?.textContent ?? null,
+      screen.getByRole('list').getAttribute('aria-label'),
+    ];
+  }
+
+  it('reads "Withheld" when a line is withheld for another reason than sample size', async () => {
+    await renderWithProviders(<WithheldList withheld={[makeWithheld(), c1bPipeline]} />);
+
+    expect(titleAndName()).toEqual([NEUTRAL_TITLE, NEUTRAL_TITLE]);
+    expect(lineTexts(NEUTRAL_TITLE)).toEqual([
+      withheldLine(makeWithheld()),
+      'C1b · Benchmarks - Lead gen (NA): pipeline unavailable: Qualified Lead count unavailable',
+    ]);
+    expect(screen.queryByText(DEFAULT_TITLE)).toBeNull();
+  });
+
+  it('records no shortfall at or above the minimum, or with a missing or unreadable size', async () => {
+    const lines: Withheld[] = [
+      // A B4 rate test that failed with the outcomes minimum met.
+      b4Withheld({
+        reason: 'weekend and weekday rates not distinguishable',
+        sample: { observed: 264, required: 10, unit: 'outcomes' },
+      }),
+      // At the minimum exactly.
+      b4Withheld({ sample: { observed: 4, required: 4, unit: 'weekend days' } }),
+      // K1 account-wide without a baseline: no observed size (run 10).
+      makeWithheld({
+        entity: null,
+        reason: 'baseline unavailable: no Google campaign facts in the trailing 90 days',
+        sample: { observed: null, required: 10, unit: 'conversions' },
+      }),
+      // An unreadable required size.
+      b4Withheld({ sample: { observed: 3, required: 'n/a', unit: 'weekend days' } }),
+    ];
+    for (const line of lines) {
+      const { unmount } = await renderWithProviders(<WithheldList withheld={[line]} />);
+      expect(titleAndName()).toEqual([NEUTRAL_TITLE, NEUTRAL_TITLE]);
+      unmount();
+    }
+  });
+
+  it('keeps "Withheld for sample size" when every line falls short, decimal strings included', async () => {
+    const withheld = [
+      makeWithheld(),
+      b4Withheld({
+        rule_id: 'C1',
+        reason: '2.9 expected outcomes of 3 required',
+        sample: { observed: '2.900000', required: 3, unit: 'expected outcomes' },
+      }),
+    ];
+    await renderWithProviders(<WithheldList withheld={withheld} />);
+
+    expect(titleAndName()).toEqual([DEFAULT_TITLE, DEFAULT_TITLE]);
+  });
+
+  it('chooses the title from every line, those beyond the first batch included', async () => {
+    const withheld = k1Terms(120);
+    withheld.splice(100, 0, c1bPipeline);
+    await renderWithProviders(<WithheldList withheld={withheld} />);
+
+    expect(lineTexts(NEUTRAL_TITLE)).toHaveLength(ROW_BATCH_SIZE);
+    fireEvent.click(screen.getByRole('button', { name: 'Show 50 more withheld patterns' }));
+    expect(titleAndName()).toEqual([NEUTRAL_TITLE, NEUTRAL_TITLE]);
+  });
+
+  it('keeps a title the caller passes whatever the lines record, and falls back from a blank one', async () => {
+    const { unmount } = await renderWithProviders(
+      <WithheldList withheld={[c1bPipeline]} title={BUDGET_TITLE} />,
+    );
+    expect(titleAndName()).toEqual([BUDGET_TITLE, BUDGET_TITLE]);
+    unmount();
+
+    await renderWithProviders(<WithheldList withheld={[c1bPipeline]} title="  " />);
+    expect(titleAndName()).toEqual([NEUTRAL_TITLE, NEUTRAL_TITLE]);
   });
 });

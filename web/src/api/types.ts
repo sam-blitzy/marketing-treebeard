@@ -304,6 +304,13 @@ export const SECTION_ORDER = [
  */
 export type SectionKey = (typeof SECTION_ORDER)[number];
 
+/**
+ * The most items one {@link Group} of a {@link RecommendationsPage} carries, and the most one
+ * {@link GroupItemsPage} returns (`schemas.GROUP_PAGE_SIZE`). A group's further items are read
+ * a page at a time, so a page read stays bounded whatever the run's size (AAP 0.1.1).
+ */
+export const GROUP_PAGE_SIZE = 100;
+
 // ---------------------------------------------------------------------------------------------
 // Errors (AAP 0.5.3 error shape)
 // ---------------------------------------------------------------------------------------------
@@ -779,8 +786,19 @@ export interface Group {
   key: string;
   /** Display title. */
   title: string;
-  /** The items, in rank order. */
+  /**
+   * The group's first items, in rank order: at most {@link GROUP_PAGE_SIZE}.
+   * `GET /recommendations/items` ({@link GroupItemsPage}) returns the rest.
+   */
   items: Item[];
+  /** How many items the run stored in the group, loaded or not. */
+  total: number;
+  /**
+   * How many of them feedback in force now hides (`current.hidden_by`), counted at read time
+   * by the overlay's rule; a C0 item is never hidden. `total - hidden` is how many the group
+   * shows.
+   */
+  hidden: number;
 }
 
 /** A non-action observation a rule emitted and the run stored (`schemas.Finding`; AAP 0.5.3). */
@@ -893,6 +911,29 @@ export interface RecommendationsPage {
   banners: Banner[];
   /** Exactly five sections, in {@link SECTION_ORDER}. */
   sections: Section[];
+}
+
+/**
+ * `GET /recommendations/items` (`schemas.GroupItemsPage`): one slice of a group's items beyond
+ * the page's first. The items continue the page's rank order (rank, then id) from `offset`
+ * (0-based), at most {@link GROUP_PAGE_SIZE}, each with its read-time `current`, so paging with
+ * `offset` stepping by the items returned visits every stored item of the group once.
+ */
+export interface GroupItemsPage {
+  /** The run the group belongs to. */
+  run_id: RunId;
+  /** The group's section. */
+  section: SectionKey;
+  /** The group key ({@link Group.key}). */
+  group: string;
+  /** How many items the run stored in the group ({@link Group.total}). */
+  total: number;
+  /** How many of them feedback in force now hides ({@link Group.hidden}). */
+  hidden: number;
+  /** The position of the first item returned. */
+  offset: number;
+  /** The items from `offset` on, in rank order; empty at or past `total`. */
+  items: Item[];
 }
 
 /**

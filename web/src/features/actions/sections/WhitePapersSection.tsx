@@ -124,7 +124,7 @@ import {
 import { BlockingDiscrepancyLinks } from '../BlockingDiscrepancies';
 import { FlagList, flagText, flagTone, mergeFlags } from '../FlagList';
 import { BatchControl, BatchEntryAnchor, ROW_BATCH_SIZE, useBatches } from '../batches';
-import type { BatchNoun } from '../batches';
+import type { BatchNoun, RemoteEntries } from '../batches';
 import {
   HISTORICAL_LABEL,
   RecommendationActions,
@@ -1090,6 +1090,12 @@ interface AssetTableProps {
    * of the table records its frozen header ({@link tableMqlHeader}).
    */
   mql: string;
+  /**
+   * The cohort's rows not loaded yet (`GroupParts.remote`), for the table of its visible rows:
+   * its control counts them and loads them once the loaded rows are shown. Omitted or `null`,
+   * the table holds every row it shows.
+   */
+  remote?: RemoteEntries | null;
 }
 
 /**
@@ -1142,8 +1148,9 @@ function rowLabelOf(row: AssetRowView, scope: string, shared: ReadonlySet<string
  * It shows `ROW_BATCH_SIZE` rows at a time, in API order, followed by a "Show {n} more white
  * papers" control when the cohort has more (`../batches`): only the shown rows are formatted,
  * and a revealed row keeps the columns, caption and expansion of the rows before it. The MQL
- * header is taken from every row of the table, shown or not yet, so revealing rows never
- * renames the column.
+ * header is taken from every loaded row of the table, shown or not yet, so revealing rows never
+ * renames the column. Given `remote`, the cohort's rows the page does not carry count in the
+ * control too, and its "Show more" loads them a page at a time once the loaded rows are shown.
  *
  * Rows are keyed by their recommendation's identity across runs ({@link itemKeys}), never by the
  * per-run item id, and the table keeps a row's expansion by that key. A newer run's row of the
@@ -1159,7 +1166,7 @@ function rowLabelOf(row: AssetRowView, scope: string, shared: ReadonlySet<string
  * compact density, as each row's per-creative table does, so its twelve columns fit a desktop
  * region before it scrolls.
  */
-function AssetTable({ caption, scope, items, mql }: AssetTableProps): ReactElement {
+function AssetTable({ caption, scope, items, mql, remote = null }: AssetTableProps): ReactElement {
   const header = useMemo(() => tableMqlHeader(items, mql), [items, mql]);
   const columns = useMemo(() => assetColumns(header), [header]);
   const rowKeys = useMemo(() => itemKeys(items), [items]);
@@ -1169,6 +1176,7 @@ function AssetTable({ caption, scope, items, mql }: AssetTableProps): ReactEleme
     // A row that takes over the focus of one the same commit removed elsewhere, such as a row a
     // refetch moved into the replaced-data table, is shown at once ({@link AssetCell}).
     mustShow: (item) => focusLeftWith(itemIdentity(item)),
+    ...(remote === null ? {} : { remote }),
   });
   const rows = batches.shown.map((item, index) =>
     assetRowOf(item, batches.batched ? batches.entryId(index) : null),
@@ -1319,6 +1327,9 @@ interface CohortTablesProps {
  * A row a feedback recorded on this page has hidden leaves its confirmation ("Dismissed:
  * {action} ({asset})") directly after the table that held it ({@link ConfirmedItems}), because a
  * `DataTable` row cannot hold one, or in the table's place when no row of it is left.
+ *
+ * A cohort larger than the page loads its further rows through the visible rows' table
+ * (`parts.remote`), which stays shown while any are pending, even before one of them is loaded.
  */
 function CohortTables({ parts, mql }: CohortTablesProps): ReactElement {
   const summary = findCohortSummary(parts.group.items);
@@ -1329,12 +1340,13 @@ function CohortTables({ parts, mql }: CohortTablesProps): ReactElement {
 
   return (
     <Stack gap={4}>
-      {parts.visible.length > 0 ? (
+      {parts.visible.length > 0 || (parts.remote !== null && parts.pending > 0) ? (
         <AssetTable
           caption={`White papers (${currency})`}
           scope={currency}
           items={parts.visible}
           mql={mql}
+          remote={parts.remote}
         />
       ) : null}
       <ConfirmedItems items={placed.visible} confirmations={confirmations} />
@@ -1397,7 +1409,8 @@ function CohortTables({ parts, mql }: CohortTablesProps): ReactElement {
  * shows stays a banner naming its asset and currency, and every other finding stays a banner at
  * the top of the section.
  *
- * @param props - see `SectionComponentProps`; only `section` is read
+ * @param props - see `SectionComponentProps`; `section` is read, and `run.id` for the further
+ *   rows of a cohort larger than the page (`SectionFrame` `runId`)
  * @returns the section region
  *
  * @example
@@ -1405,7 +1418,7 @@ function CohortTables({ parts, mql }: CohortTablesProps): ReactElement {
  * <WhitePapersSection section={whitePapers} run={page.run} overlay={page.overlay} />
  * ```
  */
-export function WhitePapersSection({ section }: SectionComponentProps): ReactElement {
+export function WhitePapersSection({ section, run }: SectionComponentProps): ReactElement {
   const config = useConfig();
   const configuredMql = mqlHeader(config.data);
   const placed = useMemo(() => placeSkippedFindings(section), [section]);
@@ -1414,6 +1427,7 @@ export function WhitePapersSection({ section }: SectionComponentProps): ReactEle
     <RowNotesContext.Provider value={placed.rowNotes}>
       <SectionFrame
         section={placed.section}
+        runId={run.id}
         renderItem={(item) => <WhitePaperItemFallback item={item} mql={configuredMql} />}
         renderGroup={(_group, parts) => <CohortTables parts={parts} mql={configuredMql} />}
       />

@@ -71,7 +71,11 @@ function subjectKey(type: string, id: string | number): string {
   return `${type}:${String(id)}`;
 }
 
-/** Every item of every group of `sections`, in API order. */
+/**
+ * Every item of every group of `sections` the page carries, in API order. A B1 item beyond a
+ * group's first `GROUP_PAGE_SIZE`, which its section loads only as asked, is not among them, so
+ * a C2 card whose link names it offers no link rather than an anchor not rendered.
+ */
 function itemsOf(sections: readonly Section[]): Item[] {
   return sections.flatMap((section) => section.groups.flatMap((group) => group.items));
 }

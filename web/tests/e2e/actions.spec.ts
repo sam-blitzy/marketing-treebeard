@@ -2604,7 +2604,7 @@ function withDiscrepancyBoundary(source: RecommendationsPage): BoundaryPage {
   const campaigns = sectionOf(page, 'campaigns');
   let group = campaigns.groups.find((candidate) => candidate.key === DISCREPANCY_GROUP_KEY);
   if (group === undefined) {
-    group = { key: DISCREPANCY_GROUP_KEY, title: 'Discrepancies', items: [] };
+    group = { key: DISCREPANCY_GROUP_KEY, title: 'Discrepancies', items: [], total: 0, hidden: 0 };
     campaigns.groups.unshift(group);
   }
   const everyItem = page.sections.flatMap(allItems);
@@ -2621,6 +2621,8 @@ function withDiscrepancyBoundary(source: RecommendationsPage): BoundaryPage {
     return item;
   });
   group.items.splice(own, 0, ...added);
+  // The group stores the added items too, so the page still carries the whole group.
+  group.total += added.length;
   page.overlay.open_discrepancies += added.length;
   return { page, resolutions };
 }

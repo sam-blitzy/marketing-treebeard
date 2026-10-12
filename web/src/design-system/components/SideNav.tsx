@@ -18,7 +18,7 @@
  *     <li class="ds-sidenav__item">
  *       <a class="ds-sidenav__link [ds-sidenav__link--current]" href="…" [aria-current="page"]>
  *         <span class="ds-sidenav__label">…</span>
- *         <span class="ds-sidenav__count">4</span>   (only when the item has a count)
+ *         <span class="ds-sidenav__count">4</span>   (only for a finite count; grouped: 20,262)
  *       </a>
  *     </li>
  *   </ul>
@@ -52,6 +52,8 @@
 import './SideNav.css';
 
 import type { ReactNode } from 'react';
+
+import { formatCount } from '../../lib/format';
 
 /** Class of every link; the contract defined in `SideNav.css`. */
 const LINK_CLASS = 'ds-sidenav__link';
@@ -87,9 +89,11 @@ export interface SideNavItem {
   /**
    * Optional count shown after the label, for example the number of items in an `/actions`
    * section. It is visible text and part of the link's accessible name ("Keywords to adjust 4"),
-   * so its meaning never rests on colour. A count of `0` is shown, not omitted; an omitted count,
-   * or a value that is not a finite number, renders no count at all, so the link can never read
-   * "NaN" or "Infinity".
+   * so its meaning never rests on colour. It is rendered by `formatCount` from `lib/format.ts`,
+   * with digit grouping, exactly as every other count in the product reads: `20262` shows
+   * "20,262" and names the link "Keywords to adjust 20,262". A count of `0` is shown as "0", not
+   * omitted; an omitted count, or a value that is not a finite number, renders no count at all,
+   * so the link can never read "NaN", "Infinity" or "unavailable".
    */
   count?: number;
   /**
@@ -220,7 +224,8 @@ type SideNavLinkContent = Omit<SideNavLinkProps, 'href'>;
  * label and count content. The destination is added only once it is validated, by
  * {@link SideNav}.
  *
- * The count is preceded by a space text node. In the flex layout of `SideNav.css` that
+ * The count, present only when finite, is the digit-grouped text of `formatCount` ("20,262"),
+ * and is preceded by a space text node. In the flex layout of `SideNav.css` that
  * whitespace-only node renders nothing, but it separates the label from the count in the link's
  * accessible name ("Keywords to adjust 4", not "Keywords to adjust4") in every accessible-name
  * implementation, whether or not it reads the CSS display of the two spans.
@@ -236,7 +241,7 @@ function buildLinkContent(item: SideNavItem): SideNavLinkContent {
       {hasCount && (
         <>
           {' '}
-          <span className="ds-sidenav__count">{item.count}</span>
+          <span className="ds-sidenav__count">{formatCount(item.count)}</span>
         </>
       )}
     </>
@@ -252,7 +257,8 @@ function buildLinkContent(item: SideNavItem): SideNavLinkContent {
 /**
  * Navigation list: a `<nav>` landmark named by `label`, holding one link per item with its
  * optional count, in the order given. The items form one column in a narrow container and a
- * compact wrapping row of content-sized items in a wide one, each count right after its label.
+ * compact wrapping row of content-sized items in a wide one, each count right after its label
+ * and digit-grouped by `formatCount` ("Keywords to adjust 20,262"; see {@link SideNavItem.count}).
  *
  * Each item's `href` is validated before it is rendered or handed to `renderLink`. An item with
  * an unsafe `href` renders an inert placeholder `<a>` without `href`, and `renderLink` is not

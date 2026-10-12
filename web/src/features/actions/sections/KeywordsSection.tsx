@@ -15,9 +15,12 @@
  *    Every tab the API returns is shown, an empty one included. A tab that holds the
  *    confirmation of a card a feedback recorded on this page has hidden keeps it in the card's
  *    place; any other empty tab's panel is an `EmptyState` titled with the reason its rule has
- *    no card: the cards feedback hides now, else the reason of the leading withheld line of the
- *    group's rule (for example "No search term met the K1 minimum of 70 clicks", with the
- *    minimum read from the recorded sample), else, when the section reports suppression counts,
+ *    no card: the cards feedback hides now, else, when the section's datasets do not cover the
+ *    window, the frame's data-gap sentence from its `incomplete_dataset` findings ("Data does
+ *    not fully cover this window: …", as the section's own empty state reads), else the reason
+ *    of the leading withheld line of the group's rule (for example "No search term met the K1
+ *    minimum of 70 clicks", with the minimum read from the recorded sample), else, when the
+ *    section reports suppression counts,
  *    "No {rule} action to show; not shown in this section: {count} {label}" (for example "No K3
  *    action to show; not shown in this section: 2 dismissed"; the counts are the section's,
  *    never the rule's), else "{rule} did not fire for this window".
@@ -78,6 +81,7 @@ import {
   FieldList,
   NO_RULE_FIRED_REASON,
   SectionFrame,
+  incompleteDataReason,
   notShownReason,
   reportedSuppressions,
   suppressionLine,
@@ -389,20 +393,22 @@ function renderKeywordCard(item: Item): ReactNode {
 // ---------------------------------------------------------------------------------------------
 
 /**
- * How many cards a group's panel holds: every item feedback does not hide, whether visible,
- * computed from replaced data or held behind the disclosure. It is the per-group share of the
- * section's navigation count (`visibleItemCount` in `../SectionNav`), so the tabs add up to it.
- * A confirmation is never counted: its hidden item is counted as hidden.
+ * How many cards a group's panel holds: every stored item feedback does not hide, whether
+ * visible, computed from replaced data, held behind the disclosure, or beyond the page and not
+ * loaded yet (`parts.pending`; the page carries each group's first `GROUP_PAGE_SIZE` items and
+ * its "Show more" loads the rest), so it is the group's `total` less its `hidden`. It is the
+ * per-group share of the section's navigation count (`visibleItemCount` in `../SectionNav`), so
+ * the tabs add up to it. A confirmation is never counted: its hidden item is counted as hidden.
  */
 function shownItemCount(parts: GroupParts): number {
-  return parts.visible.length + parts.historical.length + parts.held.length;
+  return parts.visible.length + parts.historical.length + parts.held.length + parts.pending;
 }
 
 /**
- * Whether a group has something to show: at least one visible, historical or held item (a
- * {@link shownItemCount} above 0), or the confirmation of an item a feedback recorded on this
- * page has hidden, which the tab shows in place of its empty state ({@link emptyTabReason})
- * while the run still lists the item.
+ * Whether a group has something to show: at least one visible, historical or held item, loaded
+ * or not (a {@link shownItemCount} above 0), or the confirmation of an item a feedback recorded
+ * on this page has hidden, which the tab shows in place of its empty state
+ * ({@link emptyTabReason}) while the run still lists the item.
  */
 function hasShownItems(parts: GroupParts): boolean {
   return shownItemCount(parts) > 0 || parts.placed.confirmed > 0;
@@ -410,7 +416,8 @@ function hasShownItems(parts: GroupParts): boolean {
 
 /**
  * The tab selected until the user picks one: the first group, in API order, with a visible
- * card or a confirmation, else the first with a card computed from replaced data, else the
+ * card, a confirmation or a card beyond the page not loaded yet (`parts.pending`), which its
+ * panel loads, else the first with a card computed from replaced data, else the
  * first with a held card, else the first group. A tab whose last visible card the user has just
  * dismissed, snoozed or marked done therefore stays selected with its confirmation, rather than
  * the selection jumping to another sub-list.
@@ -425,7 +432,9 @@ function hasShownItems(parts: GroupParts): boolean {
  */
 function defaultTabKey(parts: readonly GroupParts[]): string | undefined {
   const first =
-    parts.find((part) => part.visible.length > 0 || part.placed.confirmed > 0) ??
+    parts.find(
+      (part) => part.visible.length > 0 || part.pending > 0 || part.placed.confirmed > 0,
+    ) ??
     parts.find((part) => part.historical.length > 0) ??
     parts.find((part) => part.held.length > 0) ??
     parts[0];
@@ -446,34 +455,46 @@ function groupRule(key: string): string | null {
  *
  * 1. "No actions to show: {n} hidden by feedback since this run (dismissed, snoozed or done)"
  *    when feedback given since the run hides the group's cards now ({@link notShownReason});
- * 2. the reason of the leading withheld line of the group's rule ({@link withheldReason}), for
+ * 2. the section's data-gap sentence ({@link incompleteDataReason}), for example "Data does not
+ *    fully cover this window: google.metrics_daily, google.search_terms (covers from
+ *    2026-04-15, after the window start 2026-01-01)", when its `incomplete_dataset` findings
+ *    name datasets that do not cover the window. It leads the withheld reason, as in the
+ *    section's own empty state: a rule withheld over a window its data does not cover, such as
+ *    K1 without a baseline, is a consequence of the gap, and the gap is the cause to state;
+ * 3. "No rule fired for this window" ({@link NO_RULE_FIRED_REASON}) for a group key with no
+ *    known rule;
+ * 4. the reason of the leading withheld line of the group's rule ({@link withheldReason}), for
  *    example "No search term met the K1 minimum of 70 clicks" or "K3 withheld: window 7 days of
  *    14 required", every number the recorded sample's;
- * 3. "No {rule} action to show; not shown in this section: {count} {label}; …" when the section
+ * 5. "No {rule} action to show; not shown in this section: {count} {label}; …" when the section
  *    reports suppression counts ({@link reportedSuppressions}), one part per count as the
  *    frame's "Not shown" list writes it ({@link suppressionLine}), for example "No K3 action to
  *    show; not shown in this section: 2 dismissed". The run records those counts per section,
  *    never per rule, so the sentence names them as the section's and never claims they are the
  *    tab's; it only keeps the tab from saying its rule did not fire when the rule may have fired
  *    and had its items suppressed, by feedback for example;
- * 4. "{rule} did not fire for this window" for a group of a known rule with nothing withheld and
- *    nothing suppressed in the section;
- * 5. "No rule fired for this window" ({@link NO_RULE_FIRED_REASON}) for a group key with no
- *    known rule, once nothing is hidden now.
+ * 6. "{rule} did not fire for this window" for a group of a known rule with nothing withheld and
+ *    nothing suppressed in the section.
  *
  * @param parts - the group, as the frame prepared it
  * @param withheld - the section's withheld patterns, in API order
  * @param suppressions - the section's suppression counts ({@link reportedSuppressions})
+ * @param dataGap - the section's data-gap sentence ({@link incompleteDataReason}), or `null`
+ *   when no `incomplete_dataset` finding names a dataset
  * @returns the reason
  */
 function emptyTabReason(
   parts: GroupParts,
   withheld: readonly Withheld[],
   suppressions: readonly (readonly [string, number])[],
+  dataGap: string | null,
 ): string {
   const notShown = notShownReason(parts.hiddenCount);
   if (notShown !== null) {
     return notShown;
+  }
+  if (dataGap !== null) {
+    return dataGap;
   }
   const rule = groupRule(parts.group.key);
   if (rule === null) {
@@ -509,18 +530,21 @@ function emptyTabReason(
  * @param withheld - the section's withheld patterns, in API order, for an empty tab's reason
  * @param suppressions - the section's suppression counts ({@link reportedSuppressions}), for an
  *   empty tab's reason
+ * @param dataGap - the section's data-gap sentence ({@link incompleteDataReason}) or `null`, for
+ *   an empty tab's reason
  * @returns the tab
  */
 function groupTab(
   parts: GroupParts,
   withheld: readonly Withheld[],
   suppressions: readonly (readonly [string, number])[],
+  dataGap: string | null,
 ): TabItem {
   const title = textOr(parts.group.title, parts.group.key);
   const content = hasShownItems(parts) ? (
     <Stack>{parts.body}</Stack>
   ) : (
-    <EmptyState title={emptyTabReason(parts, withheld, suppressions)} />
+    <EmptyState title={emptyTabReason(parts, withheld, suppressions, dataGap)} />
   );
   return {
     key: parts.group.key,
@@ -538,13 +562,15 @@ function groupTab(
  *
  * The frame renders the section's findings, including the `search_term_coverage` finding,
  * above the tabs, and its own empty state, withheld list and suppression counts. An empty tab's
- * panel states why its rule has no card ({@link emptyTabReason}), from the section's withheld
- * lines and suppression counts, unless it holds the confirmation of a card a feedback recorded
- * on this page has hidden, which stays in the card's place. The tab list is the design-system
- * `Tabs`, so the arrow keys, Home and End move between tabs and Tab moves into the visible
- * panel. The component keeps only which tab the user selected; it fetches nothing.
+ * panel states why its rule has no card ({@link emptyTabReason}), from the section's data-gap
+ * findings, withheld lines and suppression counts, unless it holds the confirmation of a card a
+ * feedback recorded on this page has hidden, which stays in the card's place. The tab list is
+ * the design-system `Tabs`, so the arrow keys, Home and End move between tabs and Tab moves into
+ * the visible panel. The component keeps only which tab the user selected; it reads only what
+ * the frame reads for it: a tab whose group is larger than the page loads its further cards
+ * for `run.id` as its "Show more" asks, and its count is the group's every shown card.
  *
- * @param props - see {@link SectionComponentProps}; only `section` is read
+ * @param props - see {@link SectionComponentProps}; `section` and `run.id` are read
  * @returns the section region
  *
  * @example
@@ -552,7 +578,7 @@ function groupTab(
  * <KeywordsSection section={keywordsSection} run={run} overlay={overlay} />
  * ```
  */
-export function KeywordsSection({ section }: SectionComponentProps): ReactElement {
+export function KeywordsSection({ section, run }: SectionComponentProps): ReactElement {
   const [chosenKey, setChosenKey] = useState<string | undefined>(undefined);
 
   const renderGroups = (parts: readonly GroupParts[]): ReactNode => {
@@ -560,10 +586,11 @@ export function KeywordsSection({ section }: SectionComponentProps): ReactElemen
     const chosenExists = parts.some((part) => part.group.key === chosenKey);
     const selectedKey = chosenExists ? chosenKey : defaultTabKey(parts);
     const suppressions = reportedSuppressions(section);
+    const dataGap = incompleteDataReason(section.findings);
     return (
       <Tabs
         label={KEYWORD_TABS_LABEL}
-        tabs={parts.map((part) => groupTab(part, section.withheld, suppressions))}
+        tabs={parts.map((part) => groupTab(part, section.withheld, suppressions, dataGap))}
         selectedKey={selectedKey}
         onChange={setChosenKey}
       />
@@ -571,6 +598,11 @@ export function KeywordsSection({ section }: SectionComponentProps): ReactElemen
   };
 
   return (
-    <SectionFrame section={section} renderItem={renderKeywordCard} renderGroups={renderGroups} />
+    <SectionFrame
+      section={section}
+      runId={run.id}
+      renderItem={renderKeywordCard}
+      renderGroups={renderGroups}
+    />
   );
 }

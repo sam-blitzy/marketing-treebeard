@@ -33,6 +33,13 @@
  * revealed entry renders exactly as it would in an unbatched list. A list at or under its batch
  * size renders exactly as an unbatched list does, with no control and no extra element.
  *
+ * A list can also hold entries that are not loaded yet ({@link RemoteEntries}), such as a group's
+ * cards beyond the first page `GET /recommendations` carries. They count in the status ("Showing
+ * 100 of 18,003 actions"), and a reveal that reaches past the loaded entries loads the next ones:
+ * the button shows its loading state meanwhile, the new batch appears once they arrive, and focus
+ * then moves to its first entry, as after any reveal. A failed load is said in the status, and
+ * the button tries again.
+ *
  * Built only on the design-system index (AAP 0.4.4): `Button` and `Inline`, plus a `div` for the
  * status region, with no inline styles and no stylesheet.
  *
@@ -66,8 +73,9 @@ export const GROUP_BATCH_SIZE = 10;
 
 /**
  * Table rows per batch, for the white-paper asset tables, their per-creative tables and the
- * variants tables. A row is a line of formatted cells, far lighter than a card, so fifty rows
- * keep a long table readable and its first render small.
+ * variants tables, and lines per batch in a section's withheld list (`./WithheldList`). A row is
+ * a line of formatted cells, and a withheld pattern a single line of text, far lighter than a
+ * card, so fifty keep a long table or list readable and its first render small.
  */
 export const ROW_BATCH_SIZE = 50;
 
@@ -232,6 +240,48 @@ function focusId(id: string, options?: FocusOptions): boolean {
 // The hook
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * How many entries `remote` says are not loaded yet: its `pending` as a whole number, 0 without
+ * a `remote` or for a count that is not a positive whole number.
+ */
+function remotePending(remote: RemoteEntries | undefined): number {
+  const pending = remote?.pending ?? 0;
+  return Number.isSafeInteger(pending) && pending > 0 ? pending : 0;
+}
+
+/** The list as it stood when a reveal started a load of further entries. */
+interface AwaitedLoad {
+  /** How many entries were loaded. */
+  readonly loaded: number;
+  /** How many were not loaded yet. */
+  readonly pending: number;
+  /** The failure the last load had ended with, `null` for none. */
+  readonly failure: unknown;
+}
+
+/**
+ * Whether the load a reveal started has ended: entries arrived, the count not loaded changed
+ * (the load brought entries other lists show, or there are none left), or a new failure ended
+ * it. While it is in flight, or before it has started, none of these holds.
+ */
+function loadEnded(
+  awaited: AwaitedLoad,
+  loaded: number,
+  pending: number,
+  loading: boolean,
+  failure: unknown,
+): boolean {
+  if (loading) {
+    return false;
+  }
+  return (
+    loaded !== awaited.loaded ||
+    pending !== awaited.pending ||
+    pending === 0 ||
+    (failure !== null && failure !== awaited.failure)
+  );
+}
+
 /** Options of {@link useBatches}. */
 export interface BatchOptions<T> {
   /**
@@ -263,26 +313,68 @@ export interface BatchOptions<T> {
    * focus moves: the entry takes focus itself. Omitted, no entry is revealed this way.
    */
   readonly mustShow?: (entry: T) => boolean;
+  /**
+   * The list's entries that exist but are not loaded yet, such as a group's cards beyond the
+   * page's first ({@link RemoteEntries}). Given, the list always renders its control, so its
+   * status stays the focus target of a reveal whose load brought none of its entries. Omitted,
+   * every entry is in `entries`.
+   */
+  readonly remote?: RemoteEntries;
+}
+
+/**
+ * The entries of a list beyond those it was given, which exist but are not loaded yet, and how
+ * to load them: for example the cards of a group beyond the first `GROUP_PAGE_SIZE` the page
+ * carries (`GET /recommendations/items`).
+ */
+export interface RemoteEntries {
+  /**
+   * How many entries exist beyond the loaded ones; 0 when every entry is loaded. A count that is
+   * not a positive whole number is read as 0.
+   */
+  readonly pending: number;
+  /** Whether a load of further entries is in flight. */
+  readonly loading: boolean;
+  /**
+   * The message of the last failed load, shown in the list's status; `null` while a load is in
+   * flight and once one succeeds.
+   */
+  readonly error: string | null;
+  /**
+   * The object the last failed load ended with (such as its `ApiError`), or `null` when
+   * {@link RemoteEntries.error} is: a list waiting for a load it started takes a failure other
+   * than the one it saw when it asked as that load's end.
+   */
+  readonly failure: unknown;
+  /** Starts loading the next entries; it does nothing while a load is in flight. */
+  readonly loadMore: () => void;
 }
 
 /** What {@link useBatches} returns: the entries to render and the state of the control. */
 export interface Batches<T> {
   /** The entries to render now: the first ones of the list, in its order. */
   readonly shown: readonly T[];
-  /** How many entries the list holds. */
+  /** How many entries the list holds, those not loaded yet ({@link RemoteEntries}) included. */
   readonly total: number;
   /**
-   * Whether the list holds more entries than one batch. Only then does it render a
+   * Whether the list holds more entries than one batch, or was given entries not loaded yet
+   * ({@link BatchOptions.remote}), even once they are all loaded: such a list keeps its status,
+   * which takes focus when a load brings none of its own entries. Only then does it render a
    * {@link BatchControl}; otherwise every entry is shown and the list renders as unbatched.
    */
   readonly batched: boolean;
   /** How many entries the next reveal shows: at most one batch, 0 once every entry is shown. */
   readonly next: number;
   /**
-   * Shows the next batch, then moves focus to its first entry. Does nothing once every entry is
-   * shown.
+   * Shows the next batch, then moves focus to its first entry. A batch reaching past the loaded
+   * entries first loads the next ones ({@link RemoteEntries.loadMore}); it appears, and takes
+   * focus, once they arrive. Does nothing once every entry is shown.
    */
   readonly revealNext: () => void;
+  /** Whether entries the next reveal shows are being loaded. */
+  readonly loading: boolean;
+  /** The message of the last failed load of further entries, or `null`. */
+  readonly error: string | null;
   /**
    * The id the entry at `index` carries as its default focus target, unique on the page. Render
    * it through {@link BatchEntryAnchor} when no `focusIdOf` is given.
@@ -304,6 +396,12 @@ export interface Batches<T> {
  * a list that shrinks, such as after a poll or once feedback hides a card, shows fewer entries.
  * When the list grows again, up to the same limit is shown.
  *
+ * With {@link BatchOptions.remote}, the entries not loaded yet count in `total`, and a reveal
+ * whose batch reaches past the loaded entries calls `loadMore` as it raises the limit. The batch
+ * shows the loaded entries up to the limit, so the new ones appear as they arrive, and focus
+ * waits for the load: it moves to the first new entry once the load has ended, or to the status
+ * when that entry did not arrive (the load failed, or brought only entries other lists show).
+ *
  * @param entries - the list, in the order it must render (the API's rank order); never re-sorted
  * @param options - see {@link BatchOptions}
  * @returns see {@link Batches}
@@ -317,7 +415,10 @@ export interface Batches<T> {
  */
 export function useBatches<T>(entries: readonly T[], options: BatchOptions<T>): Batches<T> {
   const batchSize = normalBatchSize(options.batchSize);
-  const { anchorsOf, focusIdOf, mustShow } = options;
+  const { anchorsOf, focusIdOf, mustShow, remote } = options;
+  const pending = remotePending(remote);
+  const loading = remote?.loading === true;
+  const failure: unknown = remote?.failure ?? null;
   const baseId = useId();
   // The first render shows one batch, or, when the hash names a later entry, every batch
   // through it.
@@ -327,6 +428,11 @@ export function useBatches<T>(entries: readonly T[], options: BatchOptions<T>): 
   });
   /** The first entry of the batch a reveal showed, which takes focus once it has rendered. */
   const pendingFocus = useRef<number | null>(null);
+  /**
+   * The load a reveal started, as the list stood when it asked: focus waits until the load has
+   * ended ({@link loadEnded}).
+   */
+  const awaitedLoad = useRef<AwaitedLoad | null>(null);
   /**
    * The hash target a `hashchange` revealed, scrolled into view and focused once it has
    * rendered.
@@ -432,29 +538,54 @@ export function useBatches<T>(entries: readonly T[], options: BatchOptions<T>): 
       }
     }
     const focusIndex = pendingFocus.current;
-    pendingFocus.current = null;
-    if (focusIndex !== null) {
-      const target = targetOf(focusIndex);
-      if (target === null || !focusId(target)) {
-        focusId(statusId);
-      }
+    if (focusIndex === null) {
+      return;
     }
-  }, [limit]);
+    const awaited = awaitedLoad.current;
+    if (
+      awaited !== null &&
+      focusIndex >= entries.length &&
+      !loadEnded(awaited, entries.length, pending, loading, failure)
+    ) {
+      // The entry this reveal focuses is still being loaded.
+      return;
+    }
+    awaitedLoad.current = null;
+    pendingFocus.current = null;
+    const target = targetOf(focusIndex);
+    if (target === null || !focusId(target)) {
+      focusId(statusId);
+    }
+  }, [limit, entries.length, pending, loading, failure]);
 
-  const total = entries.length;
-  const shownCount = Math.min(limit, total);
+  const loaded = entries.length;
+  const total = loaded + pending;
+  const shownCount = Math.min(limit, loaded);
   return {
-    shown: shownCount === total ? entries : entries.slice(0, shownCount),
+    shown: shownCount === loaded ? entries : entries.slice(0, shownCount),
     total,
-    batched: total > batchSize,
+    batched: total > batchSize || remote !== undefined,
     next: Math.min(batchSize, total - shownCount),
     revealNext: () => {
       if (shownCount >= total) {
         return;
       }
+      const nextLimit = limitThrough(shownCount, batchSize);
       pendingFocus.current = shownCount;
-      setLimit(limitThrough(shownCount, batchSize));
+      if (remote !== undefined && pending > 0 && nextLimit > loaded) {
+        if (loading) {
+          // The load the batch needs is already in flight: the batch grows as it lands, and its
+          // end moves focus.
+          awaitedLoad.current ??= { loaded, pending, failure };
+        } else {
+          awaitedLoad.current = { loaded, pending, failure };
+          remote.loadMore();
+        }
+      }
+      setLimit(nextLimit);
     },
+    loading,
+    error: remote?.error ?? null,
     entryId,
     statusId,
   };
@@ -482,6 +613,11 @@ export interface BatchControlProps<T> {
  * can take focus after a reveal whose first entry has no focus target of its own; it is never a
  * Tab stop.
  *
+ * While the next batch's entries are being loaded ({@link RemoteEntries}), the button shows the
+ * design system's loading state: it keeps its name and its focus, and a press does nothing until
+ * the load ends. A failed load adds "Could not load more {noun}: {message}" to the status, and
+ * the button, still offered, tries again.
+ *
  * @param props - see {@link BatchControlProps}
  * @returns the control, or `null` for a list that is not batched (at or under one batch)
  *
@@ -496,18 +632,39 @@ export function BatchControl<T>({ batches, noun }: BatchControlProps<T>): ReactE
     return null;
   }
   const shownCount = batches.shown.length;
+  const status = batchStatusText(shownCount, batches.total, noun);
   return (
     <Inline gap={3} align="center">
       <div role="status" id={batches.statusId} tabIndex={-1}>
-        {batchStatusText(shownCount, batches.total, noun)}
+        {batches.error === null ? status : `${status}. ${loadFailedText(batches.error, noun)}`}
       </div>
       {batches.next > 0 ? (
-        <Button variant="secondary" onClick={batches.revealNext}>
+        <Button variant="secondary" loading={batches.loading} onClick={batches.revealNext}>
           {showMoreLabel(batches.next, noun)}
         </Button>
       ) : null}
     </Inline>
   );
+}
+
+/**
+ * The status text of a failed load of further entries: "Could not load more {plural}:
+ * {message}", the message trimmed, or the sentence alone when the message is blank.
+ *
+ * @param message - the failure's message, such as the API's error message
+ * @param noun - what the list counts
+ * @returns the text
+ *
+ * @example
+ * ```ts
+ * loadFailedText('The server is temporarily unavailable.', ACTION_NOUN);
+ * // "Could not load more actions: The server is temporarily unavailable."
+ * ```
+ */
+export function loadFailedText(message: string, noun: BatchNoun): string {
+  const reason = message.trim();
+  const lead = `Could not load more ${noun.plural}`;
+  return reason === '' ? lead : `${lead}: ${reason}`;
 }
 
 /** Props of {@link BatchEntryAnchor}. */
@@ -560,6 +717,8 @@ export interface BatchedListProps<T> {
   readonly focusIdOf: (entry: T, index: number) => string;
   /** Whether an entry must be shown at once, see {@link BatchOptions.mustShow}. */
   readonly mustShow?: (entry: T) => boolean;
+  /** The entries not loaded yet, see {@link BatchOptions.remote}. */
+  readonly remote?: RemoteEntries;
 }
 
 /**
@@ -598,12 +757,14 @@ export function BatchedList<T>({
   anchorsOf,
   focusIdOf,
   mustShow,
+  remote,
 }: BatchedListProps<T>): ReactElement {
   const batches = useBatches(entries, {
     batchSize,
     focusIdOf,
     ...(anchorsOf === undefined ? {} : { anchorsOf }),
     ...(mustShow === undefined ? {} : { mustShow }),
+    ...(remote === undefined ? {} : { remote }),
   });
   return (
     <>

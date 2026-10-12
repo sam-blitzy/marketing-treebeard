@@ -43,14 +43,20 @@
  * States, in precedence order:
  *
  * - **Data**: the page above. A background refetch that fails keeps the last page on screen,
- *   because TanStack Query keeps `data` when a refetch errors; the hook's own polling recovers by
- *   itself once the API answers again. Meanwhile a warning "Actions could not be refreshed",
- *   with the failure's reason and "Showing the last loaded state." as two sentences, sits in
- *   the page's refresh region, after the global banners and before the section navigation, so
- *   the open-discrepancies banner stays above everything (AAP 0.5.5) and the warning still
- *   precedes the cards it qualifies. It covers a failed refresh of the page itself, of the
- *   source chips, of the unresolved discrepancy list and of the configuration, and clears once
- *   each of them has been read again.
+ *   because TanStack Query keeps `data` when a refetch errors. While the server is unreachable
+ *   or rate-limits the read, the hook keeps polling and recovers by itself once the API answers
+ *   again, as the default page also does after a server error. For a page addressed by run id a
+ *   server error (5xx) stops the page's polling instead, so a read of that stored run that took
+ *   the API down is not repeated on a timer. Meanwhile a warning "Actions could not be
+ *   refreshed", with the failure's reason and "Showing the last loaded state." as two
+ *   sentences and a "Retry" that reads the failed reads again, sits in the page's refresh
+ *   region, after the global banners and before the section navigation, so the
+ *   open-discrepancies banner stays above everything (AAP 0.5.5) and the warning still
+ *   precedes the cards it qualifies. It covers a
+ *   failed refresh of the page itself, of the cards a group has loaded beyond the page, shown
+ *   or not, of the source chips, of the unresolved discrepancy list and of the configuration,
+ *   and clears once each of them has been read again: by its own poll, by Retry, by a refocus
+ *   or by a reload. A failed "Show more" load is not a refresh: the group's list states it.
  * - **Loading** (no data yet): the title and a `Spinner` labelled "Loading actions".
  * - **No analysis run yet** (default run only, 404 `not_found` or 409 `run_not_ready`): the first
  *   start, while the worker backfills and computes the first default run (AAP 0.11.2). The hook
@@ -60,8 +66,10 @@
  * - **Any other failure**: the API's message and a "Retry" button that refetches, rendered by
  *   {@link ActionsLoadFailure}. A reload during an outage shows it too: `src/router.tsx` renders
  *   this page even when the auth guard's `GET /auth/me` fails with anything but a 401, and the
- *   page's own read then fails the same way. The hook keeps polling after a transient failure,
- *   so the page recovers by itself once the API answers.
+ *   page's own read then fails the same way. Without a run id the hook keeps polling after a
+ *   transient failure, a server error included, so the page recovers by itself once the API
+ *   answers. A page addressed by run id stops polling after a server error, so Retry, a
+ *   refocus or a reload reads it again.
  *
  * A failure screen stays mounted while its read runs again, by poll or by Retry, so it never
  * flickers back to the spinner and keyboard focus is kept; each failure message is announced
@@ -82,7 +90,7 @@
  */
 import { Link } from '@tanstack/react-router';
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
-import type { ComponentType, ReactElement, ReactNode, Ref } from 'react';
+import type { ComponentType, ReactElement, ReactNode, Ref, RefObject } from 'react';
 
 import {
   isApiError,
@@ -91,6 +99,7 @@ import {
   useDefaultRun,
   usePrefetchActionsReads,
   useRecommendations,
+  useRetryActionsRefresh,
 } from '../../api/queries';
 import type { ApiError } from '../../api/queries';
 import { SECTION_ORDER } from '../../api/types';
@@ -160,6 +169,13 @@ const REFRESH_ERROR_TITLE = 'Actions could not be refreshed';
 
 /** What follows the failure's reason in that notice: the page keeps its last data. */
 const REFRESH_ERROR_SUFFIX = 'Showing the last loaded state.';
+
+/**
+ * Accessible name of that notice's "Retry" button. It starts with the visible label (WCAG 2.2
+ * SC 2.5.3) and tells it apart from the window picker's own Retry, which can show at the same
+ * time during an outage.
+ */
+const REFRESH_RETRY_ACCESSIBLE_LABEL = 'Retry refreshing actions';
 
 // ---------------------------------------------------------------------------------------------
 // Public API
@@ -323,13 +339,23 @@ function firstSectionByKey(sections: readonly Section[]): ReadonlyMap<SectionKey
  * group of each section, hidden ones included, since a feedback hides its item while the run
  * still lists it.
  *
+ * The page carries each group's first `GROUP_PAGE_SIZE` items, and a section loads the rest of
+ * a larger group as asked (`SectionFrame` `runId`), so for a run with such a group the page
+ * cannot name every item the run lists. Then no set is returned, and outcomes and
+ * confirmations stay until another run is opened rather than being dropped for a card loaded
+ * beyond the page (`ActionOutcomeProvider` `identities`).
+ *
  * @param sections - the sections, as `GET /recommendations` returned them
- * @returns the identities, each once
+ * @returns the identities, each once; `undefined` when a group stores more items than the page
+ *   carries
  */
-function listedIdentities(sections: readonly Section[]): ReadonlySet<string> {
+function listedIdentities(sections: readonly Section[]): ReadonlySet<string> | undefined {
   const identities = new Set<string>();
   for (const section of sections) {
     for (const group of section.groups) {
+      if (group.total > group.items.length) {
+        return undefined;
+      }
       for (const item of group.items) {
         identities.add(itemIdentity(item));
       }
@@ -382,11 +408,11 @@ interface SettledFailure {
  *
  * TanStack Query v5 puts a query that holds no data back to `status: 'pending'` with
  * `error: null` each time it fetches. Without this hook every poll of the first-start state
- * (every `FIRST_RUN_POLL_MS`), every poll after a transient failure and every Retry would swap
- * the failure screen for the loading spinner and back, remounting it: the screen would flicker,
- * its Retry button would be replaced, and keyboard focus would fall to the page body
- * (WCAG 2.2 SC 2.4.3). The failure is therefore kept until the read settles again, with a new
- * error that replaces it or with data that clears it.
+ * (every `FIRST_RUN_POLL_MS`), every poll while the server is unreachable or rate-limits the
+ * read, and every Retry would swap the failure screen for the loading spinner and back,
+ * remounting it: the screen would flicker, its Retry button would be replaced, and keyboard
+ * focus would fall to the page body (WCAG 2.2 SC 2.4.3). The failure is therefore kept until the
+ * read settles again, with a new error that replaces it or with data that clears it.
  *
  * The failure is remembered together with the run it belongs to, so a different run, for
  * example the default run after "Back to default", never inherits it: it shows the loading
@@ -419,6 +445,72 @@ function useSettledFailure(
     setKept(settled === null ? null : { runId, error: settled });
   }
   return settled;
+}
+
+/** What {@link useRetryAction} returns to the component that renders the "Retry" `Button`. */
+interface RetryAction {
+  /** Whether a Retry the user started is still running: the button shows as loading meanwhile. */
+  retrying: boolean;
+  /** The "Retry" button's ref, through which focus returns to it once its read has settled. */
+  retryButtonRef: RefObject<HTMLButtonElement | null>;
+  /** Starts a Retry; the button's `onClick`. */
+  retry: () => void;
+}
+
+/**
+ * A "Retry" the user starts, shared by the failure state's button and the refresh notice's, so
+ * both keep focus the same way.
+ *
+ * `retry` runs `read` and shows the button as loading until it settles, which makes it inert
+ * (`aria-disabled`) while it keeps focus. The loading button keeps focus, but focus can still be
+ * lost to the page body meanwhile, so once the read settles and the button is still on the page
+ * and enabled, focus on the body goes back to it (WCAG 2.2 SC 2.4.3). Focus the user moved
+ * elsewhere in the meantime is left alone, and a button that left the page (the retry succeeded)
+ * is skipped.
+ *
+ * @param read - Reads again what failed. It must settle rather than reject, as TanStack Query's
+ *   `refetch` and `useRetryActionsRefresh` both do: a failed read settles into its query's error.
+ * @returns The loading state, the button ref and the `onClick` handler.
+ */
+function useRetryAction(read: () => Promise<unknown>): RetryAction {
+  const [retrying, setRetrying] = useState(false);
+  const retryButtonRef = useRef<HTMLButtonElement>(null);
+  const returnFocusRef = useRef(false);
+
+  useEffect(() => {
+    if (retrying || !returnFocusRef.current) {
+      return;
+    }
+    returnFocusRef.current = false;
+    const button = retryButtonRef.current;
+    const active = document.activeElement;
+    if (
+      button !== null &&
+      button.isConnected &&
+      !button.disabled &&
+      (active === null || active === document.body)
+    ) {
+      button.focus();
+    }
+  }, [retrying]);
+
+  const run = async (): Promise<void> => {
+    returnFocusRef.current = true;
+    setRetrying(true);
+    try {
+      await read();
+    } finally {
+      setRetrying(false);
+    }
+  };
+
+  return {
+    retrying,
+    retryButtonRef,
+    retry: () => {
+      void run();
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -541,10 +633,66 @@ interface ActionsContentProps {
    */
   refreshFailure: ApiError | null;
   /**
+   * Reads the failed refreshes again, from `useRetryActionsRefresh`: the refresh notice's
+   * Retry. It settles once those reads have, and never rejects. It stays the same function
+   * while the run does, so it does not rebuild the memoized content.
+   */
+  retryRefresh: () => Promise<void>;
+  /**
    * Whether `/actions?run=<id>` addressed the run. Without an id the page is the latest default
    * run by definition, so it is never marked as an older one.
    */
   runAddressed: boolean;
+}
+
+/** Props of {@link RefreshFailureNotice}. */
+interface RefreshFailureNoticeProps {
+  /** The failed refresh to explain, from `useActionsRefreshFailure`. */
+  failure: ApiError;
+  /** Reads the failed refreshes again; settles once they have, and never rejects. */
+  onRetry: () => Promise<void>;
+}
+
+/**
+ * The loaded page's refresh notice: a warning `Banner` "Actions could not be refreshed" with the
+ * failure's reason and "Showing the last loaded state." as two sentences, a reason without
+ * closing punctuation ended by a full stop ({@link joinSentences}), and a "Retry" `Button`.
+ *
+ * Retry is how the page recovers a read that nothing polls: after a server error a page
+ * addressed by run id and a group's cards loaded beyond it stop polling, so a read that took
+ * the API down is not repeated on a timer. The other reads poll through an outage, and Retry
+ * reads them at once. Retry reads every failed refresh again (`onRetry`); while
+ * it runs the button shows as loading, and focus returns to it when the failure is still shown
+ * and focus fell to the page body ({@link useRetryAction}). Once every read has succeeded the
+ * notice leaves the page.
+ *
+ * It is plain content inside the page's polite refresh region, never an alert, which AAP 0.5.5
+ * reserves for discrepancies.
+ *
+ * @param props - see {@link RefreshFailureNoticeProps}
+ * @returns the warning banner with its Retry
+ */
+function RefreshFailureNotice({ failure, onRetry }: RefreshFailureNoticeProps): ReactElement {
+  const { retrying, retryButtonRef, retry } = useRetryAction(onRetry);
+  return (
+    <Banner
+      tone="warning"
+      title={REFRESH_ERROR_TITLE}
+      actions={
+        <Button
+          ref={retryButtonRef}
+          size="sm"
+          aria-label={REFRESH_RETRY_ACCESSIBLE_LABEL}
+          loading={retrying}
+          onClick={retry}
+        >
+          {RETRY_LABEL}
+        </Button>
+      }
+    >
+      {joinSentences(failureReason(failure), REFRESH_ERROR_SUFFIX)}
+    </Banner>
+  );
 }
 
 /**
@@ -593,28 +741,31 @@ function runNoticeFor(
  * the B1 card that carries its amount.
  *
  * While `refreshFailure` is set, a polite status region right after the global banners and
- * before the section navigation holds a warning `Banner` "Actions could not be refreshed" with
- * the failure's reason and "Showing the last loaded state." as two sentences, a reason without
- * closing punctuation ended by a full stop ({@link joinSentences}), so a failed poll of the page,
- * the source chips, the discrepancy list or the configuration never leaves the cards looking
- * current. It sits below the global banners, so the open-discrepancies banner, and the fixed
- * order of the banners after it, stay above it (AAP 0.5.5: the discrepancy banner sits above
- * everything), and above the sections and their cards. The region mounts with this content, so
- * a failure that arrives later lands in a region assistive technology already watches and is
- * announced politely (WCAG 2.2 SC 4.1.3), never as an alert, which AAP 0.5.5 reserves for
- * discrepancies; without a failure it is empty, and `Stack` takes it out of the column, so it
- * adds no space.
+ * before the section navigation holds the {@link RefreshFailureNotice}: a warning `Banner`
+ * "Actions could not be refreshed" with the failure's reason, "Showing the last loaded state."
+ * and a "Retry" that reads the failed refreshes again (`retryRefresh`), so a failed poll of the
+ * page, of a group's cards loaded beyond it, of the source chips, of the discrepancy list or of
+ * the configuration never leaves the cards looking current, and a read whose polling a server
+ * error stopped can be brought back. It sits
+ * below the global banners, so the open-discrepancies banner, and the fixed order of the banners
+ * after it, stay above it (AAP 0.5.5: the discrepancy banner sits above everything), and above
+ * the sections and their cards. The region mounts with this content, so a failure that arrives
+ * later lands in a region assistive technology already watches and is announced politely
+ * (WCAG 2.2 SC 4.1.3), never as an alert, which AAP 0.5.5 reserves for discrepancies; without a
+ * failure it is empty, and `Stack` takes it out of the column, so it adds no space.
  *
- * Memoized on `page`, `refreshFailure` and `runAddressed`: the page re-renders whenever its
- * read's fetch status changes, at the start and the end of every poll, and this content renders
- * again only for a newly delivered page, a change of the reported failure, whose `ApiError`
- * stays the same object until it does, or a new latest default run, which it reads for the run
- * notice. Each section then renders again only when its own inputs changed
+ * Memoized on `page`, `refreshFailure`, `retryRefresh` and `runAddressed`: the page re-renders
+ * whenever its read's fetch status changes, at the start and the end of every poll, and this
+ * content renders again only for a newly delivered page, a change of the reported failure, whose
+ * `ApiError` stays the same object until it does, or a new latest default run, which it reads
+ * for the run notice. A Retry's loading state lives in the notice, so it renders the notice
+ * alone. Each section then renders again only when its own inputs changed
  * ({@link SECTION_RENDERERS}).
  */
 const ActionsContent = memo(function ActionsContent({
   page,
   refreshFailure,
+  retryRefresh,
   runAddressed,
 }: ActionsContentProps): ReactElement {
   const { run, overlay, banners, sections } = page;
@@ -637,9 +788,7 @@ const ActionsContent = memo(function ActionsContent({
           and mounted with the page, so a later failed refresh is announced. */}
       <div role="status">
         {refreshFailure !== null && (
-          <Banner tone="warning" title={REFRESH_ERROR_TITLE}>
-            {joinSentences(failureReason(refreshFailure), REFRESH_ERROR_SUFFIX)}
-          </Banner>
+          <RefreshFailureNotice failure={refreshFailure} onRetry={retryRefresh} />
         )}
       </div>
       <SectionNav sections={sections} />
@@ -676,10 +825,12 @@ const ActionsContent = memo(function ActionsContent({
  * arrive. It renders, in precedence order:
  *
  * - the loaded page whenever data exists, including after a failed background refetch, which
- *   `useActionsRefreshFailure(runId)` reports: while the page's own read, the source chips'
- *   `GET /sources`, the unresolved discrepancy list or `GET /config` last failed to refresh,
+ *   `useActionsRefreshFailure(runId)` reports: while the page's own read, a group's cards
+ *   loaded beyond it (`GET /recommendations/items`), the source chips' `GET /sources`, the
+ *   unresolved discrepancy list or `GET /config` last failed to refresh,
  *   a warning `Banner` "Actions could not be refreshed", below the global banners and above the
- *   section navigation, gives the reason and "Showing the last loaded state." as two sentences,
+ *   section navigation, gives the reason and "Showing the last loaded state." as two sentences
+ *   with a "Retry" that reads the failed refreshes again (`useRetryActionsRefresh(runId)`),
  *   until the next successful read clears it;
  * - `PageShell.Title` "Actions" with a `Spinner` labelled "Loading actions" until the first
  *   response settles;
@@ -690,13 +841,17 @@ const ActionsContent = memo(function ActionsContent({
  * - with `runId`, an `EmptyState` "Run not found" with a "Back to default" link to `/actions`
  *   when the API does not know the run (404, or 422 for an id that cannot name a run);
  * - otherwise {@link ActionsLoadFailure}: an `EmptyState` "Actions could not be loaded" with the
- *   API's message and a "Retry" `Button` that reads the page again.
+ *   API's message and a "Retry" `Button` that reads the page again. Without a run id the read
+ *   keeps polling through a transient failure, a server error included, and the page recovers
+ *   by itself; with one, a server error (5xx) stops its polling, so Retry, a refocus or a
+ *   reload brings the page back.
  *
  * A failure screen stays in place while its read runs again, by poll or by Retry
- * ({@link useSettledFailure}), so it never flickers to the spinner. A Retry the user starts
- * shows the button as loading, which disables it; once the read settles, focus returns to the
- * button if the failure is still shown and focus has not moved elsewhere (WCAG 2.2 SC 2.4.3).
- * A background poll leaves the button enabled, so focus on it is never lost.
+ * ({@link useSettledFailure}), so it never flickers to the spinner. A Retry the user starts,
+ * here or in the refresh notice, shows its button as loading, which disables it; once the read
+ * settles, focus returns to the button if the failure is still shown and focus has not moved
+ * elsewhere (WCAG 2.2 SC 2.4.3, {@link useRetryAction}). A background poll leaves the button
+ * enabled, so focus on it is never lost.
  *
  * Every state carries the page's single `<h1>` "Actions". The component must render inside the
  * app's `QueryClientProvider` and TanStack `RouterProvider`, as every authenticated page does.
@@ -717,6 +872,8 @@ export function ActionsPage({ runId }: ActionsPageProps): ReactElement {
   usePrefetchActionsReads(runId);
   // A failed poll of a read the loaded page shows; those reads keep their last data meanwhile.
   const refreshFailure = useActionsRefreshFailure(runId);
+  // The refresh notice's Retry: a server error stops the page's polling until a read succeeds.
+  const retryRefresh = useRetryActionsRefresh(runId);
   const failure = useSettledFailure(
     runId,
     query.error,
@@ -724,48 +881,16 @@ export function ActionsPage({ runId }: ActionsPageProps): ReactElement {
     query.data !== undefined,
   );
 
-  // A Retry the user started: the button shows as loading, hence inert, until it settles.
-  const [retrying, setRetrying] = useState(false);
-  const retryButtonRef = useRef<HTMLButtonElement>(null);
-  const returnFocusRef = useRef(false);
-
-  // The loading button keeps focus, but focus can still be lost to the page body meanwhile, so
-  // once a Retry settles and the failure is still shown, focus on the body goes back to its
-  // button. Focus the user moved elsewhere in the meantime is left alone, and a button that left
-  // the page (the retry succeeded) is skipped.
-  useEffect(() => {
-    if (retrying || !returnFocusRef.current) {
-      return;
-    }
-    returnFocusRef.current = false;
-    const button = retryButtonRef.current;
-    const active = document.activeElement;
-    if (
-      button !== null &&
-      button.isConnected &&
-      !button.disabled &&
-      (active === null || active === document.body)
-    ) {
-      button.focus();
-    }
-  }, [retrying]);
-
-  const retry = async (): Promise<void> => {
-    returnFocusRef.current = true;
-    setRetrying(true);
-    try {
-      // `refetch` never rejects: a failed read settles into the query's error instead.
-      await query.refetch();
-    } finally {
-      setRetrying(false);
-    }
-  };
+  // The failure state's Retry. `refetch` never rejects: a failed read settles into the query's
+  // error instead, and a success restarts the page's polling.
+  const { retrying, retryButtonRef, retry } = useRetryAction(query.refetch);
 
   if (query.data !== undefined) {
     return (
       <ActionsContent
         page={query.data}
         refreshFailure={refreshFailure}
+        retryRefresh={retryRefresh}
         runAddressed={runId !== undefined}
       />
     );
@@ -812,9 +937,7 @@ export function ActionsPage({ runId }: ActionsPageProps): ReactElement {
   return (
     <ActionsLoadFailure
       error={failure}
-      onRetry={() => {
-        void retry();
-      }}
+      onRetry={retry}
       retrying={retrying}
       retryButtonRef={retryButtonRef}
     />

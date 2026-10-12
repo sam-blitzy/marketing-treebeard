@@ -83,7 +83,9 @@ from ads_engine.analysis.overlay import (
     _load_feedback,
     current_dataset_ids,
     is_current,
+    item_hidden_state,
     item_is_current,
+    load_check_representatives,
     overlay,
 )
 from ads_engine.analysis.thresholds import (
@@ -500,6 +502,43 @@ async def test_overlay_rejects_items_of_another_run(shipped: Thresholds) -> None
             )
     finally:
         await session.close()
+
+
+@pytest.mark.anyio
+async def test_overlay_rejects_check_items_of_another_run(shipped: Thresholds) -> None:
+    items = [Recommendation(id=10, run_id=1, rule_id=K1)]
+    check_items = [
+        Recommendation(id=11, run_id=4, rule_id=K2),
+        Recommendation(id=12, run_id=1, rule_id=K2),
+    ]
+    session = AsyncSession()
+    try:
+        with pytest.raises(ValueError, match=r"overlay of run 1 was given items of runs \[4\]"):
+            await overlay(
+                session,
+                _transient_run(1),
+                items,
+                NOW,
+                check_items=check_items,
+                thresholds=shipped,
+                display_timezone="UTC",
+            )
+    finally:
+        await session.close()
+
+
+@pytest.mark.parametrize(
+    ("now", "error", "match"),
+    [
+        (NOW.replace(tzinfo=None), ValueError, "now must be tz-aware"),
+        ("2026-10-07T12:00:00Z", TypeError, "now must be a tz-aware datetime"),
+    ],
+)
+def test_item_hidden_state_needs_an_instant(
+    now: object, error: type[Exception], match: str
+) -> None:
+    with pytest.raises(error, match=match):
+        item_hidden_state(1, now)  # type: ignore[arg-type]
 
 
 @pytest.mark.anyio
@@ -3252,3 +3291,266 @@ async def test_overlay_is_read_only_and_issues_at_most_eight_statements_per_page
         (item.evidence, item.flags, item.held, item.held_reason, item.data_status)
         for item in reloaded
     ] == before
+
+
+# ---------------------------------------------------------------------------------------
+# Bounded pages: check representatives and the hidden state, set-based
+# ---------------------------------------------------------------------------------------
+
+
+async def _bounded_page(
+    sessions: Sessions,
+    run_id: int,
+    served: Sequence[int],
+    *,
+    thresholds: Thresholds,
+    representatives: bool = True,
+) -> tuple[OverlayResult, tuple[Recommendation, ...]]:
+    """Overlay only the ``served`` items of a run, as ``GET /recommendations`` does.
+
+    With ``representatives`` the run's :func:`load_check_representatives` are passed as
+    ``check_items``; without, the aggregates cover the served items alone.
+    """
+    async with sessions() as session:
+        run = await session.get(AnalysisRun, run_id)
+        assert run is not None
+        items = list(
+            await session.scalars(
+                select(Recommendation)
+                .where(Recommendation.id.in_(served))
+                .order_by(Recommendation.id)
+            )
+        )
+        checked = await load_check_representatives(session, run_id) if representatives else ()
+        result = await overlay(
+            session,
+            run,
+            items,
+            NOW,
+            check_items=checked,
+            thresholds=thresholds,
+            display_timezone="UTC",
+        )
+        return result, checked
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_check_representatives_keep_a_bounded_pages_aggregates_equal_to_the_whole_run(
+    sessions: Sessions, shipped: Thresholds
+) -> None:
+    """AAP 0.1.1, 0.3.2: a page serving a few items still lists every item's dataset verdicts.
+
+    ``GET /recommendations`` serves a bounded number of items per group and passes the run's
+    check representatives as ``check_items``: whichever items are served, none included, the
+    page-level stale and incomplete lists and the banners equal those computed over every
+    stored item, and each served item's own view is unchanged. One representative stands for
+    the items sharing every check input, the lowest id of them.
+    """
+    window_start, window_end = date(2026, 9, 4), date(2026, 10, 1)
+    baseline_days = shipped.int("k1.baseline_days")
+    baseline_start = window_end - timedelta(days=baseline_days - 1)
+    frozen_window = {
+        "start": baseline_start.isoformat(),
+        "end": window_end.isoformat(),
+        "days": baseline_days,
+    }
+    required = ("google.search_terms", "google.metrics_daily")
+    async with sessions() as session, session.begin():
+        google = await _dataset(session, "google")
+        for name in required:
+            await _freshness(session, google, name, covered_from=window_start, through=window_end)
+        linkedin = await _dataset(session, "linkedin", mode="simulated")
+        companion = await _companion(session, linkedin)
+        for dataset, name in ((linkedin, "linkedin.leads"), (companion, "hubspot.contacts")):
+            await _freshness(session, dataset, name, covered_from=window_start, through=window_end)
+        await _covered(session, "hubspot")
+        run = await _run(session, start=window_start, end=window_end)
+        empty_run = await _run(session, start=window_start, end=window_end)
+        # Items sharing one set of check inputs, complete over the run's window.
+        expand = [
+            await _item(
+                session,
+                run,
+                rule_id=K2,
+                entity_id=f"7|expand-{index}",
+                provenance=_prov(google),
+                required=required,
+            )
+            for index in range(12)
+        ]
+        # K1 cards whose frozen baselines reach before the coverage, each with its own reason.
+        frozen = await _item(
+            session,
+            run,
+            entity_id="7|frozen",
+            required=required,
+            evidence=_k1_evidence(
+                run,
+                _prov(google),
+                thresholds={"k1.baseline_days": baseline_days},
+                baseline_window=frozen_window,
+            ),
+        )
+        frozen_days = await _item(
+            session,
+            run,
+            entity_id="7|frozen-days",
+            required=required,
+            evidence=_k1_evidence(
+                run,
+                _prov(google),
+                thresholds={"k1.baseline_days": 60},
+                baseline_window={**frozen_window, "start": "2026-13-01"},
+            ),
+        )
+        # google.entities has no freshness row: only this item's check names it.
+        unrecorded = await _item(
+            session,
+            run,
+            rule_id=K3,
+            entity_type="keyword",
+            entity_id="9",
+            provenance=_prov(google),
+            required=("google.entities",),
+        )
+        leads = await _item(
+            session,
+            run,
+            rule_id=W1,
+            entity_type=None,
+            entity_id=None,
+            provenance=_prov(linkedin, companion),
+            required=("linkedin.leads", "hubspot.contacts"),
+        )
+        # A stored evidence value that is not a JSON object reads as one without those keys.
+        malformed = await _item(
+            session,
+            run,
+            rule_id=K3,
+            entity_type="keyword",
+            entity_id="10",
+            required=("google.search_terms",),
+            evidence=["provenance"],
+        )
+
+    whole = await _page(sessions, run.id, thresholds=shipped)
+    assert {"google.entities", "google.metrics_daily"} <= set(whole.overlay.incomplete_datasets)
+    assert "google.entities" in whole.overlay.stale_datasets
+    incomplete = next(b for b in whole.banners if b.code == BANNER_INCOMPLETE_DATASETS)
+    assert "after the K1 baseline start 2026-07-04" in incomplete.message
+    assert "after the K1 baseline start 2026-08-03" in incomplete.message
+
+    stored = [*expand, frozen, frozen_days, unrecorded, leads, malformed]
+    every_id = [item.id for item in stored]
+    for served in ([], [expand[0].id], [expand[5].id], [leads.id, malformed.id], every_id):
+        page, checked = await _bounded_page(sessions, run.id, served, thresholds=shipped)
+        assert page.overlay == whole.overlay, served
+        assert page.banners == whole.banners, served
+        assert set(page.items) == set(served)
+        assert all(page.items[item_id] == whole.items[item_id] for item_id in served)
+
+    # The twelve K2 items share every input: the lowest id stands for them all.
+    assert [item.id for item in checked] == sorted(
+        [expand[0].id, frozen.id, frozen_days.id, unrecorded.id, leads.id, malformed.id]
+    )
+    # Without the representatives, a page of one complete card loses the others' verdicts.
+    alone, none = await _bounded_page(
+        sessions, run.id, [expand[0].id], thresholds=shipped, representatives=False
+    )
+    assert none == ()
+    assert "google.entities" not in alone.overlay.incomplete_datasets
+    assert alone.banners != whole.banners
+    async with sessions() as session:
+        assert await load_check_representatives(session, empty_run.id) == ()
+
+
+@pytest.mark.anyio
+@pytest.mark.db
+async def test_item_hidden_state_marks_exactly_the_items_the_overlay_hides(
+    sessions: Sessions, shipped: Thresholds
+) -> None:
+    """``Group.hidden``: the items whose latest feedback in force hides them, C0 never.
+
+    The set-based state reads the overlay's rule: feedback on the item's exact rule and
+    entity (``NULL`` matching ``NULL`` only) whose ``until`` is after now, given on any run's
+    item. Several rows in force on one key mark the item once, and every item of the run has
+    one row with a non-``NULL`` ``hidden``.
+    """
+    async with sessions() as session, session.begin():
+        google = await _dataset(session, "google")
+        provenance = _prov(google)
+        earlier = await _run(session)
+        run = await _run(session)
+        other_run = await _run(session)
+        given_earlier = await _item(session, earlier, provenance=provenance, entity_id="7|a")
+        matched = await _item(session, run, provenance=provenance, entity_id="7|a")
+        twice = await _item(session, run, rule_id=K2, provenance=provenance, entity_id="7|b")
+        other_type = await _item(
+            session, run, rule_id=K2, provenance=provenance, entity_type="keyword", entity_id="7|b"
+        )
+        expired = await _item(session, run, provenance=provenance, entity_id="7|c")
+        ends_now = await _item(session, run, provenance=provenance, entity_id="7|d")
+        entityless = await _item(
+            session, run, rule_id=W1, provenance=provenance, entity_type=None, entity_id=None
+        )
+        untyped_named = await _item(
+            session, run, rule_id=W1, provenance=provenance, entity_type=None, entity_id="x"
+        )
+        typed_without_id = await _item(
+            session, run, rule_id=K3, provenance=provenance, entity_type="keyword", entity_id=None
+        )
+        never = await _item(session, run, provenance=provenance, entity_id="7|never")
+        c0 = await _item(
+            session,
+            run,
+            rule_id=C0,
+            section="campaigns",
+            group="discrepancies",
+            entity_type="campaign",
+            entity_id="11",
+            provenance=provenance,
+            decision_subject={"type": "campaign", "id": 11},
+        )
+        await _item(session, other_run, provenance=provenance, entity_id="7|a")
+        day = timedelta(days=1)
+        await _feedback(
+            session, given_earlier, "snooze", until=NOW + 7 * day, created_at=NOW - 2 * day
+        )
+        await _feedback(session, twice, "snooze", until=NOW + 7 * day, created_at=NOW - 2 * day)
+        await _feedback(session, twice, "dismiss", until=NOW + 30 * day, created_at=NOW - day)
+        await _feedback(
+            session, expired, "dismiss", until=NOW - timedelta(seconds=1), created_at=NOW - day
+        )
+        await _feedback(session, ends_now, "snooze", until=NOW, created_at=NOW - 7 * day)
+        await _feedback(session, entityless, "snooze", until=NOW + 7 * day, created_at=NOW - day)
+        await _feedback(
+            session, typed_without_id, "done", until=NOW + 30 * day, created_at=NOW - day
+        )
+        await _feedback(session, c0, "dismiss", until=NOW + 30 * day, created_at=NOW - day)
+
+    page = await _page(sessions, run.id, thresholds=shipped)
+    hidden_by_overlay = {item_id for item_id, view in page.items.items() if view.hidden_by}
+    assert hidden_by_overlay == {matched.id, twice.id, entityless.id, typed_without_id.id}
+
+    state = item_hidden_state(run.id, NOW)
+    async with sessions() as session:
+        rows = (
+            await session.execute(
+                select(
+                    state.c.id, state.c.section, state.c["group"], state.c.rank, state.c.hidden
+                ).order_by(state.c.id)
+            )
+        ).all()
+    assert [row.id for row in rows] == sorted(page.items)
+    assert all(row.hidden in (True, False) for row in rows)
+    assert {row.id for row in rows if row.hidden} == hidden_by_overlay
+    by_id = {row.id: row for row in rows}
+    assert (by_id[c0.id].section, by_id[c0.id].group, by_id[c0.id].rank) == (
+        "campaigns",
+        "discrepancies",
+        1,
+    )
+    assert not any(
+        by_id[item.id].hidden for item in (other_type, expired, ends_now, untyped_named, never, c0)
+    )

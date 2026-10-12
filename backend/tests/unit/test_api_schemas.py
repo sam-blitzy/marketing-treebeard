@@ -64,6 +64,7 @@ from ads_engine.analysis.thresholds import (
 from ads_engine.analysis.window import AnalysisWindow, InvalidWindow, SourceDayInfo
 from ads_engine.api.schemas import (
     ERROR_RESPONSES,
+    GROUP_PAGE_SIZE,
     NOTE_MAX_LENGTH,
     Banner,
     Baseline,
@@ -89,6 +90,7 @@ from ads_engine.api.schemas import (
     Flag,
     GoogleCrmBindingView,
     Group,
+    GroupItemsPage,
     Health,
     HubSpotMappingView,
     IntendedStateIn,
@@ -1701,7 +1703,7 @@ def test_flag_holds_a_code_and_a_message() -> None:
 def test_recommendations_page_returns_the_five_sections_in_the_fixed_order() -> None:
     payload = _page(_run())
     payload["sections"][0]["groups"] = [
-        {"key": "block", "title": "Block", "items": [_item()]},
+        {"key": "block", "title": "Block", "items": [_item()], "total": 1, "hidden": 0},
     ]
     payload["sections"][1]["suppressed"] = {"feedback_dismiss": 2, "g1_blocked": 1}
     page = RecommendationsPage.model_validate(payload)
@@ -1716,7 +1718,7 @@ def test_recommendations_page_returns_the_five_sections_in_the_fixed_order() -> 
         "withheld",
         "suppressed",
     }
-    assert set(dumped["sections"][0]["groups"][0]) == {"key", "title", "items"}
+    assert set(dumped["sections"][0]["groups"][0]) == {"key", "title", "items", "total", "hidden"}
     assert dumped["sections"][1]["suppressed"] == {"feedback_dismiss": 2, "g1_blocked": 1}
     assert set(dumped["overlay"]) == {
         "open_discrepancies",
@@ -1756,9 +1758,120 @@ def test_section_refuses_an_unknown_key_and_a_non_integer_suppression_count() ->
 
 def test_group_holds_its_items_in_rank_order() -> None:
     group = Group.model_validate(
-        {"key": "pause", "title": "Pause", "items": [_item(rank=1), _item(id=502, rank=2)]}
+        {
+            "key": "pause",
+            "title": "Pause",
+            "items": [_item(rank=1), _item(id=502, rank=2)],
+            "total": 2,
+            "hidden": 0,
+        }
     )
     assert [item.rank for item in group.items] == [1, 2]
+
+
+def test_group_carries_its_first_items_and_counts_every_stored_one() -> None:
+    """AAP 0.1.1: a group carries at most ``GROUP_PAGE_SIZE`` items and counts all of them."""
+    items = [_item(id=500 + rank, rank=rank) for rank in range(1, GROUP_PAGE_SIZE + 1)]
+    group = Group.model_validate(
+        {"key": "block", "title": "Block", "items": items, "total": 18_003, "hidden": 7}
+    )
+    assert (len(group.items), group.total, group.hidden) == (GROUP_PAGE_SIZE, 18_003, 7)
+    empty = Group.model_validate(
+        {"key": "scale", "title": "Scale", "items": [], "total": 0, "hidden": 0}
+    )
+    assert empty.model_dump()["items"] == []
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"hidden": 3}, "hidden (3) must not exceed total (2)"),
+        ({"total": 1}, "at most min(total, 100) items, found 2 of total 1"),
+        ({"items": [_item(id=500 + n, rank=n) for n in range(1, 102)], "total": 500}, "found 101"),
+    ],
+)
+def test_group_refuses_counts_that_do_not_cover_its_items(
+    overrides: dict[str, Any], message: str
+) -> None:
+    payload = {
+        "key": "block",
+        "title": "Block",
+        "items": [_item(rank=1), _item(id=502, rank=2)],
+        "total": 2,
+        "hidden": 0,
+        **overrides,
+    }
+    with pytest.raises(ValidationError, match=re.escape(message)):
+        Group.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error_type"),
+    [
+        ({"total": -1}, "greater_than_equal"),
+        ({"hidden": -1}, "greater_than_equal"),
+        ({"total": None}, "int_type"),
+    ],
+)
+def test_group_counts_are_non_negative_integers(overrides: dict[str, Any], error_type: str) -> None:
+    payload = {"key": "block", "title": "Block", "items": [], "total": 0, "hidden": 0, **overrides}
+    with pytest.raises(ValidationError) as error:
+        Group.model_validate(payload)
+    assert _error_types(error) == [error_type]
+    missing = {key: value for key, value in payload.items() if key not in overrides}
+    with pytest.raises(ValidationError) as error:
+        Group.model_validate(missing)
+    assert _error_types(error) == ["missing"]
+
+
+def test_group_items_page_returns_a_slice_of_one_group() -> None:
+    """``GET /recommendations/items``: the slice names its group, counts and offset."""
+    page = GroupItemsPage.model_validate(
+        {
+            "run_id": 7,
+            "section": "keywords",
+            "group": "block",
+            "total": 250,
+            "hidden": 1,
+            "offset": 200,
+            "items": [_item(id=700 + n, rank=201 + n) for n in range(50)],
+        }
+    )
+    dumped = page.model_dump(mode="json")
+    assert set(dumped) == {"run_id", "section", "group", "total", "hidden", "offset", "items"}
+    assert [item["rank"] for item in dumped["items"]] == list(range(201, 251))
+    past = GroupItemsPage.model_validate({**dumped, "offset": 900, "items": []})
+    assert (past.offset, past.items) == (900, [])
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"hidden": 251}, "hidden (251) must not exceed total (250)"),
+        ({"offset": 201}, "items 201..251 exceed total 250"),
+        (
+            {"items": [_item(id=700 + n, rank=1 + n) for n in range(101)], "offset": 0},
+            "a slice holds at most 100 items",
+        ),
+        ({"section": "launch"}, "Input should be 'keywords'"),
+        ({"offset": -1}, "greater than or equal to 0"),
+    ],
+)
+def test_group_items_page_refuses_a_slice_outside_its_group(
+    overrides: dict[str, Any], message: str
+) -> None:
+    payload = {
+        "run_id": 7,
+        "section": "keywords",
+        "group": "block",
+        "total": 250,
+        "hidden": 0,
+        "offset": 200,
+        "items": [_item(id=700 + n, rank=201 + n) for n in range(50)],
+        **overrides,
+    }
+    with pytest.raises(ValidationError, match=re.escape(message)):
+        GroupItemsPage.model_validate(payload)
 
 
 def test_overlay_defaults_absent_source_modes_to_null_and_needs_an_aware_instant() -> None:

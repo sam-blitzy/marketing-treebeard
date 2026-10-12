@@ -37,7 +37,8 @@
  *   the card shows no link. A "Hold" has no B1 and no link.
  * - **C3a and C3b launch ideas**: the gap evidence. A segment gap lists the segment with its
  *   leads, cost per lead and impression share; a keyword-cluster gap lists the head tokens and a
- *   "Cluster member terms" table of each member term's spend and conversions.
+ *   "Cluster member terms" table of each member term's spend and conversions, its rows shown in
+ *   batches of `ROW_BATCH_SIZE` behind a "Show {n} more terms" control (`../batches`).
  *
  * The "Record decision" prefill of C1, C1b and C2 "Scale" is the card's own
  * (`decisionContextFor`), so this section passes no decision context.
@@ -97,6 +98,8 @@ import {
   STATE_LABELS,
 } from '../../decisions/DiscrepancyResolver';
 import type { FeedbackConfirmations } from '../ActionOutcomes';
+import { BatchControl, BatchEntryAnchor, ROW_BATCH_SIZE, useBatches } from '../batches';
+import type { BatchNoun, RemoteEntries } from '../batches';
 import { useLinkedB1Card } from '../B1Cards';
 import type { B1Card } from '../B1Cards';
 import { evidenceRatioDigits } from '../EvidenceTable';
@@ -428,13 +431,25 @@ function segmentField(gap: LaunchGap): FieldItem {
   return { key: 'segment', label: SEGMENT_FIELD_LABEL, value: parts.join(': ') };
 }
 
-/** One row of the cluster member table: a member term and its stable row key. */
+/**
+ * One shown row of the cluster member table: a member term, its stable row key and its row
+ * header's focus target.
+ */
 interface ClusterTermRow {
   /** Unique within the table: the term's position and text. */
   readonly key: string;
   /** The member term with its spend and conversions. */
   readonly term: LaunchGapTerm;
+  /**
+   * The id of the row header's focus target while the table shows rows in batches
+   * (`BatchEntryAnchor`), so focus lands on the row when a reveal shows it first; `null` when
+   * the table is not batched.
+   */
+  readonly focusId: string | null;
 }
+
+/** What a cluster member table counts in its batch control: "Showing 50 of 3,009 terms". */
+const CLUSTER_TERM_NOUN: BatchNoun = Object.freeze({ singular: 'term', plural: 'terms' });
 
 /** Props of {@link ClusterTermsTable}. */
 interface ClusterTermsTableProps {
@@ -448,17 +463,34 @@ interface ClusterTermsTableProps {
  * The "Cluster member terms" table of a C3b card: the term as the row header, then its window
  * spend in the account currency and its conversions, which stay fractional under data-driven
  * attribution (AAP 0.2.4). An absent amount or count renders "unavailable", never 0.
+ *
+ * The table shows `ROW_BATCH_SIZE` rows at a time, in the backend's order, followed by a
+ * "Show {n} more terms" control when the cluster has more (`../batches`), so a cluster of
+ * thousands of terms mounts a bounded table (AAP 0.1.1 Performance). A reveal moves focus to the
+ * first new row's term. A cluster at or under one batch renders exactly as an unbatched table,
+ * with no control and no focus target.
  */
 function ClusterTermsTable({ terms, currency }: ClusterTermsTableProps): ReactElement | null {
+  // The hook runs on every render, before the early return, so its reveal limit survives a
+  // render without terms.
+  const batches = useBatches(terms, { batchSize: ROW_BATCH_SIZE });
   if (terms.length === 0) {
     return null;
   }
-  const rows: ClusterTermRow[] = terms.map((term, index) => ({
+  // The shown terms are the list's first ones, so each row keeps the key its position gives it
+  // in the full table.
+  const rows: ClusterTermRow[] = batches.shown.map((term, index) => ({
     key: `${String(index)}:${term.term}`,
     term,
+    focusId: batches.batched ? batches.entryId(index) : null,
   }));
   const columns: DataTableColumn<ClusterTermRow>[] = [
-    { key: 'term', header: 'Term', isRowHeader: true, render: (row) => row.term.term },
+    {
+      key: 'term',
+      header: 'Term',
+      isRowHeader: true,
+      render: (row) => <BatchEntryAnchor id={row.focusId}>{row.term.term}</BatchEntryAnchor>,
+    },
     {
       key: 'spend',
       header: 'Spend',
@@ -473,12 +505,15 @@ function ClusterTermsTable({ terms, currency }: ClusterTermsTableProps): ReactEl
     },
   ];
   return (
-    <DataTable
-      caption={CLUSTER_TERMS_CAPTION}
-      columns={columns}
-      rows={rows}
-      getRowKey={(row) => row.key}
-    />
+    <>
+      <DataTable
+        caption={CLUSTER_TERMS_CAPTION}
+        columns={columns}
+        rows={rows}
+        getRowKey={(row) => row.key}
+      />
+      <BatchControl batches={batches} noun={CLUSTER_TERM_NOUN} />
+    </>
   );
 }
 
@@ -1050,6 +1085,11 @@ interface DiscrepancyGroupBodyProps {
    * frame read them (`GroupParts.confirmations`).
    */
   confirmations: FeedbackConfirmations;
+  /**
+   * The group's items not loaded yet (`GroupParts.remote`), loaded through the list of its C0
+   * and visible cards; `null` when the page carries the whole group.
+   */
+  remote: RemoteEntries | null;
 }
 
 /**
@@ -1070,9 +1110,10 @@ interface DiscrepancyGroupBodyProps {
  *
  * Each list is a {@link CardList}, bounded like the frame's own: the C0 and visible cards form
  * one list in that order, so a long discrepancy group mounts one batch at a time and still shows
- * every C0 card before any other card. A held card's link to a C0 card not shown yet
- * (`#item-{id}`) reveals it, and a hash naming one of the group's held cards expands the held
- * disclosure ({@link HeldDisclosure} `anchors`).
+ * every C0 card before any other card. That list also loads the group's items beyond the page
+ * (`remote`), whose C0 cards rank after the loaded ones, so the order holds as they arrive. A
+ * held card's link to a C0 card not shown yet (`#item-{id}`) reveals it, and a hash naming one
+ * of the group's held cards expands the held disclosure ({@link HeldDisclosure} `anchors`).
  *
  * The group's C0 cards share one {@link LiveDiscrepancyLookup}: the live discrepancies are read
  * once for the group, and only while it shows a current C0 card naming a discrepancy
@@ -1082,6 +1123,7 @@ function DiscrepancyGroupBody({
   group,
   anchorId,
   confirmations,
+  remote,
 }: DiscrepancyGroupBodyProps): ReactElement {
   const pinned = group.items.filter(
     (item) => item.rule_id === RULE.discrepancy && !isHidden(item),
@@ -1093,8 +1135,13 @@ function DiscrepancyGroupBody({
   const { historical, held } = partitionGroup(others);
   // The lists with the confirmations of the items a feedback recorded on this page has hidden.
   const placed = placeConfirmations(others, confirmations);
-  const cards = (items: readonly Item[]) => (
-    <CardList items={items} renderCard={renderCampaignCard} confirmations={confirmations} />
+  const cards = (items: readonly Item[], rest: RemoteEntries | null = null) => (
+    <CardList
+      items={items}
+      renderCard={renderCampaignCard}
+      confirmations={confirmations}
+      remote={rest}
+    />
   );
   // The pinned C0 cards and the visible cards are one bounded list, so its batches reveal every
   // C0 card before the first other card, however many C0 cards there are. A block emptied by a
@@ -1102,7 +1149,7 @@ function DiscrepancyGroupBody({
   return (
     <LiveDiscrepancyLookup discrepancyIds={currentDiscrepancyIds(pinned)}>
       <Stack>
-        {cards([...pinned, ...placed.visible])}
+        {cards([...pinned, ...placed.visible], remote)}
         <HistoricalItems id={`${anchorId}-historical`} count={historical.length}>
           {cards(placed.historical)}
         </HistoricalItems>
@@ -1135,8 +1182,9 @@ function DiscrepancyGroupBody({
  * once (AAP 0.5.4.2 P1). The group then shows the live count and a link to `/decisions`. Every
  * other empty group is left out, as `SectionFrame` does by default.
  *
- * @param props - see `SectionComponentProps`; `run` is not read, because every window figure
- *   the cards show comes from their own frozen evidence
+ * @param props - see `SectionComponentProps`; of `run` only its id is read, for the further
+ *   items of a group larger than the page (`SectionFrame` `runId`): every window figure the
+ *   cards show comes from their own frozen evidence
  * @returns the section region
  *
  * @example
@@ -1144,11 +1192,12 @@ function DiscrepancyGroupBody({
  * <CampaignsSection section={campaigns} run={page.run} overlay={page.overlay} />
  * ```
  */
-export function CampaignsSection({ section, overlay }: SectionComponentProps): ReactElement {
+export function CampaignsSection({ section, run, overlay }: SectionComponentProps): ReactElement {
   const openNow = liveDiscrepancyCount(overlay);
   return (
     <SectionFrame
       section={section}
+      runId={run.id}
       renderItem={(item) => <CampaignCard item={item} />}
       renderGroup={(group, parts) =>
         group.key === DISCREPANCY_GROUP_KEY ? (
@@ -1156,6 +1205,7 @@ export function CampaignsSection({ section, overlay }: SectionComponentProps): R
             group={group}
             anchorId={parts.anchorId}
             confirmations={parts.confirmations}
+            remote={parts.remote}
           />
         ) : (
           parts.body

@@ -13,7 +13,9 @@
  *   (`current.hidden_by`: dismiss, snooze or done; AAP 0.3.2) is not counted, because the
  *   section counts it under "Not shown" instead of rendering it. A held item still counts: it
  *   renders, collapsed behind "Held until discrepancies are resolved" (AAP 0.5.5). Both rules
- *   come from `SectionFrame`'s own `isHidden`, so the nav and the section never disagree.
+ *   come from `SectionFrame`'s own `groupItemCounts`, so the nav and the section never
+ *   disagree. It counts every stored item of the run, also those beyond the first
+ *   `GROUP_PAGE_SIZE` of a group the page carries, which the section loads as asked.
  * - Every title and key comes from the API (`Section.title`, `Section.key`); the only literal is
  *   the landmark's accessible name.
  * - Built only on the design-system index (AAP 0.4.4): no raw elements, no inline styles and no
@@ -28,7 +30,7 @@ import { SECTION_ORDER } from '../../api/types';
 import type { Section } from '../../api/types';
 import { SideNav } from '../../design-system';
 import type { SideNavItem } from '../../design-system';
-import { isHidden, sectionAnchorId } from './sections/SectionFrame';
+import { groupItemCounts, sectionAnchorId } from './sections/SectionFrame';
 
 /**
  * Accessible name of the section navigation landmark. It tells this `<nav>` apart from the app's
@@ -102,8 +104,11 @@ function sectionLabel(section: Section): string {
 }
 
 /**
- * How many of a section's items the page shows now: every item, in every group, that feedback
- * given since the run does not hide (`current.hidden_by` is `null`; AAP 0.3.2).
+ * How many of a section's items the page shows now: every stored item, in every group, that
+ * feedback given since the run does not hide (`current.hidden_by` is `null`; AAP 0.3.2). The
+ * page carries each group's first `GROUP_PAGE_SIZE` items with `total` and `hidden` counting
+ * every stored one, so a group's share is its `total` less its `hidden`, the loaded items read
+ * live (`groupItemCounts`), exactly what the section's lists count.
  *
  * Held items are counted, because the section renders them collapsed behind its held disclosure
  * rather than leaving them out (AAP 0.5.5).
@@ -120,11 +125,7 @@ function sectionLabel(section: Section): string {
 export function visibleItemCount(section: Section): number {
   let count = 0;
   for (const group of section.groups) {
-    for (const item of group.items) {
-      if (!isHidden(item)) {
-        count += 1;
-      }
-    }
+    count += groupItemCounts(group).shown;
   }
   return count;
 }

@@ -83,6 +83,13 @@ number of items: the active datasets, the effective CRM dataset (and its compani
 source connections, the unresolved discrepancies, the freshness rows, the active feedback and,
 when ``findings`` is not given, the run's tracking findings.
 
+Bounded pages: a page that serves only some of a run's items keeps the run-wide parts exact
+with two set-based helpers, one statement each. :func:`load_check_representatives` loads one
+item per distinct set of dataset-check inputs (a handful per run), which :func:`overlay` takes
+as ``check_items``, so ``stale_datasets``, ``incomplete_datasets`` and the banners still cover
+every stored item. :func:`item_hidden_state` is the SQL form of ``hidden_by`` over every item
+of a run, for counting hidden items per group without loading them.
+
 Database access is read-only: no writes, no flush, no commit; the caller owns the session.
 
 Example::
@@ -110,8 +117,27 @@ from datetime import date, datetime, timedelta
 from types import MappingProxyType
 from typing import Any, Final
 
-from sqlalchemy import ARRAY, ColumnElement, Text, and_, any_, literal, or_, select
+from sqlalchemy import (
+    ARRAY,
+    ColumnElement,
+    SQLColumnExpression,
+    Subquery,
+    Text,
+    and_,
+    any_,
+    case,
+    cast,
+    column,
+    func,
+    literal,
+    null,
+    or_,
+    select,
+    true,
+)
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from ads_engine.analysis.context import (
     ALERT_BANNERS,
@@ -175,8 +201,10 @@ __all__ = [
     "OverlayView",
     "current_dataset_ids",
     "is_current",
+    "item_hidden_state",
     "item_is_current",
     "item_provenance",
+    "load_check_representatives",
     "overlay",
 ]
 
@@ -952,6 +980,84 @@ async def _load_feedback(
     return active
 
 
+def _null_safe_equal(
+    left: SQLColumnExpression[str | None], right: SQLColumnExpression[str | None]
+) -> ColumnElement[bool]:
+    """``left IS NOT DISTINCT FROM right`` for ``text``, written so a hash join can use it.
+
+    Both sides are ``NULL``, or neither is and the values are equal: ``(left IS NULL) =
+    (right IS NULL) AND coalesce(left, '') = coalesce(right, '')``. The ``IS NULL`` equality
+    tells a ``NULL`` from an empty string, so the two forms match exactly the same pairs, but
+    ``IS NOT DISTINCT FROM`` is not hashable and would force a nested loop over every item.
+    """
+    return and_(
+        left.is_(None) == right.is_(None),
+        func.coalesce(left, "") == func.coalesce(right, ""),
+    )
+
+
+def item_hidden_state(run_id: int, now: datetime) -> Subquery:
+    """One row per stored item of a run, saying whether feedback in force at ``now`` hides it.
+
+    The set-based twin of :func:`_load_feedback` and ``ItemOverlayView.hidden_by``, for a read
+    that counts hidden items over a whole run without loading them: an item is hidden exactly
+    when :func:`overlay` gives it a ``hidden_by``. That is, a ``recommendation_feedback`` row
+    on the item's own ``(rule_id, entity_type, entity_id)``, a ``NULL`` key part matching only
+    ``NULL``, has ``until`` after ``now``, and the item is not C0, which is exempt (AAP
+    0.5.4.2). Several rows in force on one key hide the item once.
+
+    The active feedback keys are read once, de-duplicated, and joined to the run's items on
+    hashable equalities (:func:`_null_safe_equal`), so the cost grows with the run's items
+    plus the feedback in force, never with their product.
+
+    Args:
+        run_id: The run whose items to list.
+        now: The read time (tz-aware), as the page's overlay uses it.
+
+    Returns:
+        A subquery with the columns ``id``, ``section``, ``group``, ``rank`` and ``hidden``
+        (``boolean``, never ``NULL``), one row per item of the run, for the caller to window,
+        filter or aggregate in one statement.
+
+    Raises:
+        TypeError: When ``now`` is not a ``datetime``.
+        ValueError: When ``now`` is naive.
+
+    Example::
+
+        state = item_hidden_state(run.id, now)
+        select(state.c.section, state.c["group"], func.count().filter(state.c.hidden))
+    """
+    now = _require_aware(now, "now")
+    feedback = RecommendationFeedback
+    active = (
+        select(feedback.rule_id, feedback.entity_type, feedback.entity_id)
+        .where(feedback.until > now)
+        .distinct()
+        .subquery("active_feedback")
+    )
+    item = Recommendation
+    matches = and_(
+        active.c.rule_id == item.rule_id,
+        item.rule_id != C0,
+        _null_safe_equal(active.c.entity_type, item.entity_type),
+        _null_safe_equal(active.c.entity_id, item.entity_id),
+    )
+    return (
+        select(
+            item.id,
+            item.section,
+            item.group,
+            item.rank,
+            active.c.rule_id.is_not(None).label("hidden"),
+        )
+        .select_from(item)
+        .outerjoin(active, matches)
+        .where(item.run_id == run_id)
+        .subquery("item_hidden_state")
+    )
+
+
 async def _load_tracking_findings(session: AsyncSession, run_id: int) -> tuple[RunFinding, ...]:
     """Read a run's stored ``conversion_tracking_absent`` findings (P2), in write order."""
     result = await session.scalars(
@@ -1429,6 +1535,94 @@ def _item_view(
     return view, checks
 
 
+def _check_input_keys(item: Any, evidence: Any) -> tuple[ColumnElement[Any], ...]:
+    """The SQL value of every stored input :func:`_item_view` judges required datasets from.
+
+    Two items with equal values here get exactly the same checks, so one item per distinct
+    tuple stands for all of them in the page aggregates (:func:`load_check_representatives`):
+
+    * the rule, only for a rule with a frozen lookback (:data:`_RULE_LOOKBACKS`), the one way
+      the rule changes a required range;
+    * ``required_datasets``, in stored order;
+    * ``evidence.provenance``, which decides the CRM scope (LinkedIn-attributed or not);
+    * each lookback's frozen ``evidence.extra.{key}.start`` and each fail-closed length
+      ``evidence.thresholds[{key}]`` (:data:`_LOOKBACK_DAYS_KEYS`).
+
+    JSON values are compared as their ``jsonb`` text, which tells ``3`` from ``3.0`` as the
+    decoded Python values do, where ``jsonb`` equality would not.
+
+    Args:
+        item: The ``recommendation`` entity or alias the statement reads.
+        evidence: The ``(provenance, extra, thresholds)`` columns of its evidence, already
+            extracted once per row.
+    """
+    lookback_rules = sorted(_RULE_LOOKBACKS)
+    extra_keys = sorted({key for keys in _RULE_LOOKBACKS.values() for key in keys.values()})
+    keys: list[ColumnElement[Any]] = [
+        case((item.rule_id.in_(lookback_rules), item.rule_id), else_=null()),
+        item.required_datasets,
+        cast(evidence.provenance, Text),
+    ]
+    keys.extend(cast(evidence.extra[key]["start"], Text) for key in extra_keys)
+    keys.extend(
+        cast(evidence.thresholds[key], Text) for key in sorted(_LOOKBACK_DAYS_KEYS.values())
+    )
+    return tuple(keys)
+
+
+async def load_check_representatives(
+    session: AsyncSession, run_id: int
+) -> tuple[Recommendation, ...]:
+    """Return one stored item of a run per distinct set of dataset-check inputs.
+
+    A page that serves only some of a run's items (``GET /recommendations`` carries a bounded
+    number per group) passes these to :func:`overlay` as ``check_items``, so its page-level
+    ``stale_datasets``, ``incomplete_datasets`` and banners still aggregate the check of every
+    item the run stored, exactly as if every item were served: each item's checks are a
+    function of the inputs :func:`_check_input_keys` lists, so the items sharing them add
+    nothing a representative does not.
+
+    One set-based statement: each item's evidence is read once (``jsonb_to_record``, one
+    decompression per row; a stored value that is not a JSON object, which the runner never
+    writes, reads as one without those keys, as the per-item checks treat it), grouped by
+    those inputs, and the lowest id of each group is loaded. The result is a handful of rows
+    whatever the run's size: one per rule shape and provenance shape the run holds.
+
+    Args:
+        session: The caller's session; only read.
+        run_id: The run whose items to represent.
+
+    Returns:
+        The representatives in id order; empty for a run without items.
+    """
+    rep = aliased(Recommendation, name="check_input")
+    as_object = case(
+        (func.jsonb_typeof(rep.evidence) == "object", rep.evidence),
+        else_=literal({}, JSONB),
+    )
+    evidence = (
+        func.jsonb_to_record(as_object)
+        .table_valued(
+            column("provenance", JSONB),
+            column("extra", JSONB),
+            column("thresholds", JSONB),
+            name="check_evidence",
+        )
+        .render_derived(with_types=True)
+    )
+    lowest = (
+        select(func.min(rep.id))
+        .select_from(rep)
+        .join(evidence, true())
+        .where(rep.run_id == run_id)
+        .group_by(*_check_input_keys(rep, evidence.c))
+    )
+    result = await session.scalars(
+        select(Recommendation).where(Recommendation.id.in_(lowest)).order_by(Recommendation.id)
+    )
+    return tuple(result.all())
+
+
 # ---------------------------------------------------------------------------
 # Banners (AAP 0.5.5 fixed order; built from the run plus the overlay)
 # ---------------------------------------------------------------------------
@@ -1656,6 +1850,7 @@ async def overlay(
     now: datetime,
     *,
     findings: Sequence[RunFinding] | None = None,
+    check_items: Sequence[Recommendation] = (),
     thresholds: Thresholds,
     display_timezone: str,
 ) -> OverlayResult:
@@ -1668,10 +1863,18 @@ async def overlay(
     Args:
         session: The caller's session; only read (no flush, no commit).
         run: The run being shown, default or custom.
-        items: The run's stored items (every one must belong to ``run``).
+        items: The run's stored items the page serves (every one must belong to ``run``);
+            each gets its :class:`ItemOverlayView`.
         now: The read time (tz-aware): feedback in force, staleness and ``computed_at``.
         findings: The run's stored findings, when the caller already loaded them; only the
             ``conversion_tracking_absent`` ones of this run are used. ``None`` reads them.
+        check_items: Further stored items of ``run`` whose required-dataset checks join the
+            page-level ``stale_datasets``, ``incomplete_datasets`` and banners, without a view
+            of their own in :attr:`OverlayResult.items`. A page that serves a bounded slice of
+            the run passes :func:`load_check_representatives`, one item per distinct set of
+            check inputs, so the page-level overlay equals the one computed over every item;
+            an item in both lists counts once. Empty by default: the aggregates then cover
+            ``items`` alone.
         thresholds: Required: the loaded configuration (``sources.stale_after_hours``, and
             ``k1.baseline_days`` for a K1 item whose frozen baseline window is unusable), the
             cached instance the caller already holds, as the API injects
@@ -1693,12 +1896,12 @@ async def overlay(
             :class:`~ads_engine.analysis.thresholds.Thresholds` (``None`` included), or
             ``display_timezone`` is not a string.
         ValueError: When ``now`` is naive, ``display_timezone`` is not a loadable IANA zone,
-            or an item belongs to another run.
+            or an item or check item belongs to another run.
     """
     now = _require_aware(now, "now")
     config = _require_thresholds(thresholds)
     display_zone(display_timezone, "display_timezone")
-    foreign = sorted({item.run_id for item in items if item.run_id != run.id})
+    foreign = sorted({item.run_id for item in (*items, *check_items) if item.run_id != run.id})
     if foreign:
         raise ValueError(f"overlay of run {run.id} was given items of runs {foreign}")
     stale_after = timedelta(hours=config.int("sources.stale_after_hours"))
@@ -1750,6 +1953,21 @@ async def overlay(
             display_timezone=display_timezone,
         )
         views[item.id] = item_view
+        assessments.update(dict.fromkeys(item_checks))
+    # Items the page does not serve still count in its aggregates: their checks join the set,
+    # and their views are dropped. Equal checks collapse, so a representative standing for
+    # many items, or an item also served, adds each check once.
+    for item in check_items:
+        _, item_checks = _item_view(
+            item,
+            live,
+            now=now,
+            stale_after=stale_after,
+            window_start=window_start,
+            window_end=window_end,
+            lookback_days=lookback_days,
+            display_timezone=display_timezone,
+        )
         assessments.update(dict.fromkeys(item_checks))
     run_window = _RequiredRange(window_start, window_end)
     for (dataset_id, name), row in live.freshness.items():

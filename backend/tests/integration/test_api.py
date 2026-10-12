@@ -153,6 +153,9 @@ AAP_ROUTES: Final[frozenset[tuple[str, str]]] = frozenset(
         ("get", "/runs"),
         ("post", "/runs"),
         ("get", "/recommendations"),
+        # The page carries each group's first items; this pages through the rest, so a page
+        # read stays bounded whatever the run's size (AAP 0.1.1: render in under 2 s).
+        ("get", "/recommendations/items"),
         ("post", "/recommendations/{rec_id}/feedback"),
         ("get", "/decisions"),
         ("post", "/decisions"),
@@ -198,6 +201,11 @@ PROTECTED_REQUESTS: Final[tuple[ProtectedRequest, ...]] = (
         "POST", "/runs", "/runs", {"window_start": "2026-09-01", "window_end": "2026-09-14"}
     ),
     ProtectedRequest("GET", "/recommendations", "/recommendations"),
+    ProtectedRequest(
+        "GET",
+        "/recommendations/items",
+        "/recommendations/items?run_id=1&section=keywords&group=block",
+    ),
     ProtectedRequest(
         "POST",
         "/recommendations/{rec_id}/feedback",
@@ -2160,6 +2168,7 @@ HEAD_PARITY_PATHS: Final = (
     "/runs?kind=custom&limit=5",
     "/recommendations",
     "/recommendations?run_id={run_id}",
+    "/recommendations/items?run_id={run_id}&section=keywords&group=block",
     "/decisions",
     "/discrepancies?state=open",
     "/sources",

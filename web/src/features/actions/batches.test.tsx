@@ -16,13 +16,18 @@
  *   target), without scrolling again; a hash naming a shown or unknown entry changes nothing;
  * - table rows are sliced, the control follows the table and focus lands on the row header of
  *   the first new row;
- * - the status is never an `alert`.
+ * - the status is never an `alert`;
+ * - a list with entries not loaded yet (`remote`) counts them in its status and button, loads
+ *   the next ones only when a reveal reaches past the loaded entries, shows the button's loading
+ *   state meanwhile, reveals and focuses the batch once it lands, and on a failed load says so
+ *   in the status, focuses the status and tries again on the next press.
  *
  * The module fetches nothing, so every test renders without providers or a network stub.
  */
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { useState } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Mock } from 'vitest';
 
 import { Button, DataTable } from '../../design-system';
 import type { DataTableColumn } from '../../design-system';
@@ -37,10 +42,11 @@ import {
   GROUP_NOUN,
   ROW_BATCH_SIZE,
   batchStatusText,
+  loadFailedText,
   showMoreLabel,
   useBatches,
 } from './batches';
-import type { BatchNoun } from './batches';
+import type { BatchNoun, RemoteEntries } from './batches';
 
 // ---------------------------------------------------------------------------------------------
 // Builders
@@ -574,5 +580,239 @@ describe('batched tables', () => {
     expect(within(table).getAllByRole('rowheader')).toHaveLength(50);
     expect(table.querySelector('span[id]')).toBeNull();
     expect(screen.queryByRole('status')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Entries not loaded yet
+// ---------------------------------------------------------------------------------------------
+
+/** What a {@link RemoteCardList} exposes, so a test can end the load a reveal started. */
+interface RemoteControl {
+  /** Every `loadMore` call the list made. */
+  readonly loadMore: Mock<() => void>;
+  /** Ends the load in flight with `count` more entries loaded and `gone` fewer stored. */
+  land?: (count: number, gone?: number) => void;
+  /** Ends the load in flight with a failure. */
+  fail?: (failure: Error) => void;
+}
+
+/**
+ * A card list of which `loaded` of `stored` entries are loaded: its `remote` counts the rest,
+ * and each `loadMore` starts a load the test ends through `control`.
+ */
+function RemoteCardList({
+  stored: initialStored,
+  loaded: initialLoaded,
+  control,
+}: {
+  stored: number;
+  loaded: number;
+  control: RemoteControl;
+}) {
+  const [stored, setStored] = useState(initialStored);
+  const [loaded, setLoaded] = useState(initialLoaded);
+  const [loading, setLoading] = useState(false);
+  const [failure, setFailure] = useState<Error | null>(null);
+  control.land = (count, gone = 0) => {
+    setLoaded((previous) => previous + count);
+    setStored((previous) => previous - gone);
+    setLoading(false);
+    setFailure(null);
+  };
+  control.fail = (next) => {
+    setLoading(false);
+    setFailure(next);
+  };
+  const remote: RemoteEntries = {
+    pending: stored - loaded,
+    loading,
+    error: failure === null ? null : failure.message,
+    failure,
+    loadMore: () => {
+      control.loadMore();
+      setLoading(true);
+    },
+  };
+  return (
+    <div data-testid="list">
+      <BatchedList
+        entries={entries(loaded)}
+        batchSize={CARD_BATCH_SIZE}
+        noun={ACTION_NOUN}
+        getKey={(entry) => entry.id}
+        renderEntry={(entry) => (
+          <article
+            id={anchorOf(entry)}
+            aria-label={`Card ${String(entry.id)}`}
+            data-rank={entry.rank}
+          >
+            {`Rank ${String(entry.rank)}`}
+          </article>
+        )}
+        focusIdOf={anchorOf}
+        remote={remote}
+      />
+    </div>
+  );
+}
+
+/** A {@link RemoteControl} with a fresh `loadMore` spy. */
+function remoteControl(): RemoteControl {
+  return { loadMore: vi.fn<() => void>() };
+}
+
+describe('BatchedList with entries not loaded yet', () => {
+  it('counts the entries not loaded in its status and button, and loads nothing on mount', () => {
+    const control = remoteControl();
+    render(<RemoteCardList stored={18003} loaded={20} control={control} />);
+
+    expect(renderedRanks()).toEqual(ranksThrough(20));
+    expect(screen.getByRole('status').textContent).toBe('Showing 20 of 18,003 actions');
+    expect(showMore()?.textContent).toBe('Show 20 more actions');
+    expect(control.loadMore).not.toHaveBeenCalled();
+  });
+
+  it('reveals loaded entries without loading, and loads once a reveal reaches past them', () => {
+    const control = remoteControl();
+    render(<RemoteCardList stored={100} loaded={45} control={control} />);
+
+    fireEvent.click(showMore() as HTMLElement);
+    expect(renderedRanks()).toEqual(ranksThrough(40));
+    expect(control.loadMore).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(screen.getByRole('article', { name: 'Card 21' }));
+
+    // The next batch reaches past the 45 loaded entries: the 5 loaded show, the rest load.
+    fireEvent.click(showMore() as HTMLElement);
+    expect(control.loadMore).toHaveBeenCalledTimes(1);
+    expect(renderedRanks()).toEqual(ranksThrough(45));
+    expect(screen.getByRole('status').textContent).toBe('Showing 45 of 100 actions');
+  });
+
+  it('shows the loading state, then reveals the batch and focuses its first card once it lands', () => {
+    const control = remoteControl();
+    render(<RemoteCardList stored={50} loaded={20} control={control} />);
+    const button = showMore() as HTMLElement;
+    act(() => {
+      button.focus();
+    });
+
+    fireEvent.click(button);
+    expect(control.loadMore).toHaveBeenCalledTimes(1);
+    // Busy, still the same named, focused button; a press does nothing until the load ends.
+    expect(button.getAttribute('aria-busy')).toBe('true');
+    expect(button.getAttribute('aria-disabled')).toBe('true');
+    expect(showMore()).toBe(button);
+    expect(document.activeElement).toBe(button);
+    fireEvent.click(button);
+    expect(control.loadMore).toHaveBeenCalledTimes(1);
+    expect(renderedRanks()).toEqual(ranksThrough(20));
+
+    act(() => {
+      control.land?.(30);
+    });
+
+    expect(renderedRanks()).toEqual(ranksThrough(40));
+    expect(document.activeElement).toBe(screen.getByRole('article', { name: 'Card 21' }));
+    expect(screen.getByRole('status').textContent).toBe('Showing 40 of 50 actions');
+    expect(showMore()?.textContent).toBe('Show 10 more actions');
+    expect(showMore()?.hasAttribute('aria-busy')).toBe(false);
+
+    // The last batch is loaded already: no further load.
+    fireEvent.click(showMore() as HTMLElement);
+    expect(control.loadMore).toHaveBeenCalledTimes(1);
+    expect(renderedRanks()).toEqual(ranksThrough(50));
+    expect(showMore()).toBeNull();
+    expect(screen.getByRole('status').textContent).toBe('Showing all 50 actions');
+  });
+
+  it('says a failed load in the status, focuses it, and tries again on the next press', () => {
+    const control = remoteControl();
+    render(<RemoteCardList stored={50} loaded={20} control={control} />);
+
+    fireEvent.click(showMore() as HTMLElement);
+    act(() => {
+      control.fail?.(new Error('The server could not be reached.'));
+    });
+
+    const status = screen.getByRole('status');
+    expect(status.textContent).toBe(
+      'Showing 20 of 50 actions. Could not load more actions: The server could not be reached.',
+    );
+    expect(document.activeElement).toBe(status);
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(renderedRanks()).toEqual(ranksThrough(20));
+
+    fireEvent.click(showMore() as HTMLElement);
+    expect(control.loadMore).toHaveBeenCalledTimes(2);
+    act(() => {
+      control.land?.(20);
+    });
+    expect(screen.getByRole('status').textContent).toBe('Showing 40 of 50 actions');
+    expect(document.activeElement).toBe(screen.getByRole('article', { name: 'Card 21' }));
+  });
+
+  it('focuses the status when the load brought no entry of this list', () => {
+    const control = remoteControl();
+    render(<RemoteCardList stored={30} loaded={20} control={control} />);
+
+    fireEvent.click(showMore() as HTMLElement);
+    // The load ends the group: its last entries are shown by another list.
+    act(() => {
+      control.land?.(0, 10);
+    });
+
+    expect(document.activeElement).toBe(screen.getByRole('status'));
+    expect(showMore()).toBeNull();
+    expect(screen.getByRole('status').textContent).toBe('Showing all 20 actions');
+  });
+
+  it('shows its control while no entry is loaded yet but some exist', () => {
+    const control = remoteControl();
+    render(<RemoteCardList stored={5} loaded={0} control={control} />);
+
+    expect(screen.queryAllByRole('article')).toHaveLength(0);
+    expect(screen.getByRole('status').textContent).toBe('Showing 0 of 5 actions');
+    fireEvent.click(showMore() as HTMLElement);
+    expect(control.loadMore).toHaveBeenCalledTimes(1);
+    act(() => {
+      control.land?.(5);
+    });
+    expect(renderedRanks()).toEqual(ranksThrough(5));
+    expect(document.activeElement).toBe(screen.getByRole('article', { name: 'Card 1' }));
+  });
+
+  it('reads a pending count that is not a positive whole number as none, keeping its status', () => {
+    const control = remoteControl();
+    const remote: RemoteEntries = {
+      pending: Number.NaN,
+      loading: false,
+      error: null,
+      failure: null,
+      loadMore: control.loadMore,
+    };
+    render(
+      <BatchedList
+        entries={entries(3)}
+        batchSize={CARD_BATCH_SIZE}
+        noun={ACTION_NOUN}
+        getKey={(entry) => entry.id}
+        renderEntry={(entry) => <article aria-label={`Card ${String(entry.id)}`} />}
+        focusIdOf={anchorOf}
+        remote={remote}
+      />,
+    );
+
+    expect(screen.getAllByRole('article')).toHaveLength(3);
+    expect(screen.getByRole('status').textContent).toBe('Showing all 3 actions');
+    expect(showMore()).toBeNull();
+    expect(control.loadMore).not.toHaveBeenCalled();
+  });
+
+  it('words a failed load with the message, or alone when it is blank', () => {
+    expect(loadFailedText(' The server is temporarily unavailable. ', ACTION_NOUN)).toBe(
+      'Could not load more actions: The server is temporarily unavailable.',
+    );
+    expect(loadFailedText('  ', ROW_NOUN)).toBe('Could not load more rows');
   });
 });

@@ -278,9 +278,19 @@ Inside one run (`analysis/runner.py`):
 
 ### Performance targets
 
-- The five sections render from precomputed runs in under 2 s. `GET /api/v1/recommendations`
-  reads stored rows, and the overlay issues at most eight statements per page, whatever the
-  number of items.
+- The five sections render from precomputed runs in under 2 s, whatever the run's size.
+  `GET /api/v1/recommendations` reads stored rows and carries only each group's first
+  `GROUP_PAGE_SIZE` (100) items in rank order, with `total` and `hidden` counting every item
+  the group stores, so the response and the memory serving it stay bounded.
+  `GET /api/v1/recommendations/items?run_id=&section=&group=&offset=&limit=` serves the rest of
+  a group a page of at most 100 at a time, and each section loads them as its "Show more"
+  reaches them, so every stored item stays reachable. The page reads its first items with
+  their counts in one windowed statement, and feeds the overlay's page-level dataset checks one
+  representative row per distinct check input, so its staleness and incompleteness banners
+  equal those of the whole run. The page's statement count is fixed, and the overlay issues at
+  most eight statements per page, whatever the number of items:
+  `tests/integration/test_api_recommendations_queries.py` reads a 20,000-item run with the same
+  statements as a small run, in under 3 MB and under 2 s.
 - A custom-window run of up to `window.max_days` (default 180) on a typical account computes in
   under 30 s, because aggregation runs as SQL group-bys and statistics run on small aggregated
   vectors, never on raw rows.

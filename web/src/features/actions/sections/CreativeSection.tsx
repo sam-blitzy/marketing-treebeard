@@ -422,7 +422,8 @@ function renderCampaignBlock(group: Group, parts: GroupParts): ReactElement {
  * skipped. A block whose title repeats the section's (a campaign named "Copy/creative changes")
  * has no `<h3>` ({@link groupRepeatsSectionTitle}), so its cards render at level 3 instead.
  *
- * @param props - see {@link SectionComponentProps}; only `section` is read
+ * @param props - see {@link SectionComponentProps}; `section` is read, and `run.id` for the
+ *   further items of a block larger than the page (`SectionFrame` `runId`)
  * @returns the section region
  *
  * @example
@@ -430,10 +431,11 @@ function renderCampaignBlock(group: Group, parts: GroupParts): ReactElement {
  * <CreativeSection section={creativeSection} run={run} overlay={overlay} />
  * ```
  */
-export function CreativeSection({ section }: SectionComponentProps): ReactElement {
+export function CreativeSection({ section, run }: SectionComponentProps): ReactElement {
   return (
     <SectionFrame
       section={section}
+      runId={run.id}
       renderItem={(item, group) => (
         <RecommendationCard
           item={item}

@@ -41,7 +41,20 @@
  *   the page mounted with after the global banners (the open-discrepancies banner first) and
  *   before the section navigation and the sections, for the page's own read, the source chips,
  *   the discrepancy list and the configuration alike, cleared by the next successful read; a
- *   failure never carries over to another run.
+ *   failure never carries over to another run. The warning's Retry reads again only the failed
+ *   reads, shows as loading while they run and returns focus to itself when they fail again.
+ * - **Polling after a failure.** A server error (500, nginx's 502, 503) stops the polling of a
+ *   page addressed by run id, on the failure screen and on a loaded page alike, for two poll
+ *   intervals and more; a successful Retry, the failure screen's or the warning's, reads the
+ *   page again and its polling resumes. The default page polls on through a server error: its
+ *   failure screen fills in by itself, and its warning clears by itself, on the first poll after
+ *   the API answers again. A 429 keeps polling, and "No analysis run yet" polls every
+ *   `FIRST_RUN_POLL_MS` until the first run fills the page in.
+ * - **Cards loaded beyond the page.** A failed poll of the Keywords "Block" cards loaded from
+ *   offset 100 keeps them on screen under the page's one "Actions could not be refreshed"
+ *   warning, with no failure in the list's own status, and the warning's Retry reads that load
+ *   again, once, from offset 100, clearing it; a failed next-page load is stated by the list
+ *   alone, with no warning.
  * - **Polls.** A poll in flight, a poll that returns the same page and one whose overlay differs
  *   only in `computed_at` render no section again, even when the overlay's dataset lists arrive
  *   as new arrays equal in value; a changed overlay field, dataset list or item still reaches
@@ -60,9 +73,14 @@ import { Profiler } from 'react';
 import type { ReactElement } from 'react';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 
-import { DEFAULT_DISCREPANCY_STATES, queryKeys } from '../../api/queries';
+import {
+  CURRENT_STATE_POLL_MS,
+  DEFAULT_DISCREPANCY_STATES,
+  FIRST_RUN_POLL_MS,
+  queryKeys,
+} from '../../api/queries';
 import { SECTION_ORDER } from '../../api/types';
-import type { RecommendationsPage, Run, SectionKey } from '../../api/types';
+import type { Item, RecommendationsPage, Run, SectionKey } from '../../api/types';
 import {
   CUSTOM_RUN_ID,
   DEFAULT_RUN_ID,
@@ -76,6 +94,7 @@ import {
   makeEvidence,
   makeFeedback,
   makeItem,
+  makeItemOverlay,
   makeOverlay,
   makeRecommendationsPage,
   makeRun,
@@ -85,6 +104,7 @@ import {
 import { feedbackConfirmationText, feedbackFlow } from '../../test/feedbackFlow';
 import { createTestQueryClient, renderWithProviders } from '../../test/render';
 import { byTextContent } from '../../test/text';
+import { LARGE_RENDER_TEST_TIMEOUT_MS } from '../../test/timeouts';
 import * as statusBarModule from '../status/StatusBar';
 import { ActionsPage, SECTION_COMPONENTS } from './ActionsPage';
 import * as sectionFrameModule from './sections/SectionFrame';
@@ -334,6 +354,25 @@ function refreshRegion(): HTMLElement {
 
 /** The title of the warning a failed refresh of the loaded page's reads shows. */
 const REFRESH_TITLE = 'Actions could not be refreshed';
+
+/** The accessible name of that warning's "Retry" button, whose visible label is "Retry". */
+const REFRESH_RETRY_NAME = 'Retry refreshing actions';
+
+/**
+ * The warning's "Retry" button, inside the refresh region.
+ *
+ * @returns the button, labelled "Retry" on screen
+ */
+function refreshRetryButton(): HTMLElement {
+  const button = within(refreshRegion()).getByRole('button', { name: REFRESH_RETRY_NAME });
+  expect(button.textContent).toBe('Retry');
+  return button;
+}
+
+/** The paths of the requests sent after the first `count`, as `METHOD /path`, in order. */
+function requestsAfter(api: ApiMock, count: number): string[] {
+  return api.calls.slice(count).map((call) => `${call.method} ${call.path}`);
+}
 
 /**
  * The reads of the loaded page besides its own whose failed refresh it states: a name for the
@@ -695,6 +734,100 @@ describe('ActionsPage', () => {
         });
       },
     );
+
+    it.each(OTHER_REFRESHED_READS)(
+      "reads only %s again from the warning's Retry, which clears the warning",
+      async (_name, route, queryKey, answer) => {
+        const { api, queryClient } = await renderPage(defaultHandlers());
+        await loadedPage();
+        await waitFor(() => {
+          expect(queryClient.getQueryData(queryKey)).toBeDefined();
+        });
+        api.use({ [route]: html(502, '<html><body>502 Bad Gateway</body></html>') });
+        await act(async () => {
+          await queryClient.refetchQueries({ queryKey, exact: true });
+        });
+        await within(refreshRegion()).findByText(REFRESH_TITLE);
+
+        api.use({ [route]: answer() });
+        const before = api.calls.length;
+        fireEvent.click(refreshRetryButton());
+        await waitFor(() => {
+          expect(refreshRegion().childNodes).toHaveLength(0);
+        });
+        expect(requestsAfter(api, before)).toEqual([route]);
+        expect(sectionHeadings()).toEqual(SECTION_TITLES);
+      },
+    );
+
+    it("keeps the warning while its Retry reads the page again, and returns focus to Retry when it fails again", async () => {
+      const { api, queryClient } = await renderPage(defaultHandlers());
+      await loadedPage();
+      api.use({
+        'GET /recommendations': apiError(503, 'database_unavailable', 'The API is restarting'),
+      });
+      await act(async () => {
+        await queryClient.refetchQueries({ queryKey: queryKeys.recommendationsAll });
+      });
+      const region = refreshRegion();
+      await within(region).findByText(REFRESH_TITLE);
+      const retry = refreshRetryButton();
+      expect(retry.hasAttribute('disabled')).toBe(false);
+      // A polite warning, never an alert: the discrepancy banner stays the page's only alert.
+      expect(within(region).queryByRole('alert')).toBeNull();
+      expect(screen.getAllByRole('alert')).toHaveLength(1);
+
+      // The Retry is busy while its read runs, and the warning and the cards stay.
+      const pending = gated();
+      api.use({ 'GET /recommendations': pending.handler });
+      const before = api.calls.length;
+      act(() => {
+        retry.focus();
+      });
+      fireEvent.click(retry);
+      await waitFor(() => {
+        expect(pending.gate.release).toBeDefined();
+      });
+      expect(retry.getAttribute('aria-busy')).toBe('true');
+      expect(retry.getAttribute('aria-disabled')).toBe('true');
+      expect(retry.hasAttribute('disabled')).toBe(false);
+      expect(document.activeElement).toBe(retry);
+      expect(within(region).getByText(REFRESH_TITLE)).toBeTruthy();
+      expect(sectionHeadings()).toEqual(SECTION_TITLES);
+      // Focus lost to the page body meanwhile goes back to Retry once the read settles.
+      const title = screen.getByRole('heading', { level: 1, name: 'Actions' });
+      title.tabIndex = -1;
+      act(() => {
+        title.focus();
+        title.blur();
+      });
+      expect(document.activeElement).toBe(document.body);
+      pending.gate.release?.(
+        apiError(503, 'database_unavailable', 'The API is still restarting'),
+      );
+
+      await within(region).findByText(
+        'The API is still restarting. Showing the last loaded state.',
+      );
+      await waitFor(() => {
+        expect(retry.getAttribute('aria-disabled')).toBeNull();
+      });
+      expect(refreshRetryButton()).toBe(retry);
+      await waitFor(() => {
+        expect(document.activeElement).toBe(retry);
+      });
+      // Only the failed read was sent again; the current ones were left alone.
+      expect(requestsAfter(api, before)).toEqual(['GET /recommendations']);
+
+      // A Retry that succeeds clears the warning.
+      api.use({ 'GET /recommendations': json(200, makeRecommendationsPage()) });
+      fireEvent.click(retry);
+      await waitFor(() => {
+        expect(refreshRegion().childNodes).toHaveLength(0);
+      });
+      expect(recommendationReads(api)).toHaveLength(4);
+      expect(sectionHeadings()).toEqual(SECTION_TITLES);
+    });
 
     it('holds an empty polite outcome region between the navigation and the sections', async () => {
       await renderPage(defaultHandlers());
@@ -1175,6 +1308,489 @@ describe('ActionsPage', () => {
 });
 
 // ---------------------------------------------------------------------------------------------
+// Polling after a failure
+// ---------------------------------------------------------------------------------------------
+
+describe('ActionsPage polling after a failure', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /**
+   * Fakes the interval timers, which drive TanStack Query's polls (`refetchInterval`), so
+   * `vi.advanceTimersByTimeAsync` moves the page through its poll intervals; real time still
+   * advances them too (`shouldAdvanceTime`).
+   *
+   * Every other timer stays real. TanStack Query delivers each settled read to its components
+   * from a zero-delay `setTimeout`, and Testing Library's `waitFor` ends on one. Faked, both
+   * would run in one auto-advance tick, so React would render the delivered read only after
+   * `waitFor` had ended, outside `act`, where the Campaigns section's discrepancy lookup, which
+   * sets state from a layout effect, warns. Real, each runs in its own task, as in the page's
+   * other tests.
+   */
+  function fakePollTimers(): void {
+    vi.useFakeTimers({ shouldAdvanceTime: true, toFake: ['setInterval', 'clearInterval'] });
+  }
+
+  /** The flush rounds {@link settleReads} runs before it fails the test as one that never settles. */
+  const SETTLE_MAX_ROUNDS = 10;
+
+  /**
+   * Resolves once the page is quiescent: no read of `queryClient` is in flight, and the observer
+   * notifications of every finished read, with the renders and effects they cause, have run
+   * inside `act`, so no response lands after the test has ended.
+   *
+   * Each round waits until no read is in flight, then lets one zero-delay timer turn pass inside
+   * `act`: TanStack Query queues each notification on such a timer as a read settles, and timers
+   * of equal delay run in creation order. A round in which the query cache emitted an event, or
+   * after which a read is in flight, is followed by another; the first with neither ends the wait.
+   *
+   * @param queryClient - The client of the render, as `renderPage` resolves it.
+   * @throws Error when the cache still changed, or a read was in flight, after the last round.
+   */
+  async function settleReads(queryClient: QueryClient): Promise<void> {
+    let cacheEvents = 0;
+    const unsubscribe = queryClient.getQueryCache().subscribe(() => {
+      cacheEvents += 1;
+    });
+    try {
+      for (let round = 0; round < SETTLE_MAX_ROUNDS; round += 1) {
+        await waitFor(() => {
+          expect(queryClient.isFetching()).toBe(0);
+        });
+        const cacheEventsBefore = cacheEvents;
+        await act(async () => {
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, 0);
+          });
+        });
+        if (cacheEvents === cacheEventsBefore && queryClient.isFetching() === 0) {
+          return;
+        }
+      }
+      throw new Error(`the page did not settle within ${String(SETTLE_MAX_ROUNDS)} rounds`);
+    } finally {
+      unsubscribe();
+    }
+  }
+
+  /**
+   * The server errors: the API's own 500 and 503, and nginx's JSON 502 while the API is down, as
+   * when serving a run exhausted the API's memory. After one a page addressed by run id stops
+   * polling, while the default page polls on and recovers by itself.
+   */
+  const SERVER_ERRORS: readonly (readonly [string, MockResponse])[] = [
+    ['a 500', apiError(500, 'internal_error', 'An unexpected error occurred.')],
+    [
+      "nginx's 502",
+      apiError(
+        502,
+        'upstream_unavailable',
+        'The server is temporarily unavailable. Try again shortly.',
+      ),
+    ],
+    ['a 503', apiError(503, 'database_unavailable', 'Database unavailable')],
+  ];
+
+  /** The handler key of the custom run's own read, `GET /recommendations?run_id=202`. */
+  const CUSTOM_PAGE_READ = `GET /recommendations?run_id=${String(CUSTOM_RUN_ID)}`;
+
+  /** The path that addresses the custom run, `/actions?run=202`. */
+  const CUSTOM_PAGE_PATH = `/actions?run=${String(CUSTOM_RUN_ID)}`;
+
+  /** The `run_id` each `GET /recommendations` sent so far carried, `null` for none. */
+  function readRunIds(api: ApiMock): (string | null)[] {
+    return recommendationReads(api).map((call) => call.search.get('run_id'));
+  }
+
+  it.each(SERVER_ERRORS)(
+    'reads a page addressed by run id no more after %s on its first read, until Retry reads it and polling resumes',
+    async (_label, response) => {
+      fakePollTimers();
+      // An addressed run also reads the latest default run before its page answers.
+      const { api, queryClient } = await renderPage(
+        {
+          [CUSTOM_PAGE_READ]: response,
+          ...prefetchedReads(),
+          'GET /runs/latest': json(200, makeRun()),
+        },
+        CUSTOM_PAGE_PATH,
+      );
+      await screen.findByText('Actions could not be loaded');
+      await settleReads(queryClient);
+      expect(recommendationReads(api)).toHaveLength(1);
+
+      await act(() => vi.advanceTimersByTimeAsync(2 * CURRENT_STATE_POLL_MS));
+      expect(recommendationReads(api)).toHaveLength(1);
+      expect(screen.getByText('Actions could not be loaded')).toBeTruthy();
+
+      api.use({ ...pageReads(), [CUSTOM_PAGE_READ]: json(200, customPage()) });
+      fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+      await loadedPage();
+      await settleReads(queryClient);
+      expect(recommendationReads(api)).toHaveLength(2);
+      expect(document.getElementById('banner-custom-window')).not.toBeNull();
+
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      await waitFor(() => {
+        expect(recommendationReads(api)).toHaveLength(3);
+      });
+      await settleReads(queryClient);
+      expect(readRunIds(api)).toEqual(Array.from({ length: 3 }, () => String(CUSTOM_RUN_ID)));
+    },
+  );
+
+  it.each(SERVER_ERRORS)(
+    "stops polling a loaded page addressed by run id after %s, until the warning's Retry reads it and polling resumes",
+    async (_label, response) => {
+      fakePollTimers();
+      const { api, queryClient } = await renderPage(
+        defaultHandlers({ [CUSTOM_PAGE_READ]: json(200, customPage()) }),
+        CUSTOM_PAGE_PATH,
+      );
+      await loadedPage();
+      await settleReads(queryClient);
+      expect(recommendationReads(api)).toHaveLength(1);
+
+      api.use({ [CUSTOM_PAGE_READ]: response });
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      await within(refreshRegion()).findByText(REFRESH_TITLE);
+      await settleReads(queryClient);
+      expect(recommendationReads(api)).toHaveLength(2);
+
+      await act(() => vi.advanceTimersByTimeAsync(2 * CURRENT_STATE_POLL_MS));
+      await settleReads(queryClient);
+      expect(recommendationReads(api)).toHaveLength(2);
+      expect(sectionHeadings()).toEqual(SECTION_TITLES);
+      expect(within(refreshRegion()).getByText(REFRESH_TITLE)).toBeTruthy();
+
+      api.use({ [CUSTOM_PAGE_READ]: json(200, customPage()) });
+      fireEvent.click(refreshRetryButton());
+      await waitFor(() => {
+        expect(refreshRegion().childNodes).toHaveLength(0);
+      });
+      await settleReads(queryClient);
+      expect(recommendationReads(api)).toHaveLength(3);
+
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      await waitFor(() => {
+        expect(recommendationReads(api)).toHaveLength(4);
+      });
+      await settleReads(queryClient);
+      expect(readRunIds(api)).toEqual(Array.from({ length: 4 }, () => String(CUSTOM_RUN_ID)));
+    },
+  );
+
+  it.each(SERVER_ERRORS)(
+    'keeps reading the default page after %s on its first read, and its failure screen recovers by itself on the next poll',
+    async (_label, response) => {
+      fakePollTimers();
+      const { api, queryClient } = await renderPage({
+        'GET /recommendations': response,
+        ...prefetchedReads(),
+      });
+      await screen.findByText('Actions could not be loaded');
+      await settleReads(queryClient);
+      expect(recommendationReads(api)).toHaveLength(1);
+
+      // The outage outlasts the first poll: the failure screen stays, never "Loading actions".
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      await waitFor(() => {
+        expect(recommendationReads(api)).toHaveLength(2);
+      });
+      await settleReads(queryClient);
+      expect(screen.getByText('Actions could not be loaded')).toBeTruthy();
+      expect(screen.queryByText('Loading actions')).toBeNull();
+
+      // The API answers again. Nobody presses Retry: the next poll fills the page in.
+      api.use({ ...pageReads(), 'GET /recommendations': json(200, makeRecommendationsPage()) });
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      await loadedPage();
+      await settleReads(queryClient);
+      expect(screen.queryByText('Actions could not be loaded')).toBeNull();
+      expect(sectionHeadings()).toEqual(SECTION_TITLES);
+      expect(recommendationReads(api)).toHaveLength(3);
+      expect(readRunIds(api)).toEqual([null, null, null]);
+    },
+  );
+
+  it.each(SERVER_ERRORS)(
+    'keeps polling the loaded default page after %s, and clears the warning by itself on the next successful poll',
+    async (_label, response) => {
+      fakePollTimers();
+      const { api, queryClient } = await renderPage(defaultHandlers());
+      await loadedPage();
+      await settleReads(queryClient);
+      expect(recommendationReads(api)).toHaveLength(1);
+
+      api.use({ 'GET /recommendations': response });
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      await within(refreshRegion()).findByText(REFRESH_TITLE);
+      await settleReads(queryClient);
+      expect(recommendationReads(api)).toHaveLength(2);
+      expect(sectionHeadings()).toEqual(SECTION_TITLES);
+
+      // Nobody presses the warning's Retry: the next poll reads the page and clears it.
+      api.use({ 'GET /recommendations': json(200, makeRecommendationsPage()) });
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      await waitFor(() => {
+        expect(refreshRegion().childNodes).toHaveLength(0);
+      });
+      await settleReads(queryClient);
+      expect(recommendationReads(api)).toHaveLength(3);
+      expect(sectionHeadings()).toEqual(SECTION_TITLES);
+      expect(readRunIds(api)).toEqual([null, null, null]);
+    },
+  );
+
+  it('keeps polling the loaded page through a 429, and clears the warning by itself', async () => {
+    fakePollTimers();
+    const { api, queryClient } = await renderPage(defaultHandlers());
+    await loadedPage();
+    await settleReads(queryClient);
+
+    api.use({ 'GET /recommendations': apiError(429, 'rate_limited', 'Too many requests.') });
+    await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+    await within(refreshRegion()).findByText(REFRESH_TITLE);
+    await settleReads(queryClient);
+    expect(recommendationReads(api)).toHaveLength(2);
+
+    api.use({ 'GET /recommendations': json(200, makeRecommendationsPage()) });
+    await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+    await waitFor(() => {
+      expect(refreshRegion().childNodes).toHaveLength(0);
+    });
+    expect(recommendationReads(api)).toHaveLength(3);
+    await settleReads(queryClient);
+  });
+
+  it('polls "No analysis run yet" every FIRST_RUN_POLL_MS until the first run fills the page in', async () => {
+    fakePollTimers();
+    const { api, queryClient } = await renderPage({
+      'GET /recommendations': apiError(404, 'not_found', 'No default analysis run has succeeded yet'),
+      ...prefetchedReads(),
+    });
+    await screen.findByText('No analysis run yet');
+    await settleReads(queryClient);
+    expect(recommendationReads(api)).toHaveLength(1);
+
+    // FIRST_RUN_POLL_MS is half of CURRENT_STATE_POLL_MS, so this read comes from the first-run
+    // cadence.
+    await act(() => vi.advanceTimersByTimeAsync(FIRST_RUN_POLL_MS));
+    await waitFor(() => {
+      expect(recommendationReads(api)).toHaveLength(2);
+    });
+    await settleReads(queryClient);
+    expect(screen.getByText('No analysis run yet')).toBeTruthy();
+
+    api.use({ ...pageReads(), 'GET /recommendations': json(200, makeRecommendationsPage()) });
+    await act(() => vi.advanceTimersByTimeAsync(FIRST_RUN_POLL_MS));
+    await loadedPage();
+    expect(recommendationReads(api)).toHaveLength(3);
+    await settleReads(queryClient);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// A group's cards loaded beyond the page
+// ---------------------------------------------------------------------------------------------
+
+describe("ActionsPage: a group's cards loaded beyond the page", () => {
+  /** How many Keywords "Block" cards the run stores; the page carries the first 100. */
+  const STORED_BLOCK = 220;
+
+  /** The id of the first stored "Block" card, outside `FIXTURE_ITEM_IDS`. */
+  const FIRST_BLOCK_ID = 9001;
+
+  /** The message of nginx's 502 while the API restarts. */
+  const OUTAGE_MESSAGE = 'The server is temporarily unavailable. Try again shortly.';
+
+  /** The stored "Block" cards, ids {@link FIRST_BLOCK_ID} on, in rank order, none hidden. */
+  function storedBlock(): Item[] {
+    const base = makeItem();
+    return Array.from({ length: STORED_BLOCK }, (_, index) => {
+      const id = FIRST_BLOCK_ID + index;
+      return makeItem({
+        id,
+        rank: index + 1,
+        action: `Add "term ${String(id)}" as exact-match negative`,
+        entity: { ...base.entity, id: `term ${String(id)}`, name: `term ${String(id)}` },
+        current: makeItemOverlay(),
+      });
+    });
+  }
+
+  /** The default page, its Keywords "Block" group carrying the first 100 of `stored`. */
+  function pageWithBlock(stored: readonly Item[]): RecommendationsPage {
+    const page = makeRecommendationsPage();
+    page.sections = page.sections.map((section) =>
+      section.key !== 'keywords'
+        ? section
+        : {
+            ...section,
+            groups: section.groups.map((group) =>
+              group.key !== 'block'
+                ? group
+                : { ...group, items: stored.slice(0, 100), total: stored.length, hidden: 0 },
+            ),
+          },
+    );
+    return page;
+  }
+
+  /**
+   * Answers `GET /recommendations/items` from `stored` as the API slices it, or with nginx's 502
+   * while `outage.down` holds; it reads `outage` at each request.
+   */
+  function serveBlock(
+    stored: readonly Item[],
+    outage: { down: boolean },
+  ): (call: RecordedCall) => MockResponse {
+    return (call) => {
+      if (outage.down) {
+        return apiError(502, 'upstream_unavailable', OUTAGE_MESSAGE);
+      }
+      const offset = Number(call.search.get('offset'));
+      const limit = Number(call.search.get('limit'));
+      return json(200, {
+        run_id: DEFAULT_RUN_ID,
+        section: 'keywords',
+        group: 'block',
+        total: stored.length,
+        hidden: 0,
+        offset,
+        items: stored.slice(offset, offset + limit),
+      });
+    };
+  }
+
+  /** Renders the default page with {@link STORED_BLOCK} "Block" cards, served by `outage`. */
+  async function renderBlockPage(outage: { down: boolean }) {
+    const stored = storedBlock();
+    return renderPage(
+      defaultHandlers({
+        'GET /recommendations': json(200, pageWithBlock(stored)),
+        'GET /recommendations/items': serveBlock(stored, outage),
+      }),
+    );
+  }
+
+  /** The Keywords section. */
+  function keywordsRegion(): HTMLElement {
+    return screen.getByRole('region', { name: 'Keywords to adjust' });
+  }
+
+  /** Presses the "Block" list's "Show 20 more actions" `times` times. */
+  function showMoreBlock(times: number): void {
+    for (let press = 0; press < times; press += 1) {
+      fireEvent.click(within(keywordsRegion()).getByRole('button', { name: 'Show 20 more actions' }));
+    }
+  }
+
+  /** The card of the stored "Block" item `id`, or `null` while it is not on screen. */
+  function blockCard(id: number): HTMLElement | null {
+    return within(keywordsRegion()).queryByRole('article', {
+      name: `Add "term ${String(id)}" as exact-match negative`,
+    });
+  }
+
+  /** The offsets of the `GET /recommendations/items` reads after the first `count` requests. */
+  function itemOffsets(api: ApiMock, count: number): (string | null)[] {
+    return api.calls
+      .slice(count)
+      .filter((call) => call.path === '/recommendations/items')
+      .map((call) => call.search.get('offset'));
+  }
+
+  /** The text of the "Block" list's status, which reads "Showing …". */
+  function blockStatusText(): string {
+    const status = within(keywordsRegion())
+      .getAllByRole('status')
+      .find((region) => region.textContent.startsWith('Showing '));
+    return status?.textContent ?? '';
+  }
+
+  it(
+    "warns once a refresh of the cards loaded beyond the page fails, and its Retry reads that load again from offset 100",
+    async () => {
+      const outage = { down: false };
+      const { api, queryClient } = await renderBlockPage(outage);
+      await loadedPage();
+      // Four presses reveal the page's own 100 cards; the fifth loads the next 100 from 100.
+      showMoreBlock(5);
+      await waitFor(() => {
+        expect(blockCard(FIRST_BLOCK_ID + 100)).not.toBeNull();
+      });
+      expect(itemOffsets(api, 0)).toEqual(['100']);
+      expect(refreshRegion().childNodes).toHaveLength(0);
+
+      // A poll of the loaded cards fails: they stay on screen under the page's one warning, and
+      // the list states no failure of its own.
+      outage.down = true;
+      await act(async () => {
+        await queryClient.refetchQueries({
+          queryKey: queryKeys.groupItems(DEFAULT_RUN_ID, 'keywords', 'block'),
+          exact: true,
+        });
+      });
+      const region = refreshRegion();
+      await within(region).findByText(REFRESH_TITLE);
+      expect(
+        within(region).getByText(`${OUTAGE_MESSAGE} Showing the last loaded state.`),
+      ).toBeTruthy();
+      expect(screen.getAllByText(REFRESH_TITLE)).toHaveLength(1);
+      expect(blockCard(FIRST_BLOCK_ID + 100)).not.toBeNull();
+      expect(blockStatusText()).toBe('Showing 120 of 220 actions');
+      expect(within(region).queryByRole('alert')).toBeNull();
+
+      // Retry reads the group's one load again, from its first offset, and the warning leaves.
+      outage.down = false;
+      const before = api.calls.length;
+      fireEvent.click(refreshRetryButton());
+      await waitFor(() => {
+        expect(refreshRegion().childNodes).toHaveLength(0);
+      });
+      expect(requestsAfter(api, before)).toEqual(['GET /recommendations/items']);
+      expect(itemOffsets(api, before)).toEqual(['100']);
+      expect(blockCard(FIRST_BLOCK_ID + 100)).not.toBeNull();
+    },
+    LARGE_RENDER_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    'leaves a failed next-page load to the list, which states it, with no refresh warning',
+    async () => {
+      const outage = { down: false };
+      const { api } = await renderBlockPage(outage);
+      await loadedPage();
+      showMoreBlock(5);
+      await waitFor(() => {
+        expect(blockCard(FIRST_BLOCK_ID + 100)).not.toBeNull();
+      });
+      // Reveal the loaded cards through the 200th, then ask for the next page during an outage.
+      showMoreBlock(4);
+      await waitFor(() => {
+        expect(blockCard(FIRST_BLOCK_ID + 199)).not.toBeNull();
+      });
+      outage.down = true;
+      showMoreBlock(1);
+
+      await waitFor(() => {
+        expect(blockStatusText()).toBe(
+          `Showing 200 of 220 actions. Could not load more actions: ${OUTAGE_MESSAGE}`,
+        );
+      });
+      expect(itemOffsets(api, 0)).toEqual(['100', '200']);
+      expect(refreshRegion().childNodes).toHaveLength(0);
+      expect(screen.queryByText(REFRESH_TITLE)).toBeNull();
+    },
+    LARGE_RENDER_TEST_TIMEOUT_MS,
+  );
+});
+
+
+
+// ---------------------------------------------------------------------------------------------
 // Polls: what renders again
 // ---------------------------------------------------------------------------------------------
 
@@ -1300,7 +1916,7 @@ describe('ActionsPage polls', () => {
         : {
             ...section,
             groups: section.groups.map((group) =>
-              group.key === 'discrepancies' ? { ...group, items: [] } : group,
+              group.key === 'discrepancies' ? { ...group, items: [], total: 0, hidden: 0 } : group,
             ),
           },
     );

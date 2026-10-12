@@ -110,7 +110,11 @@ function textOrNull(value: unknown): string | null {
   return trimmed === '' ? null : trimmed;
 }
 
-/** Every item of every group of `sections`, in API order. */
+/**
+ * Every item of every group of `sections` the page carries, in API order. A C0 item beyond a
+ * group's first `GROUP_PAGE_SIZE`, which its section loads only as asked, is not among them, so
+ * a held card it blocks links `/decisions#discrepancy-{id}`, never an anchor not rendered.
+ */
 function itemsOf(sections: readonly Section[]): Item[] {
   return sections.flatMap((section) => section.groups.flatMap((group) => group.items));
 }

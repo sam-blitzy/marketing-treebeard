@@ -943,16 +943,22 @@ export function makeItem(overrides: Partial<Item> = {}): Item {
 }
 
 /**
- * An empty Keywords "Block" group (`analysis.context.GROUP_TITLES`).
+ * An empty Keywords "Block" group (`analysis.context.GROUP_TITLES`). Unless overridden, the
+ * page carries the whole group: `total` is its items' count and `hidden` how many of them
+ * feedback hides (`current.hidden_by` set), as the API counts them.
  *
- * @param overrides - fields to replace, typically `key`, `title` and `items`
+ * @param overrides - fields to replace, typically `key`, `title` and `items`; `total` and
+ *   `hidden` for a group larger than the page
  * @returns a fresh `Group`
  */
 export function makeGroup(overrides: Partial<Group> = {}): Group {
+  const items = overrides.items ?? [];
   const base = {
     key: 'block',
     title: 'Block / negative-keyword candidates',
-    items: [],
+    items,
+    total: items.length,
+    hidden: items.filter((item) => item.current.hidden_by != null).length,
   } satisfies Group;
   return { ...base, ...overrides };
 }

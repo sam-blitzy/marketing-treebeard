@@ -35,20 +35,29 @@
  *   run and the live overlay (holds, discrepancy count, source modes, freshness, feedback and
  *   historical marking) appear without a reload or a refocus. Without a run id they poll
  *   every {@link FIRST_RUN_POLL_MS} instead while no default run has succeeded yet, so the
- *   first-start screen fills in by itself. A transient failure keeps polling; an expired
- *   session (401) or any other error stops it. {@link useDecisions}, {@link useDiscrepancies}
- *   and {@link useDiscrepancyPages} refetch every {@link CURRENT_STATE_POLL_MS} with the same
- *   error rule, because the worker writes baseline decisions and opens and auto-resolves
- *   discrepancies on its own schedule; the paged list refetches only the pages already
- *   loaded. {@link useSources} polls every {@link SOURCES_POLL_MS}. {@link useConfig} polls
- *   every {@link CURRENT_STATE_POLL_MS} only after a transient failure, and {@link useMe}
- *   only while its last read failed with anything but a 401, each until a read succeeds, so a
- *   screen that an outage left without them recovers by itself. Polling runs only while
- *   the page is visible and stops when the last component using the query unmounts. A
- *   prefetch ({@link usePrefetchActionsReads}, and {@link useCreateRun}'s read of the page of
- *   the run it creates) registers no component, so it reads once and never polls. A failed
- *   poll keeps the entry's last data, and {@link useActionsRefreshFailure} reports such a
- *   failure among the reads `/actions` shows, so the page can say so.
+ *   first-start screen fills in by itself. {@link useDefaultRun} keeps polling through a
+ *   transient failure (unreachable server, 429, 5xx); an expired session (401) or any other
+ *   error stops it. {@link useRecommendations} without a run id polls the same way, so a
+ *   reload during an outage recovers by itself. With a run id it keeps polling only while the
+ *   server is unreachable or rate-limits it: a server error (5xx) stops it too, because a
+ *   stored run the API failed to serve is likely to fail again, and repeating the API's
+ *   largest read could take the API down again for everyone on every poll. It resumes after
+ *   the next successful read: Retry ({@link useRetryActionsRefresh}, or the page's own
+ *   `refetch`), a refocus, an invalidating write or a reload
+ *   ({@link recommendationsPollInterval}). {@link useDecisions},
+ *   {@link useDiscrepancies} and {@link useDiscrepancyPages} refetch every
+ *   {@link CURRENT_STATE_POLL_MS} with {@link useDefaultRun}'s error rule, because the worker
+ *   writes baseline decisions and opens and auto-resolves discrepancies on its own schedule;
+ *   the paged list refetches only the pages already loaded. {@link useSources} polls every
+ *   {@link SOURCES_POLL_MS}. {@link useConfig} polls every {@link CURRENT_STATE_POLL_MS} only
+ *   after a transient failure, and {@link useMe} only while its last read failed with anything
+ *   but a 401, each until a read succeeds, so a screen that an outage left without them
+ *   recovers by itself. Polling runs only while the page is visible and stops when the last
+ *   component using the query unmounts. A prefetch ({@link usePrefetchActionsReads}, and
+ *   {@link useCreateRun}'s read of the page of the run it creates) registers no component, so
+ *   it reads once and never polls. A failed poll keeps the entry's last data, and
+ *   {@link useActionsRefreshFailure} reports such a failure among the reads `/actions` shows,
+ *   so the page can say so and offer {@link useRetryActionsRefresh}'s Retry.
  *
  * Path ids are always sent as `encodeURIComponent(String(id))`, because `apiFetch` does not
  * encode path segments.
@@ -88,11 +97,19 @@ import {
   useQuery,
   useQueryClient,
 } from '@tanstack/react-query';
-import type { InfiniteData, NetworkMode, QueryClient, QueryKey } from '@tanstack/react-query';
+import type {
+  InfiniteData,
+  NetworkMode,
+  QueryCache,
+  QueryClient,
+  QueryKey,
+  QueryState,
+} from '@tanstack/react-query';
 import { useCallback, useEffect, useSyncExternalStore } from 'react';
 
 import { ApiError, apiFetch, apiFetchPage, isApiError } from './client';
 import type { ApiPage } from './client';
+import { GROUP_PAGE_SIZE } from './types';
 import type {
   ConfigView,
   CreateRunRequest,
@@ -103,6 +120,8 @@ import type {
   DiscrepancyState,
   Feedback,
   FeedbackRequest,
+  GroupItemsPage,
+  Item,
   LoginRequest,
   Me,
   RecommendationId,
@@ -110,6 +129,7 @@ import type {
   ResolveRequest,
   Run,
   RunId,
+  SectionKey,
   Source,
   SourceName,
   SubjectIn,
@@ -259,39 +279,51 @@ export function isAwaitingFirstRun(error: unknown): boolean {
 }
 
 /**
- * Whether a failed read may succeed if simply repeated: the server could not be reached
- * (status 0 `network_error`), it rate-limited the request (429), or it failed on its own side
- * (5xx, including nginx's 502 while the API restarts).
+ * Whether a failed read never got the server to do its work: the server could not be reached
+ * (status 0 `network_error`), or it rate-limited the request (429) before serving it. Repeating
+ * such a read later may succeed, and it costs the server nothing it did not choose to accept.
  */
-function isTransientError(error: unknown): boolean {
+function isUnreachableOrRateLimited(error: unknown): boolean {
   return (
     isApiError(error) &&
-    ((error.status === 0 && error.code === 'network_error') ||
-      error.status === 429 ||
-      error.status >= 500)
+    ((error.status === 0 && error.code === 'network_error') || error.status === 429)
   );
 }
 
 /**
- * The `refetchInterval` of the run and recommendations reads that show current state, from
- * the query's last error. TanStack re-evaluates it after every fetch.
+ * Whether a failed read may succeed if simply repeated: the server could not be reached or
+ * rate-limited the request ({@link isUnreachableOrRateLimited}), or it failed on its own side
+ * (5xx, including nginx's 502 while the API restarts).
+ */
+function isTransientError(error: unknown): boolean {
+  return isUnreachableOrRateLimited(error) || (isApiError(error) && error.status >= 500);
+}
+
+/**
+ * The `refetchInterval` of the small current-state reads: the latest default run
+ * ({@link useDefaultRun}), the decision log ({@link useDecisions}) and the discrepancy lists
+ * ({@link useDiscrepancies}, {@link useDiscrepancyPages}), from the query's last error. TanStack
+ * re-evaluates it after every fetch. The recommendations page read has a policy of its own,
+ * {@link recommendationsPollInterval}, which differs only after a server error of a page
+ * addressed by run id or of a group's further items.
  *
  * - No error (the last fetch succeeded, or the first is still pending):
  *   {@link CURRENT_STATE_POLL_MS}.
- * - With `awaitsFirstRun`, for the default-run reads only, an error saying no default run
- *   exists yet ({@link isAwaitingFirstRun}): {@link FIRST_RUN_POLL_MS}. For a custom run the
- *   same `not_found` or `run_not_ready` is final, so it stops polling.
- * - A transient failure ({@link isTransientError}): {@link CURRENT_STATE_POLL_MS}, so the
- *   screen recovers by itself once the API answers again.
+ * - With `awaitsFirstRun`, for the latest default run only, an error saying no default run
+ *   exists yet ({@link isAwaitingFirstRun}): {@link FIRST_RUN_POLL_MS}.
+ * - A transient failure ({@link isTransientError}), a server error included:
+ *   {@link CURRENT_STATE_POLL_MS}, so the screen recovers by itself once the API answers again.
+ *   Each of these reads is small and bounded, so repeating it through an outage costs the API
+ *   little.
  * - Any other error stops polling, because repeating the request cannot change its answer: a
- *   401 `unauthenticated` (the session is gone), a 404 for an unknown run, a 422, and so on.
+ *   401 `unauthenticated` (the session is gone), a 422, and so on.
  *
  * It takes the error rather than the query, and each hook calls it from an inline
  * `(query) => …` callback. A standalone callback with its own parameter type would become an
  * inference site for `useQuery`'s error type and widen every hook's `error` to `unknown`.
  *
  * @param error - The query's `state.error`: `null` after a success or before any result.
- * @param awaitsFirstRun - `true` for the reads of the latest default run.
+ * @param awaitsFirstRun - `true` for the read of the latest default run.
  */
 function currentStatePollInterval(error: unknown, awaitsFirstRun: boolean): number | false {
   if (error === null) {
@@ -301,6 +333,58 @@ function currentStatePollInterval(error: unknown, awaitsFirstRun: boolean): numb
     return FIRST_RUN_POLL_MS;
   }
   return isTransientError(error) ? CURRENT_STATE_POLL_MS : false;
+}
+
+/**
+ * The `refetchInterval` of a recommendations read, from the query's last error: the page,
+ * `GET /recommendations[?run_id=]` ({@link recommendationsQueryOptions}), and a group's further
+ * items, `GET /recommendations/items` ({@link useGroupItemPages}). TanStack re-evaluates it
+ * after every fetch.
+ *
+ * - No error (the last fetch succeeded, or the first is still pending):
+ *   {@link CURRENT_STATE_POLL_MS}.
+ * - The default page (`defaultPage`, read without a run id) polls as the small current-state
+ *   reads do ({@link currentStatePollInterval}): every {@link FIRST_RUN_POLL_MS} while no
+ *   default run exists yet ({@link isAwaitingFirstRun}), and every
+ *   {@link CURRENT_STATE_POLL_MS} through any transient failure, a server error included, so a
+ *   reload during an outage recovers by itself once the API answers. That page is whichever
+ *   default run is latest, which the worker replaces on its own schedule, so polling is also
+ *   how a newer run reaches the screen; and the page carries at most
+ *   {@link GROUP_PAGE_SIZE} items per group whatever the run's size, so repeating it through an
+ *   outage costs the API little.
+ * - A page addressed by run id, and a group's further items, which are always read by run id,
+ *   address one stored run:
+ *   - while the server could not be reached, or it rate-limited the read
+ *     ({@link isUnreachableOrRateLimited}): {@link CURRENT_STATE_POLL_MS}, so the screen
+ *     recovers by itself once the API answers again;
+ *   - a server error (status 500 or above: nginx's 502 `upstream_unavailable` while the API is
+ *     down or restarting, and the API's own 500s and 503s) stops polling. A run the API failed
+ *     to serve is likely to fail again, and when serving it takes the API down, a poll would
+ *     take it down again for everyone at every interval for as long as the screen stays open.
+ *     The read resumes only after a fetch succeeds: the screen's Retry
+ *     ({@link useRetryActionsRefresh} under a loaded page's refresh notice, or the page's own
+ *     `refetch` on its failure screen), a window refocus once the entry is stale, a write that
+ *     invalidates it, or a reload. The app's bounded query retry in `src/main.tsx` still
+ *     repeats each failed fetch a fixed number of times;
+ *   - a `not_found` or `run_not_ready` for that run is final, so it stops polling.
+ * - Any other error stops polling, because repeating the request cannot change its answer: a
+ *   401 `unauthenticated` (the session is gone), a 422, and so on.
+ *
+ * It takes the error rather than the query, for the reason {@link currentStatePollInterval}
+ * gives.
+ *
+ * @param error - The query's `state.error`: `null` after a success or before any result.
+ * @param defaultPage - `true` for the default page, read without a run id.
+ * @returns The interval in milliseconds, or `false` to stop polling.
+ */
+function recommendationsPollInterval(error: unknown, defaultPage: boolean): number | false {
+  if (defaultPage) {
+    return currentStatePollInterval(error, true);
+  }
+  if (error === null) {
+    return CURRENT_STATE_POLL_MS;
+  }
+  return isUnreachableOrRateLimited(error) ? CURRENT_STATE_POLL_MS : false;
 }
 
 /**
@@ -367,6 +451,7 @@ function pathSegment(id: string | number): string {
  * | `runs.byId(id)` | `GET /runs/{id}` |
  * | `runs.custom(limit)` | `GET /runs?kind=custom&limit=` |
  * | `recommendations(runId \| 'default')` | `GET /recommendations[?run_id=]` |
+ * | `groupItems(runId, section, group)` | `GET /recommendations/items?…`, the loads read so far |
  * | `decisions(filter)` | `GET /decisions[?subject_type=&subject_id=]` |
  * | `discrepancies(states)` | `GET /discrepancies?state=…`, every page |
  * | `discrepancyPages(states)` | `GET /discrepancies?state=…&limit=50`, the pages loaded so far |
@@ -402,6 +487,19 @@ export const queryKeys = {
   recommendationsAll: ['recommendations'] as const,
   /** One recommendations page: `'default'` for the latest default run, else a run id. */
   recommendations: (runId: RunId | 'default') => ['recommendations', runId] as const,
+  /**
+   * The further items of one group of a run's page ({@link useGroupItemPages}), under the
+   * recommendations root, so every write that invalidates `recommendationsAll` refreshes them and
+   * a decision write that removes the pages no screen shows removes them too. Keyed by the run's
+   * id, also for the default page.
+   */
+  groupItems: (runId: RunId, section: SectionKey, group: string) =>
+    ['recommendations', runId, 'items', section, group] as const,
+  /**
+   * Root of every `groupItems` entry of one run, whatever its section and group: the further
+   * items loaded into that run's page, which {@link useActionsRefreshFailure} watches with it.
+   */
+  groupItemsAll: (runId: RunId) => ['recommendations', runId, 'items'] as const,
   /** Root of every decision-log list. */
   decisionsAll: ['decisions'] as const,
   /** One decision-log list. Undefined filter members are dropped, so `{}` equals them. */
@@ -700,13 +798,21 @@ export function useForgetCustomRuns(limit: number = DEFAULT_CUSTOM_RUNS_LIMIT): 
  * The worker and other sessions change that state too, so a shown page, default or custom,
  * refetches every {@link CURRENT_STATE_POLL_MS}. A new discrepancy then holds its dependent
  * items, a replaced dataset turns items historical, and the default page moves to the
- * worker's next default run, all without a reload or a refocus. A transient failure
- * (unreachable server, 429, 5xx) keeps that cadence; a 401 or any other error stops polling.
- * Polling runs only while the page is visible (`refetchIntervalInBackground` stays `false`)
- * and ends when the last component using it unmounts.
+ * worker's next default run, all without a reload or a refocus. An unreachable server or a
+ * 429 keeps that cadence, and so, for the default page, does a server error, so a reload
+ * during an outage recovers by itself. For a page addressed by run id a server error (5xx,
+ * nginx's 502 included) stops polling, whether the page holds data or not, until a fetch
+ * succeeds again: Retry ({@link useRetryActionsRefresh}, or this hook's `refetch`), a refocus
+ * once the entry is stale, a write that invalidates it, or a reload. Repeating the API's
+ * largest read of a stored run on a timer after the API failed to serve it could take the API
+ * down again for everyone each time ({@link recommendationsPollInterval}). A 401 or any other
+ * error stops polling too. Polling
+ * runs only while the page is visible (`refetchIntervalInBackground` stays `false`) and ends
+ * when the last component using it unmounts.
  *
  * Status codes: 200; 404 `not_found` for an unknown run or before the first default run; 409
- * `run_not_ready` for a run that is still `running` or has `failed`.
+ * `run_not_ready` for a run that is still `running` or has `failed`; 5xx while the API is
+ * failing or down (502 from nginx).
  *
  * The options come from {@link recommendationsQueryOptions}, which {@link useCreateRun} also
  * prefetches, so a custom run it creates is already cached when `/actions?run=<id>` mounts
@@ -725,11 +831,13 @@ export function useRecommendations(runId?: RunId) {
  * {@link useRecommendations} observes and {@link useCreateRun} prefetches for the run it
  * creates. Without `runId` the request carries no `run_id` and reads the latest default run.
  *
- * Polling is inline, `(query) => currentStatePollInterval(query.state.error, runId ===
+ * Polling is inline, `(query) => recommendationsPollInterval(query.state.error, runId ===
  * undefined)`, for the reason {@link currentStatePollInterval} gives: every
- * {@link CURRENT_STATE_POLL_MS} while shown, every {@link FIRST_RUN_POLL_MS} while the default
- * page awaits its first run, and never after a final error. A prefetch registers no
- * component, so it reads once and never polls.
+ * {@link CURRENT_STATE_POLL_MS} while shown and while the server is unreachable or
+ * rate-limits the read, every {@link FIRST_RUN_POLL_MS} while the default page awaits its
+ * first run, through a server error for the default page only, and never after a server error
+ * of a page addressed by run id (until a fetch succeeds again) or after a final error.
+ * A prefetch registers no component, so it reads once and never polls.
  *
  * @param runId - The run to read; omitted for the latest default run.
  * @returns Options for `useQuery` or `prefetchQuery`, keyed by
@@ -743,7 +851,8 @@ export function recommendationsQueryOptions(runId?: RunId) {
         query: runId === undefined ? undefined : { run_id: runId },
         signal,
       }),
-    refetchInterval: (query) => currentStatePollInterval(query.state.error, runId === undefined),
+    refetchInterval: (query) =>
+      recommendationsPollInterval(query.state.error, runId === undefined),
   });
 }
 
@@ -1154,6 +1263,150 @@ export function useDiscrepancyPages(
 }
 
 /**
+ * One load of {@link useGroupItemPages}, as its infinite query caches it: what one "Show more"
+ * (or the first read) added. Kept private; consumers read the flattened items.
+ */
+interface GroupItemsLoad {
+  /** The items this load read, in the page's rank order (rank, then id). */
+  items: Item[];
+  /** The offset the next load starts at; `undefined` once the group's last item is read. */
+  next: number | undefined;
+}
+
+/** Whether feedback in force hides an item now (`current.hidden_by` set). */
+function isHiddenNow(item: Item): boolean {
+  return item.current.hidden_by !== null && item.current.hidden_by !== undefined;
+}
+
+/**
+ * Reads one load of {@link useGroupItemPages} from `offset`: `GET /recommendations/items` with
+ * `limit` {@link GROUP_PAGE_SIZE}, then the slices after it while every item read so far is
+ * hidden by feedback and the group holds more. A load therefore never ends with nothing to show
+ * while the group still has items to show, as a load of {@link useDiscrepancyPages} keeps
+ * following its next link while it has read no discrepancy. Every request carries `signal`.
+ *
+ * The load ends at the group's end: a slice with no item, or the offset reaching the `total`
+ * the API reported with it. Each slice moves the offset by at least one item, so the loop
+ * always ends.
+ */
+async function readGroupItemsLoad(
+  runId: RunId,
+  section: SectionKey,
+  group: string,
+  offset: number,
+  signal: AbortSignal,
+): Promise<GroupItemsLoad> {
+  const items: Item[] = [];
+  let position = offset;
+  for (;;) {
+    const slice = await apiFetch<GroupItemsPage>('/recommendations/items', {
+      query: { run_id: runId, section, group, offset: position, limit: GROUP_PAGE_SIZE },
+      signal,
+    });
+    items.push(...slice.items);
+    position += slice.items.length;
+    if (slice.items.length === 0 || position >= slice.total) {
+      return { items, next: undefined };
+    }
+    if (items.some((item) => !isHiddenNow(item))) {
+      return { items, next: position };
+    }
+  }
+}
+
+/** The `getNextPageParam` of {@link useGroupItemPages}: where the last load stopped. */
+function nextGroupItemsParam(lastPage: GroupItemsLoad): number | undefined {
+  return lastPage.next;
+}
+
+/** The `select` of {@link useGroupItemPages}: every loaded item, in rank order. */
+function selectGroupItems(data: InfiniteData<GroupItemsLoad, number>): Item[] {
+  return data.pages.flatMap((page) => page.items);
+}
+
+/**
+ * The items of one group of a run's page beyond those the page carries, a load at a time:
+ * `GET /recommendations/items?run_id=&section=&group=&offset=&limit=100` → {@link GroupItemsPage}
+ * (AAP 0.1.1: the page carries each group's first {@link GROUP_PAGE_SIZE} items, so it stays
+ * bounded whatever the run's size, and every stored item stays reachable).
+ *
+ * The first load starts at `start`, the number of items the page carries for the group
+ * (`group.items.length`); `fetchNextPage()` loads the next while `hasNextPage` is true. `data`
+ * is the items loaded so far, in the page's rank order, each with its read-time `current`. A
+ * load reads on past slices whose every item feedback hides ({@link readGroupItemsLoad}), so
+ * "Show more" always adds something to show or ends the group.
+ *
+ * `runId` is the page's `run.id`, also for the default page, so a newer default run reads its
+ * own items under its own key. The key is `queryKeys.groupItems(runId, section, group)`, under
+ * the recommendations root: a feedback, decision or resolution invalidates it with the page,
+ * and a decision write that removes the pages no screen shows removes it too.
+ *
+ * It polls like a page addressed by run id ({@link recommendationsPollInterval}): every
+ * {@link CURRENT_STATE_POLL_MS} while shown, re-reading the loads made so far from the first, so
+ * feedback given in another session hides its items here too, and never after a server error of
+ * a first load, poll or refetch until a read succeeds again. Polling runs only while it is
+ * enabled and its screen is visible. A poll or refetch that fails keeps the loaded items, and
+ * {@link useActionsRefreshFailure} reports it among the page's reads, whose Retry
+ * ({@link useRetryActionsRefresh}) reads the loads again.
+ *
+ * A failed `fetchNextPage` (the list's "Show more") is the list's own to state and to ask for
+ * again, and does not stop polling ({@link isNextPageLoadError}): it read nothing the screen
+ * shows, and a poll re-reads only the loads in `data.pages`, never the page that failed, so it
+ * cannot repeat the failing request, and the loaded items stay current (AAP 0.3.2). A poll that
+ * then succeeds clears the entry's error, and with it the list's statement of the failure; one
+ * that fails is a failed refresh, which stops polling and is reported as above.
+ *
+ * Status codes: 200; 404 `not_found` for an unknown run; 409 `run_not_ready` for a run that is
+ * not succeeded; 422 `validation_error` for a parameter outside its bounds.
+ *
+ * @param runId - The page's run.
+ * @param section - The group's section.
+ * @param group - The group key (`Group.key`).
+ * @param start - The offset of the first item to load: how many the page carries.
+ * @param options - `enabled`: whether the hook may read; nothing is sent while `false`, and the
+ *   items already cached for the key are returned.
+ * @returns The infinite query result, keyed by `queryKeys.groupItems(runId, section, group)`,
+ *   whose `data` is the loaded items.
+ */
+export function useGroupItemPages(
+  runId: RunId,
+  section: SectionKey,
+  group: string,
+  start: number,
+  options: { enabled: boolean },
+) {
+  return useInfiniteQuery({
+    queryKey: queryKeys.groupItems(runId, section, group),
+    queryFn: ({ pageParam, signal }) =>
+      readGroupItemsLoad(runId, section, group, pageParam, signal),
+    initialPageParam: start,
+    getNextPageParam: nextGroupItemsParam,
+    select: selectGroupItems,
+    enabled: options.enabled,
+    refetchInterval: (query) =>
+      recommendationsPollInterval(
+        isNextPageLoadError(query.state) ? null : query.state.error,
+        false,
+      ),
+  });
+}
+
+/**
+ * Whether the cache already holds further items of a group ({@link useGroupItemPages}), read
+ * earlier in this session, so a group mounted again shows them, and keeps them current, without
+ * the user asking again. It reads the cache at render time and sends nothing.
+ *
+ * @param runId - The page's run.
+ * @param section - The group's section.
+ * @param group - The group key.
+ * @returns `true` when `queryKeys.groupItems(runId, section, group)` holds data.
+ */
+export function useHasCachedGroupItems(runId: RunId, section: SectionKey, group: string): boolean {
+  const queryClient = useQueryClient();
+  return queryClient.getQueryData(queryKeys.groupItems(runId, section, group)) !== undefined;
+}
+
+/**
  * Health, mode, active dataset, dataset freshness, the Google call count and recent sync
  * runs of every source, in the order google, linkedin, hubspot: `GET /sources` →
  * {@link Source}[] (AAP 0.5.5 `/sources` and the status bar's source chips).
@@ -1265,14 +1518,22 @@ export function usePrefetchActionsReads(runId?: RunId): void {
 
 /**
  * The cache entries of the reads a loaded `/actions` page shows whose failed refresh
- * {@link useActionsRefreshFailure} reports, in the order it checks them:
+ * {@link useActionsRefreshFailure} reports and {@link useRetryActionsRefresh} reads again, in
+ * the order they check them:
  *
  * 1. `queryKeys.recommendations(runId ?? 'default')`: the page itself, its cards, banners and
  *    overlay (the discrepancy count among them);
- * 2. `queryKeys.sources`: the status bar's source chips and their last sync times;
- * 3. `queryKeys.discrepancies(DEFAULT_DISCREPANCY_STATES)`: the unresolved list the C0 cards
+ * 2. every entry under `queryKeys.groupItemsAll` of the page's run: the cards loaded beyond the
+ *    first {@link GROUP_PAGE_SIZE} of a group ({@link useGroupItemPages}), with their holds,
+ *    historical marking and feedback state, whether or not the group is shown now (another
+ *    Keywords tab), in the order the cache holds them. The page's run is `runId`, or without one
+ *    the `run.id` of the default page the cache holds, read without fetching; until that page
+ *    holds data there are none. The loads of any other run, an older default run's included,
+ *    are not the page's and are left out;
+ * 3. `queryKeys.sources`: the status bar's source chips and their last sync times;
+ * 4. `queryKeys.discrepancies(DEFAULT_DISCREPANCY_STATES)`: the unresolved list the C0 cards
  *    (`CampaignsSection`) and the held cards' blocker links (`BlockingDiscrepancies`) read;
- * 4. `queryKeys.config`: the window picker's presets and the White papers fallback header.
+ * 5. `queryKeys.config`: the window picker's presets and the White papers fallback header.
  *
  * Two reads of the page are left out. `queryKeys.runs.latest`: the window picker states its
  * failure itself, with a Retry of its own ("Could not read the latest default run"), so a
@@ -1281,16 +1542,94 @@ export function usePrefetchActionsReads(runId?: RunId): void {
  * the same cadence, so an outage fails the unresolved read as well, and its entry outlives that
  * lookup, so a failure left in it would stay on screen after the lookup ended.
  *
+ * @param queryCache - The cache to read; nothing is fetched.
  * @param runId - The run `/actions?run=<id>` addresses; omitted for the latest default run.
  * @returns The exact keys, most important first.
  */
-function actionsRefreshKeys(runId: RunId | undefined): readonly QueryKey[] {
+function actionsRefreshKeys(queryCache: QueryCache, runId: RunId | undefined): readonly QueryKey[] {
+  const pageKey = queryKeys.recommendations(runId ?? 'default');
+  const pageRunId =
+    runId ??
+    queryCache.find<RecommendationsPage>({ queryKey: pageKey, exact: true })?.state.data?.run.id;
+  const groupItemKeys =
+    pageRunId === undefined
+      ? []
+      : queryCache
+          .findAll({ queryKey: queryKeys.groupItemsAll(pageRunId) })
+          .map((query) => query.queryKey);
   return [
-    queryKeys.recommendations(runId ?? 'default'),
+    pageKey,
+    ...groupItemKeys,
     queryKeys.sources,
     queryKeys.discrepancies(DEFAULT_DISCREPANCY_STATES),
     queryKeys.config,
   ];
+}
+
+/**
+ * Whether the fetch that settled with each error of a cache entry was a next-page load
+ * (`fetchNextPage` of {@link useGroupItemPages}), recorded by {@link isNextPageLoadError} when it
+ * finds the entry settled. An entry's `fetchMeta` describes the fetch in flight, or else the last
+ * one, and a later fetch replaces it while the entry keeps its `error` until that fetch settles:
+ * without this record a poll or an invalidation started after a failed "Show more" would count
+ * that failure as a failed refresh for as long as it runs, both in the page's refresh notice
+ * ({@link failedRefreshError}) and in the group's polling ({@link useGroupItemPages}). Keyed
+ * weakly by the error object, so nothing outlives the error it describes.
+ */
+const nextPageLoadErrors = new WeakMap<ApiError, boolean>();
+
+/**
+ * Whether the error a cache entry holds was settled by a next-page load of a group's further
+ * items (`fetchNextPage` of {@link useGroupItemPages}, the list's "Show more") rather than by a
+ * read of what the screen shows: a first load, a poll, a refetch or an invalidation. Such a
+ * failure read nothing the screen shows, and the next page is the only thing that failed, so it
+ * is neither a failed refresh ({@link failedRefreshError}) nor a reason to stop polling the loads
+ * already shown ({@link useGroupItemPages}). Both ask this one helper, so they never disagree
+ * about which errors these are.
+ *
+ * TanStack Query marks a next-page load with the fetch meta `{fetchMore: {direction:
+ * 'forward'}}`, and a first load, poll, refetch or invalidation with none. Once the entry has
+ * settled (`fetchStatus` `idle`), its `fetchMeta` is that of the fetch that failed, and the answer
+ * is recorded for the error in {@link nextPageLoadErrors}, which keeps it while a later fetch
+ * replaces the meta and runs. TanStack evaluates a query's `refetchInterval` as soon as each fetch
+ * settles, and {@link useActionsRefreshFailure} reads the cache on each change, so the answer is
+ * recorded the moment the error settles.
+ *
+ * @param state - The entry's state.
+ * @returns `true` when the entry holds an error and the fetch that settled with it was a
+ *   next-page load; `false` when it holds no error, or a fetch of another kind failed.
+ */
+function isNextPageLoadError(state: QueryState<unknown, ApiError>): boolean {
+  const { error } = state;
+  if (error === null) {
+    return false;
+  }
+  const nextPageLoad = state.fetchMeta?.fetchMore?.direction === 'forward';
+  if (state.fetchStatus === 'idle') {
+    nextPageLoadErrors.set(error, nextPageLoad);
+  }
+  return nextPageLoadErrors.get(error) ?? nextPageLoad;
+}
+
+/**
+ * The failed refresh of the cache entry under `queryKey`: its {@link ApiError} when the entry
+ * holds data but its last fetch failed, or `null` when there is no entry, it holds no data yet
+ * (its reader shows its own loading or failure state), its last fetch succeeded, or the fetch
+ * that failed was a next-page load of a group's further items ({@link isNextPageLoadError}).
+ * That last is no refresh: it read nothing the screen already shows, the group's loaded items
+ * keep polling, and the group's list states the failure and asks for the page again itself
+ * (`isFetchNextPageError`).
+ *
+ * @param queryCache - The cache to read; nothing is fetched.
+ * @param queryKey - One exact key of {@link actionsRefreshKeys}.
+ * @returns The entry's error object, the same reference until its state changes, or `null`.
+ */
+function failedRefreshError(queryCache: QueryCache, queryKey: QueryKey): ApiError | null {
+  const state = queryCache.find({ queryKey, exact: true })?.state;
+  if (state === undefined || state.data === undefined || state.error === null) {
+    return null;
+  }
+  return isNextPageLoadError(state) ? null : state.error;
 }
 
 /**
@@ -1301,13 +1640,21 @@ function actionsRefreshKeys(runId: RunId | undefined): readonly QueryKey[] {
  *
  * TanStack Query keeps `data` when a refetch fails, so every component reading one of these
  * entries keeps showing its last result, and a failed poll would otherwise go unnoticed: during
- * an outage the cards, the source chips' sync times and the discrepancy count would look
- * current. TanStack v5 keeps the entry's `error` while a later refetch of an entry with data
- * runs, and clears it on the next success, so the result neither flickers during a poll nor
- * outlives the recovery. Each polled entry recovers by itself once the API answers again;
- * `config`, which is not polled, clears on its next successful read (on refocus, on reconnect,
- * or when a new reader finds it stale). An entry without data is not reported: the component
- * reading it shows its own loading or failure state.
+ * an outage the cards, those loaded beyond a group's first {@link GROUP_PAGE_SIZE} included,
+ * the source chips' sync times and the discrepancy count would look current. TanStack v5 keeps
+ * the entry's `error` while a later refetch of an entry with data runs, and clears it on the
+ * next success, so the result neither flickers during a poll nor outlives the recovery. The
+ * sources and the unresolved discrepancies keep polling, and `config` polls after a transient
+ * failure ({@link configQueryOptions}), so each recovers by itself once the API answers again,
+ * as does the default page through any transient failure, and a page addressed by run id and
+ * its groups' loaded items while the server is unreachable or rate-limits them. Those after a
+ * server error, which stops their polling ({@link recommendationsPollInterval}), clear on
+ * their next successful read: the notice's
+ * Retry ({@link useRetryActionsRefresh}), a refocus or reconnect once stale, or a new reader
+ * that finds them stale. An entry without data is not
+ * reported: the component reading it shows its own loading or failure state. Neither is a
+ * failed next-page load of a group ("Show more"), which its list states and asks for again
+ * itself ({@link failedRefreshError}).
  *
  * It only reads the query cache, through `QueryCache.subscribe` and React's
  * `useSyncExternalStore`. It sends no request and registers no observer, so it never fetches,
@@ -1332,15 +1679,62 @@ export function useActionsRefreshFailure(runId?: RunId): ApiError | null {
     [queryCache],
   );
   const getSnapshot = (): ApiError | null => {
-    for (const queryKey of actionsRefreshKeys(runId)) {
-      const state = queryCache.find({ queryKey, exact: true })?.state;
-      if (state !== undefined && state.data !== undefined && state.error !== null) {
-        return state.error;
+    for (const queryKey of actionsRefreshKeys(queryCache, runId)) {
+      const error = failedRefreshError(queryCache, queryKey);
+      if (error !== null) {
+        return error;
       }
     }
     return null;
   };
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
+/**
+ * A callback that reads again each failed refresh of the loaded `/actions` page: every entry of
+ * {@link actionsRefreshKeys} that holds data but whose last fetch failed, the failures
+ * {@link useActionsRefreshFailure} reports. The page's refresh notice calls it from its Retry,
+ * so the component reaches the cache only through this module (AAP 0.11.1).
+ *
+ * A page addressed by run id and its groups' loaded items stop polling after a server error
+ * ({@link recommendationsPollInterval}), so neither recovers by itself; Retry is how the user
+ * brings them back. The other reads poll through an outage, the default page included and
+ * `GET /config` after a transient failure ({@link configQueryOptions}), and Retry reads them
+ * again at once. Only the failed entries are refetched, each by its exact key: current
+ * entries, entries without data and a group whose last failure was a next-page load are left
+ * alone, and with no failed refresh the callback sends nothing. A group's loads are read again
+ * from the first load's offset, whether or not the group is shown now (another Keywords tab). A
+ * refetch already in flight is joined rather than aborted and sent again
+ * (`cancelRefetch: false`), so a Retry never repeats a read the server is still serving.
+ *
+ * The returned promise resolves once every refetch it started has settled, and never rejects:
+ * a read that fails again settles into its entry's `error`, which keeps the notice on screen,
+ * and one that succeeds clears it and, for the page itself and a shown group's loaded items,
+ * restarts its polling.
+ *
+ * @param runId - The run `/actions?run=<id>` addresses; omitted for the latest default run.
+ * @returns A callback, stable while the client and `runId` stay the same.
+ *
+ * @example
+ * ```tsx
+ * const retryRefresh = useRetryActionsRefresh(runId);
+ * // In the refresh notice: reads the failed refreshes again, then settles.
+ * <Button loading={retrying} onClick={() => void retryRefresh()}>Retry</Button>
+ * ```
+ */
+export function useRetryActionsRefresh(runId?: RunId): () => Promise<void> {
+  const queryClient = useQueryClient();
+  return useCallback(async () => {
+    const queryCache = queryClient.getQueryCache();
+    const failed = actionsRefreshKeys(queryCache, runId).filter(
+      (queryKey) => failedRefreshError(queryCache, queryKey) !== null,
+    );
+    await Promise.all(
+      failed.map((queryKey) =>
+        queryClient.refetchQueries({ queryKey, exact: true }, { cancelRefetch: false }),
+      ),
+    );
+  }, [queryClient, runId]);
 }
 
 // ---------------------------------------------------------------------------------------------

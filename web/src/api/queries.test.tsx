@@ -9,12 +9,19 @@
  * back with `new URL(…, 'http://localhost')`, so the tests assert `pathname` and
  * `searchParams` rather than string layouts. The cases cover:
  *
- * - the query keys, the polling and freshness constants and the re-exported error API;
+ * - the query keys, a run's group-item root among them, the polling and freshness constants
+ *   and the re-exported error API;
  * - every query hook's request (method, `/api/v1` path, query parameters, abort signal), its
  *   cache key, the `skipToken` placeholder of `useRun(undefined)`, the 5-minute freshness of the
  *   user and configuration reads, cancellation on unmount, the poll interval each read chooses
  *   after a success, a missing first run, a transient failure and a final error, and the polls
- *   themselves under fake timers;
+ *   themselves under fake timers. A recommendations page addressed by run id stops polling
+ *   after a server error (500, nginx's 502, 503), with or without data, sends nothing more
+ *   until a fetch succeeds again (its own `refetch` or `useRetryActionsRefresh`) and then polls
+ *   again. The default page polls on through a server error, on its first read and on a poll
+ *   alike, and recovers by itself once the API answers, its failed refresh cleared by that
+ *   poll. An unreachable server and a 429 keep either page polling, and the default page's
+ *   missing first run keeps it polling every `FIRST_RUN_POLL_MS`;
  * - the query-option factories, the latest default run seeded from a fresh cached default page
  *   (never from a page addressed by run id), the custom-run list held back while disabled and
  *   forgotten on request (only its own limit, aborting a read in flight, and read once more by
@@ -26,6 +33,16 @@
  *   error object while the entry is read again and `null` after its next success; never a
  *   failed first read, the latest default run, the resolved list or another run's page; no
  *   request, no observer, and no re-render while the reported failure stays the same;
+ * - `useRetryActionsRefresh`: it reads again only the failed refreshes among those reads, each
+ *   once and of the addressed run's page only, joins a refetch already in flight, resolves once
+ *   they have settled, never rejects, sends nothing while none failed, and stays one callback;
+ * - both, for the loads of a group's further items (`useGroupItemPages`): a failed poll of a
+ *   loaded group is reported after the page and before the sources, with its items kept; only
+ *   the page's run counts (the addressed run, or the cached default page's, read without
+ *   fetching), never an older default run's loads; a failed next page is never reported, also
+ *   while a later refetch runs, until that refetch fails; Retry reads each failed group once
+ *   from its first offset, shown or not, never a next-page failure or another run's, and the
+ *   shown group, which polled no more after the 502, polls again;
  * - `useDiscrepancies` paging: a first page at `limit=500`, every `Link: rel="next"` page
  *   followed exactly as named however short the page, a repeated page rejected, one restart
  *   from the first page after a 422 `invalid_cursor`, and its `enabled: false` option, which
@@ -35,6 +52,12 @@
  *   within one load or across loads rejected, one restart after `invalid_cursor` that re-reads
  *   what was shown, polling that re-reads only the loaded pages, a failed refetch keeping them,
  *   abort on unmount, and invalidation by both decision-state mutations;
+ * - `useGroupItemPages`: nothing sent while disabled, a first load from the page's own count at
+ *   `limit=100` for the run, section and group under `queryKeys.groupItems`, each next load from
+ *   where the last stopped, a load that reads on past slices whose every item feedback hides,
+ *   the group's end at its `total` or at an empty slice, invalidation with the recommendations
+ *   root, polling like a page addressed by run id and stopping after a server error, and
+ *   `useHasCachedGroupItems`;
  * - the current-state polling of `useDecisions` and `useDiscrepancies`;
  * - the polling lifecycle of all six polling hooks: no request while the document is hidden or
  *   `focusManager` reports the page unfocused, an immediate refetch and the usual cadence once
@@ -92,7 +115,9 @@ import {
   useDiscrepancyPages,
   useFeedback,
   useForgetCustomRuns,
+  useGroupItemPages,
   useHasCachedCustomRuns,
+  useHasCachedGroupItems,
   useLogin,
   useLogout,
   useMe,
@@ -101,6 +126,7 @@ import {
   useRecordDecision,
   useRequestSync,
   useResolveDiscrepancy,
+  useRetryActionsRefresh,
   useRun,
   useSources,
 } from './queries';
@@ -114,6 +140,7 @@ import type {
   DiscrepancyState,
   Feedback,
   FeedbackRequest,
+  GroupItemsPage,
   Item,
   Me,
   RecommendationsPage,
@@ -686,6 +713,11 @@ describe('queryKeys', () => {
     expect(queryKeys.recommendationsAll).toEqual(['recommendations']);
     expect(queryKeys.recommendations('default')).toEqual(['recommendations', 'default']);
     expect(queryKeys.recommendations(CUSTOM_RUN_ID)).toEqual(['recommendations', CUSTOM_RUN_ID]);
+    expect(queryKeys.groupItemsAll(CUSTOM_RUN_ID)).toEqual([
+      'recommendations',
+      CUSTOM_RUN_ID,
+      'items',
+    ]);
     expect(queryKeys.decisionsAll).toEqual(['decisions']);
     expect(queryKeys.discrepanciesAll).toEqual(['discrepancies']);
     expect(queryKeys.discrepancyPages(['open'])).toEqual(['discrepancies', 'pages', ['open']]);
@@ -703,6 +735,9 @@ describe('queryKeys', () => {
     expect(queryKeys.runs.latest.slice(0, 1)).toEqual(queryKeys.runs.all);
     expect(queryKeys.runs.custom(5).slice(0, 2)).toEqual(queryKeys.runs.customAll);
     expect(queryKeys.recommendations(7).slice(0, 1)).toEqual(queryKeys.recommendationsAll);
+    expect(queryKeys.groupItems(7, 'keywords', 'block').slice(0, 3)).toEqual(
+      queryKeys.groupItemsAll(7),
+    );
     expect(queryKeys.decisions({}).slice(0, 1)).toEqual(queryKeys.decisionsAll);
     expect(queryKeys.discrepancies(['open']).slice(0, 1)).toEqual(queryKeys.discrepanciesAll);
     expect(queryKeys.discrepancyPages(['open']).slice(0, 1)).toEqual(queryKeys.discrepanciesAll);
@@ -1337,10 +1372,19 @@ describe('useRecommendations', () => {
   it.each([
     ['the default page', undefined, 404, 'not_found', FIRST_RUN_POLL_MS],
     ['the default page', undefined, 401, 'unauthenticated', false],
+    ['the default page', undefined, 429, 'rate_limited', CURRENT_STATE_POLL_MS],
+    ['the default page', undefined, 500, 'internal_error', CURRENT_STATE_POLL_MS],
+    ['the default page', undefined, 502, 'upstream_unavailable', CURRENT_STATE_POLL_MS],
     ['the default page', undefined, 503, 'internal_error', CURRENT_STATE_POLL_MS],
     ['a custom page', CUSTOM_RUN_ID, 404, 'not_found', false],
     ['a custom page', CUSTOM_RUN_ID, 409, 'run_not_ready', false],
-    ['a custom page', CUSTOM_RUN_ID, 502, 'internal_error', CURRENT_STATE_POLL_MS],
+    ['a custom page', CUSTOM_RUN_ID, 401, 'unauthenticated', false],
+    ['a custom page', CUSTOM_RUN_ID, 429, 'rate_limited', CURRENT_STATE_POLL_MS],
+    ['a custom page', CUSTOM_RUN_ID, 500, 'internal_error', false],
+    ['a custom page', CUSTOM_RUN_ID, 502, 'internal_error', false],
+    ['a custom page', CUSTOM_RUN_ID, 503, 'internal_error', false],
+    // The latest default run read by id is a page addressed by run id, not the default page.
+    ['the default run addressed by id', DEFAULT_RUN_ID, 503, 'database_unavailable', false],
   ] as const)(
     '%s (run id %s) after a %i %s polls at %s',
     async (_label, runId, status, code, interval) => {
@@ -1387,6 +1431,289 @@ describe('useRecommendations', () => {
     await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
     expect(mock).toHaveBeenCalledTimes(1);
   });
+
+  /** The two recommendations pages: the default one, read without a run id, and a custom one. */
+  const PAGES: readonly (readonly [string, RunId | undefined])[] = [
+    ['the default page', undefined],
+    ['a custom page', CUSTOM_RUN_ID],
+  ];
+
+  /**
+   * nginx's JSON answer while the API is down or restarting, as when serving a run exhausted the
+   * API's memory.
+   *
+   * @returns A fresh 502 `upstream_unavailable` response.
+   */
+  function upstreamUnavailable(): Response {
+    return json(
+      502,
+      envelope('upstream_unavailable', 'The server is temporarily unavailable. Try again shortly.'),
+    );
+  }
+
+  /**
+   * The server errors, each with the response that produces it: the API's own 500 and 503, and
+   * nginx's 502. After one a page addressed by run id stops polling, while the default page
+   * polls on and recovers by itself.
+   */
+  const SERVER_ERRORS: readonly (readonly [string, () => Response])[] = [
+    ['a 500', () => json(500, envelope('internal_error', 'An unexpected error occurred.'))],
+    ["nginx's 502", upstreamUnavailable],
+    ['a 503', () => json(503, envelope('database_unavailable', 'Database unavailable'))],
+  ];
+
+  /** The pages addressed by run id, which stop polling after a server error. */
+  const RUN_ID_PAGES = PAGES.filter(([, runId]) => runId !== undefined);
+
+  /** Every page addressed by run id with every server error, as `[page, run id, error, response]`. */
+  const RUN_ID_PAGE_SERVER_ERRORS = RUN_ID_PAGES.flatMap(([page, runId]) =>
+    SERVER_ERRORS.map(([error, respond]) => [page, runId, error, respond] as const),
+  );
+
+  /**
+   * The page a successful read of `runId` returns.
+   *
+   * @param runId - The page's run id; `undefined` for the default page.
+   * @returns A fresh page payload.
+   */
+  function pageOf(runId: RunId | undefined) {
+    return runId === undefined ? pagePayload() : pagePayload(runId, 'custom');
+  }
+
+  it.each(RUN_ID_PAGE_SERVER_ERRORS)(
+    '%s (run id %s) sends nothing more for two poll intervals after %s on its first read',
+    async (_page, runId, _error, respond) => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const mock = stubFetch(respond);
+      const { result, queryClient } = renderWithWrapper(() => useRecommendations(runId));
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      expect(result.current.error?.status).toBeGreaterThanOrEqual(500);
+      expect(pollInterval(queryClient, queryKeys.recommendations(runId ?? 'default'))).toBe(false);
+
+      await act(() => vi.advanceTimersByTimeAsync(2 * CURRENT_STATE_POLL_MS));
+      expect(mock).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(RUN_ID_PAGE_SERVER_ERRORS)(
+    '%s (run id %s) keeps its data and stops polling once a poll answers %s',
+    async (_page, runId, _error, respond) => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const page = pageOf(runId);
+      const mock = stubFetch(sequence(() => json(200, page), respond));
+      const { result } = renderWithWrapper(() => useRecommendations(runId));
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      await waitFor(() => expect(result.current.isRefetchError).toBe(true));
+      expect(result.current.data).toEqual(page);
+      expect(mock).toHaveBeenCalledTimes(2);
+
+      await act(() => vi.advanceTimersByTimeAsync(2 * CURRENT_STATE_POLL_MS));
+      expect(mock).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it.each(SERVER_ERRORS)(
+    'the default page keeps polling every CURRENT_STATE_POLL_MS after %s on its first read, and recovers by itself once the API answers',
+    async (_error, respond) => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const page = pagePayload();
+      const mock = stubFetch(
+        sequence(
+          respond,
+          respond,
+          () => json(200, page),
+          () => json(200, page),
+        ),
+      );
+      const { result, queryClient } = renderWithWrapper(() => useRecommendations());
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      expect(result.current.error?.status).toBeGreaterThanOrEqual(500);
+      expect(pollInterval(queryClient, queryKeys.recommendations('default'))).toBe(
+        CURRENT_STATE_POLL_MS,
+      );
+      expect(mock).toHaveBeenCalledTimes(1);
+
+      // The outage outlasts the first poll: the page reads again and still fails.
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      await waitFor(() => expect(mock).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(result.current.fetchStatus).toBe('idle'));
+      expect(result.current.isError).toBe(true);
+      expect(result.current.data).toBeUndefined();
+
+      // The API answers again: the next poll, not a refetch, shows the page.
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      await waitFor(() => expect(result.current.data).toEqual(page));
+      expect(result.current.error).toBeNull();
+      expect(mock).toHaveBeenCalledTimes(3);
+
+      // It then polls at the usual cadence.
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      await waitFor(() => expect(mock).toHaveBeenCalledTimes(4));
+      for (const request of sent(mock)) {
+        expect(request.parsed.pathname).toBe('/api/v1/recommendations');
+        expect(request.parsed.searchParams.has('run_id')).toBe(false);
+      }
+    },
+  );
+
+  it.each(SERVER_ERRORS)(
+    'the default page keeps its data and keeps polling once a poll answers %s, and its failed refresh clears by itself on the next successful poll',
+    async (_error, respond) => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const page = pagePayload();
+      const mock = stubFetch(
+        sequence(
+          () => json(200, page),
+          respond,
+          () => json(200, page),
+          () => json(200, page),
+        ),
+      );
+      const { result, queryClient } = renderWithWrapper(() => ({
+        page: useRecommendations(),
+        failure: useActionsRefreshFailure(),
+      }));
+      await waitFor(() => expect(result.current.page.isSuccess).toBe(true));
+      expect(result.current.failure).toBeNull();
+
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      await waitFor(() => expect(result.current.page.isRefetchError).toBe(true));
+      expect(result.current.page.data).toEqual(page);
+      expect(result.current.failure?.status).toBeGreaterThanOrEqual(500);
+      expect(result.current.failure).toBe(result.current.page.error);
+      expect(pollInterval(queryClient, queryKeys.recommendations('default'))).toBe(
+        CURRENT_STATE_POLL_MS,
+      );
+      expect(mock).toHaveBeenCalledTimes(2);
+
+      // Nobody retries: the next poll reads the page again and clears the failure.
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      await waitFor(() => expect(result.current.failure).toBeNull());
+      expect(result.current.page.error).toBeNull();
+      expect(result.current.page.data).toEqual(page);
+      expect(mock).toHaveBeenCalledTimes(3);
+
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      await waitFor(() => expect(mock).toHaveBeenCalledTimes(4));
+      for (const request of sent(mock)) {
+        expect(request.parsed.searchParams.has('run_id')).toBe(false);
+      }
+    },
+  );
+
+  it.each(
+    PAGES.flatMap(([page, runId]) =>
+      (
+        [
+          ['an unreachable server', () => Promise.reject(new TypeError('Failed to fetch'))],
+          ['a 429', () => json(429, envelope('rate_limited', 'Slow down'))],
+        ] as const
+      ).map(([failure, respond]) => [page, runId, failure, respond] as const),
+    ),
+  )(
+    '%s (run id %s) keeps polling every CURRENT_STATE_POLL_MS after %s',
+    async (_page, runId, _failure, respond) => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const mock = stubFetch(respond);
+      const { result } = renderWithWrapper(() => useRecommendations(runId));
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      expect(mock).toHaveBeenCalledTimes(1);
+
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      await waitFor(() => expect(mock).toHaveBeenCalledTimes(2));
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      await waitFor(() => expect(mock).toHaveBeenCalledTimes(3));
+    },
+  );
+
+  it('keeps polling the default page every FIRST_RUN_POLL_MS while no default run exists', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    // Each fetch outcome restarts the interval shortly after its tick, so the checks sit a
+    // second either side of each expected refetch.
+    const margin = 1_000;
+    const mock = stubFetch(() => json(404, envelope('not_found', 'No analysis run yet')));
+    const { result } = renderWithWrapper(() => useRecommendations());
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    await waitFor(() => expect(result.current.error?.code).toBe('not_found'));
+    expect(mock).toHaveBeenCalledTimes(1);
+
+    for (const calls of [2, 3]) {
+      await act(() => vi.advanceTimersByTimeAsync(FIRST_RUN_POLL_MS - 2 * margin));
+      expect(mock).toHaveBeenCalledTimes(calls - 1);
+      await act(() => vi.advanceTimersByTimeAsync(2 * margin));
+      await waitFor(() => expect(mock).toHaveBeenCalledTimes(calls));
+    }
+  });
+
+  it.each(RUN_ID_PAGES)(
+    '%s (run id %s) polls again once its refetch after a server error succeeds',
+    async (_page, runId) => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const page = pageOf(runId);
+      const mock = stubFetch(
+        sequence(
+          () => json(503, envelope('database_unavailable', 'Database unavailable')),
+          () => json(200, page),
+          () => json(200, page),
+        ),
+      );
+      const { result } = renderWithWrapper(() => useRecommendations(runId));
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      await act(() => vi.advanceTimersByTimeAsync(2 * CURRENT_STATE_POLL_MS));
+      expect(mock).toHaveBeenCalledTimes(1);
+
+      // The failure screen's Retry: the hook's own refetch.
+      await act(async () => {
+        await result.current.refetch();
+      });
+      await waitFor(() => expect(result.current.data).toEqual(page));
+      expect(mock).toHaveBeenCalledTimes(2);
+
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      await waitFor(() => expect(mock).toHaveBeenCalledTimes(3));
+    },
+  );
+
+  it.each(RUN_ID_PAGES)(
+    '%s (run id %s) with data polls again once useRetryActionsRefresh reads it after a server error',
+    async (_page, runId) => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const page = pageOf(runId);
+      const mock = stubFetch(
+        sequence(
+          () => json(200, page),
+          upstreamUnavailable,
+          () => json(200, page),
+          () => json(200, page),
+        ),
+      );
+      const { result } = renderWithWrapper(() => ({
+        page: useRecommendations(runId),
+        failure: useActionsRefreshFailure(runId),
+        retry: useRetryActionsRefresh(runId),
+      }));
+      await waitFor(() => expect(result.current.page.isSuccess).toBe(true));
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      await waitFor(() => expect(result.current.failure?.status).toBe(502));
+      await act(() => vi.advanceTimersByTimeAsync(2 * CURRENT_STATE_POLL_MS));
+      expect(mock).toHaveBeenCalledTimes(2);
+
+      await act(() => result.current.retry());
+      await waitFor(() => expect(result.current.failure).toBeNull());
+      expect(mock).toHaveBeenCalledTimes(3);
+
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+      await waitFor(() => expect(mock).toHaveBeenCalledTimes(4));
+      for (const request of sent(mock)) {
+        expect(request.parsed.searchParams.get('run_id')).toBe(
+          runId === undefined ? null : String(runId),
+        );
+      }
+    },
+  );
+
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -2278,12 +2605,20 @@ describe('usePrefetchActionsReads', () => {
 });
 
 describe('useActionsRefreshFailure', () => {
-  /** The keys the hook checks for the default page, in its order. */
-  const WATCHED_KEYS: readonly (readonly [string, QueryKey])[] = [
-    ['the page', queryKeys.recommendations('default')],
-    ['the sources', queryKeys.sources],
-    ['the unresolved discrepancies', queryKeys.discrepancies(DEFAULT_DISCREPANCY_STATES)],
-    ['the configuration', queryKeys.config],
+  /**
+   * The fixed keys the hook checks for the default page, in its order, each with a factory of
+   * what its entry holds: the page under the page's key, whose run the hook reads, and a marker
+   * under each other key.
+   */
+  const WATCHED_KEYS: readonly (readonly [string, QueryKey, () => unknown])[] = [
+    ['the page', queryKeys.recommendations('default'), () => pagePayload()],
+    ['the sources', queryKeys.sources, () => ({ seeded: queryKeys.sources })],
+    [
+      'the unresolved discrepancies',
+      queryKeys.discrepancies(DEFAULT_DISCREPANCY_STATES),
+      () => ({ seeded: queryKeys.discrepancies(DEFAULT_DISCREPANCY_STATES) }),
+    ],
+    ['the configuration', queryKeys.config, () => ({ seeded: queryKeys.config })],
   ];
 
   /**
@@ -2345,19 +2680,19 @@ describe('useActionsRefreshFailure', () => {
 
   it.each(WATCHED_KEYS)(
     'reports a failed refresh of %s, which keeps its data, until the next success',
-    async (_name, queryKey) => {
+    async (_name, queryKey, data) => {
       stubFetch(unexpected);
       const { result, queryClient } = renderWithWrapper(() => useActionsRefreshFailure());
-      queryClient.setQueryData(queryKey, { seeded: queryKey });
+      queryClient.setQueryData(queryKey, data());
       await nextMacrotask();
       expect(result.current).toBeNull();
 
       const error = outage();
       await failRead(queryClient, queryKey, error);
       await waitFor(() => expect(result.current).toBe(error));
-      expect(queryClient.getQueryData(queryKey)).toEqual({ seeded: queryKey });
+      expect(queryClient.getQueryData(queryKey)).toEqual(data());
 
-      await succeedRead(queryClient, queryKey, { seeded: queryKey });
+      await succeedRead(queryClient, queryKey, data());
       await waitFor(() => expect(result.current).toBeNull());
     },
   );
@@ -2390,8 +2725,8 @@ describe('useActionsRefreshFailure', () => {
   it('reports the page before the other reads, then the next failure once the page recovers', async () => {
     stubFetch(unexpected);
     const { result, queryClient } = renderWithWrapper(() => useActionsRefreshFailure());
-    for (const [, queryKey] of WATCHED_KEYS) {
-      queryClient.setQueryData(queryKey, { seeded: queryKey });
+    for (const [, queryKey, data] of WATCHED_KEYS) {
+      queryClient.setQueryData(queryKey, data());
     }
     const configFailure = outage();
     const pageFailure = new ApiError(503, 'database_unavailable', 'Database unavailable');
@@ -2460,6 +2795,611 @@ describe('useActionsRefreshFailure', () => {
     expect(mock).not.toHaveBeenCalled();
   });
 });
+
+describe('useRetryActionsRefresh', () => {
+  /** The path of the default page's read and of each other read the loaded page shows. */
+  const PAGE_PATH = 'GET /api/v1/recommendations';
+  const CONFIG_PATH = 'GET /api/v1/config';
+
+  /**
+   * Answers to the reads of a loaded `/actions` page, by `METHOD pathname`, all successful. A
+   * test swaps an entry to make that read fail or succeed; {@link routes} reads the table at
+   * each request.
+   *
+   * @returns A fresh table.
+   */
+  function pageReadAnswers(): Record<string, () => Response | Promise<Response>> {
+    return {
+      [PAGE_PATH]: () => json(200, pagePayload()),
+      'GET /api/v1/sources': () => json(200, sourcesPayload()),
+      'GET /api/v1/discrepancies': () => json(200, []),
+      [CONFIG_PATH]: () => json(200, configPayload()),
+    };
+  }
+
+  /**
+   * The reads a loaded `/actions` page observes, the failure its refresh notice shows and the
+   * notice's Retry callback.
+   *
+   * @param runId - The run `/actions?run=<id>` addresses; omitted for the default page.
+   * @returns The four query results, the reported failure and the callback.
+   */
+  function useActionsReads(runId?: RunId) {
+    return {
+      page: useRecommendations(runId),
+      sources: useSources(),
+      discrepancies: useDiscrepancies(),
+      config: useConfig(),
+      failure: useActionsRefreshFailure(runId),
+      retry: useRetryActionsRefresh(runId),
+    };
+  }
+
+  /**
+   * Waits until every read of `useActionsReads` has data.
+   *
+   * @param result - `renderHook`'s result for {@link useActionsReads}.
+   */
+  async function loaded(result: { current: ReturnType<typeof useActionsReads> }): Promise<void> {
+    await waitFor(() => {
+      const { page, sources, discrepancies: list, config } = result.current;
+      expect([page, sources, list, config].every((read) => read.data !== undefined)).toBe(true);
+    });
+  }
+
+  /**
+   * Refetches the entries under `keys`, each by its exact key, as a poll does, and waits until
+   * they have settled.
+   *
+   * @param client - The query client.
+   * @param keys - The exact keys.
+   */
+  async function refetch(client: QueryClient, keys: readonly QueryKey[]): Promise<void> {
+    await act(async () => {
+      await Promise.all(
+        keys.map((queryKey) => client.refetchQueries({ queryKey, exact: true })),
+      );
+    });
+  }
+
+  it('reads again only the failed refreshes, each once, and resolves once they have settled', async () => {
+    const answers = pageReadAnswers();
+    const mock = stubFetch(routes(answers));
+    const { result, queryClient } = renderWithWrapper(() => useActionsReads());
+    await loaded(result);
+    const pageKey = queryKeys.recommendations('default');
+
+    answers[PAGE_PATH] = () => json(503, envelope('database_unavailable', 'Database unavailable'));
+    answers[CONFIG_PATH] = () => new Response('<html>Bad Gateway</html>', { status: 502 });
+    await refetch(queryClient, [pageKey, queryKeys.config]);
+    await waitFor(() => expect(result.current.failure?.status).toBe(503));
+    expect(queryClient.getQueryState(queryKeys.config)?.error?.status).toBe(502);
+
+    answers[PAGE_PATH] = () => json(200, pagePayload());
+    answers[CONFIG_PATH] = () => json(200, configPayload());
+    const before = mock.mock.calls.length;
+    await act(() => result.current.retry());
+
+    expect(sentPaths(mock).slice(before).sort()).toEqual([CONFIG_PATH, PAGE_PATH]);
+    // Both reads had settled by the time the callback resolved.
+    for (const queryKey of [pageKey, queryKeys.config]) {
+      expect(queryClient.getQueryState(queryKey)).toMatchObject({
+        status: 'success',
+        fetchStatus: 'idle',
+        error: null,
+      });
+    }
+    await waitFor(() => expect(result.current.failure).toBeNull());
+  });
+
+  it('sends nothing while every read is current', async () => {
+    const mock = stubFetch(routes(pageReadAnswers()));
+    const { result } = renderWithWrapper(() => useActionsReads());
+    await loaded(result);
+    const before = mock.mock.calls.length;
+    await act(() => result.current.retry());
+    expect(mock).toHaveBeenCalledTimes(before);
+  });
+
+  it('leaves a failed first read alone, which holds no data and has its own failure screen', async () => {
+    const answers = pageReadAnswers();
+    answers[PAGE_PATH] = () => json(503, envelope('database_unavailable', 'Database unavailable'));
+    const mock = stubFetch(routes(answers));
+    const { result } = renderWithWrapper(() => useActionsReads());
+    await waitFor(() => {
+      const { page, sources, discrepancies: list, config } = result.current;
+      expect(page.isError).toBe(true);
+      expect([sources, list, config].every((read) => read.isSuccess)).toBe(true);
+    });
+    expect(result.current.failure).toBeNull();
+    const before = mock.mock.calls.length;
+    await act(() => result.current.retry());
+    expect(mock).toHaveBeenCalledTimes(before);
+  });
+
+  it('never rejects: a read that fails again keeps its data and reports the new failure', async () => {
+    const answers = pageReadAnswers();
+    const mock = stubFetch(routes(answers));
+    const { result, queryClient, unmount } = renderWithWrapper(() => useActionsReads());
+    await loaded(result);
+    const pageKey = queryKeys.recommendations('default');
+    answers[PAGE_PATH] = () => json(503, envelope('database_unavailable', 'Database unavailable'));
+    await refetch(queryClient, [pageKey]);
+    await waitFor(() => expect(result.current.failure?.status).toBe(503));
+    const first = result.current.failure;
+
+    answers[PAGE_PATH] = () => json(500, envelope('internal_error', 'Still failing'));
+    const before = mock.mock.calls.length;
+    await act(() => result.current.retry());
+
+    expect(sentPaths(mock).slice(before)).toEqual([PAGE_PATH]);
+    await waitFor(() => expect(result.current.failure?.message).toBe('Still failing'));
+    expect(result.current.failure).not.toBe(first);
+    expect(result.current.page.data).toEqual(pagePayload());
+    // Unmounted before the cache is cleared after the test: with a failure still reported,
+    // clearing it under these observers would make their re-render rebuild the page's entry
+    // while the reported failure changes.
+    unmount();
+  });
+
+  it("reads the addressed run's page only, never the default page", async () => {
+    const answers = pageReadAnswers();
+    const custom = { answer: () => json(200, pagePayload(CUSTOM_RUN_ID, 'custom')) };
+    const routed = routes(answers);
+    const mock = stubFetch((url, init) =>
+      parseUrl(url).searchParams.has('run_id') ? custom.answer() : routed(url, init),
+    );
+    const { result, queryClient } = renderWithWrapper(() => ({
+      ...useActionsReads(CUSTOM_RUN_ID),
+      defaultPage: useRecommendations(),
+    }));
+    await loaded(result);
+    await waitFor(() => expect(result.current.defaultPage.isSuccess).toBe(true));
+
+    const outage = () => json(503, envelope('database_unavailable', 'Database unavailable'));
+    answers[PAGE_PATH] = outage;
+    custom.answer = outage;
+    await refetch(queryClient, [
+      queryKeys.recommendations('default'),
+      queryKeys.recommendations(CUSTOM_RUN_ID),
+    ]);
+    await waitFor(() => expect(result.current.failure?.status).toBe(503));
+
+    custom.answer = () => json(200, pagePayload(CUSTOM_RUN_ID, 'custom'));
+    const before = mock.mock.calls.length;
+    await act(() => result.current.retry());
+
+    expect(
+      sent(mock)
+        .slice(before)
+        .map((request) => `${request.parsed.pathname}${request.parsed.search}`),
+    ).toEqual([`/api/v1/recommendations?run_id=${String(CUSTOM_RUN_ID)}`]);
+    expect(queryClient.getQueryState(queryKeys.recommendations('default'))?.status).toBe('error');
+    await waitFor(() => expect(result.current.failure).toBeNull());
+  });
+
+  it('joins a refetch already in flight rather than aborting and sending it again', async () => {
+    const answers = pageReadAnswers();
+    const mock = stubFetch(routes(answers));
+    const { result, queryClient } = renderWithWrapper(() => useActionsReads());
+    await loaded(result);
+    const pageKey = queryKeys.recommendations('default');
+    answers[PAGE_PATH] = () => json(503, envelope('database_unavailable', 'Database unavailable'));
+    await refetch(queryClient, [pageKey]);
+    await waitFor(() => expect(result.current.failure?.status).toBe(503));
+
+    const held = deferred<Response>();
+    answers[PAGE_PATH] = () => held.promise;
+    const before = mock.mock.calls.length;
+    act(() => {
+      void queryClient.refetchQueries({ queryKey: pageKey, exact: true });
+    });
+    await waitFor(() => expect(mock).toHaveBeenCalledTimes(before + 1));
+    const [inFlight] = sent(mock).slice(before);
+
+    let settled = false;
+    let retried: Promise<void> = Promise.resolve();
+    act(() => {
+      retried = result.current.retry().then(() => {
+        settled = true;
+      });
+    });
+    await nextMacrotask();
+    expect(mock).toHaveBeenCalledTimes(before + 1);
+    expect(inFlight?.signal?.aborted).toBe(false);
+    expect(settled).toBe(false);
+
+    held.resolve(json(200, pagePayload()));
+    await act(async () => {
+      await retried;
+    });
+    expect(settled).toBe(true);
+    await waitFor(() => expect(result.current.failure).toBeNull());
+  });
+
+  it('returns the same callback across renders while the run stays the same', async () => {
+    stubFetch(routes(pageReadAnswers()));
+    const { result, rerender } = renderWithWrapper(() => useRetryActionsRefresh(CUSTOM_RUN_ID));
+    const first = result.current;
+    rerender();
+    expect(result.current).toBe(first);
+    await act(() => result.current());
+  });
+});
+
+describe("useActionsRefreshFailure and useRetryActionsRefresh: a group's loaded items", () => {
+  /** The path of every load of a group's further items. */
+  const ITEMS_PATH = '/api/v1/recommendations/items';
+
+  /** How many items each group served here stores: one load from 100 leaves a next page. */
+  const STORED = 250;
+
+  /** The offset of a group's first load: the 100 items the page carries. */
+  const FIRST_OFFSET = 100;
+
+  /** A default run older than {@link DEFAULT_RUN_ID}, whose loads stay cached after it. */
+  const OLDER_RUN_ID: Run['id'] = 99;
+
+  /** The message of nginx's 502 while the API restarts. */
+  const OUTAGE_MESSAGE = 'The server is temporarily unavailable. Try again shortly.';
+
+  /**
+   * The name a group's loads are served and failed under.
+   *
+   * @param runId - The run.
+   * @param section - The section.
+   * @param group - The group key.
+   * @returns `{runId}/{section}/{group}`.
+   */
+  function groupName(runId: RunId, section: string, group: string): string {
+    return `${String(runId)}/${section}/${group}`;
+  }
+
+  /**
+   * Answers `GET /recommendations/items` for any run, section and group of {@link STORED}
+   * visible items, sliced as the API slices it, with nginx's 502 for a group named in
+   * `failing`, and every other request with {@link unexpected}. It reads `failing` at each
+   * request, so a test fails and recovers a group by editing the set.
+   *
+   * @param failing - The {@link groupName}s to fail.
+   * @returns The responder.
+   */
+  function serveItems(failing: ReadonlySet<string>): Responder {
+    return (url, init) => {
+      const parsed = parseUrl(url);
+      if (parsed.pathname !== ITEMS_PATH) {
+        return unexpected(url, init);
+      }
+      const search = parsed.searchParams;
+      const runId = Number(search.get('run_id'));
+      const section = search.get('section') ?? '';
+      const group = search.get('group') ?? '';
+      if (failing.has(groupName(runId, section, group))) {
+        return json(502, envelope('upstream_unavailable', OUTAGE_MESSAGE));
+      }
+      const offset = Number(search.get('offset'));
+      const count = Math.max(0, Math.min(Number(search.get('limit')), STORED - offset));
+      return json(200, {
+        run_id: runId,
+        section,
+        group,
+        total: STORED,
+        hidden: 0,
+        offset,
+        items: Array.from({ length: count }, (_, index) => ({
+          id: offset + index + 1,
+          current: { hidden_by: null },
+        })),
+      } satisfies Omit<GroupItemsPage, 'section' | 'items'> & {
+        section: string;
+        items: unknown[];
+      });
+    };
+  }
+
+  /**
+   * The loads of a group's further items, one `{section}/{group}@{offset}` per request, in
+   * request order.
+   *
+   * @param mock - The stubbed fetch function.
+   * @param from - How many requests to skip first; none when omitted.
+   * @returns The loads; other requests are left out.
+   */
+  function itemLoads(mock: FetchMock, from = 0): string[] {
+    return sent(mock)
+      .slice(from)
+      .filter((request) => request.parsed.pathname === ITEMS_PATH)
+      .map((request) => {
+        const search = request.parsed.searchParams;
+        return `${search.get('section') ?? ''}/${search.get('group') ?? ''}@${search.get('offset') ?? ''}`;
+      });
+  }
+
+  /**
+   * Loads a group's first page past the page's own items, from {@link FIRST_OFFSET}.
+   *
+   * @param runId - The page's run.
+   * @param group - The Keywords group.
+   * @returns The infinite query result.
+   */
+  function useKeywordsLoads(runId: RunId, group: string) {
+    return useGroupItemPages(runId, 'keywords', group, FIRST_OFFSET, { enabled: true });
+  }
+
+  /**
+   * Refetches the entry under `queryKey` by its exact key, as a poll does, and waits until it
+   * has settled.
+   *
+   * @param client - The query client.
+   * @param queryKey - The exact key.
+   */
+  async function poll(client: QueryClient, queryKey: QueryKey): Promise<void> {
+    await act(async () => {
+      await client.refetchQueries({ queryKey, exact: true });
+    });
+  }
+
+  /**
+   * A client whose default page holds the run {@link DEFAULT_RUN_ID}, as a loaded `/actions`
+   * page leaves it, and its provider.
+   *
+   * @returns The client and wrapper.
+   */
+  function defaultPageLoaded(): WrapperSetup {
+    const setup = createWrapper();
+    setup.queryClient.setQueryData(queryKeys.recommendations('default'), pagePayload());
+    return setup;
+  }
+
+  it('reports a failed refresh of a loaded group, which keeps its items, after the page and before the sources', async () => {
+    const failing = new Set<string>();
+    const mock = stubFetch(serveItems(failing));
+    const setup = defaultPageLoaded();
+    setup.queryClient.setQueryData(queryKeys.sources, sourcesPayload());
+    const { result, queryClient, unmount } = renderWithWrapper(
+      () => ({ block: useKeywordsLoads(DEFAULT_RUN_ID, 'block'), failure: useActionsRefreshFailure() }),
+      setup,
+    );
+    await waitFor(() => expect(result.current.block.isSuccess).toBe(true));
+    expect(itemLoads(mock)).toEqual(['keywords/block@100']);
+    expect(result.current.failure).toBeNull();
+
+    const blockKey = queryKeys.groupItems(DEFAULT_RUN_ID, 'keywords', 'block');
+    failing.add(groupName(DEFAULT_RUN_ID, 'keywords', 'block'));
+    await poll(queryClient, blockKey);
+    await waitFor(() => expect(result.current.failure?.status).toBe(502));
+    expect(result.current.failure).toBe(queryClient.getQueryState(blockKey)?.error);
+    expect(result.current.failure?.message).toBe(OUTAGE_MESSAGE);
+    expect(result.current.block.isRefetchError).toBe(true);
+    expect(result.current.block.data).toHaveLength(100);
+    const blockFailure = result.current.failure;
+
+    // The sources come after the group, and the page before it.
+    const sourcesFailure = new ApiError(503, 'database_unavailable', 'Database unavailable');
+    await act(async () => {
+      await rejection(
+        queryClient.fetchQuery({
+          queryKey: queryKeys.sources,
+          queryFn: () => Promise.reject(sourcesFailure),
+        }),
+      );
+    });
+    await nextMacrotask();
+    expect(result.current.failure).toBe(blockFailure);
+    const pageFailure = new ApiError(500, 'internal_error', 'An unexpected error occurred.');
+    await act(async () => {
+      await rejection(
+        queryClient.fetchQuery({
+          queryKey: queryKeys.recommendations('default'),
+          queryFn: () => Promise.reject(pageFailure),
+        }),
+      );
+    });
+    await waitFor(() => expect(result.current.failure).toBe(pageFailure));
+    await act(async () => {
+      await queryClient.fetchQuery({
+        queryKey: queryKeys.recommendations('default'),
+        queryFn: () => Promise.resolve(pagePayload()),
+      });
+    });
+    await waitFor(() => expect(result.current.failure).toBe(blockFailure));
+
+    // A successful read of the group clears it, and the sources' failure shows next.
+    failing.clear();
+    await poll(queryClient, blockKey);
+    await waitFor(() => expect(result.current.failure).toBe(sourcesFailure));
+    // Unmounted before the cache is cleared after the test, for the reason the page's "never
+    // rejects" case gives: a failure is still reported.
+    unmount();
+  });
+
+  it("ignores the loads of any run but the page's: an older default run, or a run not addressed", async () => {
+    const failing = new Set<string>();
+    const mock = stubFetch(serveItems(failing));
+    // No default page is cached yet, so no run's loads are the default page's.
+    const { result, queryClient, unmount } = renderWithWrapper(() => ({
+      older: useKeywordsLoads(OLDER_RUN_ID, 'block'),
+      latest: useKeywordsLoads(DEFAULT_RUN_ID, 'block'),
+      custom: useKeywordsLoads(CUSTOM_RUN_ID, 'block'),
+      defaultPage: useActionsRefreshFailure(),
+      customPage: useActionsRefreshFailure(CUSTOM_RUN_ID),
+    }));
+    await waitFor(() => {
+      const { older, latest, custom } = result.current;
+      expect([older, latest, custom].every((loads) => loads.isSuccess)).toBe(true);
+    });
+
+    failing.add(groupName(OLDER_RUN_ID, 'keywords', 'block'));
+    failing.add(groupName(DEFAULT_RUN_ID, 'keywords', 'block'));
+    await poll(queryClient, queryKeys.groupItems(OLDER_RUN_ID, 'keywords', 'block'));
+    await poll(queryClient, queryKeys.groupItems(DEFAULT_RUN_ID, 'keywords', 'block'));
+    await waitFor(() => expect(result.current.latest.isRefetchError).toBe(true));
+    expect(result.current.older.isRefetchError).toBe(true);
+    expect(result.current.defaultPage).toBeNull();
+    expect(result.current.customPage).toBeNull();
+    // The page's run is read from the cache, never fetched.
+    expect(sentPaths(mock).filter((path) => path !== `GET ${ITEMS_PATH}`)).toEqual([]);
+
+    // Once the default page holds run 101, that run's loads are its own; the older run's stay
+    // out, and the addressed custom run sees neither.
+    act(() => {
+      queryClient.setQueryData(queryKeys.recommendations('default'), pagePayload());
+    });
+    await waitFor(() =>
+      expect(result.current.defaultPage).toBe(
+        queryClient.getQueryState(queryKeys.groupItems(DEFAULT_RUN_ID, 'keywords', 'block'))
+          ?.error,
+      ),
+    );
+    expect(result.current.customPage).toBeNull();
+
+    failing.add(groupName(CUSTOM_RUN_ID, 'keywords', 'block'));
+    await poll(queryClient, queryKeys.groupItems(CUSTOM_RUN_ID, 'keywords', 'block'));
+    await waitFor(() =>
+      expect(result.current.customPage).toBe(
+        queryClient.getQueryState(queryKeys.groupItems(CUSTOM_RUN_ID, 'keywords', 'block'))
+          ?.error,
+      ),
+    );
+    expect(result.current.defaultPage).not.toBe(result.current.customPage);
+    // Unmounted before the cache is cleared after the test: failures are still reported.
+    unmount();
+  });
+
+  it('leaves a failed next-page load to its list, also while a later refetch runs, and reports that refetch once it fails', async () => {
+    const failing = new Set<string>();
+    const served = serveItems(failing);
+    const answer: { respond: Responder } = { respond: served };
+    const mock = stubFetch((url, init) => answer.respond(url, init));
+    const { result, queryClient, unmount } = renderWithWrapper(
+      () => ({ block: useKeywordsLoads(DEFAULT_RUN_ID, 'block'), failure: useActionsRefreshFailure() }),
+      defaultPageLoaded(),
+    );
+    await waitFor(() => expect(result.current.block.isSuccess).toBe(true));
+
+    failing.add(groupName(DEFAULT_RUN_ID, 'keywords', 'block'));
+    await act(async () => {
+      await result.current.block.fetchNextPage();
+    });
+    await waitFor(() => expect(result.current.block.isFetchNextPageError).toBe(true));
+    expect(itemLoads(mock)).toEqual(['keywords/block@100', 'keywords/block@200']);
+    expect(result.current.block.data).toHaveLength(100);
+    expect(result.current.failure).toBeNull();
+
+    // A refetch started now, by a poll or an invalidation, replaces the entry's fetch meta while
+    // it keeps the next page's error: that failure is still the list's, not a refresh's.
+    const held = deferred<Response>();
+    answer.respond = () => held.promise;
+    const blockKey = queryKeys.groupItems(DEFAULT_RUN_ID, 'keywords', 'block');
+    let refetched: Promise<void> = Promise.resolve();
+    act(() => {
+      refetched = queryClient.refetchQueries({ queryKey: blockKey, exact: true });
+    });
+    await nextMacrotask();
+    expect(queryClient.getQueryState(blockKey)).toMatchObject({
+      fetchStatus: 'fetching',
+      fetchMeta: null,
+    });
+    expect(queryClient.getQueryState(blockKey)?.error?.status).toBe(502);
+    expect(result.current.failure).toBeNull();
+
+    held.resolve(json(502, envelope('upstream_unavailable', 'Still restarting')));
+    await act(async () => {
+      await refetched;
+    });
+    await waitFor(() => expect(result.current.failure?.message).toBe('Still restarting'));
+    expect(result.current.failure).toBe(queryClient.getQueryState(blockKey)?.error);
+    // Unmounted before the cache is cleared after the test: a failure is still reported.
+    unmount();
+  });
+
+  it('Retry reads each failed group of the page again once from its first offset, shown or not, and its polling resumes', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const failing = new Set<string>();
+    const mock = stubFetch(serveItems(failing));
+    const setup = defaultPageLoaded();
+    const { queryClient } = setup;
+    const page = renderWithWrapper(
+      () => ({
+        block: useKeywordsLoads(DEFAULT_RUN_ID, 'block'),
+        review: useKeywordsLoads(DEFAULT_RUN_ID, 'review'),
+        custom: useKeywordsLoads(CUSTOM_RUN_ID, 'block'),
+        failure: useActionsRefreshFailure(),
+        retry: useRetryActionsRefresh(),
+      }),
+      setup,
+    );
+    // Another Keywords tab, shown long enough to load and fail a poll, then left.
+    const tab = renderWithWrapper(() => useKeywordsLoads(DEFAULT_RUN_ID, 'expand'), setup);
+    await waitFor(() => {
+      const { block, review, custom } = page.result.current;
+      expect([block, review, custom, tab.result.current].every((loads) => loads.isSuccess)).toBe(
+        true,
+      );
+    });
+    const blockKey = queryKeys.groupItems(DEFAULT_RUN_ID, 'keywords', 'block');
+    const expandKey = queryKeys.groupItems(DEFAULT_RUN_ID, 'keywords', 'expand');
+    const reviewKey = queryKeys.groupItems(DEFAULT_RUN_ID, 'keywords', 'review');
+    const customKey = queryKeys.groupItems(CUSTOM_RUN_ID, 'keywords', 'block');
+    for (const group of ['block', 'expand']) {
+      failing.add(groupName(DEFAULT_RUN_ID, 'keywords', group));
+    }
+    failing.add(groupName(CUSTOM_RUN_ID, 'keywords', 'block'));
+    await poll(queryClient, expandKey);
+    tab.unmount();
+    await poll(queryClient, blockKey);
+    await poll(queryClient, customKey);
+    await waitFor(() => expect(page.result.current.failure?.status).toBe(502));
+    expect(queryClient.getQueryState(expandKey)?.error?.status).toBe(502);
+
+    // After the 502 the failed groups poll no more, for two intervals and more, while the
+    // healthy review group keeps polling its one load.
+    expect(pollInterval(queryClient, blockKey)).toBe(false);
+    const afterFailures = mock.mock.calls.length;
+    await act(() => vi.advanceTimersByTimeAsync(2 * CURRENT_STATE_POLL_MS));
+    expect(
+      itemLoads(mock, afterFailures).filter((load) => load !== 'keywords/review@100'),
+    ).toEqual([]);
+
+    // Review's last failure is a next page: its list asks for it again, Retry does not.
+    failing.add(groupName(DEFAULT_RUN_ID, 'keywords', 'review'));
+    await act(async () => {
+      await page.result.current.review.fetchNextPage();
+    });
+    await waitFor(() => expect(page.result.current.review.isFetchNextPageError).toBe(true));
+    failing.clear();
+    const beforeRetry = mock.mock.calls.length;
+    await act(() => page.result.current.retry());
+
+    expect(itemLoads(mock, beforeRetry).sort()).toEqual([
+      'keywords/block@100',
+      'keywords/expand@100',
+    ]);
+    for (const queryKey of [blockKey, expandKey]) {
+      expect(queryClient.getQueryState(queryKey)).toMatchObject({
+        status: 'success',
+        fetchStatus: 'idle',
+        error: null,
+      });
+    }
+    expect(queryClient.getQueryState(customKey)?.error?.status).toBe(502);
+    await waitFor(() => expect(page.result.current.failure).toBeNull());
+
+    // The shown groups poll again, the next-page failure's loaded page among them, never the
+    // page that failed; the left tab and the other run do not.
+    expect(pollInterval(queryClient, blockKey)).toBe(CURRENT_STATE_POLL_MS);
+    expect(pollInterval(queryClient, reviewKey)).toBe(CURRENT_STATE_POLL_MS);
+    const afterRetry = mock.mock.calls.length;
+    await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+    await waitFor(() => expect(mock).toHaveBeenCalledTimes(afterRetry + 2));
+    expect(itemLoads(mock, afterRetry).sort()).toEqual([
+      'keywords/block@100',
+      'keywords/review@100',
+    ]);
+  });
+});
+
+
 
 // ---------------------------------------------------------------------------------------------
 // Polling lifecycle
@@ -3631,6 +4571,323 @@ describe('useRequestSync', () => {
     expect(result.current.error?.code).toBe('service_unavailable');
     expect(invalidate).not.toHaveBeenCalled();
     expect(invalidated(queryClient, queryKeys.sources)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// useGroupItemPages
+// ---------------------------------------------------------------------------------------------
+
+describe('useGroupItemPages', () => {
+  /** The path of every load. */
+  const ITEMS_PATH = '/api/v1/recommendations/items';
+
+  /** One stored item of the group, with the only field the hook reads, `current.hidden_by`. */
+  function storedItem(id: Item['id'], hidden: boolean) {
+    return { id, current: { hidden_by: hidden ? 'dismiss' : null } } satisfies {
+      id: Item['id'];
+      current: Pick<Item['current'], 'hidden_by'>;
+    };
+  }
+
+  /**
+   * The Keywords "block" group of run 101: `count` items with ids from 1, those `hidden` names
+   * hidden by feedback.
+   */
+  function storedGroup(count: number, hidden: (id: number) => boolean = () => false) {
+    return Array.from({ length: count }, (_, index) => storedItem(index + 1, hidden(index + 1)));
+  }
+
+  /**
+   * Answers `GET /recommendations/items` from `stored` as the API slices it, every other
+   * request with {@link unexpected}.
+   */
+  function serveGroup(stored: readonly ReturnType<typeof storedItem>[]): Responder {
+    return (url, init) => {
+      const parsed = parseUrl(url);
+      if (parsed.pathname !== ITEMS_PATH) {
+        return unexpected(url, init);
+      }
+      const offset = Number(parsed.searchParams.get('offset'));
+      const limit = Number(parsed.searchParams.get('limit'));
+      return json(200, {
+        run_id: DEFAULT_RUN_ID,
+        section: 'keywords',
+        group: 'block',
+        total: stored.length,
+        hidden: stored.filter((item) => item.current.hidden_by !== null).length,
+        offset,
+        items: stored.slice(offset, offset + limit),
+      } satisfies Omit<GroupItemsPage, 'items'> & { items: unknown[] });
+    };
+  }
+
+  /** The offsets the loads read, in request order. */
+  function offsets(mock: FetchMock): number[] {
+    return sent(mock).map((request) => Number(request.parsed.searchParams.get('offset')));
+  }
+
+  /** The ids of the items loaded so far. */
+  function ids(items: readonly Item[] | undefined): number[] {
+    return (items ?? []).map((item) => item.id);
+  }
+
+  it('sends nothing while disabled', async () => {
+    const mock = stubFetch(serveGroup(storedGroup(250)));
+    const { result } = renderWithWrapper(() =>
+      useGroupItemPages(DEFAULT_RUN_ID, 'keywords', 'block', 100, { enabled: false }),
+    );
+    await nextMacrotask();
+
+    expect(mock).not.toHaveBeenCalled();
+    expect(result.current.data).toBeUndefined();
+    expect(result.current.fetchStatus).toBe('idle');
+  });
+
+  it("reads the group from the page's own count, a page at a time, to its total", async () => {
+    const mock = stubFetch(serveGroup(storedGroup(250)));
+    const { result, queryClient } = renderWithWrapper(() =>
+      useGroupItemPages(DEFAULT_RUN_ID, 'keywords', 'block', 100, { enabled: true }),
+    );
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    const [first] = sent(mock);
+    expect(first?.method).toBe('GET');
+    expect(first?.parsed.pathname).toBe(ITEMS_PATH);
+    expect(first === undefined ? [] : params(first)).toEqual([
+      ['run_id', '101'],
+      ['section', 'keywords'],
+      ['group', 'block'],
+      ['offset', '100'],
+      ['limit', '100'],
+    ]);
+    expect(first?.signal).toBeInstanceOf(AbortSignal);
+    expect(ids(result.current.data)).toEqual(Array.from({ length: 100 }, (_, i) => i + 101));
+    expect(result.current.hasNextPage).toBe(true);
+    const key = queryKeys.groupItems(DEFAULT_RUN_ID, 'keywords', 'block');
+    expect(queryClient.getQueryCache().find({ queryKey: key, exact: true })).toBeDefined();
+
+    await act(async () => {
+      await result.current.fetchNextPage();
+    });
+
+    await waitFor(() => expect(result.current.data).toHaveLength(150));
+    expect(offsets(mock)).toEqual([100, 200]);
+    expect(ids(result.current.data)).toEqual(Array.from({ length: 150 }, (_, i) => i + 101));
+    expect(result.current.hasNextPage).toBe(false);
+  });
+
+  it('reads on past slices whose every item feedback hides, within one load', async () => {
+    // Items 101–300 are all hidden; 301 is the next one to show.
+    const mock = stubFetch(serveGroup(storedGroup(400, (id) => id > 100 && id <= 300)));
+    const { result } = renderWithWrapper(() =>
+      useGroupItemPages(DEFAULT_RUN_ID, 'keywords', 'block', 100, { enabled: true }),
+    );
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(offsets(mock)).toEqual([100, 200, 300]);
+    expect(result.current.data).toHaveLength(300);
+    expect(result.current.data?.at(-1)?.id).toBe(400);
+    expect(result.current.hasNextPage).toBe(false);
+  });
+
+  it('ends the group at a slice with no item, whatever total it reports', async () => {
+    const mock = stubFetch(() =>
+      json(200, {
+        run_id: DEFAULT_RUN_ID,
+        section: 'keywords',
+        group: 'block',
+        total: 500,
+        hidden: 0,
+        offset: 100,
+        items: [],
+      } satisfies GroupItemsPage),
+    );
+    const { result } = renderWithWrapper(() =>
+      useGroupItemPages(DEFAULT_RUN_ID, 'keywords', 'block', 100, { enabled: true }),
+    );
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(mock).toHaveBeenCalledTimes(1);
+    expect(result.current.data).toEqual([]);
+    expect(result.current.hasNextPage).toBe(false);
+  });
+
+  it('is invalidated with the recommendations root and reads its loads again', async () => {
+    const mock = stubFetch(serveGroup(storedGroup(250)));
+    const { result, queryClient } = renderWithWrapper(() =>
+      useGroupItemPages(DEFAULT_RUN_ID, 'keywords', 'block', 100, { enabled: true }),
+    );
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.recommendationsAll });
+    });
+
+    expect(offsets(mock)).toEqual([100, 100]);
+    expect(queryKeys.groupItems(DEFAULT_RUN_ID, 'keywords', 'block')).toEqual([
+      'recommendations',
+      DEFAULT_RUN_ID,
+      'items',
+      'keywords',
+      'block',
+    ]);
+  });
+
+  it('polls like the page read, and stops after a server error until a read succeeds', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const serve = serveGroup(storedGroup(250));
+    const mock = stubFetch(
+      sequence(serve, serve, () =>
+        json(502, envelope('upstream_unavailable', 'The server is temporarily unavailable.')),
+      ),
+    );
+    const key = queryKeys.groupItems(DEFAULT_RUN_ID, 'keywords', 'block');
+    const { result, queryClient } = renderWithWrapper(() =>
+      useGroupItemPages(DEFAULT_RUN_ID, 'keywords', 'block', 100, { enabled: true }),
+    );
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(pollInterval(queryClient, key)).toBe(CURRENT_STATE_POLL_MS);
+
+    await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+    await waitFor(() => expect(mock).toHaveBeenCalledTimes(2));
+    await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+    await waitFor(() => expect(result.current.isRefetchError).toBe(true));
+    expect(pollInterval(queryClient, key)).toBe(false);
+    expect(result.current.data).toHaveLength(100);
+
+    await act(() => vi.advanceTimersByTimeAsync(2 * CURRENT_STATE_POLL_MS));
+    expect(mock).toHaveBeenCalledTimes(3);
+  });
+
+  /**
+   * Answers the group's loads from {@link storedGroup} as the API slices them, with nginx's 502
+   * for each offset in `failing`, read at each request so a test can fail and recover a page.
+   */
+  function serveGroupFailing(count: number, failing: ReadonlySet<number>): Responder {
+    const serve = serveGroup(storedGroup(count));
+    return (url, init) =>
+      failing.has(Number(parseUrl(url).searchParams.get('offset')))
+        ? json(502, envelope('upstream_unavailable', 'The server is temporarily unavailable.'))
+        : serve(url, init);
+  }
+
+  it('keeps polling the loads shown after a next page fails, re-reading only them from the first, and a successful poll clears the error', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const failing = new Set<number>();
+    const mock = stubFetch(serveGroupFailing(450, failing));
+    const key = queryKeys.groupItems(DEFAULT_RUN_ID, 'keywords', 'block');
+    const { result, queryClient } = renderWithWrapper(() =>
+      useGroupItemPages(DEFAULT_RUN_ID, 'keywords', 'block', 100, { enabled: true }),
+    );
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    // Read now, so the hook re-renders when they change (TanStack's tracked result).
+    expect(result.current.data).toHaveLength(100);
+    expect(result.current.isFetchNextPageError).toBe(false);
+    expect(result.current.hasNextPage).toBe(true);
+    await act(async () => {
+      await result.current.fetchNextPage();
+    });
+    await waitFor(() => expect(result.current.data).toHaveLength(200));
+
+    failing.add(300);
+    await act(async () => {
+      await result.current.fetchNextPage();
+    });
+    await waitFor(() => expect(result.current.isFetchNextPageError).toBe(true));
+    expect(offsets(mock)).toEqual([100, 200, 300]);
+    expect(result.current.data).toHaveLength(200);
+    expect(pollInterval(queryClient, key)).toBe(CURRENT_STATE_POLL_MS);
+
+    // The poll re-reads the two loads shown, from the first, and never the page that failed.
+    await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+    await waitFor(() => expect(mock).toHaveBeenCalledTimes(5));
+    await waitFor(() => expect(queryClient.getQueryState(key)?.fetchStatus).toBe('idle'));
+    expect(offsets(mock).slice(3)).toEqual([100, 200]);
+    expect(queryClient.getQueryState(key)).toMatchObject({ status: 'success', error: null });
+    expect(result.current.isFetchNextPageError).toBe(false);
+    expect(result.current.data).toHaveLength(200);
+    expect(result.current.hasNextPage).toBe(true);
+    expect(pollInterval(queryClient, key)).toBe(CURRENT_STATE_POLL_MS);
+
+    // With the error cleared, "Show more" reads the next page again once it answers.
+    failing.clear();
+    await act(async () => {
+      await result.current.fetchNextPage();
+    });
+    await waitFor(() => expect(result.current.data).toHaveLength(300));
+    expect(offsets(mock).slice(5)).toEqual([300]);
+  });
+
+  it('stops polling once a poll after a failed next page fails too, and reports that poll as a failed refresh', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const failing = new Set<number>();
+    const mock = stubFetch(serveGroupFailing(450, failing));
+    const setup = createWrapper();
+    setup.queryClient.setQueryData(queryKeys.recommendations('default'), pagePayload());
+    const key = queryKeys.groupItems(DEFAULT_RUN_ID, 'keywords', 'block');
+    const { result, queryClient, unmount } = renderWithWrapper(
+      () => ({
+        loads: useGroupItemPages(DEFAULT_RUN_ID, 'keywords', 'block', 100, { enabled: true }),
+        failure: useActionsRefreshFailure(),
+      }),
+      setup,
+    );
+    await waitFor(() => expect(result.current.loads.isSuccess).toBe(true));
+    // Read now, so the hook re-renders when they change (TanStack's tracked result).
+    expect(result.current.loads.data).toHaveLength(100);
+    expect(result.current.loads.isFetchNextPageError).toBe(false);
+    expect(result.current.loads.isRefetchError).toBe(false);
+    await act(async () => {
+      await result.current.loads.fetchNextPage();
+    });
+    await waitFor(() => expect(result.current.loads.data).toHaveLength(200));
+
+    failing.add(300);
+    await act(async () => {
+      await result.current.loads.fetchNextPage();
+    });
+    await waitFor(() => expect(result.current.loads.isFetchNextPageError).toBe(true));
+    expect(result.current.failure).toBeNull();
+
+    // The poll fails at the first load's offset: a failed refresh, which ends the polling.
+    failing.add(100);
+    await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+    await waitFor(() => expect(result.current.failure?.status).toBe(502));
+    expect(offsets(mock)).toEqual([100, 200, 300, 100]);
+    expect(result.current.failure).toBe(queryClient.getQueryState(key)?.error);
+    expect(result.current.loads.isRefetchError).toBe(true);
+    expect(result.current.loads.isFetchNextPageError).toBe(false);
+    expect(result.current.loads.data).toHaveLength(200);
+    expect(pollInterval(queryClient, key)).toBe(false);
+
+    await act(() => vi.advanceTimersByTimeAsync(2 * CURRENT_STATE_POLL_MS));
+    expect(mock).toHaveBeenCalledTimes(4);
+    // Unmounted before the cache is cleared after the test: a failure is still reported.
+    unmount();
+  });
+
+  it('reports whether the cache holds loads of a group', async () => {
+    stubFetch(serveGroup(storedGroup(150)));
+    const setup = createWrapper();
+    const cached = renderWithWrapper(
+      () => useHasCachedGroupItems(DEFAULT_RUN_ID, 'keywords', 'block'),
+      setup,
+    );
+    expect(cached.result.current).toBe(false);
+
+    const loads = renderWithWrapper(
+      () => useGroupItemPages(DEFAULT_RUN_ID, 'keywords', 'block', 100, { enabled: true }),
+      setup,
+    );
+    await waitFor(() => expect(loads.result.current.isSuccess).toBe(true));
+    cached.rerender();
+
+    expect(cached.result.current).toBe(true);
+    expect(
+      renderWithWrapper(() => useHasCachedGroupItems(CUSTOM_RUN_ID, 'keywords', 'block'), setup)
+        .result.current,
+    ).toBe(false);
   });
 });
 

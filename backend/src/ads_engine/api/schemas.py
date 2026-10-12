@@ -15,8 +15,9 @@ here are the wire contract. The groups are:
   :data:`ERROR_RESPONSES` for the routes' ``responses=``.
 * **Auth and runs**: :class:`LoginRequest`, :class:`Me`, :class:`Run`,
   :class:`CreateRunRequest`.
-* **Recommendations page**: :class:`RecommendationsPage` with its sections, groups, items,
-  frozen :class:`Evidence` and the read-time :class:`ItemOverlay` and :class:`Overlay`;
+* **Recommendations page**: :class:`RecommendationsPage` with its sections, groups (each with
+  its first :data:`GROUP_PAGE_SIZE` items), items, frozen :class:`Evidence` and the read-time
+  :class:`ItemOverlay` and :class:`Overlay`; :class:`GroupItemsPage`, the rest of a group;
   :class:`FeedbackRequest` and :class:`Feedback`.
 * **Decisions and discrepancies**: :class:`DecisionRequest` (a patch, AAP 0.5.2),
   :class:`ResolveRequest`, :class:`Decision` and :class:`Discrepancy`.
@@ -129,6 +130,7 @@ from ads_engine.db.models.ops import (
 __all__ = [
     "BIGINT_MAX",
     "ERROR_RESPONSES",
+    "GROUP_PAGE_SIZE",
     "NOTE_MAX_LENGTH",
     "ApiModel",
     "Banner",
@@ -175,6 +177,7 @@ __all__ = [
     "FlagCode",
     "GoogleCrmBindingView",
     "Group",
+    "GroupItemsPage",
     "Health",
     "HubSpotMappingView",
     "IntendedStateIn",
@@ -608,6 +611,16 @@ StorableNote = Annotated[str, Field(max_length=NOTE_MAX_LENGTH), AfterValidator(
 
 The length bound belongs to the ``str`` schema and runs first, so an overlong note is
 ``string_too_long`` whatever it contains."""
+
+GROUP_PAGE_SIZE: Final = 100
+"""The most items one :class:`Group` of a :class:`RecommendationsPage` carries, and the most one
+:class:`GroupItemsPage` returns.
+
+A run stores every item it computed, and one group can hold tens of thousands (a K1 block over a
+large search-term report). The page carries each group's first items in rank order, with the
+group's :attr:`Group.total` and :attr:`Group.hidden`, and ``GET /recommendations/items`` pages
+through the rest, so a page read is bounded whatever the run's size (AAP 0.1.1: the five sections
+render from precomputed runs in under 2 s)."""
 
 
 def _check_vocabularies() -> None:
@@ -1282,16 +1295,39 @@ class Item(ApiModel):
 class Group(ApiModel):
     """A group of items within a section, for example ``block`` or ``discrepancies``.
 
+    A page carries at most :data:`GROUP_PAGE_SIZE` items per group, the first in rank order;
+    ``GET /recommendations/items`` returns the rest (:class:`GroupItemsPage`). ``total`` and
+    ``hidden`` count every item the run stored in the group, so ``total - hidden`` is how many
+    the group shows, loaded or not.
+
     Attributes:
         key: The group key; creative groups are ``campaign:{id}`` and white-paper groups
             ``cohort:{currency}``.
         title: Display title.
-        items: The items in rank order.
+        items: The group's first items in rank order, at most :data:`GROUP_PAGE_SIZE`.
+        total: How many items the run stored in the group.
+        hidden: How many of them feedback in force now hides (``current.hidden_by``), counted
+            at read time with the overlay's rule: feedback on the item's rule and entity whose
+            ``until`` is after now; a C0 item is never hidden.
     """
 
     key: str
     title: str
     items: list[Item]
+    total: int = Field(ge=0)
+    hidden: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _counts_cover_items(self) -> Self:
+        """Require ``hidden <= total`` and no more items than ``total`` or the page size."""
+        if self.hidden > self.total:
+            raise ValueError(f"hidden ({self.hidden}) must not exceed total ({self.total})")
+        if len(self.items) > min(self.total, GROUP_PAGE_SIZE):
+            raise ValueError(
+                f"a group carries at most min(total, {GROUP_PAGE_SIZE}) items, "
+                f"found {len(self.items)} of total {self.total}"
+            )
+        return self
 
 
 class Finding(ApiModel):
@@ -1472,6 +1508,47 @@ class RecommendationsPage(ApiModel):
         if keys != tuple(SECTION_ORDER):
             raise ValueError(
                 f"sections must be exactly {list(SECTION_ORDER)} in that order, found {list(keys)}"
+            )
+        return self
+
+
+class GroupItemsPage(ApiModel):
+    """``GET /recommendations/items``: one slice of a group's items, beyond the page's first.
+
+    The items are the group's stored items in the page's rank order (``rank``, then id), from
+    position ``offset`` (0-based) on, at most the request's ``limit``, each with its read-time
+    ``current`` overlay, exactly as :class:`RecommendationsPage` serves them. Paging with
+    ``offset`` stepping by the items returned visits every item of the group exactly once: a
+    run's items are frozen, so their order never changes between requests.
+
+    Attributes:
+        run_id: The run the group belongs to.
+        section: The group's section.
+        group: The group key.
+        total: How many items the run stored in the group (:attr:`Group.total`).
+        hidden: How many of them feedback in force now hides (:attr:`Group.hidden`).
+        offset: The position of the first item returned.
+        items: The items from ``offset`` on, in rank order; empty at or past ``total``.
+    """
+
+    run_id: int
+    section: SectionKey
+    group: str
+    total: int = Field(ge=0)
+    hidden: int = Field(ge=0)
+    offset: int = Field(ge=0)
+    items: list[Item]
+
+    @model_validator(mode="after")
+    def _slice_within_group(self) -> Self:
+        """Require ``hidden <= total``, at most :data:`GROUP_PAGE_SIZE` items, inside ``total``."""
+        if self.hidden > self.total:
+            raise ValueError(f"hidden ({self.hidden}) must not exceed total ({self.total})")
+        if len(self.items) > GROUP_PAGE_SIZE:
+            raise ValueError(f"a slice holds at most {GROUP_PAGE_SIZE} items")
+        if self.items and self.offset + len(self.items) > self.total:
+            raise ValueError(
+                f"items {self.offset}..{self.offset + len(self.items)} exceed total {self.total}"
             )
         return self
 

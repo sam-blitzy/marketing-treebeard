@@ -20,8 +20,8 @@
  * - the frame itself: the section region and its `<h2>`, findings first as banners that are never
  *   alerts, groups in API order as anchored `<h3>` regions, the `renderGroup`, `renderGroups` and
  *   `renderEmptyGroup` hooks, the empty state's one-sentence reason (hidden and suppressed
- *   cards, else the leading withheld line, else the data-gap sentence of the section's
- *   `incomplete_dataset` findings, else the first finding that explains the absence, else
+ *   cards, else the data-gap sentence of the section's `incomplete_dataset` findings, else the
+ *   leading withheld line, else the first finding that explains the absence, else
  *   "No rule fired for this window", with no list repeated inside it and long identifiers
  *   wrapping at their underscores), the withheld list and the "Not shown" counts;
  * - the confirmations of items a feedback recorded on the page has hidden: placed in the hidden
@@ -1721,16 +1721,97 @@ describe('SectionFrame', () => {
       expect(screen.getAllByText('Pipeline unavailable.')).toHaveLength(1);
     });
 
-    it('lets the leading withheld line lead over the data-gap sentence', () => {
+    it('puts the data-gap sentence ahead of the leading withheld line, which stays listed below', () => {
+      const withheld = makeWithheld();
       renderFrame({
         section: makeSection('keywords', {
           groups: [makeGroup({ items: [] })],
           findings: [incompleteFinding('google.search_terms', ['partition deferred'])],
+          withheld: [withheld],
+        }),
+      });
+
+      expect(emptyTitle()).toBe(
+        'Data does not fully cover this window: google.search_terms (partition deferred)',
+      );
+      // The withheld line is still listed in full below the empty state.
+      expect(listLines('Withheld for sample size')).toEqual([withheldLine(withheld)]);
+    });
+
+    it('names the coverage gap, not one rule, for a window outside data coverage (run 10)', () => {
+      const from15 = 'covers from 2026-04-15, after the window start 2026-01-01';
+      const from14 = 'covers from 2026-04-14, after the window start 2026-01-01';
+      const segments =
+        'Segment data exists only for the preset windows 14, 28, 56, 90 ending 2026-10-10';
+      renderFrame({
+        section: makeSection('campaigns', {
+          groups: [
+            makeGroup({ key: 'discrepancies', title: 'Discrepancies', items: [] }),
+            makeGroup({ key: 'launch', title: 'Launch ideas', items: [] }),
+          ],
+          findings: [
+            makeFinding({
+              code: 'segment_window_unavailable',
+              section: 'campaigns',
+              message: segments,
+            }),
+            incompleteFinding('google.metrics_daily', [from15], 'campaigns'),
+            incompleteFinding('hubspot.contacts', [from14], 'campaigns'),
+            incompleteFinding('linkedin.analytics_daily', [from15], 'campaigns'),
+          ],
+          withheld: [
+            makeWithheld({
+              rule_id: 'C3a',
+              entity: null,
+              reason: segments,
+              sample: { observed: null, required: null, unit: 'segment windows' },
+            }),
+          ],
+        }),
+      });
+
+      expect(emptyTitle()).toBe(
+        `Data does not fully cover this window: google.metrics_daily, linkedin.analytics_daily ` +
+          `(${from15}); hubspot.contacts (${from14})`,
+      );
+      expect(emptyTitle()).not.toContain('C3a withheld');
+      // The C3a line records no sample shortfall, so its list reads "Withheld".
+      expect(listLines('Withheld')).toEqual([`C3a · Account-wide: ${segments}`]);
+    });
+
+    it('keeps the withheld reason ahead of the findings when no finding names an incomplete dataset', () => {
+      renderFrame({
+        section: makeSection('keywords', {
+          groups: [makeGroup({ items: [] })],
+          findings: [
+            makeFinding({ code: 'k1_no_baseline', message: 'K1 has no usable baseline.' }),
+            // An incomplete_dataset finding whose evidence names no dataset gives no data-gap
+            // sentence.
+            makeFinding({
+              code: 'incomplete_dataset',
+              message: 'google.search_terms is not complete over the window',
+              evidence: { dataset: null, reasons: ['partition deferred'] },
+            }),
+          ],
           withheld: [makeWithheld()],
         }),
       });
 
+      // AAP 0.5.5's example sentence still leads without a coverage gap.
       expect(emptyTitle()).toBe('No search term met the K1 minimum of 37 clicks');
+    });
+
+    it('keeps the cards hidden by feedback and the suppression counts ahead of the data-gap sentence', () => {
+      renderFrame({
+        section: makeSection('budget', {
+          groups: [makeGroup({ key: 'changes', title: 'Budget changes', items: [] })],
+          findings: [incompleteFinding('google.metrics_daily', ['partition deferred'], 'budget')],
+          withheld: [makeWithheld({ rule_id: 'B2' })],
+          suppressed: { feedback_dismiss: 2 },
+        }),
+      });
+
+      expect(emptyTitle()).toBe('No actions to show: 2 dismissed');
     });
 
     it('falls back to the first finding when no incomplete-dataset evidence names a dataset', () => {

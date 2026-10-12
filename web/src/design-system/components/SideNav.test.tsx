@@ -4,7 +4,8 @@
  *
  * They hold the wrapper to the contract in its TSDoc: a `<nav>` landmark named by `label` holding
  * one list item per destination, in order; each link named by its label and count ("Keywords to
- * adjust 4"), with `0` shown and a missing or non-finite count omitted; the current page marked
+ * adjust 4"), the count digit-grouped as `formatCount` groups it ("Keywords to adjust 20,262"),
+ * with `0` shown and a missing or non-finite count omitted; the current page marked
  * by `aria-current="page"` and the `--current` modifier, and no `aria-current` anywhere else;
  * only same-origin route paths and in-page anchors rendered as destinations, every other `href`
  * failing closed to an inert `<a>` without `href`; and `renderLink` called once per safe item
@@ -110,6 +111,43 @@ describe('SideNav', () => {
     const link = screen.getByRole('link', { name: 'Copy' });
     expect(link.textContent).toBe('Copy');
     expect(link.querySelector('.ds-sidenav__count')).toBeNull();
+  });
+
+  it.each([
+    [20262, '20,262'],
+    [18002, '18,002'],
+    [1000, '1,000'],
+    [1234567, '1,234,567'],
+    [999, '999'],
+    [0, '0'],
+  ])('groups the digits of the count %d as "%s", in its text and its name', (count, text) => {
+    render(
+      <SideNav
+        label="Sections"
+        items={[{ key: 'keywords', label: 'Keywords to adjust', href: '#section-keywords', count }]}
+      />,
+    );
+
+    const link = screen.getByRole('link', { name: `Keywords to adjust ${text}` });
+    expect(link.textContent).toBe(`Keywords to adjust ${text}`);
+    expect(link.querySelector('.ds-sidenav__count')?.textContent).toBe(text);
+  });
+
+  it('hands renderLink the grouped count, as the default link renders it', () => {
+    render(
+      <SideNav
+        label="Main"
+        items={[{ key: 'actions', label: 'Actions', href: '/actions', count: 20262 }]}
+        renderLink={(_item, linkProps) => (
+          <a href={linkProps.href} className={linkProps.className}>
+            {linkProps.children}
+          </a>
+        )}
+      />,
+    );
+
+    const link = screen.getByRole('link', { name: 'Actions 20,262' });
+    expect(link.querySelector('.ds-sidenav__count')?.textContent).toBe('20,262');
   });
 
   it('marks only the current item, by aria-current="page" and the current modifier', () => {

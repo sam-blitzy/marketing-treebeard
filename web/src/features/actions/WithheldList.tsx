@@ -6,7 +6,9 @@
  * unit}}`), and the section lists it after its items, with the sample it saw against the sample
  * it needed. The Budget section titles the list "Patterns withheld for sample size" (AAP 0.5.5),
  * where a B4 line reads, for example, "B4 · Brand search: 3 weekend days of 4 required — 3 / 4
- * weekend days".
+ * weekend days". Any other list is titled from its lines: "Withheld for sample size" when every
+ * line records observed below required, else "Withheld", because a pattern can be withheld for
+ * validity ("pipeline unavailable") rather than for sample size.
  *
  * Presentation rules this file keeps:
  * - Every number comes from the API. The sample line is rendered by `formatSample`, which
@@ -14,24 +16,49 @@
  *   the client (AAP 0.5.4.1).
  * - The reason is the backend's own sentence, frozen with the run, and is never re-derived.
  * - Lines keep the order the API returns them in.
+ * - A long list mounts in bounded batches (`./batches`; AAP 0.1.1 "the five sections render from
+ *   precomputed runs in under 2 s"): `ROW_BATCH_SIZE` lines at a time, followed by a "Show {n}
+ *   more withheld patterns" control, so a run that withholds thousands of search terms never
+ *   mounts them all at once. Every line stays reachable, with its observed and required sizes
+ *   (AAP 0.5.4.2 P6).
  * - {@link withheldReason} turns the leading line into the one-sentence reason an empty section
  *   or sub-list shows (AAP 0.5.5: "No search term met the K1 minimum of 37 clicks"), with the
  *   minimum taken from the recorded `sample.required`, stated only when every line of the
  *   leading line's rule and entity type records an observed size below it.
  *
- * Built only on the design-system index (AAP 0.4.4): `Stack` for layout and the list, with no
- * styles of its own, no raw headings and no inline styles.
+ * Built only on the design-system index (AAP 0.4.4): `Stack` for layout and the list, and the
+ * shared batch control (`Inline` and `Button`), with no styles of its own, no raw headings and
+ * no inline styles.
  *
  * @packageDocumentation
  */
+import { useMemo } from 'react';
 import type { ReactElement } from 'react';
 
 import type { EntityView, Withheld } from '../../api/types';
 import { Stack } from '../../design-system';
 import { formatCount, formatSample, isDecimalString } from '../../lib/format';
+import { BatchControl, ROW_BATCH_SIZE, useBatches } from './batches';
+import type { BatchNoun } from './batches';
 
-/** The list title when the caller passes none, or a blank one. */
-const DEFAULT_TITLE = 'Withheld for sample size';
+/**
+ * The list title when the caller passes none, or a blank one, and every line records a sample
+ * shortfall: observed below required ({@link defaultTitle}).
+ */
+const SAMPLE_SIZE_TITLE = 'Withheld for sample size';
+
+/**
+ * The list title when the caller passes none, or a blank one, and some line records no sample
+ * shortfall, such as C1b's "pipeline unavailable" or a line with no recorded sizes
+ * ({@link defaultTitle}).
+ */
+const NEUTRAL_TITLE = 'Withheld';
+
+/** What the list counts in its batch control: "Showing 50 of 16,943 withheld patterns". */
+const WITHHELD_NOUN: BatchNoun = Object.freeze({
+  singular: 'withheld pattern',
+  plural: 'withheld patterns',
+});
 
 /** Names the entity of an account-wide withholding, which has none (`entity: null`). */
 const ACCOUNT_WIDE = 'Account-wide';
@@ -240,6 +267,22 @@ function fallsShort(sample: Withheld['sample']): boolean {
 }
 
 /**
+ * The title of a withheld list whose caller passes none: "Withheld for sample size" only when
+ * every line records a sample shortfall ({@link fallsShort}: readable observed strictly below
+ * readable required), so the heading never names sample size for a pattern withheld for another
+ * reason; otherwise the neutral "Withheld". A line withheld for validity, such as C1b's
+ * "pipeline unavailable: Qualified Lead count unavailable" (no sizes recorded) or a B4 rate test
+ * that failed at 264 of 10 outcomes, or one with a missing size, records no shortfall.
+ *
+ * @param withheld - every line of the list, shown or not yet revealed, as the API returned them,
+ *   so revealing more lines never changes the title
+ * @returns the title
+ */
+function defaultTitle(withheld: readonly Withheld[]): string {
+  return withheld.every((w) => fallsShort(w.sample)) ? SAMPLE_SIZE_TITLE : NEUTRAL_TITLE;
+}
+
+/**
  * The minimum every withheld line of the leading line's rule and entity type falls short of, as
  * the parts of "No {noun} met the {rule} minimum of {size} {unit}". It is `null` when the leading
  * line names no entity type, names the account, or records no readable `required` size or no
@@ -363,25 +406,34 @@ export interface WithheldListProps {
   /** The section's withheld patterns (`Section.withheld`), in the order the API returned. */
   withheld: readonly Withheld[];
   /**
-   * The list's visible title, which also names the list for assistive technology. Defaults to
-   * "Withheld for sample size"; the Budget section passes "Patterns withheld for sample size"
-   * (AAP 0.5.5). A blank title falls back to the default, so the list is never unnamed.
+   * The list's visible title, which also names the list for assistive technology; the Budget
+   * section passes "Patterns withheld for sample size" (AAP 0.5.5). Omitted or blank, the title
+   * is chosen from the lines ({@link defaultTitle}): "Withheld for sample size" when every line
+   * records observed below required, else "Withheld", so the list is never unnamed.
    */
   title?: string;
 }
 
 /**
  * Lists a section's withheld patterns under a title, one {@link withheldLine} per pattern, in
- * the order the API returned them.
+ * the order the API returned them. The title is the caller's, or, without one, chosen from the
+ * lines ({@link defaultTitle}).
  *
  * Renders a `Stack` (gap step 2, `breakLongWords`) holding the title as bold text and a
- * `Stack as="ul"` (gap step 1, `role="list"`) with one `<li>` per pattern. `breakLongWords` lets
- * a long unbroken title, entity name or search term wrap inside a narrow section instead of
+ * `Stack as="ul"` (gap step 1, `role="list"`) with one `<li>` per shown pattern. `breakLongWords`
+ * lets a long unbroken title, entity name or search term wrap inside a narrow section instead of
  * overflowing it (WCAG 2.2 SC 1.4.10 Reflow). The list is named by its `aria-label`, equal to
  * the visible title, because `Stack` accepts no `aria-labelledby`. When there is nothing
  * withheld, nothing is rendered: no title and no empty list.
  *
- * The component holds no state and has no effects; its output depends only on its props.
+ * The lines mount `ROW_BATCH_SIZE` at a time, in API order (`./batches`). A list longer than one
+ * batch is followed, after the `<ul>` and inside the outer `Stack`, by the `BatchControl`: the
+ * polite status "Showing 50 of 16,943 withheld patterns" and a "Show 50 more withheld patterns"
+ * button. Each shown `<li>` of such a list carries its batch entry id, so after a reveal focus
+ * moves to the first newly revealed line. A list at or under one batch renders every line with
+ * no id and no control, exactly as an unbatched list.
+ *
+ * The component keeps only how many batches it shows; it fetches nothing.
  *
  * @param props - see {@link WithheldListProps}
  * @returns the titled list, or `null` when nothing is withheld
@@ -392,10 +444,13 @@ export interface WithheldListProps {
  * ```
  */
 export function WithheldList({ withheld, title }: WithheldListProps): ReactElement | null {
+  // Called before the early return, so every render calls the same hooks in the same order.
+  const batches = useBatches(withheld, { batchSize: ROW_BATCH_SIZE });
+  // Choosing the title reads every line, so it is not repeated when a reveal renders again.
+  const label = useMemo(() => textOrNull(title) ?? defaultTitle(withheld), [title, withheld]);
   if (withheld.length === 0) {
     return null;
   }
-  const label = textOrNull(title) ?? DEFAULT_TITLE;
 
   return (
     <Stack gap={2} breakLongWords>
@@ -410,10 +465,17 @@ export function WithheldList({ withheld, title }: WithheldListProps): ReactEleme
       */}
       <strong>{label}</strong>
       <Stack as="ul" gap={1} aria-label={label}>
-        {withheld.map((w, index) => (
-          <li key={`${w.rule_id}-${index}`}>{withheldLine(w)}</li>
+        {batches.shown.map((w, index) => (
+          <li
+            key={`${w.rule_id}-${index}`}
+            // The focus target of the line when a reveal shows it first; none when unbatched.
+            id={batches.batched ? batches.entryId(index) : undefined}
+          >
+            {withheldLine(w)}
+          </li>
         ))}
       </Stack>
+      <BatchControl batches={batches} noun={WITHHELD_NOUN} />
     </Stack>
   );
 }

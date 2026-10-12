@@ -10,13 +10,14 @@
  *   card stays collapsed behind "Held until discrepancies are resolved". The section opens on
  *   the first sub-list with a visible card, else one with a card computed from replaced data,
  *   else one with a held card; an empty sub-list states why its rule has no card (cards hidden
- *   by feedback, else its rule's leading withheld line, such as "No search term met the K1
- *   minimum of 70 clicks", else the section's suppression counts as the frame writes them, such
- *   as "No K3 action to show; not shown in this section: 2 dismissed", else "{rule} did not fire
- *   for this window"); a chosen tab survives a
+ *   by feedback, else the section's data-gap sentence when its `incomplete_dataset` findings
+ *   name datasets that do not cover the window, else its rule's leading withheld line, such as
+ *   "No search term met the K1 minimum of 70 clicks", else the section's suppression counts as
+ *   the frame writes them, such as "No K3 action to show; not shown in this section: 2
+ *   dismissed", else "{rule} did not fire for this window"); a chosen tab survives a
  *   refetch and falls back to the default when its group disappears. A section with no card to
  *   show renders the frame's empty state with its one-sentence reason (the cards feedback hides,
- *   a withheld K1 term's minimum) and no tabs.
+ *   the data-gap sentence, a withheld K1 term's minimum) and no tabs.
  * - **The coverage finding.** The `search_term_coverage` finding (search-term spend ÷ keyword
  *   spend, below 80%) sits above the tabs as a banner, never an alert, and every keyword card
  *   carries the low-coverage flag.
@@ -33,12 +34,17 @@
  *
  * - **A card hidden on the page.** Dismissing a sub-list's only card leaves its confirmation in
  *   the tab's panel, not an empty state, focused, and the tab stays selected with its count of 0.
+ * - **A sub-list larger than the page.** Its tab counts every stored card less those feedback
+ *   hides (`total` − `hidden`), so the tabs still add up to the navigation count and to what
+ *   the panel's status counts; a sub-list whose loaded cards are all hidden while it stores
+ *   more is no empty tab: it opens first and loads its next cards by itself.
  *
- * The section fetches nothing, so every test stubs the API with no handler: any request fails
- * the test. The feedback-flow test alone renders the section from a stubbed
- * `GET /recommendations` (`../../../test/feedbackFlow`), whose feedback post hides the item.
+ * The section reads only the further cards of a sub-list larger than the page, so every other
+ * test stubs the API with no handler: any request fails the test. The feedback-flow test alone
+ * renders the section from a stubbed `GET /recommendations` (`../../../test/feedbackFlow`),
+ * whose feedback post hides the item.
  */
-import { mockApi } from '../../../test/mockApi';
+import { json, mockApi } from '../../../test/mockApi';
 
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { useState } from 'react';
@@ -116,6 +122,20 @@ function k1Withheld(name: string, observed: number, required: number) {
   });
 }
 
+/**
+ * An `incomplete_dataset` finding of the Keywords section, as the runner records one: its
+ * dataset and its one cause in `evidence`.
+ */
+function incompleteDataset(dataset: string, cause: string) {
+  return makeFinding({
+    code: 'incomplete_dataset',
+    section: 'keywords',
+    entity: null,
+    message: `${dataset} is not complete over the window: ${cause}`,
+    evidence: { dataset, reasons: [cause] },
+  });
+}
+
 /** One evidence metric, as the backend serialises it. */
 function metric(
   key: string,
@@ -179,12 +199,15 @@ function tabNames(): (string | null)[] {
   return screen.getAllByRole('tab').map(tabText);
 }
 
-/** The sum of the counts the tabs show, each read from the end of its tab's name. */
+/**
+ * The sum of the counts the tabs show, each read from the end of its tab's name, where it is
+ * digit-grouped as `formatCount` groups it ("18,002").
+ */
 function tabCountTotal(): number {
   return tabNames().reduce((total, name) => {
-    const count = /(\d+)$/u.exec(name ?? '')?.[1];
+    const count = /(\d{1,3}(?:,\d{3})*)$/u.exec(name ?? '')?.[1];
     expect(count, `tab "${name ?? ''}" shows a count`).toBeDefined();
-    return total + Number(count);
+    return total + Number((count ?? '').replaceAll(',', ''));
   }, 0);
 }
 
@@ -1068,6 +1091,114 @@ describe('KeywordsSection', () => {
       expect(listEntries(document.body, 'Withheld for sample size')).toEqual([exactLine]);
       expect(screen.getAllByText(line)).toHaveLength(1);
     });
+
+    it('names the coverage gap, not K1, in the empty state for a window outside data coverage (run 10)', async () => {
+      const from15 = 'covers from 2026-04-15, after the window start 2026-01-01';
+      const baseline = 'baseline unavailable: no Google campaign facts in the trailing 90 days';
+      await renderKeywords(
+        makeSection('keywords', {
+          groups: [
+            makeGroup({ key: 'block', title: 'Block / negative-keyword candidates', items: [] }),
+            makeGroup({ key: 'expand', title: 'Expansion candidates', items: [] }),
+            makeGroup({ key: 'review', title: 'Review', items: [] }),
+          ],
+          findings: [
+            makeFinding({
+              code: 'k1_no_baseline',
+              message: 'Block candidates withheld account-wide: no Google campaign facts.',
+            }),
+            incompleteDataset('google.metrics_daily', from15),
+            incompleteDataset('google.search_terms', from15),
+          ],
+          withheld: [
+            makeWithheld({
+              entity: null,
+              reason: baseline,
+              sample: { observed: null, required: 10, unit: 'conversions' },
+            }),
+          ],
+        }),
+      );
+
+      expect(screen.queryByRole('tablist')).toBeNull();
+      expect(emptyStateTitle(document.body)).toBe(
+        `Data does not fully cover this window: google.metrics_daily, google.search_terms ` +
+          `(${from15})`,
+      );
+      // The K1 line is still listed, under the neutral title: it records no sample shortfall.
+      expect(listEntries(document.body, 'Withheld')).toHaveLength(1);
+      expect(screen.queryByText('Withheld for sample size')).toBeNull();
+    });
+
+    it('names the coverage gap ahead of the rule\'s withheld line in an empty tab, and the K1 minimum without one', async () => {
+      const groups = [
+        makeGroup({ key: 'block', title: 'Block / negative-keyword candidates', items: [] }),
+        makeGroup({
+          key: 'expand',
+          title: 'Expansion candidates',
+          items: [pageItem(FIXTURE_ITEM_IDS.k2)],
+        }),
+        makeGroup({ key: 'review', title: 'Review', items: [] }),
+        makeGroup({ key: 'future', title: 'Future rule', items: [] }),
+      ];
+      const withheld = [
+        k1Withheld('attribution modeling', 28, 70),
+        makeWithheld({
+          rule_id: 'K3',
+          entity: null,
+          reason: 'window 7 days of 14 required',
+          sample: { observed: 7, required: 14, unit: 'days' },
+        }),
+      ];
+      const gap = incompleteDataset('google.search_terms', 'partition deferred');
+      const { unmount } = await renderKeywords(
+        makeSection('keywords', { groups, findings: [gap], withheld }),
+      );
+
+      const sentence =
+        'Data does not fully cover this window: google.search_terms (partition deferred)';
+      fireEvent.click(screen.getByRole('tab', { name: 'Block / negative-keyword candidates 0' }));
+      expect(emptyStateTitle(visiblePanel())).toBe(sentence);
+      fireEvent.click(screen.getByRole('tab', { name: 'Review 0' }));
+      expect(emptyStateTitle(visiblePanel())).toBe(sentence);
+      fireEvent.click(screen.getByRole('tab', { name: 'Future rule 0' }));
+      expect(emptyStateTitle(visiblePanel())).toBe(sentence);
+      unmount();
+
+      // Without a coverage gap, each rule's withheld line is the reason again (AAP 0.5.5).
+      await renderKeywords(makeSection('keywords', { groups, withheld }));
+      fireEvent.click(screen.getByRole('tab', { name: 'Block / negative-keyword candidates 0' }));
+      expect(emptyStateTitle(visiblePanel())).toBe(
+        'No search term met the K1 minimum of 70 clicks',
+      );
+      fireEvent.click(screen.getByRole('tab', { name: 'Review 0' }));
+      expect(emptyStateTitle(visiblePanel())).toBe('K3 withheld: window 7 days of 14 required');
+    });
+
+    it('keeps the cards feedback hides now ahead of the coverage gap in an empty tab', async () => {
+      const hiddenK3 = {
+        ...pageItem(FIXTURE_ITEM_IDS.k3),
+        current: makeItemOverlay({ hidden_by: 'snooze' }),
+      };
+      await renderKeywords(
+        makeSection('keywords', {
+          groups: [
+            makeGroup({
+              key: 'block',
+              title: 'Block / negative-keyword candidates',
+              items: [pageItem(FIXTURE_ITEM_IDS.k1)],
+            }),
+            makeGroup({ key: 'review', title: 'Review', items: [hiddenK3] }),
+          ],
+          findings: [incompleteDataset('google.metrics_daily', 'partition deferred')],
+        }),
+      );
+
+      fireEvent.click(screen.getByRole('tab', { name: 'Review 0' }));
+      expect(emptyStateTitle(visiblePanel())).toBe(
+        'No actions to show: 1 hidden by feedback since this run (dismissed, snoozed or done)',
+      );
+    });
   });
 
   describe('keyword card field order', () => {
@@ -1393,5 +1524,108 @@ describe('KeywordsSection: a card a refetch moves into the replaced-data block',
     // The block shows the batches through the moved card, and no more.
     expect(within(replacedBlock).getAllByRole('article')).toHaveLength(2 * CARD_BATCH_SIZE);
     expect(within(replacedBlock).getByText('Showing 40 of 45 actions')).toBeDefined();
+  });
+});
+
+describe('KeywordsSection: a sub-list larger than the page', () => {
+  /** `count` K1 items with ids from `first`, ranked in that order; `hidden` names the dismissed. */
+  function blockItems(first: number, count: number, hidden: (id: number) => boolean): Item[] {
+    const base = makeItem();
+    return Array.from({ length: count }, (_, index) => {
+      const id = first + index;
+      return makeItem({
+        id,
+        rank: index + 1,
+        action: `Add "term ${String(id)}" as exact-match negative`,
+        entity: { ...base.entity, id: `term ${String(id)}`, name: `term ${String(id)}` },
+        current: makeItemOverlay({ hidden_by: hidden(id) ? 'dismiss' : null }),
+      });
+    });
+  }
+
+  /** The Block group as the page carries it: the first 100 of `stored`, counting every one. */
+  function pageBlock(stored: readonly Item[]): Group {
+    return makeGroup({
+      key: 'block',
+      title: 'Block / negative-keyword candidates',
+      items: stored.slice(0, 100),
+      total: stored.length,
+      hidden: stored.filter((item) => item.current.hidden_by !== null).length,
+    });
+  }
+
+  /** The default page's Expand and Review groups, one card each. */
+  function otherGroups(): Group[] {
+    return defaultKeywords().groups.filter((group) => group.key !== 'block');
+  }
+
+  it('counts every stored card less the hidden ones, and the tabs add up to the nav count', async () => {
+    // Two of the page's cards and three beyond it are hidden.
+    const stored = blockItems(9001, 250, (id) => id === 9004 || id === 9050 || id > 9247);
+    const section = keywordsWith(pageBlock(stored), ...otherGroups());
+    await renderKeywords(section);
+
+    expect(tabNames()).toEqual([
+      'Block / negative-keyword candidates 245',
+      'Expansion candidates 1',
+      'Review 1',
+    ]);
+    expect(tabCountTotal()).toBe(visibleItemCount(section));
+    expect(selectedTabName()).toBe('Block / negative-keyword candidates 245');
+    expect(screen.getByText('Showing 20 of 245 actions')).toBeDefined();
+  });
+
+  it('digit-groups a stored total in the thousands in its tab, as the batch status does', async () => {
+    // The page carries the first 100 of 18,002 stored Block cards, none of them hidden.
+    const block = makeGroup({
+      key: 'block',
+      title: 'Block / negative-keyword candidates',
+      items: blockItems(9001, 100, () => false),
+      total: 18_002,
+      hidden: 0,
+    });
+    const section = keywordsWith(block, ...otherGroups());
+    await renderKeywords(section);
+
+    expect(tabNames()).toEqual([
+      'Block / negative-keyword candidates 18,002',
+      'Expansion candidates 1',
+      'Review 1',
+    ]);
+    expect(tabCountTotal()).toBe(visibleItemCount(section));
+    expect(
+      screen.getByRole('tab', { name: 'Block / negative-keyword candidates 18,002' }),
+    ).toBeDefined();
+    expect(screen.getByText('Showing 20 of 18,002 actions')).toBeDefined();
+  });
+
+  it('opens, and loads, a sub-list whose loaded cards are all hidden while it stores more', async () => {
+    const stored = blockItems(9001, 130, (id) => id < 9101);
+    const api = mockApi({
+      'GET /recommendations/items': (call) => {
+        const offset = Number(call.search.get('offset'));
+        const limit = Number(call.search.get('limit'));
+        return json(200, {
+          run_id: RUN.id,
+          section: 'keywords',
+          group: 'block',
+          total: stored.length,
+          hidden: 100,
+          offset,
+          items: stored.slice(offset, offset + limit),
+        });
+      },
+    });
+    const section = keywordsWith(pageBlock(stored), ...otherGroups());
+    await renderKeywords(section);
+
+    expect(selectedTabName()).toBe('Block / negative-keyword candidates 30');
+    await waitFor(() => {
+      expect(
+        screen.getByRole('article', { name: 'Add "term 9101" as exact-match negative' }),
+      ).toBeDefined();
+    });
+    expect(api.calls.map((call) => call.search.get('offset'))).toEqual(['100']);
+    expect(screen.getByText('Showing 20 of 30 actions')).toBeDefined();
   });
 });

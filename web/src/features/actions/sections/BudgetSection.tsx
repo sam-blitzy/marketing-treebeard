@@ -614,10 +614,11 @@ function BudgetCardDetails({ item }: { item: Item }): ReactElement {
  * lines (see the module overview). Withheld patterns, findings, held cards and suppression
  * counts are the frame's.
  *
- * Fetches nothing and holds no state: everything shown comes from `section`, as
- * `GET /recommendations` returned it.
+ * Holds no state, and reads only what the frame reads for it: everything shown comes from
+ * `section`, as `GET /recommendations` returned it, and a group larger than the page loads its
+ * further items from `GET /recommendations/items` for `run.id` as its "Show more" asks.
  *
- * @param props - see {@link SectionComponentProps}; only `section` is read.
+ * @param props - see {@link SectionComponentProps}; `section` and `run.id` are read.
  * @returns the section region
  *
  * @example
@@ -628,10 +629,11 @@ function BudgetCardDetails({ item }: { item: Item }): ReactElement {
  * );
  * ```
  */
-export function BudgetSection({ section }: SectionComponentProps): ReactElement {
+export function BudgetSection({ section, run }: SectionComponentProps): ReactElement {
   return (
     <SectionFrame
       section={section}
+      runId={run.id}
       withheldTitle={WITHHELD_TITLE}
       renderItem={(item, group) => (
         <RecommendationCard

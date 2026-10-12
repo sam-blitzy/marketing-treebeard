@@ -8,7 +8,9 @@
  *   Copy/creative changes, White papers), each pointing at `#section-{key}`, the region
  *   `SectionFrame` anchors;
  * - each link's text is the API title followed by the count of cards the section shows now:
- *   held items count, items hidden by feedback since the run do not, and a 0 is shown;
+ *   held items count, items hidden by feedback since the run do not, and a 0 is shown; a group
+ *   larger than the page counts every stored item (`total`) less those feedback hides
+ *   (`hidden`), the page's own read live;
  * - the order is the client's own: shuffled sections are sorted, an unknown key follows the
  *   known ones in API order, a repeated key links once (its first section), and a key the API
  *   left out gets no link; a blank title falls back to the key.
@@ -174,6 +176,63 @@ describe('SectionNav', () => {
 
     expect(visibleItemCount(campaigns)).toBe(3);
     expect(linkSummary()).toEqual([['Campaigns to pause or launch 3', '#section-campaigns']]);
+  });
+
+  it('counts every stored item of a group larger than the page, less those feedback hides', async () => {
+    // The page carries 100 of the group's 250 items; 2 of them and 5 beyond it are hidden.
+    const items = Array.from({ length: 100 }, (_, index) =>
+      itemWith(index + 1, {
+        current: makeItemOverlay({ hidden_by: index === 3 || index === 50 ? 'dismiss' : null }),
+      }),
+    );
+    const keywords = makeSection('keywords', {
+      groups: [
+        makeGroup({ key: 'block', title: 'Block', items, total: 250, hidden: 7 }),
+        makeGroup({ key: 'expand', title: 'Expand', items: [itemWith(301)] }),
+      ],
+    });
+
+    await renderWithProviders(<SectionNav sections={[keywords]} />);
+
+    expect(visibleItemCount(keywords)).toBe(244);
+    expect(linkSummary()).toEqual([['Keywords to adjust 244', '#section-keywords']]);
+  });
+
+  it('digit-groups a stored total in the thousands, as the batch status words it', async () => {
+    // A run whose Keywords groups store 18,002 and 2,260 items, of which the page carries 100.
+    const items = Array.from({ length: 100 }, (_, index) => itemWith(index + 1));
+    const keywords = makeSection('keywords', {
+      groups: [
+        makeGroup({ key: 'block', title: 'Block', items, total: 18_002, hidden: 0 }),
+        makeGroup({ key: 'expand', title: 'Expand', items: [itemWith(101)], total: 2_260 }),
+      ],
+    });
+
+    await renderWithProviders(<SectionNav sections={[keywords]} />);
+
+    expect(visibleItemCount(keywords)).toBe(20_262);
+    expect(linkSummary()).toEqual([['Keywords to adjust 20,262', '#section-keywords']]);
+    expect(screen.getByRole('link', { name: 'Keywords to adjust 20,262' })).toBe(navLinks()[0]);
+  });
+
+  it('reads the page items live when a count does not cover them', async () => {
+    // A count the page items exceed, or one that is not a whole number, leaves nothing beyond.
+    const keywords = makeSection('keywords', {
+      groups: [
+        makeGroup({
+          key: 'block',
+          title: 'Block',
+          items: [itemWith(1), itemWith(2, { current: makeItemOverlay({ hidden_by: 'snooze' }) })],
+          total: 1,
+          hidden: 0,
+        }),
+        makeGroup({ key: 'expand', title: 'Expand', items: [itemWith(3)], total: Number.NaN }),
+      ],
+    });
+
+    await renderWithProviders(<SectionNav sections={[keywords]} />);
+
+    expect(visibleItemCount(keywords)).toBe(2);
   });
 
   it('orders shuffled sections by SECTION_ORDER and gives no link to a section left out', async () => {

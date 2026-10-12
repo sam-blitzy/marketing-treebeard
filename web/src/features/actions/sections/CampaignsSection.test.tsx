@@ -2523,6 +2523,121 @@ describe('launch idea cards', () => {
 });
 
 // ---------------------------------------------------------------------------------------------
+// Bounded batches in a C3b cluster member table
+// ---------------------------------------------------------------------------------------------
+
+describe('a long cluster member table', () => {
+  /** The C3b action of {@link clusterOf}. */
+  const CLUSTER_ACTION = "Create ad group or campaign for 'warehouse'";
+
+  /** "warehouse term {n}" for n = first…last. */
+  function termNames(first: number, last: number): string[] {
+    return Array.from(
+      { length: last - first + 1 },
+      (_, index) => `warehouse term ${String(first + index)}`,
+    );
+  }
+
+  /**
+   * A C3b launch idea whose cluster holds `count` member terms in the backend's order, "warehouse
+   * term 1" … "warehouse term {count}", term n spending USD n.00 for one conversion.
+   */
+  function clusterOf(count: number): Section {
+    const c3b = makeItem({
+      id: 3020,
+      rule_id: 'C3b',
+      action: CLUSTER_ACTION,
+      evidence: makeEvidence({
+        metrics: [metric('spend', 'Cluster spend', `${String(count)}.00`, 'currency', 'USD')],
+        extra: {
+          head_tokens: ['warehouse'],
+          members: termNames(1, count).map((term, index) => ({
+            term,
+            spend: `${String(index + 1)}.00`,
+            conversions: '1',
+            clicks: 3,
+          })),
+        },
+      }),
+    });
+    return oneGroup('launch', 'Launch ideas', [c3b]);
+  }
+
+  /** The row headers (terms) of the card's member table, in document order. */
+  function shownTerms(): string[] {
+    return within(within(card(CLUSTER_ACTION)).getByRole('table', { name: CLUSTER_TERMS_CAPTION }))
+      .getAllByRole('rowheader')
+      .map((cell) => cell.textContent);
+  }
+
+  /** The card's batch statuses ("Showing …"), told apart from the card's own status regions. */
+  function batchStatuses(): string[] {
+    return within(card(CLUSTER_ACTION))
+      .queryAllByRole('status')
+      .map((status) => status.textContent)
+      .filter((text) => text.startsWith('Showing '));
+  }
+
+  it('mounts 50 of 3,009 member terms, then the next 50, focusing the first new term', async () => {
+    mockApi({});
+    await renderCampaigns(clusterOf(3009));
+    const article = card(CLUSTER_ACTION);
+
+    expect(shownTerms()).toEqual(termNames(1, 50));
+    expect(batchStatuses()).toEqual(['Showing 50 of 3,009 terms']);
+    fireEvent.click(within(article).getByRole('button', { name: 'Show 50 more terms' }));
+
+    expect(shownTerms()).toEqual(termNames(1, 100));
+    expect(batchStatuses()).toEqual(['Showing 100 of 3,009 terms']);
+    // Focus lands on the first revealed row's header, and the row keeps its columns and values.
+    const focused = document.activeElement;
+    expect(focused?.textContent).toBe('warehouse term 51');
+    const header = focused?.closest('th');
+    expect(header?.getAttribute('scope')).toBe('row');
+    const cells = header?.closest('tr')?.querySelectorAll('th, td') ?? [];
+    expect([...cells].map((cell) => cell.textContent)).toEqual([
+      'warehouse term 51',
+      'USD\u00a051.00',
+      '1',
+    ]);
+    expect(within(article).getByRole('button', { name: 'Show 50 more terms' })).toBeTruthy();
+  }, LARGE_RENDER_TEST_TIMEOUT_MS);
+
+  it('reveals a short last batch and then drops the button', async () => {
+    mockApi({});
+    await renderCampaigns(clusterOf(51));
+    const article = card(CLUSTER_ACTION);
+
+    expect(shownTerms()).toEqual(termNames(1, 50));
+    expect(batchStatuses()).toEqual(['Showing 50 of 51 terms']);
+    fireEvent.click(within(article).getByRole('button', { name: 'Show 1 more term' }));
+
+    expect(shownTerms()).toEqual(termNames(1, 51));
+    expect(document.activeElement?.textContent).toBe('warehouse term 51');
+    expect(batchStatuses()).toEqual(['Showing all 51 terms']);
+    expect(within(article).queryByRole('button', { name: /^Show \d+ more term/u })).toBeNull();
+  });
+
+  it('renders a cluster of 50 terms as one table, with no control or focus target', async () => {
+    mockApi({});
+    await renderCampaigns(clusterOf(50));
+    const article = card(CLUSTER_ACTION);
+
+    expect(shownTerms()).toEqual(termNames(1, 50));
+    expect(batchStatuses()).toEqual([]);
+    expect(within(article).queryByRole('button', { name: /^Show \d+ more term/u })).toBeNull();
+    // No row carries a focus target: each row header holds its term as plain text.
+    const table = within(article).getByRole('table', { name: CLUSTER_TERMS_CAPTION });
+    expect(table.querySelectorAll('tbody [id]')).toHaveLength(0);
+    expect(
+      within(table)
+        .getAllByRole('rowheader')
+        .every((cell) => cell.children.length === 0),
+    ).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
 // Flags and data state
 // ---------------------------------------------------------------------------------------------
 

@@ -51,6 +51,8 @@ import './Tabs.css';
 import { useId, useRef, useState } from 'react';
 import type { KeyboardEvent, ReactNode } from 'react';
 
+import { formatCount } from '../../lib/format';
+
 /**
  * One tab and the panel it shows.
  *
@@ -75,8 +77,11 @@ export interface TabItem {
   label: ReactNode;
   /**
    * Optional item count shown beside the label, for example the number of items in a sub-list.
-   * It is part of the tab's accessible name ("Block 3"). `0` is rendered; omit the prop to
-   * show no count.
+   * It is part of the tab's accessible name ("Block 3"). It is rendered by `formatCount` from
+   * `lib/format.ts`, with digit grouping, exactly as every other count in the product reads:
+   * `18002` shows "18,002" and names the tab "Block 18,002". `0` is rendered as "0"; omit the
+   * prop to show no count. A value that is not a finite number renders "unavailable", the
+   * formatter's text for a value it cannot format, never "NaN" or "Infinity".
    */
   count?: number;
   /**
@@ -196,7 +201,8 @@ function revealTab(tab: HTMLElement, scroller: HTMLElement | null): void {
  *
  * Renders `null` when `tabs` is empty. Element ids derive from `useId`, so several `Tabs` on one
  * page never collide; a tab's `id`, when given, names its panel instead. Every panel element is
- * rendered from the start, and its content from the first time its tab is selected.
+ * rendered from the start, and its content from the first time its tab is selected. Each count
+ * is digit-grouped by `formatCount` ("Block 18,002"; see {@link TabItem.count}).
  *
  * GAP: bind to Blitzy OS on source arrival.
  *
@@ -320,7 +326,7 @@ export function Tabs({ label, tabs, selectedKey, onChange }: TabsProps) {
                 {tab.count !== undefined && (
                   <>
                     {' '}
-                    <span className="ds-tabs__count">{tab.count}</span>
+                    <span className="ds-tabs__count">{formatCount(tab.count)}</span>
                   </>
                 )}
               </button>

@@ -5,7 +5,8 @@
  *
  * They pin what feature code and assistive technology rely on, so a later Blitzy OS binding that
  * changes the wrapper's internals must still pass them:
- * - one `tablist` named by `label`, one `tab` per item named by its label and count;
+ * - one `tablist` named by `label`, one `tab` per item named by its label and count, the count
+ *   digit-grouped as `formatCount` groups it ("Block 18,002");
  * - each label rendered visibly and once more as an `aria-hidden` sizer that reserves its
  *   semibold width, out of the tab's name, with a tab's content the same selected or not;
  * - exactly one tab selected (`aria-selected`), alone in the Tab sequence, controlling the one
@@ -89,6 +90,50 @@ describe('Tabs', () => {
         expect(tab.tagName).toBe('BUTTON');
         expect(tab.getAttribute('type')).toBe('button');
       }
+    });
+
+    it('groups the digits of each count as formatCount does, in its text and tab name', () => {
+      const counts: readonly [number, string][] = [
+        [18002, '18,002'],
+        [20262, '20,262'],
+        [1000, '1,000'],
+        [1234567, '1,234,567'],
+        [999, '999'],
+        [0, '0'],
+      ];
+      render(
+        <Tabs
+          label="Keyword actions"
+          tabs={counts.map(([count], index) => ({
+            key: `tab-${String(index)}`,
+            label: 'Block',
+            count,
+            content: <p>{`List ${String(index)}`}</p>,
+          }))}
+        />,
+      );
+
+      counts.forEach(([, text], index) => {
+        expect(presentedText(tabAt(index))).toBe(`Block ${text}`);
+        expect(tabAt(index).querySelector('.ds-tabs__count')?.textContent).toBe(text);
+      });
+      expect(screen.getByRole('tab', { name: 'Block 18,002' })).toBe(tabAt(0));
+      expect(screen.getByRole('tab', { name: 'Block 0' })).toBe(tabAt(5));
+    });
+
+    it.each([
+      ['NaN', Number.NaN],
+      ['Infinity', Number.POSITIVE_INFINITY],
+    ])('renders the count %s as "unavailable", never as the raw value', (_name, count) => {
+      render(
+        <Tabs
+          label="Keyword actions"
+          tabs={[{ key: 'block', label: 'Block', count, content: <p>Block list</p> }]}
+        />,
+      );
+
+      expect(tabAt(0).querySelector('.ds-tabs__count')?.textContent).toBe('unavailable');
+      expect(screen.getByRole('tab', { name: 'Block unavailable' })).toBe(tabAt(0));
     });
 
     it('reserves each label width with one hidden copy that stays out of the tab name', () => {

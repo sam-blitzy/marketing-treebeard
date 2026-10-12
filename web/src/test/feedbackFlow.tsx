@@ -115,8 +115,9 @@ function feedbackKindOf(body: unknown): FeedbackKind {
 /**
  * Stub handlers for the feedback flow: every `GET /recommendations` answers a fresh page from
  * `build`, with each item a feedback was posted for carrying `current.hidden_by`, and without
- * the items {@link FeedbackFlow.drop} has dropped; `POST /recommendations/:id/feedback` records
- * the kind for that item and answers 201 with its `Feedback`.
+ * the items {@link FeedbackFlow.drop} has dropped, each group's `total` and `hidden` counting
+ * them as the API does; `POST /recommendations/:id/feedback` records the kind for that item and
+ * answers 201 with its `Feedback`.
  *
  * @param build - builds a fresh page; the default fixture page when omitted
  * @returns the handlers and the state they share
@@ -130,10 +131,16 @@ export function feedbackFlow(
     const page = build();
     for (const section of page.sections) {
       for (const group of section.groups) {
+        const listed = group.items.length;
         group.items = group.items.filter((item) => !dropped.has(item.id));
+        // A dropped item is no longer stored, and a newly hidden one is counted as hidden.
+        group.total -= listed - group.items.length;
         for (const item of group.items) {
           const kind = hidden.get(item.id);
           if (kind !== undefined) {
+            if (item.current.hidden_by == null) {
+              group.hidden += 1;
+            }
             item.current.hidden_by = kind;
           }
         }

@@ -29,15 +29,18 @@
  * 4. an `EmptyState` whose title is the one sentence that says why, when no group has a card or
  *    a confirmation to show (AAP 0.5.5): the cards feedback has hidden since the run and the
  *    run's suppression counts first, so a section emptied by feedback or suppression says so;
- *    else the leading withheld line's reason (`withheldReason`, for example "No search term met
- *    the K1 minimum of 70 clicks"); else, when datasets the section needs do not cover the
- *    window, one sentence summarising its `incomplete_dataset` findings
- *    (`incompleteDataReason`, for example "Data does not fully cover this window:
- *    google.entities, google.metrics_daily (no active Google dataset)"); else the first finding
- *    that explains the absence. "No rule fired for this window" is reserved for a section with
- *    none of these. The findings above and the lists below are not repeated inside it, and a
- *    long identifier the sentence quotes wraps at its underscores, as in the finding's banner;
- * 5. the patterns withheld for sample size, with observed and required sizes (AAP 0.5.4.2 P6);
+ *    else, when datasets the section needs do not cover the window, one sentence summarising its
+ *    `incomplete_dataset` findings (`incompleteDataReason`, for example "Data does not fully
+ *    cover this window: google.entities, google.metrics_daily (no active Google dataset)"),
+ *    ahead of any withheld line, because a rule withheld over data that does not cover the
+ *    window is a consequence of the gap, not its cause; else the leading withheld line's reason
+ *    (`withheldReason`, for example "No search term met the K1 minimum of 70 clicks"); else the
+ *    first finding that explains the absence. "No rule fired for this window" is reserved for a
+ *    section with none of these. The findings above and the lists below are not repeated inside
+ *    it, and a long identifier the sentence quotes wraps at its underscores, as in the finding's
+ *    banner;
+ * 5. the patterns withheld for sample size or validity, with observed and required sizes
+ *    (AAP 0.5.4.2 P6), mounted in bounded batches;
  * 6. the counts of what the run did not show, by suppression reason (`run_suppression`,
  *    AAP 0.5.4.2), plus the cards hidden by feedback given since the run.
  *
@@ -57,6 +60,12 @@
  *   each followed by a "Show {n} more" control. Every card that renders is the card
  *   `renderItem` returns, with its rank, flags and evidence, and a link to one not yet shown
  *   (`#item-{id}`, `#group-…`) reveals it.
+ * - The page itself is bounded: it carries each group's first `GROUP_PAGE_SIZE` items, with
+ *   `total` and `hidden` counting every stored one. Given `runId`, a group larger than the page
+ *   loads the rest from `GET /recommendations/items` a page at a time ({@link PagedGroup}),
+ *   when its visible list's "Show more" has shown every loaded card, so every stored item stays
+ *   reachable; every count the frame and its sections show counts the items not loaded yet
+ *   ({@link groupItemCounts}), and a group with any is never empty.
  * - A card is keyed by its recommendation's identity across runs ({@link itemIdentity}), never by
  *   the per-run item id, so a newer run's items update the cards in place: keyboard focus stays
  *   on the control that had it (WCAG 2.2 SC 2.4.3). Anchors stay `item-{id}`. A card that moves
@@ -67,9 +76,10 @@
  *
  * @packageDocumentation
  */
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 
+import { isApiError, useGroupItemPages, useHasCachedGroupItems } from '../../../api/queries';
 import type {
   Finding,
   FindingCode,
@@ -77,6 +87,7 @@ import type {
   Item,
   Overlay,
   Run,
+  RunId,
   Section,
   SectionKey,
 } from '../../../api/types';
@@ -109,6 +120,7 @@ import {
   GROUP_NOUN,
   hashTarget,
   scrollToId,
+  type RemoteEntries,
 } from '../batches';
 
 // ---------------------------------------------------------------------------------------------
@@ -290,6 +302,61 @@ export function partitionGroup(group: Group): GroupPartition {
   return { visible, historical, held, hiddenCount };
 }
 
+/** What {@link groupItemCounts} counts of a group's stored items. */
+export interface GroupItemCounts {
+  /** How many stored items the group shows: every one feedback does not hide, loaded or not. */
+  readonly shown: number;
+  /** How many stored items feedback hides now, loaded or not. */
+  readonly hidden: number;
+  /** How many of the shown items are not loaded yet: 0 once the group's items are all loaded. */
+  readonly pending: number;
+}
+
+/** A count from the API as a non-negative whole number: anything else reads as 0. */
+function storedCount(value: unknown): number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
+/**
+ * The counts of a group's stored items, the loaded ones and those not loaded yet. The page
+ * carries each group's first items, at most `GROUP_PAGE_SIZE`, with `total`, every item the run
+ * stored in the group, and `hidden`, how many of them feedback hides now (AAP 0.1.1: the page
+ * stays bounded whatever the run's size); the rest load from `GET /recommendations/items`.
+ *
+ * The loaded items are read live ({@link isHidden}); the API's `hidden` stands only for the
+ * items not loaded yet: those it counts beyond the hidden loaded ones, at most as many as are
+ * not loaded. A group whose every item is loaded therefore counts exactly what its items say,
+ * and a `total` the items already reach, or a count that is not a whole number, leaves nothing
+ * pending.
+ *
+ * @param group - the group, with every item loaded so far
+ * @returns the counts
+ *
+ * @example
+ * ```ts
+ * // A page group of 100 items, 2 of them hidden, of 18,003 stored, 5 of them hidden:
+ * groupItemCounts(group); // { shown: 17998, hidden: 5, pending: 17900 }
+ * ```
+ */
+export function groupItemCounts(group: Group): GroupItemCounts {
+  const loaded = group.items.length;
+  let loadedHidden = 0;
+  for (const item of group.items) {
+    if (isHidden(item)) {
+      loadedHidden += 1;
+    }
+  }
+  const notLoaded = Math.max(0, storedCount(group.total) - loaded);
+  const hiddenBeyond = Math.max(0, storedCount(group.hidden) - loadedHidden);
+  const hiddenNotLoaded = Math.min(notLoaded, hiddenBeyond);
+  const pending = notLoaded - hiddenNotLoaded;
+  return {
+    shown: loaded - loadedHidden + pending,
+    hidden: loadedHidden + hiddenNotLoaded,
+    pending,
+  };
+}
+
 /**
  * Whether the page shows a confirmation in an item's place: feedback hides the item now, and
  * that feedback was recorded on this page, so `confirmations` holds its recommendation's
@@ -377,8 +444,25 @@ export interface GroupParts {
   historical: readonly Item[];
   /** Items held until discrepancies are resolved and not hidden, in API order. */
   held: readonly Item[];
-  /** How many of the group's items feedback hides now. */
+  /**
+   * How many of the group's stored items feedback hides now, loaded or not
+   * ({@link groupItemCounts}).
+   */
   hiddenCount: number;
+  /**
+   * How many items the group shows that are not loaded yet ({@link groupItemCounts}): the page
+   * carries each group's first `GROUP_PAGE_SIZE` items. A group with any is never empty, and
+   * `visible`, `historical` and `held` plus `pending` is everything it shows.
+   */
+  pending: number;
+  /**
+   * Loads the group's items not loaded yet, for the batched list of its visible items: a
+   * {@link CardList}'s `remote`, or `useBatches`' for a table (`../batches`). Its "Show more"
+   * then counts them and loads them a page at a time once the loaded ones are shown, and each
+   * load lands in `visible`, `historical` or `held` as its items are. `null` when the page
+   * carries every item the group stores, or the frame does not page (no `runId`).
+   */
+  remote: RemoteEntries | null;
   /**
    * The feedback confirmations recorded on this page for the section's hidden items, by
    * {@link itemIdentity}: what a {@link CardList} or {@link ConfirmedItems} of an override
@@ -511,6 +595,12 @@ export interface CardListProps {
    * (`GroupParts.confirmations`). Omitted, a hidden item shows nothing.
    */
   confirmations?: FeedbackConfirmations;
+  /**
+   * The group's cards not loaded yet (`GroupParts.remote`), for the list of its visible cards:
+   * the status counts them and "Show more" loads them once the loaded ones are shown. Omitted
+   * or `null`, the list holds every card it shows.
+   */
+  remote?: RemoteEntries | null;
 }
 
 /** One confirmation a card list shows in a hidden card's place, with its React key. */
@@ -622,6 +712,11 @@ function renderConfirmations(confirmations: readonly ListConfirmation[]): ReactN
  * block from the group's visible cards (`../carriedFocus`), is revealed with the batches through
  * it, so it mounts in time to take that focus (WCAG 2.2 SC 2.4.3).
  *
+ * Given `remote`, the group's cards not loaded yet count too: "Showing 20 of 18,003 actions".
+ * Once the loaded cards are all shown, a press loads the next page of the group, the button in
+ * its loading state meanwhile, then reveals the batch and moves focus to its first card; a
+ * failed load is said in the status, and the button tries again (`../batches`).
+ *
  * An item a feedback recorded on this page has hidden ({@link isConfirmed}) shows, in its card's
  * place, its {@link FeedbackConfirmation} from `confirmations`: "Dismissed: {action}
  * ({entity})", directly after the card before it, so the outcome is visible where the user
@@ -653,6 +748,7 @@ export function CardList({
   items,
   renderCard,
   confirmations = NO_FEEDBACK_CONFIRMATIONS,
+  remote = null,
 }: CardListProps): ReactElement {
   const layout = useMemo(() => cardListLayout(items, confirmations), [items, confirmations]);
   const keys = useMemo(() => itemKeys(layout.cards), [layout.cards]);
@@ -677,6 +773,7 @@ export function CardList({
         // A card that takes over the focus of one the same commit removed elsewhere, such as
         // a card a refetch moved into this list, is shown at once, however far down it is.
         mustShow={(item) => focusLeftWith(itemIdentity(item))}
+        {...(remote === null ? {} : { remote })}
       />
     </>
   );
@@ -1203,12 +1300,21 @@ export interface SectionFrameProps {
    */
   renderEmptyGroup?: (group: Group, parts: GroupParts) => ReactNode;
   /**
-   * The title of the withheld list. Omitted, `WithheldList`'s default applies; the Budget
-   * section passes "Patterns withheld for sample size" (AAP 0.5.5).
+   * The title of the withheld list. Omitted, `WithheldList` chooses it from the lines ("Withheld
+   * for sample size" when every line records observed below required, else "Withheld"); the
+   * Budget section passes "Patterns withheld for sample size" (AAP 0.5.5).
    */
   withheldTitle?: string;
   /** Content placed after the findings and before the groups, such as a section-level note. */
   beforeGroups?: ReactNode;
+  /**
+   * The run of the page the section belongs to (`run.id`, also for the default page). Given, a
+   * group whose page carries fewer items than it stores (`Group.total`) loads the rest from
+   * `GET /recommendations/items` a page at a time (`useGroupItemPages`), as its list's "Show
+   * more" reaches them, so every stored item stays reachable while the page stays bounded
+   * (AAP 0.1.1). Omitted, the frame shows the items the page carries and reads nothing.
+   */
+  runId?: RunId;
 }
 
 /**
@@ -1395,15 +1501,17 @@ function textOr(text: unknown, fallback: string): string {
 }
 
 /**
- * Whether a group has something to show: at least one visible, historical or held item, or the
- * confirmation of an item a feedback recorded on this page has hidden, which a group whose
- * every item was hidden here shows instead of an empty state while it lasts.
+ * Whether a group has something to show: at least one visible, historical or held item, one
+ * not loaded yet ({@link GroupParts.pending}), however many of the loaded ones feedback hides,
+ * or the confirmation of an item a feedback recorded on this page has hidden, which a group
+ * whose every item was hidden here shows instead of an empty state while it lasts.
  */
 function hasShownItems(parts: GroupParts): boolean {
   return (
     parts.visible.length > 0 ||
     parts.historical.length > 0 ||
     parts.held.length > 0 ||
+    parts.pending > 0 ||
     parts.placed.confirmed > 0
   );
 }
@@ -1418,6 +1526,8 @@ interface ItemCardsProps {
   renderItem: SectionFrameProps['renderItem'];
   /** The feedback confirmations recorded on this page, passed on to the {@link CardList}. */
   confirmations: FeedbackConfirmations;
+  /** The group's cards not loaded yet, for the list of its visible cards; else `null`. */
+  remote: RemoteEntries | null;
 }
 
 /**
@@ -1431,12 +1541,19 @@ interface ItemCardsProps {
  * held cards of a {@link HeldDisclosure} nobody has opened are never even built, and a card
  * beyond the shown batches is built only once it is revealed.
  */
-function ItemCards({ items, group, renderItem, confirmations }: ItemCardsProps): ReactElement {
+function ItemCards({
+  items,
+  group,
+  renderItem,
+  confirmations,
+  remote,
+}: ItemCardsProps): ReactElement {
   return (
     <CardList
       items={items}
       renderCard={(item) => renderItem(item, group)}
       confirmations={confirmations}
+      remote={remote}
     />
   );
 }
@@ -1450,34 +1567,39 @@ function hiddenItemIdentities(section: Section): string[] {
 }
 
 /**
- * Prepares one group: partitions its items, places the confirmations of the items a feedback
- * recorded on this page has hidden, derives its anchor and builds the default body.
+ * Prepares one group: partitions its items, counts what it stores ({@link groupItemCounts}),
+ * places the confirmations of the items a feedback recorded on this page has hidden, derives
+ * its anchor and builds the default body, whose visible cards' list loads the group's items
+ * not loaded yet through `remote`.
  */
 function buildGroupParts(
   sectionKey: SectionKey,
   group: Group,
   renderItem: SectionFrameProps['renderItem'],
   confirmations: FeedbackConfirmations,
+  remote: RemoteEntries | null,
 ): GroupParts {
-  const { visible, historical, held, hiddenCount } = partitionGroup(group);
+  const { visible, historical, held } = partitionGroup(group);
+  const counts = groupItemCounts(group);
   // Without a confirmation on the page, the placed lists are the partition's own.
   const placed =
     confirmations.size === 0
       ? { visible, historical, held, confirmed: 0 }
       : placeConfirmations(group, confirmations);
   const anchorId = groupAnchorId(sectionKey, group.key);
-  const cards = (items: readonly Item[]) => (
+  const cards = (items: readonly Item[], rest: RemoteEntries | null = null) => (
     <ItemCards
       items={items}
       group={group}
       renderItem={renderItem}
       confirmations={confirmations}
+      remote={rest}
     />
   );
   // A block emptied by the feedback renders nothing, so its confirmations take its place.
   const body = (
     <Stack>
-      {cards(placed.visible)}
+      {cards(placed.visible, remote)}
       <HistoricalItems id={`${anchorId}-historical`} count={historical.length}>
         {cards(placed.historical)}
       </HistoricalItems>
@@ -1492,7 +1614,198 @@ function buildGroupParts(
       {held.length === 0 && placed.held.length > 0 ? cards(placed.held) : null}
     </Stack>
   );
-  return { group, anchorId, visible, historical, held, hiddenCount, confirmations, placed, body };
+  return {
+    group,
+    anchorId,
+    visible,
+    historical,
+    held,
+    hiddenCount: counts.hidden,
+    pending: remote === null ? counts.pending : remote.pending,
+    remote,
+    confirmations,
+    placed,
+    body,
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Groups larger than the page
+// ---------------------------------------------------------------------------------------------
+
+/** No items loaded beyond those the page carries. */
+const NO_LOADED_ITEMS: readonly Item[] = Object.freeze([]);
+
+/** No recommendation identities to read confirmations for. */
+const NO_IDENTITIES: readonly string[] = Object.freeze([]);
+
+/** The reason a failed load of further items gives when the API sent no message of its own. */
+const LOAD_FAILED_FALLBACK = 'The request did not complete';
+
+/** What {@link useGroupLoads} returns. */
+interface GroupLoads {
+  /** The group with every item loaded so far: the page's, then the loaded ones, in rank order. */
+  readonly group: Group;
+  /** The group's items not loaded yet ({@link GroupParts.remote}); `null` when none exist. */
+  readonly remote: RemoteEntries | null;
+}
+
+/**
+ * The items of a group beyond the first `GROUP_PAGE_SIZE` the page carries, loaded a page at a
+ * time from `GET /recommendations/items` (`useGroupItemPages`), and the {@link RemoteEntries}
+ * its visible list loads them through.
+ *
+ * - Nothing is read until the list asks: its "Show more", once the loaded items are all shown,
+ *   calls `loadMore`, which starts the first load, and each later call loads the next page. A
+ *   group whose loads the cache already holds, such as a Keywords tab shown again, reads them
+ *   again at once.
+ * - A group none of whose loaded items is shown, every one hidden by feedback, while it stores
+ *   items to show, loads on by itself until one is shown, so it never reads as empty. It
+ *   stops at a failed read, which the list's status states and its button tries again.
+ * - `loading` is set while the first load or a next page is read, never during a poll, and
+ *   `error` holds the message of a first load or next page that failed, never of a poll. A
+ *   failed next page does not stop the loaded items' polling (`useGroupItemPages`): its message
+ *   lasts until the next poll starts, a poll that succeeds lets the loading on by itself above
+ *   resume, and one that fails is the page's refresh notice to state.
+ * - Once the API has no next page, nothing is pending, whatever the counts say.
+ *
+ * A group the page carries whole sends nothing and gets no `remote`.
+ */
+function useGroupLoads(runId: RunId, sectionKey: SectionKey, group: Group): GroupLoads {
+  const start = group.items.length;
+  const truncated = storedCount(group.total) > start;
+  const cached = useHasCachedGroupItems(runId, sectionKey, group.key);
+  const [requested, setRequested] = useState(false);
+  const query = useGroupItemPages(runId, sectionKey, group.key, start, {
+    enabled: truncated && (requested || cached),
+  });
+  const { data, error, hasNextPage, fetchNextPage, refetch } = query;
+  const loadedItems = truncated ? (data ?? NO_LOADED_ITEMS) : NO_LOADED_ITEMS;
+  const merged = useMemo(
+    () =>
+      loadedItems.length === 0 ? group : { ...group, items: [...group.items, ...loadedItems] },
+    [group, loadedItems],
+  );
+  const failure: unknown =
+    query.isFetchNextPageError || (query.isError && data === undefined) ? error : null;
+  const loading = query.isFetchingNextPage || (query.isPending && query.isFetching);
+  const exhausted = data !== undefined && !hasNextPage;
+  const pending = !truncated || exhausted ? 0 : groupItemCounts(merged).pending;
+
+  const loadMore = useCallback(() => {
+    if (!truncated || loading) {
+      return;
+    }
+    if (data === undefined) {
+      if (requested || cached) {
+        // The first load failed: read it again.
+        void refetch();
+      } else {
+        setRequested(true);
+      }
+      return;
+    }
+    if (hasNextPage) {
+      void fetchNextPage();
+    }
+  }, [truncated, loading, data, requested, cached, refetch, hasNextPage, fetchNextPage]);
+
+  const anyShown = merged.items.some((item) => !isHidden(item));
+  const autoLoad = pending > 0 && !anyShown && !query.isFetching && error === null;
+  useEffect(() => {
+    if (autoLoad) {
+      loadMore();
+    }
+  }, [autoLoad, loadMore]);
+
+  if (!truncated) {
+    return { group: merged, remote: null };
+  }
+  const message =
+    failure === null
+      ? null
+      : isApiError(failure)
+        ? textOr(failure.message, LOAD_FAILED_FALLBACK)
+        : LOAD_FAILED_FALLBACK;
+  return { group: merged, remote: { pending, loading, error: message, failure, loadMore } };
+}
+
+/** Both maps' confirmations, `extra`'s added to `base`'s; one alone when the other is empty. */
+function withConfirmations(
+  base: FeedbackConfirmations,
+  extra: FeedbackConfirmations,
+): FeedbackConfirmations {
+  if (extra.size === 0) {
+    return base;
+  }
+  if (base.size === 0) {
+    return extra;
+  }
+  return new Map([...base, ...extra]);
+}
+
+/** Props of {@link PagedGroup}. */
+interface PagedGroupProps {
+  /** The page's run, whose items are read. */
+  readonly runId: RunId;
+  /** The section the group belongs to. */
+  readonly sectionKey: SectionKey;
+  /** The group, as the page carries it. */
+  readonly group: Group;
+  /** The section's `renderItem`. */
+  readonly renderItem: SectionFrameProps['renderItem'];
+  /** The confirmations the frame read for the section's hidden items. */
+  readonly confirmations: FeedbackConfirmations;
+  /** Renders the group from its parts: `renderGroup`, or the default body. */
+  readonly render: (group: Group, parts: GroupParts) => ReactNode;
+}
+
+/**
+ * One group's content with its items beyond the page loaded as it asks ({@link useGroupLoads}):
+ * `render` receives the group holding every item loaded so far and the parts built from it, so
+ * a section's own body, such as a table, sees them too, and `parts.remote` loads the rest. The
+ * items loaded beyond the page that feedback recorded on this page has hidden show their
+ * confirmation, as the page's own do.
+ *
+ * Rendered for every group of a frame given `runId`, whether or not the page carries the whole
+ * group, so the element tree, and the keyboard focus inside it, stays the same when a newer run
+ * stores more or fewer items in the group.
+ */
+function PagedGroup({
+  runId,
+  sectionKey,
+  group,
+  renderItem,
+  confirmations,
+  render,
+}: PagedGroupProps): ReactElement {
+  const loads = useGroupLoads(runId, sectionKey, group);
+  const loadedGroup = loads.group;
+  const loadedHidden = useMemo(
+    () =>
+      loadedGroup === group
+        ? NO_IDENTITIES
+        : loadedGroup.items.slice(group.items.length).filter(isHidden).map(itemIdentity),
+    [loadedGroup, group],
+  );
+  const loadedConfirmations = useFeedbackConfirmations(loadedHidden);
+  const allConfirmations = useMemo(
+    () => withConfirmations(confirmations, loadedConfirmations),
+    [confirmations, loadedConfirmations],
+  );
+  const parts = buildGroupParts(
+    sectionKey,
+    loadedGroup,
+    renderItem,
+    allConfirmations,
+    loads.remote,
+  );
+  return <>{render(loadedGroup, parts)}</>;
+}
+
+/** The default group content: the frame's own body. */
+function defaultGroupContent(_group: Group, parts: GroupParts): ReactNode {
+  return parts.body;
 }
 
 /** One group region the frame's groups area renders: the group and the content it holds. */
@@ -1578,11 +1891,13 @@ function renderGroupEntry({ part, content, repeatsSectionTitle }: GroupEntry): R
  * The one-sentence reason of an empty section, the first that applies:
  *
  * 1. {@link notShownReason}, when feedback hides cards now or the run suppressed some;
- * 2. the leading withheld line's reason ({@link withheldReason}), for example "No search term
- *    met the K1 minimum of 70 clicks";
- * 3. the data-gap sentence of its `incomplete_dataset` findings ({@link incompleteDataReason}),
+ * 2. the data-gap sentence of its `incomplete_dataset` findings ({@link incompleteDataReason}),
  *    for example "Data does not fully cover this window: google.entities, google.metrics_daily
- *    (no active Google dataset)";
+ *    (no active Google dataset)". It leads the withheld reason: over a window the section's
+ *    datasets do not cover, a rule withheld for a missing baseline or segment window is a
+ *    consequence of the gap, and the gap is the cause to state;
+ * 3. the leading withheld line's reason ({@link withheldReason}), for example "No search term
+ *    met the K1 minimum of 70 clicks";
  * 4. the first finding that explains the absence ({@link findingReason}), such as a
  *    `k1_no_baseline` finding, or an `incomplete_dataset` finding whose evidence names no
  *    dataset;
@@ -1604,8 +1919,8 @@ function emptyReason(
 ): string {
   return (
     notShownReason(hiddenTotal, suppressions) ??
-    withheldReason(section.withheld) ??
     incompleteDataReason(section.findings) ??
+    withheldReason(section.withheld) ??
     findingReason(section.findings) ??
     NO_RULE_FIRED_REASON
   );
@@ -1635,21 +1950,25 @@ function emptyReason(
  * 4. when no group has a visible, historical or held item or a confirmation, an `EmptyState`
  *    whose title is the one sentence that says why ({@link emptyReason}): "No actions to show:
  *    {n} hidden by feedback since this run (dismissed, snoozed or done); {count} {label}" when
- *    feedback hides items now or the run suppressed some, else the leading withheld line's
- *    reason, else "Data does not fully cover this window: {datasets} ({cause}); …" from the
- *    section's `incomplete_dataset` findings, else the first finding that explains the absence,
- *    else "No rule fired for this window". Its long identifiers wrap at their underscores
+ *    feedback hides items now or the run suppressed some, else "Data does not fully cover this
+ *    window: {datasets} ({cause}); …" from the section's `incomplete_dataset` findings, else the
+ *    leading withheld line's reason, else the first finding that explains the absence, else
+ *    "No rule fired for this window". Its long identifiers wrap at their underscores
  *    (`withIdentifierBreaks`), as they do in a finding's banner. It has no reason body: the
  *    finding banners above and the lists below are not repeated in it;
- * 5. the `WithheldList` of the section's withheld patterns;
+ * 5. the `WithheldList` of the section's withheld patterns, `ROW_BATCH_SIZE` lines at a time;
  * 6. a list named "Not shown": one "{count} {label}" line per suppression reason, in API order,
  *    and "{n} hidden since this run" for items feedback hides now, confirmed ones included.
  *    Nothing when both are empty.
  *
- * The frame holds no state of its own (each held disclosure keeps its open state, and each
- * batched list how many batches it shows) and fetches nothing. It reads the confirmations of
- * its own hidden items from the nearest `ActionOutcomeProvider` (`../ActionOutcomes`), and
- * none outside one.
+ * The frame holds no state of its own (each held disclosure keeps its open state, each
+ * batched list how many batches it shows, and each group larger than the page whether its
+ * further items were asked for). It reads nothing but those further items: given `runId`, a
+ * group whose page carries fewer items than it stores (`Group.total`) loads the rest from
+ * `GET /recommendations/items` as its visible list's "Show more" reaches them, or by itself
+ * while none of its loaded items is shown ({@link PagedGroup}); without `runId` it reads
+ * nothing. It reads the confirmations of its own hidden items from the nearest
+ * `ActionOutcomeProvider` (`../ActionOutcomes`), and none outside one.
  *
  * @param props - see {@link SectionFrameProps}
  * @returns the section region
@@ -1680,26 +1999,48 @@ export function SectionFrame({
   renderEmptyGroup,
   withheldTitle,
   beforeGroups,
+  runId,
 }: SectionFrameProps): ReactElement {
   // Only this section's hidden items can show a confirmation, so the frame reads theirs alone,
   // and a feedback recorded in another section does not render this one again.
   const hiddenIdentities = useMemo(() => hiddenItemIdentities(section), [section]);
   const confirmations = useFeedbackConfirmations(hiddenIdentities);
   const parts = section.groups.map((group) =>
-    buildGroupParts(section.key, group, renderItem, confirmations),
+    buildGroupParts(section.key, group, renderItem, confirmations, null),
   );
   const anyShown = parts.some(hasShownItems);
   const hiddenTotal = parts.reduce((sum, part) => sum + part.hiddenCount, 0);
+  // A group's content, given runId with the items beyond the page loaded as its list asks.
+  const contentOf = (
+    part: GroupParts,
+    render: (group: Group, groupParts: GroupParts) => ReactNode,
+  ): ReactNode =>
+    runId === undefined ? (
+      render(part.group, part)
+    ) : (
+      <PagedGroup
+        runId={runId}
+        sectionKey={section.key}
+        group={part.group}
+        renderItem={renderItem}
+        confirmations={confirmations}
+        render={render}
+      />
+    );
 
   let groupsArea: ReactNode;
   if (renderGroups !== undefined) {
-    groupsArea = anyShown ? renderGroups(parts) : null;
+    const shownParts =
+      runId === undefined
+        ? parts
+        : parts.map((part) => ({ ...part, body: contentOf(part, defaultGroupContent) }));
+    groupsArea = anyShown ? renderGroups(shownParts) : null;
   } else {
     const shownGroups: GroupEntry[] = [];
     for (const part of parts) {
       const repeatsSectionTitle = groupRepeatsSectionTitle(section, part.group);
       if (hasShownItems(part)) {
-        const content = renderGroup === undefined ? part.body : renderGroup(part.group, part);
+        const content = contentOf(part, renderGroup ?? defaultGroupContent);
         shownGroups.push({ part, content, repeatsSectionTitle });
       } else {
         // Empty groups are left out by default; renderEmptyGroup lets a section render one anyway.
