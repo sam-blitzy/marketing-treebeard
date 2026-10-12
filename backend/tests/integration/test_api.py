@@ -15,6 +15,13 @@ test database; nothing reaches the network. The guarantees proven here:
 * **Bounded waits** (AAP 0.5.3 ``GET /healthz`` and error envelope): a database that accepts
   TCP and never answers, as a paused or partitioned PostgreSQL does, makes ``/healthz`` answer
   503 ``database_unavailable`` within its 3 s bound, logged as ``health.database_unavailable``;
+  a request that cannot get a database connection (refused, libpq's connect timeout, the pool's
+  checkout timeout, a connection SQLAlchemy invalidated, or a server SQLSTATE of class 08 or 53
+  or 57P01 to 57P03) is answered 503 ``database_unavailable`` too, long before the deadline,
+  logged as one ``api.database_unavailable`` WARNING with its error class and SQLSTATE, never
+  its text, and naming an owner that already logged it, while every other database error
+  (a deadlock, a serialization failure, a cancelled statement, a lock not available, an
+  aborted pipeline, an integrity error) stays the catch-all 500 ``internal_error``;
   a request still running at the request deadline, a database-backed one included, is
   answered 503 ``request_timeout`` at the deadline, logged as ``api.request_timeout``, and
   cancelled, while its cleanup unwinds in the background: what it sends meanwhile is dropped,
@@ -90,8 +97,10 @@ import pytest
 import structlog
 import yaml
 from fastapi import FastAPI
+from psycopg import errors as pg_errors
 from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import Engine, inspect, text
+from sqlalchemy import exc as sa_exc
 from starlette.types import Message, Receive, Scope, Send
 
 from ads_engine import logging as ads_logging
@@ -1130,10 +1139,17 @@ def refusing_port() -> Iterator[int]:
         yield sock.getsockname()[1]
 
 
-async def point_database_at(set_env: Callable[..., None], port: int, password: str) -> None:
-    """Dispose this test's engines, then point ``DATABASE_URL`` at loopback ``port``."""
+async def point_database_at(
+    set_env: Callable[..., None], port: int, password: str, *, connect_timeout: int | None = None
+) -> None:
+    """Dispose this test's engines, then point ``DATABASE_URL`` at loopback ``port``.
+
+    ``connect_timeout`` (seconds), when given, goes in the URL's query string, which the engine
+    keeps instead of its own 10 s.
+    """
     await db_session.dispose_engine()
-    set_env(DATABASE_URL=f"postgresql+psycopg://ads:{password}@127.0.0.1:{port}/ads_engine")
+    query = "" if connect_timeout is None else f"?connect_timeout={connect_timeout}"
+    set_env(DATABASE_URL=f"postgresql+psycopg://ads:{password}@127.0.0.1:{port}/ads_engine{query}")
 
 
 def events_named(captured_logs: CapturedLogs, event: str) -> list[dict[str, Any]]:
@@ -1213,6 +1229,327 @@ async def test_healthz_503_at_once_when_the_database_refuses(
     assert set(record) == LOG_FIELDS | {"error_type", "timeout_s"}
     assert record["error_type"] == "OperationalError"
     assert password not in captured_logs.text
+
+
+DATABASE_OUTAGE_FIELDS: Final = LOG_FIELDS | {"path", "method", "error_type", "sqlstate"}
+"""The fields of an ``api.database_unavailable`` record of an outage no owner logged."""
+
+# The statement and parameters every fake database error carries, as SQLAlchemy wraps a
+# driver error: neither may reach a log line or a response of the outage path.
+OUTAGE_STATEMENT: Final = "SELECT app_user.id FROM app_user WHERE app_user.email = %(email)s"
+
+
+def database_error(
+    kind: type[sa_exc.DBAPIError],
+    orig: Exception,
+    marker: str,
+    *,
+    connection_invalidated: bool = False,
+) -> sa_exc.DBAPIError:
+    """Wrap the psycopg error ``orig`` as SQLAlchemy does, its parameters carrying ``marker``.
+
+    Args:
+        kind: The SQLAlchemy class psycopg's error maps to, for example ``OperationalError``.
+        orig: The driver's exception, an instance of a real psycopg class.
+        marker: A value that must never be logged, sent as the statement's parameter.
+        connection_invalidated: Whether SQLAlchemy found the connection lost and invalidated.
+
+    Returns:
+        The wrapped error, as a route would see it raised.
+    """
+    return kind(
+        OUTAGE_STATEMENT, {"email": marker}, orig, connection_invalidated=connection_invalidated
+    )
+
+
+def raising_route(error: Exception) -> Callable[[], Awaitable[dict[str, bool]]]:
+    """Return a route endpoint that fails with ``error``."""
+
+    async def endpoint() -> dict[str, bool]:
+        """Fail with the error the test chose."""
+        raise error
+
+    return endpoint
+
+
+async def test_requests_503_database_unavailable_at_once_when_the_database_refuses(
+    admin_user: AppUser,
+    set_env: Callable[..., None],
+    captured_logs: CapturedLogs,
+    test_identity: AdminIdentity,
+) -> None:
+    """A database that refuses connections makes every database-backed request a prompt 503.
+
+    Signed in while the database answers, then pointed at a refusing port: ``GET /auth/me``,
+    ``POST /sources/linkedin/sync`` and an anonymous ``POST /auth/login`` each answer 503
+    ``database_unavailable`` with the message ``/healthz`` gives and ``Cache-Control:
+    no-store``, well before any timeout, and the login sets no session cookie. Each is logged
+    once as the WARNING ``api.database_unavailable`` with its method, path, error class and no
+    SQLSTATE, never the URL's password or the credentials, and nothing is logged as
+    ``api.unhandled_error``.
+    """
+    del admin_user  # Requested so the admin row exists before signing in.
+    password = "-".join(("pw", "outage", "r8d"))
+    csrf = dict(test_identity.csrf_headers)
+    app = create_app()
+    loop = asyncio.get_running_loop()
+    async with serve(app) as client, serve(app) as anonymous:
+        signed_in = await post_login(
+            client, test_identity, email=test_identity.email, password=test_identity.password
+        )
+        assert signed_in.status_code == 200, signed_in.text
+        with refusing_port() as port:
+            await point_database_at(set_env, port, password)
+            captured_logs.configure(settings=get_settings())
+            captured_logs.clear()
+            started = loop.time()
+            me = await client.get(api("/auth/me"))
+            sync = await client.post(api("/sources/linkedin/sync"), headers=csrf)
+            login = await post_login(
+                anonymous, test_identity, email=test_identity.email, password=test_identity.password
+            )
+            elapsed = loop.time() - started
+        assert test_identity.session_cookie not in anonymous.cookies
+
+    for response in (me, sync, login):
+        error = assert_error(response, 503, "database_unavailable")
+        assert error.error.message == "Database unavailable"
+        assert_no_store(response)
+    assert elapsed < health._PING_TIMEOUT_S
+    records = events_named(captured_logs, "api.database_unavailable")
+    assert [(record["method"], record["path"]) for record in records] == [
+        ("GET", api("/auth/me")),
+        ("POST", api("/sources/linkedin/sync")),
+        ("POST", api("/auth/login")),
+    ]
+    for record in records:
+        assert set(record) == DATABASE_OUTAGE_FIELDS
+        assert record["level"] == "warning"
+        assert record["logger"] == "ads_engine.api.app"
+        assert record["error_type"] == "OperationalError"
+        assert record["sqlstate"] is None
+    assert events_named(captured_logs, "api.unhandled_error") == []
+    for value in (password, test_identity.email, test_identity.password):
+        assert value not in captured_logs.text
+
+
+async def test_request_503_database_unavailable_when_the_connect_timeout_expires(
+    db: object,
+    set_env: Callable[..., None],
+    captured_logs: CapturedLogs,
+    test_identity: AdminIdentity,
+) -> None:
+    """A database that accepts TCP and never answers fails a new connection at its timeout.
+
+    With ``connect_timeout=2`` (psycopg's minimum) in ``DATABASE_URL``, ``POST /auth/login`` on
+    a silent server answers 503 ``database_unavailable`` once psycopg's ``ConnectionTimeout``
+    ends the attempt, long before the 45 s request deadline, and is logged as
+    ``api.database_unavailable`` with ``OperationalError`` and no SQLSTATE, never as
+    ``api.request_timeout`` or ``api.unhandled_error``.
+    """
+    del db  # Requested for the per-test engine lifecycle: the engine is disposed on teardown.
+    connect_timeout = 2
+    password = "-".join(("pw", "connect", "t5n"))
+    async with silent_server() as (port, accepted):
+        await point_database_at(set_env, port, password, connect_timeout=connect_timeout)
+        app = create_app()
+        captured_logs.configure(settings=get_settings())
+        captured_logs.clear()
+        loop = asyncio.get_running_loop()
+        async with serve(app) as client:
+            started = loop.time()
+            response = await post_login(
+                client, test_identity, email=test_identity.email, password=test_identity.password
+            )
+            elapsed = loop.time() - started
+            assert test_identity.session_cookie not in client.cookies
+        assert accepted
+
+    error = assert_error(response, 503, "database_unavailable")
+    assert error.error.message == "Database unavailable"
+    assert_no_store(response)
+    assert connect_timeout - 0.1 <= elapsed < api_app._REQUEST_TIMEOUT_S / 4
+    [record] = events_named(captured_logs, "api.database_unavailable")
+    assert set(record) == DATABASE_OUTAGE_FIELDS
+    assert (record["method"], record["path"]) == ("POST", api("/auth/login"))
+    assert (record["error_type"], record["sqlstate"]) == ("OperationalError", None)
+    assert events_named(captured_logs, "api.request_timeout") == []
+    assert events_named(captured_logs, "api.unhandled_error") == []
+    for value in (password, test_identity.email, test_identity.password):
+        assert value not in captured_logs.text
+
+
+async def test_database_outage_errors_are_503_database_unavailable(
+    captured_logs: CapturedLogs,
+) -> None:
+    """Every error meaning the database cannot be reached is a 503, logged without its text.
+
+    Routes added to ``create_app()`` raise, as SQLAlchemy wraps them: the pool checkout's
+    ``TimeoutError``; an ``OperationalError`` and an ``InterfaceError`` on a connection
+    SQLAlchemy invalidated; and an ``OperationalError`` from psycopg's connect timeout (no
+    SQLSTATE), a connection failure (08006), too many connections (53300), an administrator
+    shutdown (57P01), a crash shutdown (57P02) and a server not yet accepting connections
+    (57P03). Each answers 503 ``database_unavailable`` with ``Cache-Control: no-store`` and is
+    logged once as the WARNING ``api.database_unavailable`` naming the error class and the
+    SQLSTATE; the statement, its parameters and the driver's message reach neither the log
+    nor the response.
+    """
+    app = create_app()
+    marker = "-".join(("outage", "marker", "6b1"))
+    cases: dict[str, tuple[Exception, str, str | None]] = {
+        "/test-pool-timeout": (
+            sa_exc.TimeoutError(f"QueuePool limit reached, connection timed out {marker}"),
+            "TimeoutError",
+            None,
+        ),
+        "/test-invalidated-operational": (
+            database_error(
+                sa_exc.OperationalError,
+                pg_errors.OperationalError(f"server closed the connection {marker}"),
+                marker,
+                connection_invalidated=True,
+            ),
+            "OperationalError",
+            None,
+        ),
+        "/test-invalidated-interface": (
+            database_error(
+                sa_exc.InterfaceError,
+                pg_errors.InterfaceError(f"the connection is lost {marker}"),
+                marker,
+                connection_invalidated=True,
+            ),
+            "InterfaceError",
+            None,
+        ),
+        "/test-connect-timeout": (
+            database_error(
+                sa_exc.OperationalError,
+                pg_errors.ConnectionTimeout(f"connection timeout expired {marker}"),
+                marker,
+            ),
+            "OperationalError",
+            None,
+        ),
+    }
+    for sqlstate in ("08006", "53300", "57P01", "57P02", "57P03"):
+        orig = pg_errors.lookup(sqlstate)(f"server error {marker}")
+        cases[f"/test-sqlstate-{sqlstate}"] = (
+            database_error(sa_exc.OperationalError, orig, marker),
+            "OperationalError",
+            sqlstate,
+        )
+    for path, (error, _, _) in cases.items():
+        app.add_api_route(api(path), raising_route(error), methods=["GET"])
+    captured_logs.configure(settings=get_settings())
+    captured_logs.clear()
+    responses: dict[str, httpx.Response] = {}
+    async with serve(app) as client:
+        for path in cases:
+            responses[path] = await client.get(api(path))
+
+    for response in responses.values():
+        error_body = assert_error(response, 503, "database_unavailable")
+        assert error_body.error.message == "Database unavailable"
+        assert marker not in response.text
+        assert_no_store(response)
+    records = events_named(captured_logs, "api.database_unavailable")
+    assert [(record["path"], record["error_type"], record["sqlstate"]) for record in records] == [
+        (api(path), error_type, sqlstate) for path, (_, error_type, sqlstate) in cases.items()
+    ]
+    for record in records:
+        assert set(record) == DATABASE_OUTAGE_FIELDS
+        assert (record["level"], record["logger"]) == ("warning", "ads_engine.api.app")
+        assert record["method"] == "GET"
+    assert events_named(captured_logs, "api.unhandled_error") == []
+    assert marker not in captured_logs.text
+
+
+async def test_a_database_outage_its_owner_logged_names_the_owner(
+    captured_logs: CapturedLogs, test_identity: AdminIdentity
+) -> None:
+    """An outage the analysis runner already logged (``analysis_run_failed``) names that event.
+
+    The answer is the same 503 ``database_unavailable``; its one ``api.database_unavailable``
+    WARNING also carries ``logged_as``, and no traceback is logged again.
+    """
+    app = create_app()
+    marker = "-".join(("owned", "marker", "2c9"))
+    error = database_error(sa_exc.OperationalError, pg_errors.AdminShutdown(marker), marker)
+    ads_logging.mark_logged(error, "analysis_run_failed")
+    app.add_api_route(api("/test-owned-outage"), raising_route(error), methods=["POST"])
+    captured_logs.configure(settings=get_settings())
+    captured_logs.clear()
+    async with serve(app) as client:
+        response = await client.post(
+            api("/test-owned-outage"), headers=dict(test_identity.csrf_headers)
+        )
+
+    assert_error(response, 503, "database_unavailable")
+    [record] = events_named(captured_logs, "api.database_unavailable")
+    assert set(record) == DATABASE_OUTAGE_FIELDS | {"logged_as"}
+    assert record["level"] == "warning"
+    assert (record["method"], record["path"]) == ("POST", api("/test-owned-outage"))
+    assert (record["error_type"], record["sqlstate"]) == ("OperationalError", "57P01")
+    assert record["logged_as"] == "analysis_run_failed"
+    assert events_named(captured_logs, "api.unhandled_error") == []
+    assert marker not in captured_logs.text
+
+
+async def test_other_database_errors_stay_500_internal_error(captured_logs: CapturedLogs) -> None:
+    """A database error that belongs to the request itself stays the catch-all 500.
+
+    A deadlock (40P01), a serialization failure (40001), a cancelled statement (57014) and a
+    lock not available (55P03), each an ``OperationalError`` in psycopg, an aborted pipeline
+    (no SQLSTATE), an ``InterfaceError`` on a connection SQLAlchemy did not invalidate, and an
+    ``IntegrityError`` (23505) are passed on to the catch-all handler: each answers 500
+    ``internal_error`` with ``Cache-Control: no-store``, is logged once as
+    ``api.unhandled_error`` naming its class, and never as ``api.database_unavailable``.
+    """
+    app = create_app()
+    marker = "-".join(("request", "marker", "9f4"))
+    cases: dict[str, tuple[Exception, str]] = {
+        f"/test-sqlstate-{sqlstate}": (
+            database_error(
+                sa_exc.OperationalError, pg_errors.lookup(sqlstate)("request failed"), marker
+            ),
+            "OperationalError",
+        )
+        for sqlstate in ("40P01", "40001", "57014", "55P03")
+    }
+    cases["/test-pipeline-aborted"] = (
+        database_error(
+            sa_exc.OperationalError, pg_errors.PipelineAborted("pipeline aborted"), marker
+        ),
+        "OperationalError",
+    )
+    cases["/test-interface"] = (
+        database_error(sa_exc.InterfaceError, pg_errors.InterfaceError("bad cursor"), marker),
+        "InterfaceError",
+    )
+    cases["/test-integrity"] = (
+        database_error(sa_exc.IntegrityError, pg_errors.UniqueViolation("duplicate key"), marker),
+        "IntegrityError",
+    )
+    for path, (error, _) in cases.items():
+        app.add_api_route(api(path), raising_route(error), methods=["GET"])
+    captured_logs.configure(settings=get_settings())
+    captured_logs.clear()
+    responses: dict[str, httpx.Response] = {}
+    # Starlette re-raises an unhandled error after answering 500; the client must not.
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as client:
+        for path in cases:
+            responses[path] = await client.get(api(path))
+
+    for response in responses.values():
+        assert_error(response, 500, "internal_error")
+        assert_no_store(response)
+    unhandled = events_named(captured_logs, "api.unhandled_error")
+    assert [(record["path"], record["error_type"]) for record in unhandled] == [
+        (api(path), error_type) for path, (_, error_type) in cases.items()
+    ]
+    assert events_named(captured_logs, "api.database_unavailable") == []
 
 
 async def test_database_backed_request_past_the_deadline_is_503_request_timeout(

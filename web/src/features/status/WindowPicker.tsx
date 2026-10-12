@@ -20,7 +20,8 @@
  * opens below the preset row, so nothing moves a control on it.
  *
  * A custom run is computed synchronously and can take up to about half a minute (AAP 0.1.1), so
- * the picker is disabled and a spinner shows while it computes. A failure is stated in a
+ * from the press that starts it the picker is disabled, ignores every further press, and shows a
+ * spinner until the computation settles. A failure is stated in a
  * warning banner: 409 `run_in_progress` as "Another analysis is running. Try again shortly.",
  * and every other API error, the 422 window-validation errors included, with the API's own
  * message.
@@ -469,10 +470,12 @@ export interface WindowPickerProps {
  *   `run` ends on the default window end; otherwise `run`'s dates show as the custom range.
  * - **Choosing**: the default preset navigates to `/actions` with no search params; any other
  *   preset or a valid custom range posts `POST /runs` and, once the run is created, navigates to
- *   `/actions?run=<id>`. While it computes, every control is disabled and a "Computing custom
- *   window" spinner shows in the picker's status region below the controls, before any
- *   warning, so it is announced and moves no control; afterwards focus returns to the control
- *   that started it.
+ *   `/actions?run=<id>`. One run computes at a time: from the press that starts it until it
+ *   settles, every control is disabled and a "Computing custom window" spinner shows in the
+ *   picker's status region below the controls, before any warning, so it is announced and
+ *   moves no control; afterwards focus returns to the control that started it. A press that
+ *   lands before the controls are disabled, the second click of a double click say, is ignored,
+ *   so one `POST /runs` goes out and its run is the one opened.
  * - **Failure to compute**: a warning banner states it ({@link createRunErrorMessage}) until the
  *   next choice clears it.
  * - **Failure to read the default run**: when `GET /runs/latest` fails with anything but "no
@@ -537,7 +540,19 @@ export function WindowPicker({ run }: WindowPickerProps) {
   // picker validates its configuration before it renders a preset, so this stays null unless
   // the two validations ever disagree; it is still shown rather than thrown from a handler.
   const [inputError, setInputError] = useState<string | null>(null);
-  const pending = createRun.isPending;
+  // Whether a computation is in flight, set synchronously by the press that starts it and
+  // cleared when its mutation settles. The rendered `disabled` state cannot stop a second press
+  // before React renders again (a double click, or `click(); click();` from a script): TanStack
+  // Query reports the mutation pending only from a timer after the press. A second POST /runs
+  // would also replace the first as the mutation the picker follows, so the first's created run
+  // would never be opened and the second's 409 `run_in_progress` would be shown instead. Every
+  // handler that must be inert while a run computes returns at once while it is set.
+  const computingRef = useRef(false);
+  // The same flag as state, set in the same press: React renders it before the next event, so
+  // every control is disabled, and the spinner shows, from the press that starts the run rather
+  // than from TanStack Query's later notification.
+  const [computing, setComputing] = useState(false);
+  const pending = createRun.isPending || computing;
   // The reopen select's choice not yet opened (ReopenDraft). It belongs to the run on screen
   // when it was made, so it is dropped as soon as another run is on screen, and the select then
   // shows that run. State adjusted while rendering, as in useSettledError.
@@ -694,18 +709,41 @@ export function WindowPicker({ run }: WindowPickerProps) {
       active instanceof HTMLElement && active !== document.body ? active : null;
   };
 
-  /** Computes a custom-window run and opens it once created; `mutate` clears the last error. */
+  /**
+   * Computes a custom-window run and opens it once created; `mutate` clears the last error.
+   *
+   * One computation runs at a time: a call while one is in flight (`computingRef`) does
+   * nothing, so a double press posts one `POST /runs` and opens the run it created. The lock is
+   * released when the mutation settles, with success or failure, so the next choice computes
+   * again, and a 409 `run_in_progress` from a run another process holds is still stated. The
+   * per-call callbacks run only while the picker is mounted, so a picker that has left the page
+   * never navigates.
+   */
   const compute = (body: CreateRunRequest) => {
+    if (computingRef.current) {
+      return;
+    }
+    computingRef.current = true;
+    setComputing(true);
     setInputError(null);
     rememberFocus();
     createRun.mutate(body, {
       onSuccess: (created) => {
         openRun(created.id);
       },
+      onSettled: () => {
+        computingRef.current = false;
+        setComputing(false);
+      },
     });
   };
 
   const selectPreset = (days: number) => {
+    // Inert while a run computes: the default preset's reset would also drop the computation's
+    // navigation to the run it creates.
+    if (computingRef.current) {
+      return;
+    }
     if (days === windowConfig.default_days) {
       // The default window is the worker's default run, never a POST /runs.
       clearErrors();
@@ -737,23 +775,37 @@ export function WindowPicker({ run }: WindowPickerProps) {
     setReopenDraft({ runId: run.id, value: selected });
   };
 
-  /** Opens the custom run the reopen select shows, by id; the empty choice opens nothing. */
+  /**
+   * Opens the custom run the reopen select shows, by id; the empty choice opens nothing, and
+   * neither does a press while a run computes.
+   */
   const reopen = () => {
-    if (chosen === undefined) {
+    if (computingRef.current || chosen === undefined) {
       return;
     }
     clearErrors();
     openRun(chosen.id);
   };
 
-  /** Reads the latest default run again, from its warning's Retry button. */
+  /**
+   * Reads the latest default run again, from its warning's Retry button, unless a run computes.
+   */
   const retryDefaultRun = () => {
+    if (computingRef.current) {
+      return;
+    }
     rememberFocus();
     void defaultRun.refetch();
   };
 
-  /** Lists the recent custom runs again, from their warning's Retry button. */
+  /**
+   * Lists the recent custom runs again, from their warning's Retry button, unless a run
+   * computes.
+   */
   const retryCustomRuns = () => {
+    if (computingRef.current) {
+      return;
+    }
     rememberFocus();
     void customRuns.refetch();
   };
@@ -861,6 +913,10 @@ export function WindowPicker({ run }: WindowPickerProps) {
       aria-controls={customRunsRegionId}
       disabled={pending}
       onClick={() => {
+        // Inert while a run computes, like every other control (computingRef).
+        if (computingRef.current) {
+          return;
+        }
         // A closed list is no longer needed: forgetting it keeps every later mount closed and
         // unread until the user opens it again, which reads it afresh.
         if (customRunsOpen) {

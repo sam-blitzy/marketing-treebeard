@@ -28,7 +28,13 @@
  * literals is a UI default of the client.
  */
 import { apiError, html, json, mockApi } from '../../test/mockApi';
-import type { ApiMock, MockHandlers, MockResponse, RecordedCall } from '../../test/mockApi';
+import type {
+  ApiMock,
+  MockHandler,
+  MockHandlers,
+  MockResponse,
+  RecordedCall,
+} from '../../test/mockApi';
 import { createTestQueryClient, renderWithProviders } from '../../test/render';
 import { useRouterState } from '@tanstack/react-router';
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
@@ -1034,6 +1040,338 @@ describe('WindowPicker', () => {
         screen.queryByText('The server is temporarily unavailable. Try again shortly.'),
       ).toBeNull();
       expect(posts(api)).toHaveLength(2);
+    });
+  });
+
+  describe('one computation at a time', () => {
+    /** The warning a 409 `run_in_progress` shows. */
+    const RUN_IN_PROGRESS = 'Another analysis is running. Try again shortly.';
+
+    /**
+     * A preset of the fixture configuration other than its default and other than `except`, in
+     * configured order.
+     */
+    function otherPreset(except?: number): number {
+      const days = otherPresets.find((candidate) => candidate !== except);
+      if (days === undefined) {
+        throw new Error('The fixture configuration offers no preset besides its default.');
+      }
+      return days;
+    }
+
+    /**
+     * The custom run `POST /runs` creates for the fixture preset of `days`: that preset's window,
+     * ending on the default window end, under `id`.
+     */
+    function presetRun(days: number, id: Run['id'] = CUSTOM_RUN_ID): Run {
+      return makeRun({
+        id,
+        kind: 'custom',
+        trigger: 'manual',
+        ...presetWindow(days, defaultRun.window_end),
+        days,
+      });
+    }
+
+    /**
+     * A `POST /runs` handler that answers as the API's analysis lock does while one computation
+     * runs: the first request waits for `first`, and every request that arrives meanwhile is
+     * refused with 409 `run_in_progress`.
+     */
+    function lockedWhileComputing(first: Deferred): MockHandler {
+      let computing = false;
+      return () => {
+        if (computing) {
+          return apiError(409, 'run_in_progress', 'An analysis is already running.');
+        }
+        computing = true;
+        return first.handler().finally(() => {
+          computing = false;
+        });
+      };
+    }
+
+    /**
+     * Two presses of one control that both land before the picker can stop the second by its
+     * rendered state: two clicks in a row, as a double click delivers them, and two clicks in
+     * one task, as a script delivers them, with no render between them.
+     */
+    const doublePresses = [
+      {
+        title: 'two clicks in a row',
+        press: (target: HTMLElement) => {
+          fireEvent.click(target);
+          fireEvent.click(target);
+        },
+      },
+      {
+        title: 'two clicks in one task',
+        press: (target: HTMLElement) => {
+          act(() => {
+            target.click();
+            target.click();
+          });
+        },
+      },
+    ] as const;
+
+    it.each(doublePresses)(
+      'posts a preset once for $title, and opens the run it created',
+      async ({ press }) => {
+        const days = otherPreset();
+        const created = presetRun(days);
+        const answer = deferred();
+        const api = stubApi({ 'POST /runs': lockedWhileComputing(answer) });
+        const { router } = await renderPicker();
+        await presetsShown();
+
+        press(button(presetLabel(days)));
+
+        await waitFor(() => {
+          expect(posts(api)).toHaveLength(1);
+        });
+        answer.resolve(json(201, created));
+
+        await waitFor(() => {
+          expect(router.state.location.search).toEqual({ run: created.id });
+        });
+        expect(router.state.location.pathname).toBe('/actions');
+        expect(posts(api).map((call) => call.body)).toEqual([
+          presetWindow(days, defaultRun.window_end),
+        ]);
+        expect(screen.queryByText(RUN_IN_PROGRESS)).toBeNull();
+        await waitFor(() => {
+          expect(statusWithText('Computing custom window')).toBeUndefined();
+        });
+      },
+    );
+
+    it('disables every control and shows the computing spinner from the press that starts a run', async () => {
+      const days = otherPreset();
+      const created = presetRun(days);
+      const answer = deferred();
+      const api = stubApi({
+        'GET /runs': json(200, [customRun]),
+        'POST /runs': answer.handler,
+      });
+      const { router } = await renderPicker();
+      await presetsShown();
+      const toggle = openRecentCustomRuns();
+      const select = await screen.findByRole<HTMLSelectElement>('combobox', {
+        name: 'Reopen a custom window',
+      });
+      // The custom panel is opened first, so its fields and Apply are on screen too.
+      fireEvent.click(button('Custom range'));
+      const start = screen.getByLabelText<HTMLInputElement>(/^Start date/u);
+      const end = screen.getByLabelText<HTMLInputElement>(/^End date/u);
+      expect(start.disabled).toBe(false);
+
+      fireEvent.click(button(presetLabel(days)));
+
+      // Checked at once, with no wait: the press itself has disabled the picker, before the
+      // POST has answered.
+      expect(statusWithText('Computing custom window')).toBeDefined();
+      for (const name of [...presetLabels(), 'Custom range', 'Apply']) {
+        expect(button(name).hasAttribute('disabled')).toBe(true);
+      }
+      expect(start.disabled).toBe(true);
+      expect(end.disabled).toBe(true);
+      expect(toggle.hasAttribute('disabled')).toBe(true);
+      expect(select.hasAttribute('disabled')).toBe(true);
+      expect(reopenButton().hasAttribute('disabled')).toBe(true);
+
+      await waitFor(() => {
+        expect(posts(api)).toHaveLength(1);
+      });
+      answer.resolve(json(201, created));
+
+      await waitFor(() => {
+        expect(router.state.location.search).toEqual({ run: created.id });
+      });
+      await waitFor(() => {
+        expect(button('Custom range').hasAttribute('disabled')).toBe(false);
+      });
+      expect(toggle.hasAttribute('disabled')).toBe(false);
+      expect(posts(api)).toHaveLength(1);
+    });
+
+    it('ignores the default preset pressed in the same task as a computing press, and still opens the computed run', async () => {
+      // The run on screen is a custom run, so a choice of the default preset would navigate.
+      const days = otherPreset(customRun.days);
+      const created = presetRun(days, CUSTOM_RUN_ID + 8);
+      const answer = deferred();
+      const api = stubApi({ 'POST /runs': lockedWhileComputing(answer) });
+      const { router } = await renderPicker(customRun, `/actions?run=${String(CUSTOM_RUN_ID)}`);
+      await presetsShown();
+      const entriesBefore = router.history.length;
+
+      act(() => {
+        button(presetLabel(days)).click();
+        button(presetLabel(fixtureWindow.default_days)).click();
+      });
+
+      await waitFor(() => {
+        expect(posts(api)).toHaveLength(1);
+      });
+      // The default preset neither navigated nor reset the computation.
+      expect(router.state.location.search).toEqual({ run: CUSTOM_RUN_ID });
+      expect(router.history.length).toBe(entriesBefore);
+      expect(statusWithText('Computing custom window')).toBeDefined();
+
+      answer.resolve(json(201, created));
+
+      await waitFor(() => {
+        expect(router.state.location.search).toEqual({ run: created.id });
+      });
+      // One navigation only: to the computed run.
+      expect(router.history.length).toBe(entriesBefore + 1);
+      expect(posts(api).map((call) => call.body)).toEqual([
+        presetWindow(days, defaultRun.window_end),
+      ]);
+      expect(screen.queryByText(RUN_IN_PROGRESS)).toBeNull();
+    });
+
+    it('ignores Reopen and the recent custom windows toggle pressed in the same task as a computing press', async () => {
+      const days = otherPreset(customRun.days);
+      const created = presetRun(days, CUSTOM_RUN_ID + 8);
+      const answer = deferred();
+      const api = stubApi({
+        'GET /runs': json(200, [customRun]),
+        'POST /runs': answer.handler,
+      });
+      const { router } = await renderPicker();
+      await presetsShown();
+      const toggle = openRecentCustomRuns();
+      const select = await screen.findByRole<HTMLSelectElement>('combobox', {
+        name: 'Reopen a custom window',
+      });
+      fireEvent.change(select, { target: { value: String(customRun.id) } });
+      const reads = customRunReads(api).length;
+
+      act(() => {
+        button(presetLabel(days)).click();
+        reopenButton().click();
+        toggle.click();
+      });
+
+      await waitFor(() => {
+        expect(posts(api)).toHaveLength(1);
+      });
+      // Reopen opened nothing, and the list stayed open and was neither forgotten nor read.
+      expect(router.state.location.search).toEqual({});
+      expect(toggle.getAttribute('aria-expanded')).toBe('true');
+      expect(customRunReads(api)).toHaveLength(reads);
+
+      answer.resolve(json(201, created));
+
+      await waitFor(() => {
+        expect(router.state.location.search).toEqual({ run: created.id });
+      });
+    });
+
+    it('ignores both Retry buttons pressed in the same task as a computing press', async () => {
+      const days = otherPreset();
+      const created = presetRun(days);
+      const answer = deferred();
+      const api = stubApi({
+        'GET /runs/latest': apiError(500, 'internal_error', 'The database is unavailable.'),
+        'GET /runs': apiError(503, 'unavailable', 'The API is restarting.'),
+        'POST /runs': answer.handler,
+      });
+      const { router } = await renderPicker();
+      await presetsShown();
+      openRecentCustomRuns();
+      await waitFor(() => {
+        expect(noticeTitles()).toEqual([
+          'Could not read the latest default run',
+          'Could not load recent custom windows',
+        ]);
+      });
+      const latestReads = (): number =>
+        api.calls.filter((call) => call.method === 'GET' && call.path === '/runs/latest').length;
+      const latestBefore = latestReads();
+      const customBefore = customRunReads(api).length;
+
+      act(() => {
+        button(presetLabel(days)).click();
+        button('Retry reading the latest default run').click();
+        button('Retry loading recent custom windows').click();
+      });
+
+      await waitFor(() => {
+        expect(posts(api)).toHaveLength(1);
+      });
+      expect(latestReads()).toBe(latestBefore);
+      expect(customRunReads(api)).toHaveLength(customBefore);
+
+      answer.resolve(json(201, created));
+
+      await waitFor(() => {
+        expect(router.state.location.search).toEqual({ run: created.id });
+      });
+    });
+
+    it.each(doublePresses)(
+      'posts a custom range once for $title on Apply, and opens the run it created',
+      async ({ press }) => {
+        const answer = deferred();
+        const api = stubApi({ 'POST /runs': lockedWhileComputing(answer) });
+        const { router } = await renderPicker();
+        await presetsShown();
+        fireEvent.click(button('Custom range'));
+        fireEvent.change(screen.getByLabelText(/^Start date/u), {
+          target: { value: '2026-08-01' },
+        });
+        fireEvent.change(screen.getByLabelText(/^End date/u), {
+          target: { value: '2026-08-30' },
+        });
+
+        press(button('Apply'));
+
+        await waitFor(() => {
+          expect(posts(api)).toHaveLength(1);
+        });
+        answer.resolve(json(201, customRun));
+
+        await waitFor(() => {
+          expect(router.state.location.search).toEqual({ run: CUSTOM_RUN_ID });
+        });
+        expect(posts(api).map((call) => call.body)).toEqual([
+          { window_start: '2026-08-01', window_end: '2026-08-30' },
+        ]);
+        expect(screen.queryByText(RUN_IN_PROGRESS)).toBeNull();
+      },
+    );
+
+    it('frees the picker after a 409 from a run another process holds, so a later choice posts again', async () => {
+      const days = otherPreset();
+      const created = presetRun(days);
+      const api = stubApi({
+        'POST /runs': apiError(409, 'run_in_progress', 'An analysis is already running.'),
+      });
+      const { router } = await renderPicker();
+      await presetsShown();
+
+      fireEvent.click(button(presetLabel(days)));
+
+      await waitFor(() => {
+        expect(noticeTitles()).toEqual([RUN_IN_PROGRESS]);
+      });
+      expect(noticeRegion().getAttribute('role')).toBe('status');
+      expect(screen.queryByRole('alert')).toBeNull();
+      expect(router.state.location.search).toEqual({});
+      await waitFor(() => {
+        expect(button(presetLabel(days)).hasAttribute('disabled')).toBe(false);
+      });
+
+      api.use({ 'POST /runs': json(201, created) });
+      fireEvent.click(button(presetLabel(days)));
+
+      await waitFor(() => {
+        expect(router.state.location.search).toEqual({ run: created.id });
+      });
+      expect(posts(api)).toHaveLength(2);
+      expect(screen.queryByText(RUN_IN_PROGRESS)).toBeNull();
     });
   });
 

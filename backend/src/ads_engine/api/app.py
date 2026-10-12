@@ -29,10 +29,12 @@ uvicorn serves the factory, never a module-level application::
   OpenAPI document publishes no ``head`` operation, and a 405's ``Allow`` that names ``GET``
   names ``HEAD`` too.
 * **Request deadline**: every HTTP request runs under a 45 s deadline. A request still
-  running then, typically one waiting on a database that stopped answering, is answered
-  503 ``request_timeout`` in the error envelope at the deadline itself, and logged as one
-  ``api.request_timeout`` WARNING naming its method and path. It is cancelled, and its
-  cleanup finishes in the background without delaying the answer.
+  running then, typically one already waiting on a pooled connection to a database that
+  stopped answering, is answered 503 ``request_timeout`` in the error envelope at the
+  deadline itself, and logged as one ``api.request_timeout`` WARNING naming its method and
+  path. It is cancelled, and its cleanup finishes in the background without delaying the
+  answer. A request that cannot get a connection at all fails sooner, in 503
+  ``database_unavailable`` (error envelope below).
 * **No caching**: every HTTP response carries exactly one ``Cache-Control: no-store``, so no
   browser or shared cache keeps an API answer, signed-in evidence, decisions and identity
   included, after sign-out (CWE-525). :class:`_NoStoreMiddleware`, the outermost user
@@ -43,8 +45,13 @@ uvicorn serves the factory, never a module-level application::
   ``/api/v1`` and behind :func:`~ads_engine.api.deps.require_csrf`, which requires
   ``X-Requested-With: ads-engine`` on mutating methods and passes safe methods untouched.
 * **Error envelope**: every error the API returns, a domain rejection, a validation
-  failure, an unknown path or an unexpected crash, is rendered as
-  :class:`~ads_engine.api.schemas.ErrorResponse`, ``{"error": {"code", "message"}}``.
+  failure, an unknown path, a database outage or an unexpected crash, is rendered as
+  :class:`~ads_engine.api.schemas.ErrorResponse`, ``{"error": {"code", "message"}}``. A
+  database that cannot be reached, a refused or timed-out connection (libpq's 10 s
+  ``connect_timeout``) or a pool checkout that waited 10 s, is answered 503
+  ``database_unavailable``, as ``GET /healthz`` answers it, and logged as one
+  ``api.database_unavailable`` WARNING naming the method, path, error class and SQLSTATE;
+  every other database error stays a 500 ``internal_error``.
 * **Lifespan**: loads ``config/*.yaml`` at boot, so a broken file stops uvicorn instead of
   failing the first request, and starts the analysis process in which ``POST /runs``
   computes (:func:`~ads_engine.analysis.runner.start_analysis_process`); one that cannot
@@ -76,7 +83,10 @@ from typing import Any, Final
 from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from psycopg.errors import PipelineAborted
 from pydantic import ValidationError
+from sqlalchemy.exc import DBAPIError, OperationalError, SQLAlchemyError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from starlette.datastructures import MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
@@ -179,6 +189,18 @@ _VALIDATION_ERROR_CODE: Final = "validation_error"
 _INTERNAL_ERROR_CODE: Final = "internal_error"
 _INTERNAL_ERROR_MESSAGE: Final = "Internal server error"
 _HTTP_ERROR_CODE: Final = "http_error"
+# The answer to a database that cannot be reached: the code and message GET /healthz uses.
+_DATABASE_UNAVAILABLE_CODE: Final = "database_unavailable"
+_DATABASE_UNAVAILABLE_MESSAGE: Final = "Database unavailable"
+
+# SQLSTATEs (PostgreSQL Appendix A) of a server that cannot serve any request: class 08
+# connection_exception, class 53 insufficient_resources (53300 too_many_connections among
+# them), and 57P01 admin_shutdown, 57P02 crash_shutdown and 57P03 cannot_connect_now. Every
+# other server error, such as a deadlock (40P01), a serialization failure (40001), a
+# cancelled statement (57014) or a lock not available (55P03), belongs to the request itself
+# and stays a 500 `internal_error`.
+_OUTAGE_SQLSTATE_CLASSES: Final = frozenset({"08", "53"})
+_OUTAGE_SQLSTATES: Final = frozenset({"57P01", "57P02", "57P03"})
 
 # Codes for HTTP errors that Starlette and FastAPI raise themselves, such as an unknown path
 # (404) or an unsupported method (405). Routes raise ApiError instead, with their own codes.
@@ -548,6 +570,107 @@ async def _handle_http_exception(request: Request, exc: Exception) -> JSONRespon
     return _error_response(error.status_code, code, message, headers)
 
 
+def _database_sqlstate(error: SQLAlchemyError) -> str | None:
+    """Return the SQLSTATE the server sent with ``error``, or ``None`` when it sent none.
+
+    Args:
+        error: A database error SQLAlchemy raised.
+
+    Returns:
+        The five-character code psycopg read from the server for a
+        :class:`~sqlalchemy.exc.DBAPIError`; ``None`` for a client-side failure, such as a
+        refused or timed-out connection, and for any other SQLAlchemy error.
+    """
+    if not isinstance(error, DBAPIError):
+        return None
+    raw: object = getattr(error.orig, "sqlstate", None)
+    return raw if isinstance(raw, str) and raw else None
+
+
+def _is_database_outage(error: SQLAlchemyError) -> bool:
+    """Whether ``error`` means the database cannot be reached, rather than the request failed.
+
+    An outage is:
+
+    * a pool checkout that waited ``pool_timeout`` (10 s) for a free connection
+      (SQLAlchemy's own ``TimeoutError``, not the builtin);
+    * a driver error on a connection SQLAlchemy found lost and invalidated;
+    * an ``OperationalError`` psycopg raised without a SQLSTATE, a client-side connection
+      failure such as a refused connection, libpq's ``connect_timeout`` expiring or a
+      connection the server closed, except ``PipelineAborted``, which only reports an
+      earlier failure in the same pipeline;
+    * an ``OperationalError`` whose SQLSTATE is in class 08 or 53, or is 57P01, 57P02 or
+      57P03 (:data:`_OUTAGE_SQLSTATE_CLASSES`, :data:`_OUTAGE_SQLSTATES`).
+
+    Args:
+        error: A database error SQLAlchemy raised.
+
+    Returns:
+        ``True`` for an outage; ``False`` for any other error, a deadlock, a serialization
+        failure, a cancelled statement, a lock not available and every integrity,
+        programming or data error included.
+    """
+    if isinstance(error, PoolTimeoutError):
+        return True
+    if not isinstance(error, DBAPIError):
+        return False
+    if error.connection_invalidated:
+        return True
+    if not isinstance(error, OperationalError) or isinstance(error.orig, PipelineAborted):
+        return False
+    sqlstate = _database_sqlstate(error)
+    if sqlstate is None:
+        return True
+    return sqlstate[:2] in _OUTAGE_SQLSTATE_CLASSES or sqlstate in _OUTAGE_SQLSTATES
+
+
+async def _handle_database_unavailable(request: Request, exc: Exception) -> JSONResponse:
+    """Answer a database that cannot be reached with 503 ``database_unavailable``.
+
+    A request that cannot get a connection, because the server refuses it, libpq's
+    ``connect_timeout`` (10 s) expires or the pool's checkout waits 10 s for a free one, gets
+    the answer ``GET /healthz`` gives, not a 500: the outage is the database's, not a defect
+    of the API. It is logged as one ``api.database_unavailable`` WARNING with the path, the
+    method, the error class and the SQLSTATE, never the error's text, whose statement,
+    parameters and connection details can name the host, the user or a lead. An error its
+    owner already logged in full (the analysis runner's ``analysis_run_failed``) also names
+    that event (``logged_as``).
+
+    Any other database error is raised again untouched, without a log line, so it reaches
+    :func:`_handle_unexpected` and stays a 500 ``internal_error`` with its traceback.
+    FastAPI's route wrapper and Starlette's exception middleware each call this handler for
+    such an error, so that path has no side effect.
+
+    Args:
+        request: The failed request.
+        exc: The raised :class:`~sqlalchemy.exc.DBAPIError` or SQLAlchemy ``TimeoutError``.
+
+    Returns:
+        503 with ``database_unavailable`` and "Database unavailable".
+
+    Raises:
+        SQLAlchemyError: ``exc`` itself, when it is not an outage (:func:`_is_database_outage`).
+    """
+    error = _expect(exc, SQLAlchemyError)
+    if not _is_database_outage(error):
+        raise error
+    owner = logged_as(error)
+    ownership: dict[str, str] = {} if owner is None else {"logged_as": owner}
+    _log.warning(
+        "api.database_unavailable",
+        path=request.url.path,
+        method=request.method,
+        error_type=type(error).__name__,
+        sqlstate=_database_sqlstate(error),
+        **ownership,
+    )
+    return _error_response(
+        http.HTTPStatus.SERVICE_UNAVAILABLE,
+        _DATABASE_UNAVAILABLE_CODE,
+        _DATABASE_UNAVAILABLE_MESSAGE,
+    )
+
+
 async def _handle_unexpected(request: Request, exc: Exception) -> JSONResponse:
     """Answer any other exception with 500 ``internal_error``, logging its traceback.
 
@@ -595,6 +718,13 @@ def _register_error_handlers(app: FastAPI) -> None:
     ``ValueError`` subclasses ``InvalidWindow`` and ``ConfigError`` keep their own codes,
     and every ``DecisionError`` subclass shares one handler.
 
+    Every SQLAlchemy ``DBAPIError`` and the pool's ``TimeoutError`` go to
+    :func:`_handle_database_unavailable`: a database that cannot be reached (a refused or
+    timed-out connection, a pool checkout that waited 10 s) is answered 503
+    ``database_unavailable``, and any other database error is passed on to the catch-all
+    500. A request already waiting on a stuck pooled connection raises nothing and still
+    ends at the request deadline in 503 ``request_timeout``.
+
     Args:
         app: The application being built.
     """
@@ -606,6 +736,8 @@ def _register_error_handlers(app: FastAPI) -> None:
     app.add_exception_handler(ConfigError, _handle_config_error)
     app.add_exception_handler(RequestValidationError, _handle_request_validation)
     app.add_exception_handler(StarletteHTTPException, _handle_http_exception)
+    app.add_exception_handler(DBAPIError, _handle_database_unavailable)
+    app.add_exception_handler(PoolTimeoutError, _handle_database_unavailable)
     app.add_exception_handler(Exception, _handle_unexpected)
 
 

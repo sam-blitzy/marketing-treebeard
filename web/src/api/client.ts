@@ -340,7 +340,10 @@ export type ApiErrorCode =
   | 'config_error'
   /** 500: an unexpected server failure, in the API or in nginx (`web/nginx.conf`). */
   | 'internal_error'
-  /** 503: `GET /healthz` could not reach the database. */
+  /**
+   * 503: the database could not be reached (a refused or timed-out connection, or no pooled
+   * connection free within 10 s); any route can answer it, `GET /healthz` included.
+   */
   | 'database_unavailable'
   /** Any other framework-raised HTTP error status. */
   | 'http_error'

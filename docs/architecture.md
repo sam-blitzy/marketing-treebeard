@@ -287,6 +287,10 @@ Inside one run (`analysis/runner.py`):
 - `POST /api/v1/runs` computes synchronously. The API cancels any request after its own 45 s
   deadline (503 `request_timeout`), and nginx waits up to 120 s (`proxy_read_timeout`), so a
   slow request still ends in the API's error envelope.
+- A request that cannot get a database connection (refused, libpq's 10 s `connect_timeout`, or
+  a 10 s wait for a pooled connection) ends in 503 `database_unavailable`, logged as the
+  WARNING `api.database_unavailable`, while one already stuck on a pooled connection ends at
+  the 45 s deadline in 503 `request_timeout`.
 - nginx gives up connecting to the API after 5 s (`proxy_connect_timeout`; a connect on the
   Compose network takes well under a millisecond). Once `api` stops, a request ends within 5 s
   in 504 `upstream_timeout`, and from the moment nginx's resolver drops the name (within 10 s)
