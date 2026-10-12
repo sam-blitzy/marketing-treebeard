@@ -757,11 +757,30 @@ describe('isAwaitingFirstRun', () => {
 // ---------------------------------------------------------------------------------------------
 
 describe('meQueryOptions and useMe', () => {
-  it('keys GET /auth/me under queryKeys.me, fresh for 5 minutes, never retried', () => {
+  it('keys GET /auth/me under queryKeys.me, fresh for 5 minutes, kept for the tab, never retried', () => {
     const options = meQueryOptions();
     expect(options.queryKey).toEqual(queryKeys.me);
     expect(options.staleTime).toBe(LONG_STALE_MS);
+    expect(options.gcTime).toBe(Infinity);
     expect(options.retry).toBe(false);
+  });
+
+  it("keeps an unobserved user beyond TanStack's 5-minute garbage collection", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const mock = stubFetch(routes({ 'GET /api/v1/auth/me': () => json(200, mePayload()) }));
+    // TanStack's own default lifetime, which createWrapper's clients turn off.
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 5 * 60_000 } },
+    });
+    clients.push(queryClient);
+    // The auth guard's read: nothing observes the entry afterwards.
+    await expect(queryClient.ensureQueryData(meQueryOptions())).resolves.toEqual(mePayload());
+
+    await vi.advanceTimersByTimeAsync(6 * 60_000);
+
+    expect(queryClient.getQueryData(queryKeys.me)).toEqual(mePayload());
+    await expect(queryClient.ensureQueryData(meQueryOptions())).resolves.toEqual(mePayload());
+    expect(mock).toHaveBeenCalledTimes(1);
   });
 
   it('resolves the user from GET /api/v1/auth/me with an abort signal', async () => {
@@ -800,6 +819,74 @@ describe('meQueryOptions and useMe', () => {
     expect(second.result.current.data).toEqual(mePayload());
     expect(second.result.current.isStale).toBe(false);
     expect(mock).toHaveBeenCalledTimes(1);
+    // With the user read, nothing polls.
+    expect(pollInterval(first.queryClient, queryKeys.me)).toBe(false);
+  });
+
+  it('useMe sends nothing while disabled, and returns what the cache holds', async () => {
+    const mock = stubFetch(routes({ 'GET /api/v1/auth/me': () => json(200, mePayload()) }));
+    const empty = renderWithWrapper(() => useMe({ enabled: false }));
+    await act(() => Promise.resolve());
+    expect(empty.result.current.data).toBeUndefined();
+    expect(empty.result.current.fetchStatus).toBe('idle');
+
+    const setup = createWrapper();
+    setup.queryClient.setQueryData(queryKeys.me, mePayload());
+    const seeded = renderWithWrapper(() => useMe({ enabled: false }), setup);
+    await act(() => Promise.resolve());
+    expect(seeded.result.current.data).toEqual(mePayload());
+    expect(mock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      'an unreachable server',
+      CURRENT_STATE_POLL_MS,
+      () => Promise.reject(new TypeError('Failed to fetch')),
+    ],
+    [
+      'nginx 502 during an outage',
+      CURRENT_STATE_POLL_MS,
+      () => new Response('<html>Bad Gateway</html>', { status: 502 }),
+    ],
+    [
+      'a 503',
+      CURRENT_STATE_POLL_MS,
+      () => json(503, envelope('database_unavailable', 'Database unavailable')),
+    ],
+    ['a 429', CURRENT_STATE_POLL_MS, () => json(429, envelope('rate_limited', 'Slow down'))],
+    ['an ended session', false, () => json(401, envelope('unauthenticated', 'Sign in again.'))],
+  ] as const)('useMe after %s polls at %s', async (_label, interval, respond) => {
+    stubFetch(respond);
+    const { result, queryClient } = renderWithWrapper(() => useMe());
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(pollInterval(queryClient, queryKeys.me)).toBe(interval);
+  });
+
+  it('useMe reads an entry that already failed only by poll, until the user arrives', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const badGateway = () => new Response('<html>Bad Gateway</html>', { status: 502 });
+    const mock = stubFetch(sequence(badGateway, badGateway, () => json(200, mePayload())));
+    const setup = createWrapper();
+    // The auth guard's read, failed during an outage.
+    await rejection(setup.queryClient.ensureQueryData(meQueryOptions()));
+    expect(mock).toHaveBeenCalledTimes(1);
+
+    // Mounting does not repeat the guard's read at once.
+    const { result } = renderWithWrapper(() => useMe(), setup);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(result.current.isError).toBe(true);
+    expect(mock).toHaveBeenCalledTimes(1);
+
+    await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+    await waitFor(() => expect(mock).toHaveBeenCalledTimes(2));
+    await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+    await waitFor(() => expect(result.current.data).toEqual(mePayload()));
+    expect(mock).toHaveBeenCalledTimes(3);
+
+    // The user ends the polling.
+    await act(() => vi.advanceTimersByTimeAsync(2 * CURRENT_STATE_POLL_MS));
+    expect(mock).toHaveBeenCalledTimes(3);
   });
 });
 
@@ -2037,7 +2124,8 @@ describe('useConfig', () => {
     const options = configQueryOptions();
     expect(options.queryKey).toEqual(queryKeys.config);
     expect(options.staleTime).toBe(LONG_STALE_MS);
-    expect(options.refetchInterval).toBeUndefined();
+    // A function of the last error: see the polling cases below.
+    expect(typeof options.refetchInterval).toBe('function');
   });
 
   it('reads GET /api/v1/config and stays fresh for a second mount', async () => {
@@ -2056,6 +2144,53 @@ describe('useConfig', () => {
     expect(second.result.current.data).toEqual(config);
     expect(second.result.current.isStale).toBe(false);
     expect(mock).toHaveBeenCalledTimes(1);
+    // A loaded configuration is not polled.
+    expect(pollInterval(first.queryClient, queryKeys.config)).toBe(false);
+  });
+
+  it.each([
+    [
+      'an unreachable server',
+      CURRENT_STATE_POLL_MS,
+      () => Promise.reject(new TypeError('Failed to fetch')),
+    ],
+    [
+      'nginx 502 during an outage',
+      CURRENT_STATE_POLL_MS,
+      () => new Response('<html>Bad Gateway</html>', { status: 502 }),
+    ],
+    [
+      'a 500 config_error',
+      CURRENT_STATE_POLL_MS,
+      () => json(500, envelope('config_error', 'thresholds.yaml is invalid')),
+    ],
+    ['an expired session', false, () => json(401, envelope('unauthenticated', 'Sign in again.'))],
+  ] as const)('after %s polls at %s', async (_label, interval, respond) => {
+    stubFetch(respond);
+    const { result, queryClient } = renderWithWrapper(() => useConfig());
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(pollInterval(queryClient, queryKeys.config)).toBe(interval);
+  });
+
+  it('reads again after a transient failure until the configuration arrives', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const config = configPayload();
+    const mock = stubFetch(
+      sequence(
+        () => new Response('<html>Bad Gateway</html>', { status: 502 }),
+        () => json(200, config),
+      ),
+    );
+    const { result } = renderWithWrapper(() => useConfig());
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+    await waitFor(() => expect(result.current.data).toEqual(config));
+    expect(mock).toHaveBeenCalledTimes(2);
+
+    // The configuration ends the polling.
+    await act(() => vi.advanceTimersByTimeAsync(2 * CURRENT_STATE_POLL_MS));
+    expect(mock).toHaveBeenCalledTimes(2);
   });
 
   it('surfaces 500 config_error', async () => {

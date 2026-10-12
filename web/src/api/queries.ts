@@ -40,7 +40,10 @@
  *   and {@link useDiscrepancyPages} refetch every {@link CURRENT_STATE_POLL_MS} with the same
  *   error rule, because the worker writes baseline decisions and opens and auto-resolves
  *   discrepancies on its own schedule; the paged list refetches only the pages already
- *   loaded. {@link useSources} polls every {@link SOURCES_POLL_MS}. Polling runs only while
+ *   loaded. {@link useSources} polls every {@link SOURCES_POLL_MS}. {@link useConfig} polls
+ *   every {@link CURRENT_STATE_POLL_MS} only after a transient failure, and {@link useMe}
+ *   only while its last read failed with anything but a 401, each until a read succeeds, so a
+ *   screen that an outage left without them recovers by itself. Polling runs only while
  *   the page is visible and stops when the last component using the query unmounts. A
  *   prefetch ({@link usePrefetchActionsReads}, and {@link useCreateRun}'s read of the page of
  *   the run it creates) registers no component, so it reads once and never polls. A failed
@@ -420,6 +423,27 @@ export const queryKeys = {
   config: ['config'] as const,
 } as const;
 
+/**
+ * The keys of the mutations whose 401 says nothing about an ended session elsewhere in the app,
+ * so `src/main.tsx` tells them apart from every other write (`matchMutation` on the exact key):
+ *
+ * | Key | Endpoint | What its 401 means |
+ * |-----|----------|--------------------|
+ * | `login` | `POST /auth/login` | a wrong email or password, which `LoginPage` shows |
+ * | `logout` | `POST /auth/logout` | the session had already ended: signed out either way |
+ *
+ * @example
+ * ```ts
+ * matchMutation({ mutationKey: mutationKeys.logout, exact: true }, mutation);
+ * ```
+ */
+export const mutationKeys = {
+  /** Sign-in, `POST /auth/login` ({@link useLogin}). */
+  login: ['auth', 'login'] as const,
+  /** Sign-out, `POST /auth/logout` ({@link useLogout}). */
+  logout: ['auth', 'logout'] as const,
+} as const;
+
 // ---------------------------------------------------------------------------------------------
 // Queries
 // ---------------------------------------------------------------------------------------------
@@ -428,10 +452,18 @@ export const queryKeys = {
  * Query options for the signed-in user, `GET /auth/me` → {@link Me}.
  *
  * `src/router.tsx`'s auth guard calls `queryClient.ensureQueryData(meQueryOptions())` and
- * redirects to `/login` on a 401 `unauthenticated` {@link ApiError}. The options never retry,
- * so a signed-out user is redirected at once. The result stays fresh for 5 minutes, and
- * {@link useLogin} seeds it and {@link useLogout} clears it, so navigation does not re-ask the
- * API on every route change.
+ * redirects to `/login` on a 401 `unauthenticated` {@link ApiError}; any other failure leaves
+ * the session unknown, and the layout reads it again through {@link useMe}. The options never
+ * retry, so a signed-out user is redirected at once.
+ *
+ * The user stays fresh for 5 minutes and stays cached for the life of the tab
+ * (`gcTime: Infinity`), so navigation never re-asks the API, however long ago the user was read.
+ * The guard and the sign-in screen's session check read the entry without observing it, and
+ * TanStack's default 5-minute garbage collection of an unobserved entry would drop the user, so
+ * a later navigation would ask again, and fail during an outage. The entry ends with the session
+ * instead: {@link useLogin} seeds it, into the entry the sign-in screen's session check created
+ * with these options, and {@link useLogout}, an expired session and a page entering the
+ * back/forward cache (`src/main.tsx`) clear the whole cache.
  *
  * Status codes: 200 `{email}`; 401 `unauthenticated` without a valid session.
  *
@@ -442,19 +474,64 @@ export function meQueryOptions() {
     queryKey: queryKeys.me,
     queryFn: ({ signal }) => apiFetch<Me>('/auth/me', { signal }),
     staleTime: LONG_STALE_MS,
+    gcTime: Infinity,
     retry: false,
   });
+}
+
+/**
+ * The `refetchInterval` of {@link useMe}, from the query's last error:
+ * {@link CURRENT_STATE_POLL_MS} while the last read failed with anything but a 401 (a 5xx, a 429,
+ * no network), because the session is then unknown and a repeat may confirm it; `false` after a
+ * success, before any result and after a 401, which means the session is gone.
+ *
+ * It takes the error rather than the query, for the reason given at
+ * {@link currentStatePollInterval}.
+ *
+ * @param error - The query's `state.error`: `null` after a success or before any result.
+ * @returns The interval in milliseconds, or `false` to stop polling.
+ */
+function mePollInterval(error: unknown): number | false {
+  if (error === null || (isApiError(error) && error.status === 401)) {
+    return false;
+  }
+  return CURRENT_STATE_POLL_MS;
+}
+
+/** Options of {@link useMe}. */
+export interface MeOptions {
+  /**
+   * Whether the hook may send `GET /auth/me`; `true` when omitted. `false` sends nothing and
+   * returns only what the cache already holds for `queryKeys.me`.
+   */
+  enabled?: boolean;
 }
 
 /**
  * The signed-in user: `GET /auth/me` → {@link Me}. See {@link meQueryOptions} for caching,
  * retries and status codes.
  *
+ * `src/router.tsx`'s authenticated layout observes it, enabled only while its auth guard could
+ * not confirm the session (a 5xx, no network), so the top bar's email comes back by itself once
+ * the API answers again:
+ *
+ * - While the last read failed with anything but a 401, it reads again every
+ *   {@link CURRENT_STATE_POLL_MS} while the page is visible, and, like every query of the app
+ *   (`src/main.tsx`), when the window regains focus. A success or a 401 ends the polling.
+ * - An entry whose last read failed is not read again when the hook mounts (`retryOnMount:
+ *   false`): the guard has just asked, so the first repeat waits for the poll or for focus.
+ *
+ * @param options - See {@link MeOptions}.
  * @returns The query result; `error` is a 401 `unauthenticated` {@link ApiError} when
  *   signed out.
  */
-export function useMe() {
-  return useQuery(meQueryOptions());
+export function useMe({ enabled = true }: MeOptions = {}) {
+  return useQuery({
+    ...meQueryOptions(),
+    enabled,
+    refetchInterval: (query) => mePollInterval(query.state.error),
+    retryOnMount: false,
+  });
 }
 
 /**
@@ -1112,6 +1189,12 @@ export function sourcesQueryOptions() {
  * options {@link useConfig} observes and {@link usePrefetchActionsReads} prefetches. The
  * result stays fresh for 5 minutes, because thresholds change only when the API restarts.
  *
+ * They poll only after a transient failure ({@link isTransientError}: no network, a 429 or a
+ * 5xx): a component observing them then reads again every {@link CURRENT_STATE_POLL_MS}, so a
+ * screen that could not load or refresh the configuration during an outage recovers by itself
+ * once the API answers, and polling ends with the next success or any other error. A prefetch
+ * reads once.
+ *
  * @returns Options for `useQuery` or `prefetchQuery`, keyed by `queryKeys.config`.
  */
 export function configQueryOptions() {
@@ -1119,6 +1202,8 @@ export function configQueryOptions() {
     queryKey: queryKeys.config,
     queryFn: ({ signal }) => apiFetch<ConfigView>('/config', { signal }),
     staleTime: LONG_STALE_MS,
+    refetchInterval: (query) =>
+      isTransientError(query.state.error) ? CURRENT_STATE_POLL_MS : false,
   });
 }
 
@@ -1128,7 +1213,9 @@ export function configQueryOptions() {
  * HubSpot mapping with its resolved bindings, the white paper registry and `config_hash`.
  * The web client hard-codes no window length (AAP 0.5.5).
  *
- * It stays fresh for 5 minutes, because thresholds change only when the API restarts.
+ * It stays fresh for 5 minutes, because thresholds change only when the API restarts. After a
+ * transient failure it reads again every {@link CURRENT_STATE_POLL_MS} until a read succeeds
+ * (see {@link configQueryOptions}).
  *
  * Status codes: 200; 500 `config_error` when a configuration file or stored binding is
  * invalid.
@@ -1307,13 +1394,15 @@ function invalidateDecisionState(queryClient: QueryClient): Promise<unknown> {
  * message for both); 429 `rate_limited` from the 6th attempt within a minute, with
  * {@link ApiError.retryAfter} in seconds; 422 `validation_error` for an empty field.
  * `LoginPage` shows each. Invalidates nothing. Offline it fails at once with status 0
- * `network_error` and is never sent later ({@link WRITE_NETWORK_MODE}).
+ * `network_error` and is never sent later ({@link WRITE_NETWORK_MODE}). Keyed
+ * `mutationKeys.login`, so `src/main.tsx` never takes its 401 for an ended session.
  *
  * @returns The mutation; call `mutate({ email, password })`.
  */
 export function useLogin() {
   const queryClient = useQueryClient();
   return useMutation({
+    mutationKey: mutationKeys.login,
     networkMode: WRITE_NETWORK_MODE,
     mutationFn: (body: LoginRequest) =>
       apiFetch<Me>('/auth/login', { method: 'POST', body }),
@@ -1334,13 +1423,16 @@ export function useLogin() {
  *
  * Status codes: 200 with the signed-out `{email}`; 401 `unauthenticated` without a valid
  * session. Offline it fails at once with status 0 `network_error`, leaving the cache intact, and
- * is never sent later ({@link WRITE_NETWORK_MODE}).
+ * is never sent later ({@link WRITE_NETWORK_MODE}). Keyed `mutationKeys.logout`, so
+ * `src/main.tsx` leaves its 401 to the caller, which opens `/login` as after any sign-out: the
+ * sign-out lost no action.
  *
  * @returns The mutation; call `mutate()`. It resolves `void`.
  */
 export function useLogout() {
   const queryClient = useQueryClient();
   return useMutation({
+    mutationKey: mutationKeys.logout,
     networkMode: WRITE_NETWORK_MODE,
     // The API answers 200 with the signed-out `{email}`; nothing reads it, so the body is
     // discarded and the mutation resolves `void` whether the response is 200 or 204.

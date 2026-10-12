@@ -18,13 +18,17 @@
  *      server. A 4xx answer (401, 404 `not_found`, 409 `run_not_ready`, 422 …) is final and
  *      shown at once. See {@link isRetryableQueryError}.
  *    - Mutations are never retried: a write is not idempotent from the UI's point of view.
- *    - An expired session (a 401 from any mutation, or from any query except the auth guard's
- *      `GET /auth/me`, outside `/login`) clears the cache and opens
+ *    - An expired session (a 401 from any mutation but sign-in and sign-out, or from any query
+ *      except the auth guard's `GET /auth/me`, outside `/login`) clears the cache and opens
  *      `/login?redirect=<the current href>`, so sign-in returns the user to the screen they were
- *      on. The session cookie lives 12 h, so this happens to any tab left open. The router's auth
- *      guard handles that read's 401 itself, during a hover preload too; see
- *      {@link isAuthGuardQuery}. Every other error is left to the screen that made the request.
- *      See {@link redirectToLoginIfSessionExpired}.
+ *      on. The session cookie lives 12 h, so this happens to any tab left open, and a sign-out
+ *      elsewhere revokes every session at once. The `/login` entry's history state says why
+ *      (`sessionEnded`), so the sign-in screen tells the user their session ended and, after a
+ *      refused write, that their last action was not saved. The router's auth guard handles
+ *      the `GET /auth/me` read's 401 itself, during a hover preload too; see
+ *      {@link isAuthGuardQuery}. Sign-in and sign-out handle their own 401s; see
+ *      {@link isOwnSessionMutation}. Every other error is left to the screen that made the
+ *      request. See {@link redirectToLoginIfSessionExpired}.
  * 3. **The router**, from {@link createAppRouter}, with the query client as every route's
  *    context.
  * 4. **The render**: `StrictMode`, then `QueryClientProvider`, then `RouterProvider`. The router
@@ -58,14 +62,16 @@ import {
   QueryCache,
   QueryClient,
   QueryClientProvider,
+  matchMutation,
   matchQuery,
 } from '@tanstack/react-query';
-import type { Query } from '@tanstack/react-query';
+import type { Mutation, Query } from '@tanstack/react-query';
 import { RouterProvider } from '@tanstack/react-router';
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 
-import { isApiError, queryKeys } from './api/queries';
+import { isApiError, mutationKeys, queryKeys } from './api/queries';
+import type { SessionEndedNotice } from './features/auth/LoginPage';
 import { createAppRouter } from './router';
 
 // ---------------------------------------------------------------------------------------------
@@ -158,15 +164,24 @@ function isLoginPath(pathname: string): boolean {
 }
 
 /**
- * Sends the user to sign in when `error` says the session has ended: a 401, while the app is not
- * on `/login`. The query cache does not call it for the `queryKeys.me` read, whose 401 the
- * router's auth guard owns (see {@link isAuthGuardQuery}), so it sees every mutation's 401 and
- * every other query's. It clears the whole cache, so no data of the ended session survives, and
- * opens `/login` with the current href (path, search and hash) as `redirect`, which the login
- * route accepts only as a same-origin path. Every other error is left to the screen that made
- * the request.
+ * Sends the user to sign in when `error` says the session has ended: a 401. The query cache does
+ * not call it for the `queryKeys.me` read, whose 401 the router's auth guard owns (see
+ * {@link isAuthGuardQuery}), and the mutation cache does not call it for sign-in and sign-out,
+ * which handle their own 401s (see {@link isOwnSessionMutation}), so it sees every other query's
+ * and mutation's 401. Every other error is left to the screen that made the request.
  *
- * On `/login` a 401 is a wrong email or password, which the sign-in form shows itself.
+ * Outside `/login` it clears the whole cache, so no data of the ended session survives, and
+ * opens `/login` with the current href (path, search and hash) as `redirect`, which the login
+ * route accepts only as a same-origin path, and with `notice` as the entry's `sessionEnded`
+ * state. The sign-in screen then says that the session ended and, after a write, that the last
+ * action was not saved. The reason travels in the history state, not the URL, so no link can
+ * make the screen claim that an action was lost.
+ *
+ * On `/login` the only 401 still to arrive from the ended session is that of a request started
+ * before the screen opened. A write's 401 replaces the `/login` entry with the same address and
+ * `'action_not_saved'`, unless the entry already says so: the write was still in flight when an
+ * earlier 401 (a read's, or a sign-out's) opened the screen, and was not saved either. A read's
+ * 401 there changes nothing.
  *
  * The check reads `router.latestLocation`, which moves to `/login` as soon as the navigation
  * below starts. When several requests of one screen fail with 401 together, the first one
@@ -177,17 +192,26 @@ function isLoginPath(pathname: string): boolean {
  * can be declared before either exists.
  *
  * @param error - The failure a query or mutation ended with.
+ * @param notice - What a 401 of that request cost the user: `'session_ended'` for a query,
+ *   `'action_not_saved'` for a mutation.
  */
-function redirectToLoginIfSessionExpired(error: unknown): void {
+function redirectToLoginIfSessionExpired(error: unknown, notice: SessionEndedNotice): void {
   if (!isApiError(error) || error.status !== UNAUTHENTICATED_STATUS) {
     return;
   }
   const current = router.latestLocation;
-  if (isLoginPath(current.pathname)) {
+  if (!isLoginPath(current.pathname)) {
+    queryClient.clear();
+    void router.navigate({
+      to: LOGIN_PATH,
+      search: { redirect: current.href },
+      state: { sessionEnded: notice },
+    });
     return;
   }
-  queryClient.clear();
-  void router.navigate({ to: LOGIN_PATH, search: { redirect: current.href } });
+  if (notice === 'action_not_saved' && current.state.sessionEnded !== notice) {
+    void router.navigate({ href: current.href, state: { sessionEnded: notice }, replace: true });
+  }
 }
 
 /**
@@ -205,6 +229,30 @@ function isAuthGuardQuery(query: Query<unknown, unknown, unknown>): boolean {
   return matchQuery({ queryKey: queryKeys.me, exact: true }, query);
 }
 
+/** The keys of {@link isOwnSessionMutation}'s mutations: sign-in, then sign-out. */
+const OWN_SESSION_MUTATION_KEYS = [mutationKeys.login, mutationKeys.logout] as const;
+
+/**
+ * Whether `mutation` is the sign-in or the sign-out, whose 401 says nothing about a screen's
+ * ended session, so the global handler leaves it to the code that made the request:
+ *
+ * - Sign-in (`mutationKeys.login`): a 401 is a wrong email or password, which the sign-in form
+ *   shows itself.
+ * - Sign-out (`mutationKeys.logout`): a 401 means the session had already ended, and the
+ *   sign-out treats it as signed out: it clears the cache and opens `/login`, as after any
+ *   sign-out (`SignedInShell` in `./router`). The user asked to sign out and lost nothing, so
+ *   the sign-in screen shows no session-ended notice, and one navigation opens it instead of
+ *   two.
+ *
+ * @param mutation - The mutation that failed.
+ * @returns `true` for the `mutationKeys.login` and `mutationKeys.logout` mutations.
+ */
+function isOwnSessionMutation(mutation: Mutation<unknown, unknown, unknown>): boolean {
+  return OWN_SESSION_MUTATION_KEYS.some((mutationKey) =>
+    matchMutation({ mutationKey, exact: true }, mutation),
+  );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Query client and router
 // ---------------------------------------------------------------------------------------------
@@ -214,13 +262,15 @@ const queryClient = new QueryClient({
   queryCache: new QueryCache({
     onError: (error, query) => {
       if (!isAuthGuardQuery(query)) {
-        redirectToLoginIfSessionExpired(error);
+        redirectToLoginIfSessionExpired(error, 'session_ended');
       }
     },
   }),
   mutationCache: new MutationCache({
-    onError: (error) => {
-      redirectToLoginIfSessionExpired(error);
+    onError: (error, _variables, _onMutateResult, mutation) => {
+      if (!isOwnSessionMutation(mutation)) {
+        redirectToLoginIfSessionExpired(error, 'action_not_saved');
+      }
     },
   }),
   defaultOptions: {

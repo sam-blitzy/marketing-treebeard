@@ -24,20 +24,25 @@
  * - outages (a 5xx, with or without the API's envelope, and a request that never reached the
  *   server): one message at the head of the form, in the polite status region mounted with the
  *   page, no field marked invalid, nothing typed cleared, and focus back on "Sign in" when it had
- *   fallen to `<body>`.
+ *   fallen to `<body>`;
+ * - the session-ended notice: none without `sessionEnded`; with it, "Your session ended" and the
+ *   sentence of its reason, in an info or warning banner, never `role="alert"`, added to its own
+ *   polite status region after the region mounted, so it is announced; it stays at the head of
+ *   the form beside a refused attempt and an outage.
  *
  * @packageDocumentation
  */
 import { apiError, html, json, mockApi } from '../../test/mockApi';
 import type { MockResponse } from '../../test/mockApi';
 import { renderWithProviders } from '../../test/render';
-import { fireEvent, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
 import { queryKeys } from '../../api/queries';
 import type { Me } from '../../api/types';
 import { CUSTOM_RUN_ID, makeMe } from '../../test/fixtures';
 import { LoginPage } from './LoginPage';
+import type { SessionEndedNotice } from './LoginPage';
 
 // ---------------------------------------------------------------------------------------------
 // Helpers
@@ -115,6 +120,8 @@ describe('LoginPage', () => {
     await renderWithProviders(<LoginPage redirectTo="/actions" />, { path: '/login' });
 
     expect(screen.getByRole('heading', { level: 1, name: 'Sign in' })).toBeTruthy();
+    // WCAG 2.2 SC 2.4.2: the document title names the page.
+    expect(document.title).toBe('Sign in · Ads Action Engine');
     expect(screen.getByText('Ads Action Engine')).toBeTruthy();
     const { email, password, submit } = controls();
     expect(email.type).toBe('email');
@@ -882,5 +889,133 @@ describe('LoginPage', () => {
       { email: ADMIN_EMAIL, password: 'wrong' },
       { email: ADMIN_EMAIL, password: TYPED_PASSWORD },
     ]);
+  });
+});
+
+describe('LoginPage session-ended notice', () => {
+  /** The notice's title, whichever reason it shows. */
+  const NOTICE_TITLE = 'Your session ended';
+
+  /** The sentence below the title when an action was lost. */
+  const NOT_SAVED_TEXT = 'Sign in again. Your last action was not saved.';
+
+  /** Each reason, the banner tone it shows in, and the sentence below the title. */
+  const NOTICES: readonly (readonly [SessionEndedNotice, string, string])[] = [
+    ['session_ended', 'info', 'Sign in again to continue.'],
+    ['action_not_saved', 'warning', NOT_SAVED_TEXT],
+  ];
+
+  /**
+   * The banner that holds `title`.
+   *
+   * @param title - The banner's title paragraph.
+   * @returns The `.ds-banner` element.
+   */
+  function bannerOf(title: HTMLElement): HTMLElement {
+    const banner = title.closest<HTMLElement>('.ds-banner');
+    if (banner === null) {
+      throw new Error(`"${title.textContent ?? ''}" is not inside a banner.`);
+    }
+    return banner;
+  }
+
+  it('shows no notice without sessionEnded, now or later', async () => {
+    mockApi({});
+    await renderWithProviders(<LoginPage redirectTo="/actions" />, { path: '/login' });
+
+    // Longer than the notice's delay, so a late notice would have arrived.
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 250);
+        }),
+    );
+    expect(screen.queryByText(NOTICE_TITLE)).toBeNull();
+    expect(screen.queryByText(NOT_SAVED_TEXT)).toBeNull();
+    // Only the outage message's region: no empty notice region either.
+    expect(screen.getAllByRole('status')).toHaveLength(1);
+  });
+
+  it.each(NOTICES)(
+    'announces the %s notice in its own polite region, added after the region mounted',
+    async (sessionEnded, tone, text) => {
+      mockApi({});
+      // Every node added under <body> from the first render on, so the test can tell a notice
+      // added to a region already in the page from a region inserted with its notice.
+      const records: MutationRecord[] = [];
+      const observer = new MutationObserver((delivered) => {
+        records.push(...delivered);
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+      try {
+        await renderWithProviders(
+          <LoginPage redirectTo="/actions" sessionEnded={sessionEnded} />,
+          { path: '/login' },
+        );
+
+        const title = await screen.findByText(NOTICE_TITLE);
+        records.push(...observer.takeRecords());
+        const banner = bannerOf(title);
+        expect(within(banner).getByText(text)).toBeTruthy();
+        expect(banner.classList.contains(`ds-banner--${tone}`)).toBe(true);
+        if (sessionEnded === 'session_ended') {
+          expect(screen.queryByText(NOT_SAVED_TEXT)).toBeNull();
+        }
+
+        // Its own polite region, first at the head of the form, apart from the outage region.
+        const [region, outageRegion] = screen.getAllByRole('status');
+        expect(screen.getAllByRole('status')).toHaveLength(2);
+        expect(banner.parentElement).toBe(region);
+        expect(region?.getAttribute('aria-live')).toBeNull();
+        expect(outageRegion?.childNodes).toHaveLength(0);
+        expect(region?.closest('form')?.firstElementChild?.firstElementChild).toBe(region);
+        // Announced: the banner was added to the region, which was in the page before it.
+        expect(
+          records.some(
+            (record) =>
+              record.target === region && Array.from(record.addedNodes).includes(banner),
+          ),
+        ).toBe(true);
+        // Never an alert (AAP 0.5.5), and focus is left where it was.
+        expect(screen.queryByRole('alert')).toBeNull();
+        expect(banner.getAttribute('role')).toBeNull();
+        expect(document.activeElement).toBe(document.body);
+      } finally {
+        observer.disconnect();
+      }
+    },
+  );
+
+  it('keeps the notice at the head of the form beside a refused attempt and an outage', async () => {
+    const api = mockApi({
+      'POST /auth/login': apiError(401, 'invalid_credentials', 'Invalid email or password'),
+    });
+    await renderWithProviders(
+      <LoginPage redirectTo="/sources" sessionEnded="action_not_saved" />,
+      { path: '/login?redirect=/sources' },
+    );
+    const notice = bannerOf(await screen.findByText(NOTICE_TITLE));
+
+    signIn(ADMIN_EMAIL, TYPED_PASSWORD);
+
+    const refused = 'Email or password is incorrect';
+    expect(await screen.findAllByText(refused)).toHaveLength(2);
+    expect(bannerOf(screen.getByText(NOTICE_TITLE))).toBe(notice);
+    expect(within(notice).getByText(NOT_SAVED_TEXT)).toBeTruthy();
+    // The refusal's banner follows the notice; it does not take its place.
+    const [refusedBanner] = screen.getAllByText(refused);
+    expect(
+      notice.compareDocumentPosition(refusedBanner ?? notice) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    api.use({ 'POST /auth/login': apiError(503, 'database_unavailable', 'Database unavailable') });
+    signIn(ADMIN_EMAIL, TYPED_PASSWORD);
+
+    const outage = await screen.findByText('Database unavailable');
+    const [noticeRegion, outageRegion] = screen.getAllByRole('status');
+    expect(outageRegion?.contains(outage)).toBe(true);
+    expect(noticeRegion?.contains(notice)).toBe(true);
+    expect(within(notice).getByText(NOT_SAVED_TEXT)).toBeTruthy();
+    expect(screen.queryByRole('alert')).toBeNull();
   });
 });

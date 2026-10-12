@@ -21,8 +21,9 @@
  *   binding, property and reason in the resolved tables, and the registry's title, with the
  *   resolved property and reason held at a minimum width;
  * - the read-only contract (no control, no request but `GET /config` and, while an instant is on
- *   screen, `GET /runs/latest`), text lines that are never paragraphs, loading, failure, and a
- *   failed background refresh that keeps the last configuration under a non-alert "Settings
+ *   screen, `GET /runs/latest`), text lines that are never paragraphs, loading, failure (kept in
+ *   place, with no spinner and no new announcement, while an outage poll reads again, until a
+ *   poll succeeds), and a failed background refresh that keeps the last configuration under a non-alert "Settings
  *   could not be refreshed" notice with the reason and the last-loaded instant in the default
  *   run's display time zone (UTC before the first run), which leaves once a refresh succeeds.
  *
@@ -33,9 +34,9 @@ import type { ApiMock, MockHandler, MockResponse } from '../../test/mockApi';
 import { renderWithProviders } from '../../test/render';
 import type { QueryClient } from '@tanstack/react-query';
 import { act, screen, waitFor, within } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
-import { queryKeys } from '../../api/queries';
+import { CURRENT_STATE_POLL_MS, queryKeys } from '../../api/queries';
 import type { ConfigView, CrmBindingsView, WindowConfig } from '../../api/types';
 import { formatInstant } from '../../lib/format';
 import { FIXTURE_CONFIG_HASH, makeConfig, makeRun } from '../../test/fixtures';
@@ -267,6 +268,8 @@ describe('SettingsPage', () => {
       await renderLoaded();
 
       expect(screen.getByRole('heading', { level: 1, name: 'Settings' })).toBeTruthy();
+      // WCAG 2.2 SC 2.4.2: the document title names the page.
+      expect(document.title).toBe('Settings · Ads Action Engine');
       expect(
         screen.getByText('Read-only. Change the files in config/ and restart the services.'),
       ).toBeTruthy();
@@ -980,6 +983,108 @@ describe('SettingsPage', () => {
       });
       expect(within(status).getByText('The configuration could not be loaded.')).toBeTruthy();
       expect(screen.queryAllByRole('table')).toHaveLength(0);
+    });
+
+    it('keeps a failed first read on screen while an outage poll reads again, until one succeeds', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        const secondRead = heldResponse();
+        let reads = 0;
+        stubConfig(() => {
+          reads += 1;
+          if (reads === 1) {
+            return apiError(502, 'http_502', 'Bad gateway');
+          }
+          return reads === 2 ? secondRead.promise : json(200, makeConfig());
+        });
+        const { queryClient } = await renderWithProviders(<SettingsPage />, { path: '/settings' });
+        const status = screen.getByRole('status');
+        const failure = await within(status).findByText('Settings unavailable');
+
+        // Every node added, removed or rewritten from here on, so a spinner that replaced the
+        // failure for a single render is caught even after the failure is back.
+        const records: MutationRecord[] = [];
+        const changes = new MutationObserver((batch) => {
+          records.push(...batch);
+        });
+        changes.observe(document.body, { childList: true, subtree: true, characterData: true });
+        try {
+          // The poll reads again holding no data, which TanStack Query reports as pending with
+          // no error until the read settles.
+          await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+          expect(reads).toBe(2);
+          expect(queryClient.getQueryState(queryKeys.config)).toMatchObject({
+            status: 'pending',
+            fetchStatus: 'fetching',
+            error: null,
+          });
+          expect(screen.queryByText('Loading settings')).toBeNull();
+          expect(within(status).getByText('Settings unavailable')).toBe(failure);
+
+          // The outage goes on: the poll fails as the first read did.
+          secondRead.release(apiError(502, 'http_502', 'Bad gateway'));
+          await waitFor(() => {
+            expect(queryClient.getQueryState(queryKeys.config)).toMatchObject({
+              status: 'error',
+              fetchStatus: 'idle',
+              errorUpdateCount: 2,
+            });
+          });
+          expect(within(status).getByText('Settings unavailable')).toBe(failure);
+          expect(within(status).getByText('Bad gateway')).toBeTruthy();
+          expect(screen.queryByText('Loading settings')).toBeNull();
+
+          records.push(...changes.takeRecords());
+          // Nothing in the status region changed, so the failure is not announced again, and no
+          // spinner was rendered at any point of the poll.
+          expect(records.filter((record) => status.contains(record.target))).toHaveLength(0);
+          expect(
+            records.some((record) =>
+              Array.from(record.addedNodes).some((node) =>
+                node.textContent?.includes('Loading settings'),
+              ),
+            ),
+          ).toBe(false);
+        } finally {
+          changes.disconnect();
+        }
+
+        // The API answers again: the next poll's configuration replaces the failure.
+        await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+        expect(await screen.findByRole('region', { name: 'Analysis window' })).toBeTruthy();
+        expect(reads).toBe(3);
+        expect(screen.queryByText('Settings unavailable')).toBeNull();
+        expect(screen.queryByText('Loading settings')).toBeNull();
+        expect(screen.getByRole('status').childNodes).toHaveLength(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('shows the reason a later poll fails with in the same failure state', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        let reads = 0;
+        stubConfig(() => {
+          reads += 1;
+          return reads === 1
+            ? apiError(502, 'http_502', 'Bad gateway')
+            : apiError(503, 'service_unavailable', 'Service unavailable');
+        });
+        await renderWithProviders(<SettingsPage />, { path: '/settings' });
+        const status = screen.getByRole('status');
+        const failure = await within(status).findByText('Settings unavailable');
+        expect(within(status).getByText('Bad gateway')).toBeTruthy();
+
+        await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+        expect(await within(status).findByText('Service unavailable')).toBeTruthy();
+        expect(reads).toBe(2);
+        expect(within(status).queryByText('Bad gateway')).toBeNull();
+        expect(within(status).getByText('Settings unavailable')).toBe(failure);
+        expect(screen.queryByText('Loading settings')).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('keeps the last configuration and announces a failed background refresh', async () => {

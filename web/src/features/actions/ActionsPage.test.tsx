@@ -1067,12 +1067,16 @@ describe('ActionsPage', () => {
 
   describe('failure and Retry', () => {
     it('shows the API message and a Retry that keeps the screen while it reads again', async () => {
+      // Cleared first, so the title read below is the one this failure state set.
+      document.title = '';
       const { api } = await renderPage({
         'GET /recommendations': apiError(500, 'internal_error', 'Database unavailable'),
         ...prefetchedReads(),
       });
 
       await screen.findByText('Actions could not be loaded');
+      // WCAG 2.2 SC 2.4.2: the failure state still titles the document after the page.
+      expect(document.title).toBe('Actions · Ads Action Engine');
       expect(within(noticeRegion()).getByText('Database unavailable')).toBeTruthy();
       expect(screen.queryByRole('alert')).toBeNull();
       const retry = screen.getByRole('button', { name: 'Retry' });

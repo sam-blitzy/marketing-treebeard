@@ -4,7 +4,8 @@
  * The page is a ranked list of "do this because of this", not a dashboard (AAP 0.1.2): it has no
  * charts, and every number it shows sits on the card it justifies. Top to bottom it renders:
  *
- * 1. the page title, the page's single `<h1>` ("Actions");
+ * 1. the page title, the page's single `<h1>` ("Actions"), which also titles the document
+ *    "Actions · Ads Action Engine" in every state ({@link useDocumentTitle}, WCAG 2.2 SC 2.4.2);
  * 2. the {@link StatusBar}: window picker, each source's day boundary and the source chips;
  * 3. the {@link GlobalBanners}, in their fixed order and one `Stack`: open discrepancies first,
  *    because the discrepancy banner sits above everything, then the run notice, then the rest.
@@ -57,10 +58,10 @@
  *   waits on this state.
  * - **Run not found** (a `runId` the API does not know): a "Back to default" link.
  * - **Any other failure**: the API's message and a "Retry" button that refetches, rendered by
- *   {@link ActionsLoadFailure}. `src/router.tsx` renders the same failure state, with a Retry
- *   that re-runs the auth guard, when that guard's `GET /auth/me` fails with anything but a 401
- *   on `/actions` (a reload during an outage), so the page's own failure state appears inside
- *   the signed-in shell before any page read has started.
+ *   {@link ActionsLoadFailure}. A reload during an outage shows it too: `src/router.tsx` renders
+ *   this page even when the auth guard's `GET /auth/me` fails with anything but a 401, and the
+ *   page's own read then fails the same way. The hook keeps polling after a transient failure,
+ *   so the page recovers by itself once the API answers.
  *
  * A failure screen stays mounted while its read runs again, by poll or by Retry, so it never
  * flickers back to the spinner and keyboard focus is kept; each failure message is announced
@@ -74,9 +75,8 @@
  *   API, and no window length or threshold is written here (AAP 0.5.4.1).
  * - **No alert**: nothing here carries `role="alert"`; AAP 0.5.5 reserves it for the
  *   open-discrepancies banner, which `GlobalBanners` owns.
- * - **No router import**: `src/router.tsx` imports this page and {@link ActionsLoadFailure}, so
- *   `Link` comes straight from `@tanstack/react-router` and is typed by the router's `Register`
- *   augmentation.
+ * - **No router import**: `src/router.tsx` imports this page, so `Link` comes straight from
+ *   `@tanstack/react-router` and is typed by the router's `Register` augmentation.
  *
  * @packageDocumentation
  */
@@ -96,6 +96,7 @@ import type { ApiError } from '../../api/queries';
 import { SECTION_ORDER } from '../../api/types';
 import type { RecommendationsPage, Run, RunId, Section, SectionKey } from '../../api/types';
 import { Banner, Button, EmptyState, PageShell, Spinner, Stack } from '../../design-system';
+import { useDocumentTitle } from '../../lib/documentTitle';
 import { joinSentences } from '../../lib/format';
 import {
   CustomRunBanner,
@@ -447,9 +448,12 @@ interface ActionsFrameProps {
  * first render: a notice that replaces the loading spinner lands in a region that already exists
  * and is announced politely (WCAG 2.2 SC 4.1.3), never as an alert, which AAP 0.5.5 reserves
  * for discrepancies. While the region is empty, `Stack` takes it out of the column, so it adds
- * no space.
+ * no space. Being in every state, it is also where the document is titled "Actions · Ads Action
+ * Engine" ({@link useDocumentTitle}), so the failure state {@link ActionsLoadFailure} carries
+ * that title wherever it renders.
  */
 function ActionsFrame({ notice, children }: ActionsFrameProps): ReactElement {
+  useDocumentTitle(PAGE_TITLE);
   return (
     <Stack gap={6}>
       <PageShell.Title>{PAGE_TITLE}</PageShell.Title>
@@ -485,13 +489,10 @@ export interface ActionsLoadFailureProps {
  * The `/actions` failure state: the page's `<h1>` "Actions" and, in its polite status region,
  * an `EmptyState` "Actions could not be loaded" with the failure's reason and a "Retry" `Button`.
  *
- * It is presentational and reads no server state, so it renders the same screen for both
- * callers: {@link ActionsPage}, when `GET /recommendations` fails without data, and the
- * authenticated layout's error screen in `src/router.tsx`, when the auth guard's
- * `GET /auth/me` fails with anything but a 401 on `/actions` (a 502 or 503 during an outage).
- * There no session has been confirmed, so no page read may start; `onRetry` re-runs the guard.
- * The notice is announced politely, never as an alert, which AAP 0.5.5 reserves for
- * discrepancies.
+ * It is presentational and reads no server state: {@link ActionsPage} renders it when
+ * `GET /recommendations` fails without data, a reload during an outage (a 502 or 503) included,
+ * and passes the Retry that reads the page again. The notice is announced politely, never as an
+ * alert, which AAP 0.5.5 reserves for discrepancies.
  *
  * @param props - see {@link ActionsLoadFailureProps}
  * @returns the failure state, rendered inside the app's `PageShell`

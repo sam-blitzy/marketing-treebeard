@@ -23,25 +23,34 @@
  * the guard has just asked, so `/login` takes that answer once for that history entry and asks
  * nothing (see {@link isGuardSignedOutArrival}).
  *
- * `LoginPage` and `ActionsPage`, with its presentational failure state `ActionsLoadFailure`, are
- * imported statically; the `/decisions`, `/sources` and `/settings` screens are code-split (see
- * "Code splitting" below).
+ * `/login` receives two things besides that mark: the `redirect` search, and, when an open
+ * screen's request found the session ended, the reason in its history state (`sessionEnded`,
+ * written by `src/main.tsx`). `LoginPage` shows the reason as its "Your session ended" notice. It
+ * travels in the history state, not the URL, so no link can make the screen claim that an action
+ * was lost; the guard's own 401 redirect writes none, so a first visit while signed out shows no
+ * notice.
+ *
+ * `LoginPage` and `ActionsPage` are imported statically; the `/decisions`, `/sources` and
+ * `/settings` screens are code-split (see "Code splitting" below).
  *
  * The four signed-in screens sit under one pathless layout route, `authenticated`. Its
  * `beforeLoad` reads `GET /auth/me` through the TanStack Query cache
- * (`ensureQueryData(meQueryOptions())`), so navigation between screens re-asks nothing while the
- * cached user is present. A 401 redirects to `/login?redirect=<the requested href>`, marked as
- * the guard's redirect in its history state; any other failure (for example 503
- * `database_unavailable`, or a 502 while the API is down) is rethrown and shown by the layout's
- * own error screen ({@link SignedInError}) with a Retry button, never mistaken for a signed-out
- * session. On `/actions` that screen is the page's own failure state, "Actions could not be
- * loaded" (`ActionsLoadFailure`); on every other path it is "Something went wrong".
+ * (`ensureQueryData(meQueryOptions())`), which keeps the user for the life of the tab, so
+ * navigation between screens re-asks nothing while the cached user is present, however long ago
+ * it was read. A 401 redirects to `/login?redirect=<the requested href>`, marked as the guard's
+ * redirect in its history state. Any other failure (for example 503 `database_unavailable`, or a
+ * 502 while the API is down) leaves the session unknown, never mistaken for a signed-out one: the
+ * layout renders the requested page, whose own failure state explains the outage and reads again
+ * by itself, and the top bar shows the email once `GET /auth/me` answers (see {@link AppLayout}).
+ * No data can appear without a session: every page read needs the session cookie, and a 401
+ * from any of them opens `/login` (`src/main.tsx`).
  *
  * The layout ({@link AppLayout}) renders the one `PageShell` of every signed-in screen through
- * {@link SignedInShell}: the `TopBar` with the signed-in email and "Sign out", the primary
- * `SideNav` (Actions, Decisions, Sources, Settings) and the routed page in `<main>`. The
+ * {@link SignedInShell}: the `TopBar` with the signed-in email (once known) and "Sign out", the
+ * primary `SideNav` (Actions, Decisions, Sources, Settings) and the routed page in `<main>`. The
  * layout's own error and pending screens ({@link SignedInError}, {@link SignedInPending}) use
- * the same shell without the email, because no session has been confirmed, and render no page.
+ * the same shell without the email and render no page: the pending screen waits for the guard,
+ * and the error screen stands in for a layout that failed to render.
  * Each page renders its own `PageShell.Title` and sections, and `LoginPage` renders its own
  * `PageShell`, so every screen has exactly one `<main>` landmark.
  *
@@ -53,6 +62,11 @@
  * `TopBar` and a `SideNav` (AAP 0.5.5) and exactly one `<main>`. The error and not-found
  * screens render a `PageShell.Title`, the page's one `<h1>`; the pending screen renders only its
  * labelled `Spinner`, with no heading.
+ *
+ * Document titles (WCAG 2.2 SC 2.4.2 Page Titled): every screen with a `PageShell.Title` titles
+ * the document "{title} · Ads Action Engine" through `useDocumentTitle` (`./lib/documentTitle`),
+ * each page from its own module and {@link RootError} and {@link NotFound} here; the pending
+ * screen sets none, so the previous screen's title stays until the next screen renders.
  *
  * Code splitting (AAP 0.1.1: the five sections render from precomputed runs in under 2 s): the
  * entry bundle carries only the screens a first load can show, `/actions` (the landing page)
@@ -128,7 +142,7 @@ import type { ErrorComponentProps, ParsedLocation, RouterHistory } from '@tansta
 import { createContext, useContext, useEffect, useId, useRef, useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 
-import { isApiError, meQueryOptions, useLogout } from './api/queries';
+import { isApiError, meQueryOptions, useLogout, useMe } from './api/queries';
 import type { ApiError } from './api/queries';
 import type { Me, RunId } from './api/types';
 import {
@@ -143,8 +157,10 @@ import {
   TopBar,
 } from './design-system';
 import type { SideNavItem, SideNavLinkProps } from './design-system';
-import { ActionsLoadFailure, ActionsPage } from './features/actions/ActionsPage';
+import { ActionsPage } from './features/actions/ActionsPage';
 import { LoginPage } from './features/auth/LoginPage';
+import type { SessionEndedNotice } from './features/auth/LoginPage';
+import { useDocumentTitle } from './lib/documentTitle';
 import { focusElement, idFromHash } from './lib/focus';
 
 // ---------------------------------------------------------------------------------------------
@@ -684,25 +700,26 @@ function RootComponent(): ReactElement {
 /**
  * The error screen of every route: the root route's `errorComponent` and the router's
  * `defaultErrorComponent`, and the content of the authenticated layout's own error screen
- * ({@link SignedInError}) on every path but `/actions`, which it renders inside a
- * {@link SignedInShell}.
+ * ({@link SignedInError}), which renders it inside a {@link SignedInShell}.
  *
  * It shows the "Something went wrong" title, then a critical `Banner` whose title is the
  * failure's message: the {@link ApiError} message, which the API client guarantees is safe to
- * show (for example "Database unavailable" for a 503 from the auth guard), or a generic sentence
- * for anything else. A stack trace or an internal error text is never shown. The banner has no
- * `role="alert"` (AAP 0.5.5).
+ * show (for example "Database unavailable" for a 503 `database_unavailable`), or a generic
+ * sentence for anything else. A stack trace or an internal error text is never shown. The banner
+ * has no `role="alert"` (AAP 0.5.5).
  *
  * "Retry" invalidates the router, which re-runs every matched route's `beforeLoad` (the auth
- * guard reads `GET /auth/me` again, because a failed query holds no data), and resets the error
+ * guard reads `GET /auth/me` again unless the cache holds the user), and resets the error
  * boundary so the route renders again. For a {@link ScreenChunkError} it reloads the page
  * instead: the browser keeps the failed module fetch for the life of the document, so only a
  * new document can load the screen's chunk.
  *
  * The title carries "Something went wrong" and the banner the specific message, so each text
- * appears once on the screen and the page keeps one `<h1>` (UI1: one `<h1>` per page).
+ * appears once on the screen and the page keeps one `<h1>` (UI1: one `<h1>` per page). The
+ * document is titled "Something went wrong · Ads Action Engine" ({@link useDocumentTitle}).
  */
 function RootError({ error, reset }: ErrorComponentProps): ReactElement {
+  useDocumentTitle(ERROR_TITLE);
   const router = useRouter();
   const message = isApiError(error) && error.message !== '' ? error.message : GENERIC_ERROR_MESSAGE;
 
@@ -737,10 +754,12 @@ function RootError({ error, reset }: ErrorComponentProps): ReactElement {
  * `notFound()` raised outside it. It shows the "Page not found" title and an `EmptyState` with a
  * router link to `/actions`, the default page.
  *
- * The title is the page's single `<h1>` (UI1); the empty state states why the page is empty and
+ * The title is the page's single `<h1>` (UI1) and titles the document "Page not found · Ads
+ * Action Engine" ({@link useDocumentTitle}); the empty state states why the page is empty and
  * offers the way back.
  */
 function NotFound(): ReactElement {
+  useDocumentTitle(NOT_FOUND_TITLE);
   return (
     <RouteFrame>
       <PageShell.Title>{NOT_FOUND_TITLE}</PageShell.Title>
@@ -760,6 +779,10 @@ function NotFound(): ReactElement {
  * The router's `defaultPendingComponent`: a design-system `Spinner` labelled "Loading", shown
  * while a route's `beforeLoad` (the auth guard's first `GET /auth/me`) or a code-split screen's
  * chunk takes longer than the router's pending threshold.
+ *
+ * It renders no heading and sets no document title: the previous screen's title (or, on a first
+ * load, the boot document's "Ads Action Engine") stays until the screen being loaded renders and
+ * sets its own.
  */
 function RoutePending(): ReactElement {
   return (
@@ -850,7 +873,8 @@ function isSessionGone(error: ApiError): boolean {
 interface SignedInShellProps {
   /**
    * The signed-in email the top bar shows. Omitted on the authenticated layout's own error and
-   * pending screens, where no session has been confirmed; an empty email is not shown either.
+   * pending screens, and by the layout while the session is unknown (the API could not answer
+   * `GET /auth/me`); an empty email is not shown either.
    */
   email?: string;
   /** What `<main>` holds: the routed page, or the layout's error or pending content. */
@@ -869,14 +893,16 @@ interface SignedInShellProps {
  *   {@link useFocusRecoveryAfterNavigation} places focus. Any other failure keeps the user signed
  *   in and shows "Sign-out failed. Try again." beside the button, linked to it through
  *   `aria-describedby` while it shows.
- *   - **Announcement** (WCAG 2.2 SC 4.1.3): the button and the message sit in one polite
- *     `role="status"` region that mounts with the layout, so each failure adds the message to a
- *     region assistive technology already watches; the next attempt removes it while pending, so
- *     a repeated failure is announced again. `aria-atomic="false"` limits the announcement to
- *     the message instead of re-reading the button's label with it. The region is never
- *     `role="alert"`, which open discrepancies alone use. Inside it an `Inline`, spaced like the
- *     top bar's actions row, lays out the message and the button, so without a failure the
- *     region holds the button alone and the bar looks as it would without the region.
+ *   - **Announcement** (WCAG 2.2 SC 4.1.3): the message sits in a polite `role="status"`
+ *     region that mounts with the layout and holds nothing else, so each failure adds the
+ *     message to a region assistive technology already watches; the next attempt removes it
+ *     while pending, so a repeated failure is announced again. The button sits outside the
+ *     region, so no control is inside a live region and a change of its label or busy state is
+ *     never announced as status; with the message alone inside, the region needs no
+ *     `aria-atomic`. The region is never `role="alert"`, which open discrepancies alone use.
+ *     An `Inline`, spaced like the top bar's actions row, lays out the region and then the
+ *     button on one row. `Inline` takes the region out of flow while it is empty, so without a
+ *     failure the row holds the button alone and the bar looks as it would without the region.
  *   - **Focus** (WCAG 2.2 SC 2.4.3): the loading button keeps focus (it is `aria-disabled`,
  *     never natively disabled), but focus can still be lost to `<body>` while the request is
  *     pending. After each failure, once the render that re-enables the button has committed,
@@ -943,20 +969,20 @@ function SignedInShell({ email, children }: SignedInShellProps): ReactElement {
         topBar={
           <TopBar productName={PRODUCT_NAME}>
             {email !== undefined && email !== '' && <span>{email}</span>}
-            <div role="status" aria-live="polite" aria-atomic="false">
-              <Inline gap={3} justify="end">
+            <Inline gap={3} justify="end">
+              <div role="status" aria-live="polite">
                 {signOutFailed && <span id={signOutErrorId}>{SIGN_OUT_FAILED_MESSAGE}</span>}
-                <Button
-                  ref={signOutButtonRef}
-                  variant="quiet"
-                  loading={logout.isPending}
-                  aria-describedby={signOutFailed ? signOutErrorId : undefined}
-                  onClick={signOut}
-                >
-                  {SIGN_OUT_LABEL}
-                </Button>
-              </Inline>
-            </div>
+              </div>
+              <Button
+                ref={signOutButtonRef}
+                variant="quiet"
+                loading={logout.isPending}
+                aria-describedby={signOutFailed ? signOutErrorId : undefined}
+                onClick={signOut}
+              >
+                {SIGN_OUT_LABEL}
+              </Button>
+            </Inline>
           </TopBar>
         }
         sideNav={<SideNav label={PRIMARY_NAV_LABEL} items={items} renderLink={renderPrimaryLink} />}
@@ -971,13 +997,48 @@ function SignedInShell({ email, children }: SignedInShellProps): ReactElement {
  * The authenticated layout: the {@link SignedInShell} of every signed-in screen, with the
  * signed-in email, around the routed page, or "Page not found" for a path no screen matches.
  *
- * The email is the user the auth guard read from `GET /auth/me` and put in the route context. It
- * is read from there rather than through a `useMe()` observer: sign-out clears the query cache
- * before the screen leaves, and an observer would then re-fetch `GET /auth/me` only to receive
- * the 401 of the session just ended.
+ * The email is the user the auth guard read from `GET /auth/me` (or sign-in seeded) and put in
+ * the route context. When the guard could not confirm the session (a 5xx or no network: the
+ * context holds no user), the routed page renders all the same and its own failure state
+ * explains the outage, while the top bar shows no email and {@link useMe} reads the user again:
+ * every `CURRENT_STATE_POLL_MS` while the read fails, and when the window regains focus. Its
+ * first answer settles the session:
+ *
+ * - **200**: the top bar shows the email, and the layout keeps it while it stays mounted. Nothing
+ *   reloads, so focus stays where it is; the next navigation's guard takes the user from the
+ *   cache, sending nothing.
+ * - **401**: the layout re-runs the guard (`router.invalidate()`), which asks once more and
+ *   redirects to `/login` exactly as on any other 401, its history mark included, because
+ *   `src/main.tsx` leaves the 401 of this read to the guard.
+ *
+ * The observer is enabled only while no email is known, so once the context or that read has
+ * given the user it sends nothing: sign-out clears the query cache before the screen leaves, and
+ * an enabled observer would then re-fetch `GET /auth/me` only to receive the 401 of the session
+ * just ended.
  */
 function AppLayout(): ReactElement {
-  const email = authenticatedRoute.useRouteContext({ select: (context) => context.me.email });
+  const router = useRouter();
+  const confirmedEmail = authenticatedRoute.useRouteContext({
+    select: (context) => context.me?.email,
+  });
+  // The email the layout's own read returned while the guard could not confirm the session.
+  const [readEmail, setReadEmail] = useState<string | undefined>(undefined);
+  const email = confirmedEmail ?? readEmail;
+  const me = useMe({ enabled: email === undefined });
+  if (email === undefined && me.data !== undefined) {
+    // React's pattern for adjusting state from what a render reads: the update made during
+    // render re-renders this component at once, before its children, with the email kept, so
+    // the observer is disabled before a later cache clear could make it read again.
+    setReadEmail(me.data.email);
+  }
+  const sessionEnded = email === undefined && me.error?.status === 401;
+
+  useEffect(() => {
+    if (sessionEnded) {
+      void router.invalidate();
+    }
+  }, [sessionEnded, router]);
+
   return (
     <SignedInShell email={email}>
       <Outlet />
@@ -986,108 +1047,21 @@ function AppLayout(): ReactElement {
 }
 
 /**
- * The routers whose `/actions` guard-failure screen ({@link ActionsGuardError}) saw its Retry
- * fail again, until the screen that shows the new failure has read the mark.
- *
- * Re-running the guard replaces the screen: the router shows the layout's pending screen while
- * `GET /auth/me` runs, and the error boundary then mounts a new error screen, so the screen that
- * started the Retry cannot return focus to the button of the one that follows it. Keyed weakly
- * by router, so a discarded router (each test builds one) is not retained.
- */
-const actionsRetriesFailedAgain = new WeakSet<object>();
-
-/**
- * The authenticated layout's error screen on `/actions` ({@link SignedInError}): the page's own
- * failure state, {@link ActionsLoadFailure}, with the `<h1>` "Actions", "Actions could not be
- * loaded", the error's safe reason and "Retry". It reads no server state and renders no page, so
- * no protected read starts before the guard has confirmed the session.
- *
- * "Retry" re-runs the guard: it shows the button as loading, invalidates the router, which reads
- * `GET /auth/me` again (a failed query holds no data), and once that load has settled resets
- * the error boundary, as {@link RootError} does. When the guard passes, the routed page renders
- * in the layout. When it fails again, the new screen returns focus to its Retry button if focus
- * fell to `<body>` (or to `<main>`, where {@link useFocusRecoveryAfterNavigation} places focus
- * that fell), so keyboard users can retry at once (WCAG 2.2 SC 2.4.3); focus the user moved to
- * another control is left alone.
- *
- * @param props - The router's error props: the guard's error and the boundary's `reset`.
- * @returns The `/actions` failure state, filling the signed-in shell's `<main>`.
- */
-function ActionsGuardError({ error, reset }: ErrorComponentProps): ReactElement {
-  const router = useRouter();
-  const [retrying, setRetrying] = useState(false);
-  const retryButtonRef = useRef<HTMLButtonElement>(null);
-
-  // Mounted for a Retry that failed again: focus goes back to this screen's Retry button.
-  useEffect(() => {
-    if (!actionsRetriesFailedAgain.delete(router)) {
-      return;
-    }
-    const focused = document.activeElement;
-    if (focused === null || focused === document.body || focused.tagName === 'MAIN') {
-      retryButtonRef.current?.focus();
-    }
-  }, [router]);
-
-  const retry = async (): Promise<void> => {
-    setRetrying(true);
-    try {
-      await router.invalidate();
-    } finally {
-      setRetrying(false);
-      // Marked before the reset, so the screen the reset mounts for a renewed failure reads it.
-      const failedAgain =
-        isCurrentPath(router.state.location.pathname, '/actions') &&
-        router.state.matches.some(
-          (match) => match.routeId === authenticatedRoute.id && match.status === 'error',
-        );
-      if (failedAgain) {
-        actionsRetriesFailedAgain.add(router);
-      }
-      reset();
-    }
-  };
-
-  return (
-    <ActionsLoadFailure
-      error={error}
-      onRetry={() => {
-        void retry();
-      }}
-      retrying={retrying}
-      retryButtonRef={retryButtonRef}
-    />
-  );
-}
-
-/**
- * The authenticated layout's `errorComponent`: the error screen of a failure the layout itself
- * hit, chiefly its auth guard's `GET /auth/me` failing with anything but a 401 (a 502 or 503
- * while the API is down, or no network). Its content fills the `<main>` of a
+ * The authenticated layout's `errorComponent`: the error screen of a failure of the layout's own
+ * match, such as its component failing to render. Its auth guard throws nothing but the redirect
+ * of a 401, and a routed screen's failure (a code-split screen's {@link ScreenChunkError}
+ * included) is shown by that screen's own route, inside the layout. Its content,
+ * {@link RootError}'s "Something went wrong", safe message and Retry, fills the `<main>` of a
  * {@link SignedInShell}, beside the primary navigation and below "Sign out", as on every
- * signed-in screen:
+ * signed-in screen. The top bar shows no email, because the layout that holds it is what failed.
  *
- * - on `/actions` (one trailing slash and any search allowed, as {@link isCurrentPath} judges
- *   it), the page's own failure state, {@link ActionsGuardError}, so a reload during an outage
- *   shows "Actions could not be loaded" where the page would be;
- * - on every other path, and for a {@link ScreenChunkError}, {@link RootError}'s "Something went
- *   wrong", safe message and Retry.
- *
- * It stays fail-closed: no session was confirmed, so the top bar shows no email, and no page
- * renders or reads data, because the routed screens sit only under {@link AppLayout}. Either
- * Retry re-runs the guard. A 401 never reaches it: the guard turns it into the redirect to
- * `/login`.
- *
- * @param props - The router's error props, passed on to the screen it renders.
+ * @param props - The router's error props, passed on to {@link RootError}.
  * @returns The error screen inside the signed-in shell.
  */
 function SignedInError(props: ErrorComponentProps): ReactElement {
-  const pathname = useRouterState({ select: (state) => state.location.pathname });
-  const onActions =
-    isCurrentPath(pathname, '/actions') && !(props.error instanceof ScreenChunkError);
   return (
     <SignedInShell>
-      {onActions ? <ActionsGuardError {...props} /> : <RootError {...props} />}
+      <RootError {...props} />
     </SignedInShell>
   );
 }
@@ -1234,6 +1208,11 @@ async function hasSession(
  * the API again, which answers 401. A `redirect` that is itself a `/login` URL is followed the
  * same way, from the cached user, and each hop drops one level of nesting, so the chain ends at
  * the innermost target, or at `/actions` when that has none.
+ *
+ * The screen ({@link LoginRouteComponent}) receives the sanitised `redirect` and, from the
+ * location's history state, the `sessionEnded` reason `src/main.tsx` wrote when an open screen's
+ * request was answered 401 ({@link sessionEndedNoticeOf}). Neither changes what `beforeLoad`
+ * does: a visitor whose session holds again is sent on whatever the reason says.
  */
 const loginRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -1251,10 +1230,33 @@ const loginRoute = createRoute({
   component: LoginRouteComponent,
 });
 
-/** The `/login` screen with its sanitised redirect target, `/actions` by default. */
+/**
+ * The session-ended reason a `/login` history entry carries, when it is one `LoginPage` knows.
+ *
+ * The browser keeps an entry's state across reloads and across versions of the app, so the
+ * value is checked rather than trusted: anything but `'session_ended'` or `'action_not_saved'`
+ * reads as no reason.
+ *
+ * @param state - The history state of the current location.
+ * @returns The reason, or `undefined` when the entry carries none.
+ */
+function sessionEndedNoticeOf(state: ParsedLocation['state']): SessionEndedNotice | undefined {
+  const value: unknown = state.sessionEnded;
+  return value === 'session_ended' || value === 'action_not_saved' ? value : undefined;
+}
+
+/**
+ * The `/login` screen with its sanitised redirect target, `/actions` by default, and the
+ * session-ended reason of its history entry, if any ({@link sessionEndedNoticeOf}).
+ */
 function LoginRouteComponent(): ReactElement {
   const search = loginRoute.useSearch();
-  return <LoginPage redirectTo={search.redirect ?? DEFAULT_AFTER_LOGIN} />;
+  const sessionEnded = useRouterState({
+    select: (state) => sessionEndedNoticeOf(state.location.state),
+  });
+  return (
+    <LoginPage redirectTo={search.redirect ?? DEFAULT_AFTER_LOGIN} sessionEnded={sessionEnded} />
+  );
 }
 
 /** `/`: always redirects to `/actions`, whose guard sends a signed-out user to `/login`. */
@@ -1268,23 +1270,34 @@ const indexRoute = createRoute({
 
 /** What the auth guard adds to the context of the signed-in routes. */
 interface AuthenticatedContext {
-  /** The signed-in user, as `GET /auth/me` (or sign-in) returned it. */
-  me: Me;
+  /**
+   * The signed-in user, as `GET /auth/me` (or sign-in) returned it; `undefined` while the
+   * session is unknown, because the API could not answer (a 5xx, no network).
+   */
+  me: Me | undefined;
 }
 
 /**
  * The pathless layout of the signed-in screens, with the auth guard.
  *
  * `ensureQueryData` resolves from the cache when `queryKeys.me` holds the user (seeded by
- * sign-in, or read once by an earlier navigation) and otherwise calls `GET /auth/me`, which never
- * retries. The user is returned as route context (`me`), which the layout's top bar shows. A 401
- * becomes a redirect to `/login` carrying the requested href (path, search and hash) as
- * `redirect`, so sign-in returns there, and the `authGuardSignedOut` mark in its history state,
- * so `/login` takes that fresh 401 as its own check instead of asking again
- * ({@link isGuardSignedOutArrival}). Every other failure is rethrown, so the layout's own
- * error screen ({@link SignedInError}) shows it with Retry, inside the signed-in shell, instead
- * of sending a signed-in user to the login form. While the guard waits longer than the router's
- * pending threshold, {@link SignedInPending} shows the spinner in the same shell.
+ * sign-in, or read once by an earlier navigation, and kept for the life of the tab) and
+ * otherwise calls `GET /auth/me`, which never retries. The user is returned as route context
+ * (`me`), which the layout's top bar shows. A 401 becomes a redirect to `/login` carrying the
+ * requested href (path, search and hash) as `redirect`, so sign-in returns there, and the
+ * `authGuardSignedOut` mark in its history state, so `/login` takes that fresh 401 as its own
+ * check instead of asking again ({@link isGuardSignedOutArrival}).
+ *
+ * Every other failure (another `ApiError`, such as a 502 or 503 while the API is down or a
+ * `network_error`, or any other rejection) means the session is unknown, not ended: the guard
+ * returns no user, and the layout renders the requested page, whose own failure state shows the
+ * outage and reads again by itself, rather than sending a signed-in user to the login form or
+ * replacing the page with an error screen. That stays safe: every page read needs the session
+ * cookie, and a 401 from any of them opens `/login` (`src/main.tsx`). The layout reads the user
+ * again until the API answers, and re-runs this guard on a 401 ({@link AppLayout}); the next
+ * navigation asks again too, because the failed read left no user in the cache. While the
+ * guard waits longer than the router's pending threshold, {@link SignedInPending} shows the
+ * spinner in the signed-in shell.
  */
 const authenticatedRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -1301,7 +1314,9 @@ const authenticatedRoute = createRoute({
           state: { authGuardSignedOut: true },
         });
       }
-      throw error;
+      // Session unknown: an explicit `undefined`, so no user from an earlier load survives in
+      // the merged route context.
+      return { me: undefined };
     }
   },
   component: AppLayout,
@@ -1479,7 +1494,7 @@ export function createAppRouter(
 /**
  * Registers the app's router with TanStack Router, so features type `Link to="/actions"
  * search={{ run }}` and `useNavigate()` against this tree without importing this module, and
- * types the app's own key in the history state that `redirect`, `Link` and `navigate` write.
+ * types the app's own keys in the history state that `redirect`, `Link` and `navigate` write.
  */
 declare module '@tanstack/react-router' {
   interface Register {
@@ -1494,5 +1509,14 @@ declare module '@tanstack/react-router' {
      * its session check ({@link isGuardSignedOutArrival}).
      */
     authGuardSignedOut?: true;
+    /**
+     * Why an open screen sent the visitor to sign in, only on the `/login` entry that
+     * `src/main.tsx` opens (or replaces) for a 401 of that screen's request; absent everywhere
+     * else, the guard's own 401 redirect included. `'session_ended'` after a read,
+     * `'action_not_saved'` after a refused write. `LoginPage` states it as its session-ended
+     * notice ({@link LoginRouteComponent}). It is history state, never search, so no link can
+     * set it.
+     */
+    sessionEnded?: SessionEndedNotice;
   }
 }

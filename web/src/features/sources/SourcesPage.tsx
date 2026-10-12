@@ -81,6 +81,7 @@ import {
   withTokenBreaks,
 } from '../../design-system';
 import type { DataTableColumn, Tone } from '../../design-system';
+import { useDocumentTitle } from '../../lib/documentTitle';
 import {
   EM_DASH,
   formatCount,
@@ -998,7 +999,9 @@ function SourceSection({
  * Data comes from `useSources()` (`GET /sources`, polled by the hook) and the display time zone
  * from `useDefaultRun()` (`Run.display_timezone`; `GET /config` carries none). Until a default
  * run exists (404 `not_found` at first start) instants are shown in UTC, and the line under the
- * title says "Times shown in UTC (display time zone not yet known)".
+ * title says "Times shown in UTC (display time zone not yet known)". The title, the page's single
+ * `<h1>` "Sources" in every state, also titles the document "Sources · Ads Action Engine"
+ * ({@link useDocumentTitle}, WCAG 2.2 SC 2.4.2).
  *
  * States, in precedence order:
  * - **Data**: one section per source in API order, never re-sorted; "No sources configured" for
@@ -1030,6 +1033,7 @@ function SourceSection({
  * ```
  */
 export function SourcesPage(): ReactElement {
+  useDocumentTitle(PAGE_TITLE);
   const sources = useSources();
   const defaultRun = useDefaultRun();
   const failure = useSettledError(sources.error, sources.data !== undefined);

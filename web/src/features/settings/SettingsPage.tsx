@@ -51,9 +51,10 @@
  *
  * @packageDocumentation
  */
+import { useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 
-import { isApiError, useConfig, useDefaultRun } from '../../api/queries';
+import { isApiError, useConfig, useDefaultRun, type ApiError } from '../../api/queries';
 import type {
   ConfigView,
   ContentAssetView,
@@ -74,6 +75,7 @@ import {
   withTokenBreaks,
   type DataTableColumn,
 } from '../../design-system';
+import { useDocumentTitle } from '../../lib/documentTitle';
 import { formatInstant } from '../../lib/format';
 
 // ---------------------------------------------------------------------------------------------
@@ -235,6 +237,41 @@ function useDisplayTimezone(): string {
   return configuredZone !== undefined && hasText(configuredZone)
     ? configuredZone.trim()
     : FALLBACK_TIMEZONE;
+}
+
+/**
+ * The error the configuration read last settled with while it holds no data, kept while the
+ * same read runs again.
+ *
+ * TanStack Query v5 puts a query that holds no data back to `status: 'pending'` with
+ * `error: null` each time it fetches. During an outage `useConfig` polls every
+ * `CURRENT_STATE_POLL_MS` and retries each poll, so without this hook every attempt would swap
+ * "Settings unavailable" for the loading spinner and back: the screen would flicker, and the
+ * polite status region would announce the failure again each time (WCAG 2.2 SC 4.1.3). The
+ * failure is kept until the read settles again, with a new error that replaces it or with data
+ * that clears it. Before any read has settled there is nothing to keep, so the first load still
+ * shows the spinner.
+ *
+ * The state is adjusted while rendering, React's pattern for information kept from earlier
+ * renders; the guard makes the second render a no-op.
+ *
+ * @param error - the query's `error`
+ * @param fetching - whether the query is fetching or paused waiting for the network
+ * @param hasData - whether the query holds data
+ * @returns the failure to present, or `null` while there is data, before any read failed, or
+ *   once a read settled without an error
+ */
+function useSettledFailure(
+  error: ApiError | null,
+  fetching: boolean,
+  hasData: boolean,
+): ApiError | null {
+  const [kept, setKept] = useState<ApiError | null>(null);
+  const settled = hasData ? null : error === null && fetching ? kept : error;
+  if (settled !== kept) {
+    setKept(settled);
+  }
+  return settled;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -936,8 +973,9 @@ interface RefreshFailureNoticeProps {
  *   {@link FALLBACK_TIMEZONE}, labelled as such.
  * - The banner is not an alert (AAP 0.5.5 reserves `role="alert"` for discrepancies). The page
  *   renders it inside its polite status region, which announces it.
- * - It offers no Retry, because the page has no controls. The query reads again by itself on
- *   window focus or when the page mounts again, and the notice leaves once a read succeeds.
+ * - It offers no Retry, because the page has no controls. The query reads again by itself, on
+ *   window focus, when the page mounts again and, after a transient failure (an outage), every
+ *   `CURRENT_STATE_POLL_MS`; the notice leaves once a read succeeds.
  */
 function RefreshFailureNotice({ error, dataUpdatedAt }: RefreshFailureNoticeProps): ReactElement {
   const displayTimezone = useDisplayTimezone();
@@ -963,8 +1001,9 @@ function RefreshFailureNotice({ error, dataUpdatedAt }: RefreshFailureNoticeProp
  * inputs and performs no mutations.
  *
  * It reads the configuration with one `useConfig()` call and renders, under the page's single
- * `<h1>` "Settings" and the note "Read-only. Change the files in config/ and restart the
- * services.":
+ * `<h1>` "Settings", which also titles the document "Settings · Ads Action Engine"
+ * ({@link useDocumentTitle}, WCAG 2.2 SC 2.4.2), and the note "Read-only. Change the files in
+ * config/ and restart the services.":
  *
  * - the five sections (analysis window, thresholds, HubSpot mapping, white paper registry and
  *   configuration hash) whenever the configuration is loaded;
@@ -977,7 +1016,12 @@ function RefreshFailureNotice({ error, dataUpdatedAt }: RefreshFailureNoticeProp
  *   the same region.
  *
  * Neither failure offers an action, because the page has no controls: the query reads again by
- * itself on window focus or when the page mounts again, once its 5-minute freshness has passed.
+ * itself on window focus or when the page mounts again, once its 5-minute freshness has passed,
+ * and after a transient failure (no network, a 429 or a 5xx, as during an outage) every
+ * `CURRENT_STATE_POLL_MS` until a read succeeds, so the page recovers by itself once the API
+ * answers (`configQueryOptions`). While such a read runs again, "Settings unavailable" stays in
+ * place, never replaced by the spinner or announced again, until the read settles with the
+ * configuration or a new error ({@link useSettledFailure}).
  *
  * Instants (the bindings' verification and the notice's last-loaded time) are shown in the
  * latest default run's display time zone ({@link useDisplayTimezone}), so while either is on
@@ -995,9 +1039,11 @@ function RefreshFailureNotice({ error, dataUpdatedAt }: RefreshFailureNoticeProp
  * ```
  */
 export function SettingsPage(): ReactElement {
-  const { data, dataUpdatedAt, error, isPending } = useConfig();
+  useDocumentTitle(PAGE_TITLE);
+  const { data, dataUpdatedAt, error, fetchStatus, isPending } = useConfig();
 
-  const failed = data === undefined && !isPending;
+  // A failed read that holds no data, kept on screen while a poll or retry reads again.
+  const failure = useSettledFailure(error, fetchStatus !== 'idle', data !== undefined);
   // TanStack Query keeps the last data when a refetch fails and sets `error` beside it.
   const refreshFailed = data !== undefined && error !== null;
 
@@ -1009,8 +1055,8 @@ export function SettingsPage(): ReactElement {
           failed refetch behind the cached sections, is announced (WCAG 2.2 SC 4.1.3); while
           empty, Stack takes it out of the column. */}
       <div role="status">
-        {failed ? (
-          <EmptyState title={LOAD_ERROR_TITLE}>{failureReason(error)}</EmptyState>
+        {failure !== null ? (
+          <EmptyState title={LOAD_ERROR_TITLE}>{failureReason(failure)}</EmptyState>
         ) : null}
         {refreshFailed ? (
           <RefreshFailureNotice error={error} dataUpdatedAt={dataUpdatedAt} />
@@ -1019,7 +1065,7 @@ export function SettingsPage(): ReactElement {
       {data !== undefined ? (
         <SettingsContent config={data} />
       ) : (
-        isPending && <Spinner label={LOADING_LABEL} showLabel />
+        failure === null && isPending && <Spinner label={LOADING_LABEL} showLabel />
       )}
     </Stack>
   );

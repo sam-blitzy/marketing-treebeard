@@ -217,6 +217,8 @@ describe('SourcesPage', () => {
       await renderLoaded('HubSpot');
 
       expect(screen.getByRole('heading', { level: 1, name: 'Sources' })).toBeTruthy();
+      // WCAG 2.2 SC 2.4.2: the document title names the page.
+      expect(document.title).toBe('Sources · Ads Action Engine');
       expect(
         screen.getAllByRole('heading', { level: 2 }).map((heading) => heading.textContent),
       ).toEqual(['HubSpot', 'Google', 'LinkedIn']);

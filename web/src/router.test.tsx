@@ -12,13 +12,15 @@
  *
  * - **Auth guard**: a 401 from `GET /auth/me` redirects to `/login` carrying the requested href
  *   (path, search and hash) as `redirect`, and sign-in returns there without asking
- *   `GET /auth/me` again; any other failure (a 503, or nginx's 502 during an outage) shows the
- *   error screen with Retry inside the signed-in shell (primary navigation and "Sign out", no
- *   email, no page read), never the sign-in form, and Retry asks again and restores the screen.
- *   On `/actions` (trailing slash and search included) that screen is the page's own failure
- *   state, "Actions could not be loaded", whose Retry, when it fails again, returns focus to the
- *   new screen's Retry; elsewhere it is "Something went wrong". The user is read once across
- *   navigations; a slow guard shows the "Loading" spinner in the same shell.
+ *   `GET /auth/me` again; any other failure (a 503, or nginx's 502 during an outage) leaves the
+ *   session unknown, never the sign-in form and never "Something went wrong": a reload or a
+ *   navigation renders the requested screen (`/actions` with a trailing slash and a run search
+ *   too) inside the signed-in shell (primary navigation and "Sign out", no email), with that
+ *   screen's own failure state, and once the API answers the screen and the email recover by
+ *   themselves, without Retry and without a further read on later navigations; when it answers
+ *   401 instead, the guard redirects to `/login` as on any other 401. The user is read once
+ *   across navigations, more than 5 minutes apart too, whether the guard read it or sign-in
+ *   seeded it; a slow guard shows the "Loading" spinner in the same shell.
  * - **Error screen outside the layout**: a failed sign-in screen keeps a `PageShell` with the
  *   one-link "Sign in" navigation, current and keeping its `redirect`, and Retry recovers it.
  * - **`/`** redirects to `/actions`.
@@ -37,6 +39,9 @@
  *   screen), an in-app navigation, or Back to the marked entry.
  * - **Not found**: an unknown path renders "Page not found" inside the shell when signed in, and
  *   sends a signed-out visitor to sign in.
+ * - **Document title** (WCAG 2.2 SC 2.4.2): each screen, sign-in, the four signed-in screens,
+ *   not found and an error screen, titles the document "{its `<h1>`} · Ads Action Engine", and
+ *   the title follows a navigation and a Retry to the next screen.
  * - **Sign out**: success and a 401 clear the cache and open `/login`, so `/login` and the guard
  *   ask the API again; any other failure keeps the session and explains itself beside the button, in the
  *   polite status region mounted with the layout, and returns focus to the button only when focus
@@ -51,7 +56,11 @@
  *   mutation ("Sync now") clears the cache and opens `/login` once, carrying the current href
  *   (path, search and hash) as `redirect`, and sign-in returns there and reads the data again; a
  *   wrong password on that form keeps it, with the same `redirect`; the guard's own
- *   `GET /auth/me` 401 is left to the guard, so a signed-out visit redirects once.
+ *   `GET /auth/me` 401 is left to the guard, so a signed-out visit redirects once. The sign-in
+ *   screen says "Your session ended": "Sign in again to continue." after a read's 401, "Sign in
+ *   again. Your last action was not saved." after a write's, also when the write was still in
+ *   flight as a read's 401 opened the screen, and on through a failed sign-in and a "Sign in"
+ *   link; no notice after the guard's 401 or a sign-out's own 401, which opens `/login` once.
  */
 // mockApi registers an afterEach hook that fails a test with an unmatched request. Vitest skips
 // the remaining afterEach hooks once one throws and runs them in reverse order of registration,
@@ -70,7 +79,7 @@ import type * as ReactDomClient from 'react-dom/client';
 import type { Container, Root, RootOptions } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { queryKeys } from './api/queries';
+import { CURRENT_STATE_POLL_MS, queryKeys } from './api/queries';
 import type * as LoginPageModule from './features/auth/LoginPage';
 import type { LoginPageProps } from './features/auth/LoginPage';
 import { createAppRouter } from './router';
@@ -223,10 +232,10 @@ interface AppHarness extends RenderResult {
  * `QueryClientProvider` of the same client, as `src/main.tsx` renders it.
  *
  * @param path - The initial entry, search and hash included.
+ * @param queryClient - The client to run on; a fresh {@link createQueryClient} when omitted.
  * @returns The harness.
  */
-function renderApp(path: string): AppHarness {
-  const queryClient = createQueryClient();
+function renderApp(path: string, queryClient: QueryClient = createQueryClient()): AppHarness {
   const router = createAppRouter(queryClient, {
     history: createMemoryHistory({ initialEntries: [path] }),
   });
@@ -309,6 +318,22 @@ beforeEach(() => {
 // Auth guard
 // ---------------------------------------------------------------------------------------------
 
+/** What the API client says for a 502, 503 or 504 that carries no API error envelope. */
+const OUTAGE_MESSAGE = 'The server is temporarily unavailable. Try again shortly.';
+
+/**
+ * An API outage: nginx answers `GET /auth/me` and every read of the four screens with its own
+ * 502 page.
+ *
+ * @returns Fresh handlers for one test.
+ */
+function outage(): MockHandlers {
+  const badGateway = html(502, '<html><body>502 Bad Gateway</body></html>');
+  return Object.fromEntries(
+    ['GET /auth/me', ...Object.keys(pageReads())].map((key) => [key, badGateway]),
+  );
+}
+
 describe('auth guard', () => {
   it('redirects a signed-out visitor to /login with the requested href and hash', async () => {
     const api = mockApi({ ...pageReads(), ...SIGNED_OUT });
@@ -382,134 +407,208 @@ describe('auth guard', () => {
     expect(reads.every((call) => call.search.get('run_id') === '202')).toBe(true);
   });
 
-  it('shows any other failure inside the signed-in shell with Retry, not the sign-in form', async () => {
-    const api = mockApi({
-      ...pageReads(),
-      'GET /auth/me': apiError(503, 'database_unavailable', 'Database unavailable'),
-    });
-    const { router } = renderApp('/settings');
+  it('renders the screen for any other failure, with no email until GET /auth/me answers', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const api = mockApi({
+        ...pageReads(),
+        'GET /auth/me': apiError(503, 'database_unavailable', 'Database unavailable'),
+      });
+      const { router } = renderApp('/settings');
 
-    await findTitle('Something went wrong');
-    expect(screen.getByText('Database unavailable')).toBeTruthy();
-    expect(router.state.location.pathname).toBe('/settings');
-    expect(screen.queryByRole('heading', { name: 'Sign in' })).toBeNull();
-    // Only /actions has a failure state of its own; every other screen gets the generic one.
-    expect(screen.queryByText('Actions could not be loaded')).toBeNull();
-    // The layout's own error screen keeps the signed-in shell (AAP 0.5.5: PageShell, TopBar and
-    // SideNav on every screen): one <main>, one <h1>, the primary navigation beside <main> with
-    // the requested screen current, "Sign out" in the top bar, and no alert role (reserved for
-    // open discrepancies).
-    expect(screen.getAllByRole('main')).toHaveLength(1);
-    expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
-    const banner = screen.getByRole('banner');
-    expect(banner.textContent).toContain('Ads Action Engine');
-    expect(within(banner).getByRole('button', { name: 'Sign out' })).toBeTruthy();
-    const links = within(primaryNav()).getAllByRole('link');
-    expect(links.map((link) => link.textContent)).toEqual([
-      'Actions',
-      'Decisions',
-      'Sources',
-      'Settings',
-    ]);
-    const current = links.filter((link) => link.getAttribute('aria-current') === 'page');
-    expect(current.map((link) => link.textContent)).toEqual(['Settings']);
-    const main = screen.getByRole('main');
-    expect(within(main).getByText('Database unavailable')).toBeTruthy();
-    expect(within(main).getByRole('button', { name: 'Retry' })).toBeTruthy();
-    expect(main.contains(primaryNav())).toBe(false);
-    expect(screen.queryByRole('alert')).toBeNull();
-    // Fail-closed: no session was confirmed, so no email shows and no screen reads its data.
-    expect(screen.queryByText(ADMIN_EMAIL)).toBeNull();
-    expect(screen.queryByRole('heading', { name: 'Settings' })).toBeNull();
-    expect(api.calls.filter((call) => call.path !== '/auth/me')).toEqual([]);
+      // The session is unknown, not ended: the requested screen renders and reads its own data,
+      // here successfully, instead of the sign-in form or the generic error screen.
+      await findTitle('Settings');
+      await waitForPath(router, '/settings');
+      await screen.findByRole('heading', { name: 'Analysis window' });
+      expect(screen.queryByRole('heading', { name: 'Sign in' })).toBeNull();
+      expect(screen.queryByText('Something went wrong')).toBeNull();
+      expect(screen.queryByText('Database unavailable')).toBeNull();
+      // The signed-in shell (AAP 0.5.5: PageShell, TopBar and SideNav on every screen): one
+      // <main>, one <h1>, the primary navigation beside <main> with the requested screen
+      // current, "Sign out" in the top bar, and no alert role (reserved for open discrepancies).
+      expect(screen.getAllByRole('main')).toHaveLength(1);
+      expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
+      const banner = screen.getByRole('banner');
+      expect(banner.textContent).toContain('Ads Action Engine');
+      expect(within(banner).getByRole('button', { name: 'Sign out' })).toBeTruthy();
+      const links = within(primaryNav()).getAllByRole('link');
+      expect(links.map((link) => link.textContent)).toEqual([
+        'Actions',
+        'Decisions',
+        'Sources',
+        'Settings',
+      ]);
+      const current = links.filter((link) => link.getAttribute('aria-current') === 'page');
+      expect(current.map((link) => link.textContent)).toEqual(['Settings']);
+      expect(screen.getByRole('main').contains(primaryNav())).toBe(false);
+      expect(screen.queryByRole('alert')).toBeNull();
+      // No email while no session is confirmed, and no second read at once: the guard has just
+      // asked.
+      expect(within(banner).queryByText(ADMIN_EMAIL)).toBeNull();
+      expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
 
-    api.use(SIGNED_IN);
-    fireEvent.click(within(main).getByRole('button', { name: 'Retry' }));
+      // GET /auth/me answers again: the layout's own poll reads the user, nobody presses Retry.
+      api.use(SIGNED_IN);
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
 
-    await findTitle('Settings');
-    expect(primaryNav()).toBeTruthy();
-    expect(screen.queryByText('Database unavailable')).toBeNull();
-    expect(within(screen.getByRole('banner')).getByText(ADMIN_EMAIL)).toBeTruthy();
-    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(2);
-  });
-
-  it("shows a reload of /actions in an outage as the page's failure state, and Retry recovers", async () => {
-    const api = mockApi({
-      ...pageReads(),
-      'GET /auth/me': html(502, '<html><body>502 Bad Gateway</body></html>'),
-    });
-    const { router } = renderApp('/actions');
-
-    await findTitle('Actions');
-    await waitForPath(router, '/actions');
-    const main = screen.getByRole('main');
-    // The page's failure state, not the generic error screen: "Actions could not be loaded" with
-    // the client's safe outage message and Retry, announced in a polite status region.
-    const notice = within(main).getByText('Actions could not be loaded');
-    expect(notice.closest('[role="status"]')).not.toBeNull();
-    expect(
-      within(main).getByText('The server is temporarily unavailable. Try again shortly.'),
-    ).toBeTruthy();
-    expect(within(main).getByRole('button', { name: 'Retry' })).toBeTruthy();
-    expect(screen.queryByText('Something went wrong')).toBeNull();
-    // Inside the signed-in shell (AAP 0.5.5): one <main>, one <h1>, the primary navigation with
-    // Actions current, "Sign out" in the top bar, and no alert role (reserved for discrepancies).
-    expect(screen.getAllByRole('main')).toHaveLength(1);
-    expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
-    const actions = within(primaryNav()).getByRole('link', { name: 'Actions' });
-    expect(actions.getAttribute('aria-current')).toBe('page');
-    expect(main.contains(primaryNav())).toBe(false);
-    const banner = screen.getByRole('banner');
-    expect(within(banner).getByRole('button', { name: 'Sign out' })).toBeTruthy();
-    expect(screen.queryByRole('alert')).toBeNull();
-    // Fail-closed: no email, and no page read before the guard has confirmed the session.
-    expect(screen.queryByText(ADMIN_EMAIL)).toBeNull();
-    expect(api.calls.filter((call) => call.path !== '/auth/me')).toEqual([]);
-    // The initial load leaves focus on <body>, as every first load does.
-    expect(document.activeElement).toBe(document.body);
-
-    // A Retry that fails again: the guard asks the API again, the button shows as loading
-    // meanwhile, and the new failure screen returns focus to its own Retry.
-    const retry = within(main).getByRole('button', { name: 'Retry' });
-    act(() => {
-      retry.focus();
-    });
-    fireEvent.click(retry);
-    // A loading Button is inert but never natively disabled, so it keeps focus meanwhile.
-    expect(retry.getAttribute('aria-busy')).toBe('true');
-    expect(retry.getAttribute('aria-disabled')).toBe('true');
-    await waitFor(() => {
+      await waitFor(() => {
+        expect(within(screen.getByRole('banner')).getByText(ADMIN_EMAIL)).toBeTruthy();
+      });
       expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(2);
-    });
-    await waitFor(() => {
-      expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Retry' }));
-    });
-    // The router replaced the screen, so this is a new button that took focus back.
-    expect(screen.getByRole('button', { name: 'Retry' })).not.toBe(retry);
-    expect(screen.getByText('Actions could not be loaded')).toBeTruthy();
-    expect(primaryNav()).toBeTruthy();
-    expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
-    expect(api.calls.filter((call) => call.path !== '/auth/me')).toEqual([]);
 
-    api.use(SIGNED_IN);
-    fireEvent.click(within(screen.getByRole('main')).getByRole('button', { name: 'Retry' }));
-
-    // The guard passes: the page itself renders, here its first-start state, and reads its data.
-    await screen.findByText('No analysis run yet');
-    await waitForPath(router, '/actions');
-    expect(screen.queryByText('Actions could not be loaded')).toBeNull();
-    expect(screen.getAllByRole('heading', { level: 1 }).map((h) => h.textContent)).toEqual([
-      'Actions',
-    ]);
-    expect(within(screen.getByRole('banner')).getByText(ADMIN_EMAIL)).toBeTruthy();
-    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(3);
-    expect(callsTo(api, 'GET', '/recommendations').length).toBeGreaterThan(0);
+      // The guard took the user from that read, so the next navigation asks nothing more.
+      fireEvent.click(within(primaryNav()).getByRole('link', { name: 'Sources' }));
+      await findTitle('Sources');
+      await waitForPath(router, '/sources');
+      expect(within(screen.getByRole('banner')).getByText(ADMIN_EMAIL)).toBeTruthy();
+      expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
-  it('shows the /actions failure state for a guard 503 on /actions/ with a run search too', async () => {
+  it("shows a reload of /actions in an outage as the page's own failure state, which recovers by itself", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const api = mockApi(outage());
+      const { router, queryClient } = renderApp('/actions');
+
+      await findTitle('Actions');
+      await waitForPath(router, '/actions');
+      const main = screen.getByRole('main');
+      // The page's own failure state, not the generic error screen: "Actions could not be
+      // loaded" with the client's safe outage message and Retry, in a polite status region.
+      const notice = await within(main).findByText('Actions could not be loaded');
+      expect(notice.closest('[role="status"]')).not.toBeNull();
+      expect(within(main).getByText(OUTAGE_MESSAGE)).toBeTruthy();
+      expect(within(main).getByRole('button', { name: 'Retry' })).toBeTruthy();
+      expect(screen.queryByText('Something went wrong')).toBeNull();
+      // Inside the signed-in shell (AAP 0.5.5): one <main>, one <h1>, the primary navigation
+      // with Actions current, "Sign out" in the top bar, and no alert role (reserved for
+      // discrepancies).
+      expect(screen.getAllByRole('main')).toHaveLength(1);
+      expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
+      const actions = within(primaryNav()).getByRole('link', { name: 'Actions' });
+      expect(actions.getAttribute('aria-current')).toBe('page');
+      expect(main.contains(primaryNav())).toBe(false);
+      const banner = screen.getByRole('banner');
+      expect(within(banner).getByRole('button', { name: 'Sign out' })).toBeTruthy();
+      expect(screen.queryByRole('alert')).toBeNull();
+      // No email: no session is confirmed. The page asked for its own data, which, like every
+      // read, needs the session cookie.
+      expect(screen.queryByText(ADMIN_EMAIL)).toBeNull();
+      expect(callsTo(api, 'GET', '/recommendations').length).toBeGreaterThan(0);
+      expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
+      // The initial load leaves focus on <body>, as every first load does.
+      expect(document.activeElement).toBe(document.body);
+
+      // The API comes back. Nobody presses Retry: the page's poll and the layout's read of the
+      // user recover the screen and the email by themselves.
+      api.use({ ...pageReads(), ...sessionUntilSignOut(json(200, makeMe())) });
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+
+      await screen.findByText('No analysis run yet');
+      await waitFor(() => {
+        expect(within(screen.getByRole('banner')).getByText(ADMIN_EMAIL)).toBeTruthy();
+      });
+      expect(screen.queryByText('Actions could not be loaded')).toBeNull();
+      expect(screen.getAllByRole('heading', { level: 1 }).map((h) => h.textContent)).toEqual([
+        'Actions',
+      ]);
+      await waitForPath(router, '/actions');
+      expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(2);
+      // Recovering moves no focus.
+      expect(document.activeElement).toBe(document.body);
+
+      // The session is confirmed again, so sign-out reads the user no more than with a session
+      // confirmed from the start: only /login's own check asks after the cache is cleared.
+      fireEvent.click(within(screen.getByRole('banner')).getByRole('button', { name: 'Sign out' }));
+      await findTitle('Sign in');
+      await waitForPath(router, '/login');
+      expect(queryClient.getQueryData(queryKeys.me)).toBeUndefined();
+      expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * Each screen a navigation opens during an outage: its link text and `<h1>`, the title of each
+   * of its own failure states, and texts only its loaded state shows.
+   */
+  const OUTAGE_SCREENS: readonly (readonly [string, readonly string[], readonly string[]])[] = [
+    ['Settings', ['Settings unavailable'], ['Analysis window']],
+    [
+      'Decisions',
+      ['Discrepancies could not be loaded', 'Decisions could not be loaded'],
+      ['No open discrepancies', 'No decisions recorded yet'],
+    ],
+    ['Sources', ['Sources unavailable'], ['Sync now']],
+  ];
+
+  it.each(OUTAGE_SCREENS)(
+    'shows %s, opened during an outage, with its own failure state, which recovers by itself',
+    async (name, failures, loadedTexts) => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        const api = mockApi(outage());
+        const { router } = renderApp('/actions');
+        await findTitle('Actions');
+        await within(screen.getByRole('main')).findByText('Actions could not be loaded');
+
+        fireEvent.click(within(primaryNav()).getByRole('link', { name }));
+
+        // The screen itself, with its own failure states and the client's outage message, inside
+        // the signed-in shell, never the generic "Something went wrong".
+        await findTitle(name);
+        await waitForPath(router, `/${name.toLowerCase()}`);
+        const main = screen.getByRole('main');
+        for (const failure of failures) {
+          expect(await within(main).findByText(failure)).toBeTruthy();
+        }
+        expect(within(main).getAllByText(OUTAGE_MESSAGE)).toHaveLength(failures.length);
+        expect(screen.queryByText('Something went wrong')).toBeNull();
+        expect(screen.getAllByRole('main')).toHaveLength(1);
+        expect(screen.getAllByRole('heading', { level: 1 }).map((h) => h.textContent)).toEqual([
+          name,
+        ]);
+        const links = within(primaryNav()).getAllByRole('link');
+        const current = links.filter((link) => link.getAttribute('aria-current') === 'page');
+        expect(current.map((link) => link.textContent)).toEqual([name]);
+        const banner = screen.getByRole('banner');
+        expect(within(banner).getByRole('button', { name: 'Sign out' })).toBeTruthy();
+        expect(within(banner).queryByText(ADMIN_EMAIL)).toBeNull();
+        expect(screen.queryByRole('alert')).toBeNull();
+        // The reload's guard read and the navigation's: each navigation asks again.
+        expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(2);
+
+        // The API comes back: the screen's own reads and the user recover without Retry.
+        api.use({ ...pageReads(), ...SIGNED_IN });
+        await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+
+        for (const loaded of loadedTexts) {
+          expect((await within(main).findAllByText(loaded)).length).toBeGreaterThan(0);
+        }
+        await waitFor(() => {
+          expect(within(screen.getByRole('banner')).getByText(ADMIN_EMAIL)).toBeTruthy();
+        });
+        for (const failure of failures) {
+          expect(within(main).queryByText(failure)).toBeNull();
+        }
+        expect(router.state.location.pathname).toBe(`/${name.toLowerCase()}`);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("shows /actions/ with a run search during a guard 503 as that run's own failure state", async () => {
+    const databaseDown = apiError(503, 'database_unavailable', 'Database unavailable');
     const api = mockApi({
       ...pageReads(),
-      'GET /auth/me': apiError(503, 'database_unavailable', 'Database unavailable'),
+      'GET /auth/me': databaseDown,
+      'GET /recommendations': databaseDown,
     });
     renderApp('/actions/?run=202');
 
@@ -528,7 +627,41 @@ describe('auth guard', () => {
     expect(within(banner).getByRole('button', { name: 'Sign out' })).toBeTruthy();
     expect(screen.queryByRole('alert')).toBeNull();
     expect(screen.queryByText(ADMIN_EMAIL)).toBeNull();
-    expect(api.calls.filter((call) => call.path !== '/auth/me')).toEqual([]);
+    // The page read the run its search addressed.
+    const reads = callsTo(api, 'GET', '/recommendations');
+    expect(reads.length).toBeGreaterThan(0);
+    expect(reads.every((call) => call.search.get('run_id') === '202')).toBe(true);
+  });
+
+  it('sends a tab whose session ended during an outage to /login once GET /auth/me answers 401', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const api = mockApi(outage());
+      const { router } = renderApp('/actions');
+      await findTitle('Actions');
+      await within(screen.getByRole('main')).findByText('Actions could not be loaded');
+      expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
+
+      // The API comes back, but the session ended meanwhile, so every read answers 401.
+      api.use({
+        ...pageReads(),
+        ...SIGNED_OUT,
+        'GET /recommendations': apiError(401, 'unauthenticated', 'Not signed in'),
+      });
+      await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+
+      await findTitle('Sign in');
+      await waitForPath(router, '/login');
+      // The guard's own redirect, as on any other 401: the requested href and its history mark.
+      expect(router.state.location.search).toEqual({ redirect: '/actions' });
+      expect(router.state.location.state.authGuardSignedOut).toBe(true);
+      // The reload's 502, the layout's 401 and the guard's own read on its re-run; /login took
+      // the guard's 401 instead of asking again.
+      expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(3);
+      expect(screen.queryByText(ADMIN_EMAIL)).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('reads GET /auth/me once while navigating between screens', async () => {
@@ -546,6 +679,55 @@ describe('auth guard', () => {
 
     expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
   });
+
+  /** How the cached user came to be: the case, and whether sign-in seeded it. */
+  const CACHED_USER_ORIGINS: readonly (readonly [string, boolean])[] = [
+    ['read by the guard', false],
+    ['seeded by sign-in', true],
+  ];
+
+  it.each(CACHED_USER_ORIGINS)(
+    'keeps a user %s for a navigation more than 5 minutes later, asking nothing',
+    async (_case, signsIn) => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      // TanStack's own 5-minute garbage collection, which the harness client turns off: the user
+      // must outlive it.
+      const queryClient = new QueryClient({
+        defaultOptions: {
+          queries: { retry: false, gcTime: 5 * 60_000, staleTime: 0, refetchOnWindowFocus: false },
+          mutations: { retry: false },
+        },
+      });
+      try {
+        const session = signsIn ? { ...SIGNED_OUT, ...LOGIN_OK } : SIGNED_IN;
+        const api = mockApi({ ...pageReads(), ...session });
+        const { router, unmount } = renderApp('/settings', queryClient);
+        if (signsIn) {
+          await findTitle('Sign in');
+          signIn();
+        }
+        await findTitle('Settings');
+        await waitForPath(router, '/settings');
+        expect(within(screen.getByRole('banner')).getByText(ADMIN_EMAIL)).toBeTruthy();
+        expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
+
+        await act(() => vi.advanceTimersByTimeAsync(6 * 60_000));
+
+        fireEvent.click(within(primaryNav()).getByRole('link', { name: 'Sources' }));
+        await findTitle('Sources');
+        await waitForPath(router, '/sources');
+        expect(within(screen.getByRole('banner')).getByText(ADMIN_EMAIL)).toBeTruthy();
+        expect(queryClient.getQueryData(queryKeys.me)).toEqual(makeMe());
+        // Only the first read: the navigation took the user from the cache.
+        expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
+        unmount();
+      } finally {
+        // No garbage-collection timer of this client outlives the test.
+        queryClient.clear();
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it('shows the "Loading" spinner inside the signed-in shell while the guard waits for GET /auth/me', async () => {
     let answer: (response: MockResponse) => void = () => undefined;
@@ -1061,7 +1243,8 @@ describe('/login session check', () => {
       'GET /auth/me': apiError(503, 'database_unavailable', 'Database unavailable'),
     });
     const { router } = renderApp('/settings');
-    await findTitle('Something went wrong');
+    // The guard's failed read leaves the session unknown, and the screen renders.
+    await findTitle('Settings');
     expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(1);
 
     // A hovered or focused "Sign in" link preloads /login ('intent'). The cache holds no user,
@@ -1256,6 +1439,86 @@ describe('not found', () => {
 });
 
 // ---------------------------------------------------------------------------------------------
+// Document title
+// ---------------------------------------------------------------------------------------------
+
+describe('document title', () => {
+  // jsdom keeps the title from one test to the next, so each test starts from an empty one and
+  // reads only the title its own screen set.
+  beforeEach(() => {
+    document.title = '';
+  });
+
+  /** Each signed-in screen: its path, its `<h1>` and the document title it sets. */
+  const SIGNED_IN_TITLES: readonly (readonly [string, string, string])[] = [
+    ['/actions', 'Actions', 'Actions · Ads Action Engine'],
+    ['/decisions', 'Decisions', 'Decisions · Ads Action Engine'],
+    ['/sources', 'Sources', 'Sources · Ads Action Engine'],
+    ['/settings', 'Settings', 'Settings · Ads Action Engine'],
+    ['/no-such-page', 'Page not found', 'Page not found · Ads Action Engine'],
+  ];
+
+  it('titles the sign-in screen after its page', async () => {
+    mockApi({ ...pageReads(), ...SIGNED_OUT });
+    const { router } = renderApp('/login');
+
+    await findTitle('Sign in');
+    await waitForPath(router, '/login');
+    expect(document.title).toBe('Sign in · Ads Action Engine');
+  });
+
+  it.each(SIGNED_IN_TITLES)(
+    'titles %s after the page its <h1> names, %s',
+    async (path, heading, title) => {
+      mockApi({ ...pageReads(), ...SIGNED_IN });
+      const { router } = renderApp(path);
+
+      await findTitle(heading);
+      await waitForPath(router, path);
+      expect(document.title).toBe(title);
+    },
+  );
+
+  it('follows a client-side navigation to the next screen', async () => {
+    mockApi({ ...pageReads(), ...SIGNED_IN });
+    const { router } = renderApp('/actions');
+    await findTitle('Actions');
+    expect(document.title).toBe('Actions · Ads Action Engine');
+
+    fireEvent.click(within(primaryNav()).getByRole('link', { name: 'Decisions' }));
+
+    await findTitle('Decisions');
+    await waitForPath(router, '/decisions');
+    expect(document.title).toBe('Decisions · Ads Action Engine');
+  });
+
+  it('titles an error screen "Something went wrong", and the screen Retry recovers after itself', async () => {
+    loginPageFault.throwOnRender = true;
+    mockApi({ ...pageReads(), ...SIGNED_OUT });
+    // The sign-in screen fails on purpose, and React and the router report that failure on the
+    // console, as the error-screen test above already shows. Both reports are silenced until the
+    // error screen is up, so this test adds no output of its own.
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const { router } = renderApp('/login?redirect=%2Fsettings');
+      await findTitle('Something went wrong');
+      await waitForPath(router, '/login');
+    } finally {
+      consoleError.mockRestore();
+      consoleWarn.mockRestore();
+    }
+    expect(document.title).toBe('Something went wrong · Ads Action Engine');
+
+    loginPageFault.throwOnRender = false;
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+
+    await findTitle('Sign in');
+    expect(document.title).toBe('Sign in · Ads Action Engine');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
 // Sign out
 // ---------------------------------------------------------------------------------------------
 
@@ -1312,7 +1575,8 @@ function sessionUntilSignOut(logout: MockResponse): MockHandlers {
 }
 
 /**
- * The top bar's polite status region, which holds "Sign out" and, after a failure, the message.
+ * The top bar's polite status region, which holds the sign-out failure message and nothing else:
+ * "Sign out" sits beside it, outside the region.
  *
  * @returns The `role="status"` element inside the `banner` landmark.
  */
@@ -1376,12 +1640,17 @@ describe('sign out', () => {
     await findTitle('Settings');
     const button = screen.getByRole('button', { name: 'Sign out' });
     expect(button.hasAttribute('aria-describedby')).toBe(false);
-    // The polite region is mounted before any failure, holding the button and no message.
+    // The polite region is mounted before any failure, with no child node at all (no message,
+    // not even whitespace), so Inline takes it out of the row. The button is never inside it: a
+    // control in a live region would have its label or busy state announced as status. The two
+    // are siblings in one Inline row.
     const status = signOutStatus();
     expect(status.getAttribute('aria-live')).toBe('polite');
-    expect(status.getAttribute('aria-atomic')).toBe('false');
-    expect(status.contains(button)).toBe(true);
-    expect(status.textContent).toBe('Sign out');
+    expect(status.childNodes).toHaveLength(0);
+    expect(status.contains(button)).toBe(false);
+    expect(within(status).queryByRole('button')).toBeNull();
+    expect(status.parentElement).toBe(button.parentElement);
+    expect(status.parentElement?.classList.contains('ds-inline')).toBe(true);
 
     fireEvent.click(button);
 
@@ -1390,12 +1659,19 @@ describe('sign out', () => {
     expect(screen.getByRole('heading', { level: 1, name: 'Settings' })).toBeTruthy();
     expect(queryClient.getQueryData(queryKeys.me)).toEqual(makeMe());
     const signOut = screen.getByRole('button', { name: 'Sign out' });
-    // The message lands in the region that already existed, beside the same button.
+    // The message lands in the region that already existed and is all it holds; the same button
+    // stays beside it, outside the region, described by the message.
     expect(signOutStatus()).toBe(status);
     expect(status.contains(message)).toBe(true);
+    expect(status.textContent).toBe(SIGN_OUT_FAILED);
+    expect(status.contains(signOut)).toBe(false);
+    expect(within(status).queryByRole('button')).toBeNull();
     expect(signOut).toBe(button);
     expect(message.id).not.toBe('');
     expect(signOut.getAttribute('aria-describedby')).toBe(message.id);
+    expect(screen.getByRole('button', { name: 'Sign out', description: SIGN_OUT_FAILED })).toBe(
+      signOut,
+    );
     await waitFor(() => {
       expect(signOut.hasAttribute('disabled')).toBe(false);
     });
@@ -1430,13 +1706,21 @@ describe('sign out', () => {
     });
     expect(screen.queryByText(SIGN_OUT_FAILED)).toBeNull();
     expect(button.hasAttribute('aria-describedby')).toBe(false);
+    // The busy button stays outside the region, which is empty again while the retry is pending.
+    expect(status.childNodes).toHaveLength(0);
+    expect(status.contains(button)).toBe(false);
 
     retry.release(LOGOUT_FAILED);
 
     const message = await screen.findByText(SIGN_OUT_FAILED);
     expect(signOutStatus()).toBe(status);
     expect(status.contains(message)).toBe(true);
+    expect(status.textContent).toBe(SIGN_OUT_FAILED);
+    expect(within(status).queryByRole('button')).toBeNull();
     expect(button.getAttribute('aria-describedby')).toBe(message.id);
+    expect(screen.getByRole('button', { name: 'Sign out', description: SIGN_OUT_FAILED })).toBe(
+      button,
+    );
     expect(screen.queryByRole('alert')).toBeNull();
     expect(callsTo(api, 'POST', '/auth/logout')).toHaveLength(2);
   });
@@ -1977,6 +2261,43 @@ function expectNoSessionData(queryClient: QueryClient): void {
   expect(queryClient.getMutationCache().getAll()).toHaveLength(0);
 }
 
+/** The title of the sign-in screen's session-ended notice (`LoginPage`). */
+const SESSION_ENDED_TITLE = 'Your session ended';
+
+/** What the notice says below its title after a read's 401: nothing was lost. */
+const SIGN_IN_AGAIN = 'Sign in again to continue.';
+
+/** What the notice says below its title after a write's 401. */
+const ACTION_NOT_SAVED = 'Sign in again. Your last action was not saved.';
+
+/**
+ * Waits for the sign-in screen's session-ended notice to say `text`, and checks that it is a
+ * banner in a polite status region, never an alert, with only that sentence below its title.
+ *
+ * @param text - {@link SIGN_IN_AGAIN} or {@link ACTION_NOT_SAVED}.
+ */
+async function expectSessionNotice(text: string): Promise<void> {
+  const sentence = await screen.findByText(text);
+  const banner = sentence.closest('.ds-banner');
+  expect(banner).not.toBeNull();
+  expect(banner?.querySelector('.ds-banner__title')?.textContent).toBe(SESSION_ENDED_TITLE);
+  expect(banner?.parentElement?.getAttribute('role')).toBe('status');
+  expect(screen.getAllByText(SESSION_ENDED_TITLE)).toHaveLength(1);
+  const other = text === ACTION_NOT_SAVED ? SIGN_IN_AGAIN : ACTION_NOT_SAVED;
+  expect(screen.queryByText(other)).toBeNull();
+  expect(screen.queryByRole('alert')).toBeNull();
+}
+
+/**
+ * Checks that the sign-in screen shows no session-ended notice. Call it once the app has run
+ * longer than the notice's delay ({@link settle}), so a late notice would show.
+ */
+function expectNoSessionNotice(): void {
+  expect(screen.queryByText(SESSION_ENDED_TITLE)).toBeNull();
+  expect(screen.queryByText(SIGN_IN_AGAIN)).toBeNull();
+  expect(screen.queryByText(ACTION_NOT_SAVED)).toBeNull();
+}
+
 describe('expired session, through the production bootstrap (src/main.tsx)', () => {
   // Registered inside this block, so it runs before the file-level hooks: mockApi's, which can
   // throw and skip the hooks after it and which removes the network stub, and Testing
@@ -2015,6 +2336,9 @@ describe('expired session, through the production bootstrap (src/main.tsx)', () 
     );
 
     await expectSignInFor(router, RUN_HREF);
+    // Only reads were refused: the screen says the session ended, and nothing was lost.
+    await expectSessionNotice(SIGN_IN_AGAIN);
+    expect(router.state.location.state.sessionEnded).toBe('session_ended');
     // The custom run's own read was among those refused.
     const runReads = callsTo(api, 'GET', '/recommendations');
     expect(runReads.length).toBeGreaterThan(0);
@@ -2068,10 +2392,81 @@ describe('expired session, through the production bootstrap (src/main.tsx)', () 
     fireEvent.click(within(google).getByRole('button', { name: 'Sync now' }));
 
     await expectSignInFor(router, href);
+    // The refused write is named: the sync was not requested.
+    await expectSessionNotice(ACTION_NOT_SAVED);
+    expect(router.state.location.state.sessionEnded).toBe('action_not_saved');
     expect(callsTo(api, 'POST', '/sources/google/sync')).toHaveLength(1);
     expectNoSessionData(queryClient);
     expect(window.history.length).toBe(historyLength + 1);
     expect(screen.queryByRole('region', { name: 'Google' })).toBeNull();
+    // The screen's reads that were refused after the write leave the notice as it is.
+    await settle();
+    await expectSessionNotice(ACTION_NOT_SAVED);
+    expect(window.history.length).toBe(historyLength + 1);
+  });
+
+  it('names a write still in flight when a read opened sign-in, keeping the address', async () => {
+    const api = mockApi({ ...pageReads(), ...SIGNED_IN });
+    const { router } = await bootMain('/sources');
+    const google = await screen.findByRole('region', { name: 'Google' });
+    let releaseSync: (response: MockResponse) => void = () => undefined;
+    const heldSync = new Promise<MockResponse>((resolve) => {
+      releaseSync = resolve;
+    });
+    api.use({ 'POST /sources/:source/sync': () => heldSync });
+    fireEvent.click(within(google).getByRole('button', { name: 'Sync now' }));
+    await waitFor(() => {
+      expect(callsTo(api, 'POST', '/sources/google/sync')).toHaveLength(1);
+    });
+
+    // The session ends while the sync is in flight; the next screen's reads get the 401 first.
+    api.use(expiredSession());
+    fireEvent.click(within(primaryNav()).getByRole('link', { name: 'Decisions' }));
+    await expectSignInFor(router, '/decisions');
+    await expectSessionNotice(SIGN_IN_AGAIN);
+    const loginHref = browserHref();
+    const historyLength = window.history.length;
+    const meReads = callsTo(api, 'GET', '/auth/me').length;
+
+    // The sync is then refused too: the notice now says the last action was not saved.
+    act(() => {
+      releaseSync(EXPIRED);
+    });
+
+    await expectSessionNotice(ACTION_NOT_SAVED);
+    await waitForPath(router, '/login');
+    expect(router.state.location.state.sessionEnded).toBe('action_not_saved');
+    // The same address, replaced in place: no entry added, the redirect kept.
+    expect(router.state.location.search).toEqual({ redirect: '/decisions' });
+    expect(browserHref()).toBe(loginHref);
+    expect(window.history.length).toBe(historyLength);
+    // The replaced entry checked the session once more, and then the app stopped asking.
+    await settle();
+    expect(callsTo(api, 'GET', '/auth/me')).toHaveLength(meReads + 1);
+    const settled = api.calls.length;
+    await settle();
+    expect(api.calls).toHaveLength(settled);
+  });
+
+  it('shows no notice when sign-out finds the session already ended: one plain /login', async () => {
+    mockApi({ ...pageReads(), ...sessionUntilSignOut(EXPIRED) });
+    const { queryClient, router } = await bootMain('/settings');
+    await findTitle('Settings');
+    const historyLength = window.history.length;
+
+    fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+
+    await findTitle('Sign in');
+    await waitForPath(router, '/login');
+    await settle();
+    // Signed out as the user asked: no session-ended notice, and no redirect back.
+    expectNoSessionNotice();
+    expect(router.state.location.state.sessionEnded).toBeUndefined();
+    expect(router.state.location.search).toEqual({});
+    // One navigation, the sign-out's own: the global handler leaves its 401 alone.
+    expect(window.history.length).toBe(historyLength + 1);
+    expect(queryClient.getQueryData(queryKeys.me)).toBeUndefined();
+    expect(screen.queryByText('Sign-out failed. Try again.')).toBeNull();
   });
 
   it('keeps a failed sign-in after an expired session on /login, with the same redirect', async () => {
@@ -2081,6 +2476,7 @@ describe('expired session, through the production bootstrap (src/main.tsx)', () 
     api.use(expiredSession());
     fireEvent.click(within(primaryNav()).getByRole('link', { name: 'Decisions' }));
     await expectSignInFor(router, '/decisions');
+    await expectSessionNotice(SIGN_IN_AGAIN);
     const loginHref = browserHref();
     const historyLength = window.history.length;
 
@@ -2094,11 +2490,25 @@ describe('expired session, through the production bootstrap (src/main.tsx)', () 
     await settle();
     await waitForPath(router, '/login');
     expect(router.state.location.search).toEqual({ redirect: '/decisions' });
-    // No navigation at all: a 401 on /login is a wrong password, not an expired session.
+    // No navigation at all: a 401 on /login is a wrong password, not an expired session, and
+    // the notice still says only that the session ended.
     expect(browserHref()).toBe(loginHref);
     expect(window.history.length).toBe(historyLength);
     expect(callsTo(api, 'POST', '/auth/login')).toHaveLength(1);
     expect(screen.getByRole('heading', { level: 1, name: 'Sign in' })).toBeTruthy();
+    await expectSessionNotice(SIGN_IN_AGAIN);
+    expect(router.state.location.state.sessionEnded).toBe('session_ended');
+
+    // The "Sign in" link opens /login again without the reason; the screen keeps its notice.
+    fireEvent.click(within(primaryNav()).getByRole('link', { name: 'Sign in' }));
+    await waitFor(() => {
+      expect(window.history.length).toBe(historyLength + 1);
+    });
+    await waitForPath(router, '/login');
+    await settle();
+    expect(router.state.location.state.sessionEnded).toBeUndefined();
+    expect(router.state.location.search).toEqual({ redirect: '/decisions' });
+    await expectSessionNotice(SIGN_IN_AGAIN);
   });
 
   it('leaves a GET /auth/me 401 to the guard: one replacing redirect carrying the href', async () => {
@@ -2108,6 +2518,9 @@ describe('expired session, through the production bootstrap (src/main.tsx)', () 
 
     await expectSignInFor(router, RUN_HREF);
     await settle();
+    // A first visit while signed out: nothing ended under an open screen, so no notice.
+    expectNoSessionNotice();
+    expect(router.state.location.state.sessionEnded).toBeUndefined();
     // The guard's redirect replaces the entry it refused; a second redirect from the cache's
     // error handler would push another.
     expect(window.history.length).toBe(historyLength);

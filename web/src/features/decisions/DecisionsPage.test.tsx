@@ -75,6 +75,8 @@ describe('DecisionsPage', () => {
     const [title] = screen.getAllByRole('heading', { level: 1 });
     expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
     expect(title?.textContent).toBe('Decisions');
+    // WCAG 2.2 SC 2.4.2: the document title names the page.
+    expect(document.title).toBe('Decisions · Ads Action Engine');
     expect(
       screen.getAllByRole('heading', { level: 2 }).map((heading) => heading.textContent),
     ).toEqual(['Discrepancies', 'Decision log']);

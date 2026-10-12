@@ -7,6 +7,10 @@
  * and renders nothing else, so binding Blitzy OS later changes only this file and its
  * stylesheet, never the feature code that uses it.
  *
+ * `Inline.css` also takes an empty `role="status"` or `aria-live="polite"` child out of the row,
+ * so a polite live region rendered ahead of its first message adds no space and no gap (see
+ * {@link Inline}).
+ *
  * GAP: bind to Blitzy OS on source arrival.
  *
  * @packageDocumentation
@@ -73,7 +77,11 @@ export interface InlineProps {
    * treated as no label.
    */
   'aria-label'?: string;
-  /** The row's content. With `as="ul"` or `as="ol"`, `<li>` elements only. */
+  /**
+   * The row's content. With `as="ul"` or `as="ol"`, `<li>` elements only. A direct child with
+   * `role="status"` or `aria-live="polite"` and no child nodes adds no space or gap until it has
+   * content.
+   */
   children?: ReactNode;
 }
 
@@ -88,6 +96,13 @@ export interface InlineProps {
  *
  * When `as` is `ul` or `ol`, every child must be an `<li>`, and the list carries `role="list"`.
  * A `div` given a non-empty `aria-label` carries `role="group"`; without one it has no role.
+ *
+ * Empty live regions: a direct child with `role="status"` or `aria-live="polite"` and no child
+ * nodes adds no space or gap until it has content. A polite live region can therefore be
+ * rendered ahead of its first message, as WCAG 2.2 SC 4.1.3 needs for that message to be
+ * announced, beside a control that stays outside it, without shifting the row by a gap step.
+ * Render nothing inside it, not even whitespace, while there is no message; it stays in the
+ * accessibility tree and takes its place in the row, spaced by `gap`, as soon as it has content.
  *
  * @example
  * ```tsx

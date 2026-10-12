@@ -9,6 +9,11 @@
  *
  * Messages the page shows, each in text beside the field it concerns (WCAG 2.2 SC 3.3.1):
  *
+ * - "Your session ended", the notice of a sign-in screen that an ended session opened: a 401 of
+ *   an open screen's request (`src/main.tsx`), passed in as `sessionEnded` (see
+ *   {@link SessionEndedNotice}). Below the title it says "Sign in again to continue." when a
+ *   read found the session ended, or "Sign in again. Your last action was not saved." when a
+ *   write was refused for it. It reports no failed attempt of this form.
  * - Checks the page runs before sending, each mirroring what the API accepts
  *   (`LoginRequest` in `backend/src/ads_engine/api/schemas.py`; the admin email's shape in
  *   `backend/src/ads_engine/settings.py`), with lengths counted in code points:
@@ -38,6 +43,15 @@
  * - Any other API failure shows the API's own message, and a failure without an API error shows
  *   "Sign-in failed. Try again."
  *
+ * Where the session-ended notice shows: first at the head of the form, above any failed
+ * attempt's message, in an info `Banner` (warning when an action was not saved). It sits in a
+ * polite `role="status"` region of its own, which the page renders empty with the form and fills
+ * {@link SESSION_NOTICE_DELAY_MS} later: the page mounts fresh after the redirect, and a message
+ * present when its region appears is not announced, while one added to a region assistive
+ * technology already tracks is (WCAG 2.2 SC 4.1.3). Its own region keeps it out of the outage
+ * region, which a polite status re-reads whole on every change. It stays while the page is
+ * mounted, whatever the attempts on the form show, and a later notice replaces it.
+ *
  * Where a failed attempt's message shows:
  * - **An outage**: only at the head of the form, in a critical `Banner`. No field is marked
  *   invalid and nothing typed is cleared, because the credentials were not refused. The banner
@@ -58,8 +72,9 @@
  * - **Design system only** (AAP 0.4.4): `PageShell`, `TopBar`, `SideNav`, `TextField`,
  *   `Button`, `Banner`, and layout through `Stack` and `Inline`; no raw interactive or heading
  *   elements, no styles and no stylesheet of its own. The `<form>` element is plain HTML because
- *   the design system has no form wrapper and a form carries no visual styling; so is the
- *   outage message's `role="status"` region, an unstyled `<div>` that `Stack` spaces.
+ *   the design system has no form wrapper and a form carries no visual styling; so are the
+ *   session notice's and the outage message's `role="status"` regions, unstyled `<div>`s that
+ *   `Stack` spaces.
  * - **Sign-in navigation**: every screen uses `PageShell`, `TopBar` and `SideNav` (AAP 0.5.5),
  *   and `/login` sits outside the authenticated layout that renders the signed-in screens'
  *   navigation, so the page renders its own "Primary" `SideNav`. It holds one link, "Sign in",
@@ -98,7 +113,8 @@ import {
   TextField,
   TopBar,
 } from '../../design-system';
-import type { SideNavItem, SideNavLinkProps } from '../../design-system';
+import type { SideNavItem, SideNavLinkProps, Tone } from '../../design-system';
+import { useDocumentTitle } from '../../lib/documentTitle';
 
 // ---------------------------------------------------------------------------------------------
 // Texts
@@ -160,6 +176,32 @@ const RATE_LIMITED_SHORTLY_MESSAGE = 'Too many attempts. Try again shortly.';
 
 /** Message for a failure that is not an API error, or an API error without a message. */
 const GENERIC_FAILURE_MESSAGE = 'Sign-in failed. Try again.';
+
+/** Title of the session-ended notice, whichever {@link SessionEndedNotice} it shows. */
+const SESSION_ENDED_TITLE = 'Your session ended';
+
+/**
+ * What the session-ended notice says below its title, and its banner tone, per
+ * {@link SessionEndedNotice}: info when nothing was lost, warning when a write was refused.
+ */
+const SESSION_NOTICES: Readonly<Record<SessionEndedNotice, { tone: Tone; text: string }>> =
+  Object.freeze({
+    session_ended: { tone: 'info', text: 'Sign in again to continue.' },
+    action_not_saved: { tone: 'warning', text: 'Sign in again. Your last action was not saved.' },
+  });
+
+/**
+ * How long, in milliseconds, the session notice's region stays empty after it mounts, and after
+ * the notice changes, before the notice fills it.
+ *
+ * A live region must already be in the accessibility tree when its content changes, or screen
+ * readers may skip the announcement. The region mounts with the page, and React can flush the
+ * effect that fills it in the same task as the commit that inserted it, with no rendering step
+ * between them. The delay puts the notice in a later task, at least one rendered frame after the
+ * region, as `DateRangePicker` does for its status message. It is a timing literal, not a design
+ * token, and short enough that the notice still appears with the page.
+ */
+const SESSION_NOTICE_DELAY_MS = 100;
 
 /** Where a successful sign-in goes when `redirectTo` is not a safe internal path. */
 const DEFAULT_REDIRECT = '/actions';
@@ -497,10 +539,28 @@ function safeRedirectTarget(redirectTo: string): string {
 // Public API
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * Why an open screen sent the visitor to sign in, which the page states in its session-ended
+ * notice. `src/main.tsx` writes it into the `/login` history entry's state when a request of
+ * that screen is answered 401, so only the app itself can set it, never a link:
+ *
+ * - `'session_ended'`: a read found the session ended; nothing the visitor did was lost.
+ * - `'action_not_saved'`: a write (dismiss, snooze, mark done, a decision, a resolution, a sync
+ *   or a custom run) was refused because the session had ended, so it was not saved.
+ */
+export type SessionEndedNotice = 'session_ended' | 'action_not_saved';
+
 /** Props of {@link LoginPage}. */
 export interface LoginPageProps {
   /** Internal path to open after sign-in, already sanitised by `src/router.tsx`. */
   redirectTo: string;
+  /**
+   * Why an ended session opened this screen, from the `/login` history entry's state; omitted
+   * on every other visit (a first visit while signed out, a sign-out, a link), which shows no
+   * notice. Once given, the notice stays while the page is mounted, even if a later render
+   * omits it, and a different value replaces it.
+   */
+  sessionEnded?: SessionEndedNotice;
 }
 
 /**
@@ -514,6 +574,10 @@ export interface LoginPageProps {
  * signed-in screen is listed.
  *
  * Behaviour:
+ * - With `sessionEnded`, the form opens with the "Your session ended" notice at its head, in a
+ *   polite `role="status"` region that mounts empty and receives the notice
+ *   {@link SESSION_NOTICE_DELAY_MS} later, so it is announced. It never moves focus, and no
+ *   attempt on the form clears it.
  * - Pressing Enter in either field submits the form natively, because the submit button sits in
  *   the same `<form>`. `noValidate` turns off the browser's own bubbles, so the page's messages
  *   are the only ones shown.
@@ -538,13 +602,14 @@ export interface LoginPageProps {
  * @example
  * ```tsx
  * // src/router.tsx, for the /login route:
- * <LoginPage redirectTo={search.redirect ?? '/actions'} />
+ * <LoginPage redirectTo={search.redirect ?? '/actions'} sessionEnded={sessionEnded} />
  * ```
  *
  * @param props - See {@link LoginPageProps}.
  * @returns The sign-in page.
  */
-export function LoginPage({ redirectTo }: LoginPageProps) {
+export function LoginPage({ redirectTo, sessionEnded }: LoginPageProps) {
+  useDocumentTitle(PAGE_TITLE);
   const login = useLogin();
   const navigate = useNavigate();
 
@@ -558,10 +623,38 @@ export function LoginPage({ redirectTo }: LoginPageProps) {
   // once per outage, after the render that re-enables the button has committed.
   const [outages, setOutages] = useState(0);
   const [focusRequest, setFocusRequest] = useState<FocusRequest | undefined>(undefined);
+  // The session notice: the latest `sessionEnded` given, kept while the page stays mounted, so a
+  // navigation to a `/login` entry without one (the "Sign in" link, Back) never hides it. It is
+  // adjusted while rendering, so no commit shows a superseded notice.
+  const [notice, setNotice] = useState(sessionEnded);
+  if (sessionEnded !== undefined && sessionEnded !== notice) {
+    setNotice(sessionEnded);
+  }
+  // What the notice's region holds: `notice`, once the region has been tracked for
+  // SESSION_NOTICE_DELAY_MS; `undefined` until then.
+  const [announcedNotice, setAnnouncedNotice] = useState<SessionEndedNotice | undefined>(
+    undefined,
+  );
 
   const emailRef = useRef<HTMLInputElement>(null);
   const passwordRef = useRef<HTMLInputElement>(null);
   const submitRef = useRef<HTMLButtonElement>(null);
+
+  // The notice fills its region only after the region has existed, empty, for
+  // SESSION_NOTICE_DELAY_MS, so assistive technology tracks the region before its content
+  // changes and announces the notice (WCAG 2.2 SC 4.1.3). A later notice replaces it the same
+  // way; an unmount cancels the wait.
+  useEffect(() => {
+    if (notice === undefined) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setAnnouncedNotice(notice);
+    }, SESSION_NOTICE_DELAY_MS);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [notice]);
 
   // After an outage, focus returns to "Sign in" when it fell to <body> (or nowhere) during the
   // request, so Enter retries. Focus in a field, as after Enter pressed there, stays where it
@@ -670,6 +763,18 @@ export function LoginPage({ redirectTo }: LoginPageProps) {
       <PageShell.Title>{PAGE_TITLE}</PageShell.Title>
       <form noValidate onSubmit={handleSubmit}>
         <Stack gap={4}>
+          {/* The session notice's own polite region, never role="alert": rendered empty with
+              the page when there is a notice, and filled once tracked, so it is announced;
+              while empty, Stack.css takes it out of the column. */}
+          {notice !== undefined ? (
+            <div role="status">
+              {announcedNotice !== undefined ? (
+                <Banner tone={SESSION_NOTICES[announcedNotice].tone} title={SESSION_ENDED_TITLE}>
+                  {SESSION_NOTICES[announcedNotice].text}
+                </Banner>
+              ) : null}
+            </div>
+          ) : null}
           {/* Polite, never role="alert", and present before its first message so the message
               is announced; while empty, Stack.css takes it out of the column. */}
           <div role="status">

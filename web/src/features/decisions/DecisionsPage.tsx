@@ -4,7 +4,8 @@
  * The page is where the user records what was decided and settles what the platforms disagree
  * with (FR-10). Top to bottom it renders:
  *
- * 1. the page title, the page's single `<h1>` ("Decisions");
+ * 1. the page title, the page's single `<h1>` ("Decisions"), which also titles the document
+ *    "Decisions · Ads Action Engine" ({@link useDocumentTitle}, WCAG 2.2 SC 2.4.2);
  * 2. the "Discrepancies" section (`<h2>`, anchor `#discrepancies`), holding the
  *    {@link DiscrepancyResolver}: every open and awaiting-platform discrepancy with the
  *    resolutions valid for its kind and subject type (AAP 0.5.4.4). It comes first because
@@ -35,6 +36,7 @@
 import type { ReactElement } from 'react';
 
 import { PageShell, Stack } from '../../design-system';
+import { useDocumentTitle } from '../../lib/documentTitle';
 import { DecisionLog } from './DecisionLog';
 import { DiscrepancyResolver } from './DiscrepancyResolver';
 
@@ -75,7 +77,8 @@ const DECISION_LOG_SECTION_TITLE = 'Decision log';
  * It takes no props and holds no state: it lays out three blocks in one `Stack`, spaced like the
  * other screens' columns:
  *
- * - `PageShell.Title` "Decisions" (the page's `<h1>`);
+ * - `PageShell.Title` "Decisions" (the page's `<h1>`), with the document title
+ *   "Decisions · Ads Action Engine";
  * - `PageShell.Section` `id="discrepancies"` titled "Discrepancies" (an `<h2>`) holding
  *   {@link DiscrepancyResolver}, first because discrepancies must be resolved before other
  *   recommendations are trusted (AAP 0.5.4.2 P1);
@@ -101,6 +104,7 @@ const DECISION_LOG_SECTION_TITLE = 'Decision log';
  * ```
  */
 export function DecisionsPage(): ReactElement {
+  useDocumentTitle(PAGE_TITLE);
   return (
     <Stack gap={6}>
       <PageShell.Title>{PAGE_TITLE}</PageShell.Title>
