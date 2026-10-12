@@ -136,7 +136,13 @@ export interface PageShellSectionProps {
  * Activating the skip link (click, or Enter from the keyboard) moves focus to `<main>`, which
  * carries `tabindex="-1"` so it can take focus without entering the tab order. The default
  * navigation is prevented, so the router's URL is never rewritten to `#ds-main`; focusing the
- * element scrolls it into view in browsers.
+ * element scrolls it into view in browsers, and `PageShell.css` gives main a scroll margin so its
+ * focus ring stays inside the viewport. Enter activates the link with a click whose `detail` is
+ * 0, and a pointer click has a `detail` of 1 or more. The focus call passes that as
+ * `focusVisible`, so keyboard activation always shows main's focus ring (WCAG 2.2 SC 2.4.7) and a
+ * pointer click shows none. Without it, main would inherit the link's keyboard-visible focus,
+ * because the link is hidden until focused and so is only ever clicked after a Tab. Browsers
+ * that ignore the option fall back to their own focus-visible heuristic.
  *
  * GAP: bind to Blitzy OS on source arrival.
  */
@@ -145,7 +151,7 @@ function PageShellRoot({ topBar, sideNav, children }: PageShellProps) {
 
   const skipToMain = (event: MouseEvent<HTMLAnchorElement>) => {
     event.preventDefault();
-    mainRef.current?.focus();
+    mainRef.current?.focus({ focusVisible: event.detail === 0 });
   };
 
   return (

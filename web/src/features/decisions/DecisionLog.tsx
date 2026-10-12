@@ -126,7 +126,8 @@ const COMPACT_COLUMN_SIZES: Readonly<Record<DecisionColumnKey, DecisionColumnSiz
  * `'lg'` minimum, so an instant labelled "America/New_York" stays on one line from a 1280 CSS px
  * viewport and takes at most two lines below it. Origin, Patch applied, Resulting expected state
  * and Note keep "Recommendation", amounts and ordinary words of a note whole at 1280, which leaves
- * Decided by one twelfth: at that width an author as long as "admin@example.com" breaks. No sizes
+ * Decided by one twelfth: at that width an author as long as "admin@example.com" breaks after its
+ * "@" and ".", the separators `DataTable` breaks a long token at. No sizes
  * of the twelfths and minimums `DataTable` offers keep that instant and that author both whole
  * there.
  */
@@ -417,12 +418,13 @@ function describePatch(decision: Decision): string {
  *   for a longer one, such as "America/New_York".
  * - Origin and Resulting expected state hold the `'md'` minimum, so "Resolution", "Baseline" and
  *   a shared budget id stay whole wherever the table is too narrow for every share.
- * - Every column but Decided may break a token anywhere, so no row's content sets its column's
- *   minimum: no row moves its table's grid, and no long author, patch or note pushes the table
- *   past its region. A token breaks only where its column is narrower than it, for example
- *   "Recommendation" at a 1024 CSS px viewport, where Origin is held at its minimum. Decided
- *   breaks only between words, and no instant moves its minimum between tables: the minimum
- *   holds the date and time, and the zone is the same in every table.
+ * - Every column breaks only between words, and a long token, such as an author's address,
+ *   after its separators (the `DataTable` default), so "Platform state at first sync" never
+ *   splits inside a word. A column is therefore at least as wide as its longest word: wherever
+ *   the shares leave every column that room, the tables keep one grid; in a region too narrow
+ *   for that, a column holding a longer word widens in its own table, and that table scrolls in
+ *   its region. No instant moves Decided's minimum between tables: the minimum holds the date
+ *   and time, and the zone is the same in every table.
  *
  * @param displayTimezone - The IANA zone instants are shown in.
  * @param budgetNames - Shared budget names by internal id, for members' expected states.
@@ -442,33 +444,29 @@ function decisionColumns(
       ...sizes.decided,
       render: (decision) => formatInstant(decision.decided_at, displayTimezone),
     },
-    { key: 'origin', header: 'Origin', ...sizes.origin, wrap: 'anywhere', render: originLabel },
+    { key: 'origin', header: 'Origin', ...sizes.origin, render: originLabel },
     {
       key: 'decided_by',
       header: 'Decided by',
       ...sizes.decided_by,
-      wrap: 'anywhere',
       render: (decision) => textOrNull(decision.decided_by) ?? SYSTEM_AUTHOR,
     },
     {
       key: 'patch',
       header: 'Patch applied',
       ...sizes.patch,
-      wrap: 'anywhere',
       render: describePatch,
     },
     {
       key: 'expected_state',
       header: 'Resulting expected state',
       ...sizes.expected_state,
-      wrap: 'anywhere',
       render: (decision) => describeExpectedState(decision, budgetNames),
     },
     {
       key: 'note',
       header: 'Note',
       ...sizes.note,
-      wrap: 'anywhere',
       render: (decision) => textOrNull(decision.note) ?? EM_DASH,
     },
   ];

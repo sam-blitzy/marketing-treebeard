@@ -166,8 +166,23 @@ const THREE_MINOR_DIGIT_CURRENCIES: ReadonlySet<string> = new Set([
  */
 const MAX_EXACT_PLACE = 307;
 
-/** Fraction digits of a per-unit-of-spend rate: the six places the backend records it at. */
-const RATE_DIGITS = 6;
+/**
+ * Fraction digits the backend records a per-unit-of-spend rate at (`stats._ratio`, six places):
+ * the most a rate shows before {@link RATE_SCALE_PLACES} moves its point.
+ */
+const RATE_RECORDED_DIGITS = 6;
+
+/**
+ * The places a rate's point moves when it is stated per {@link RATE_SPEND_BASIS} units of its
+ * spend currency rather than per one: `"0.013652"` per USD reads `1.3652` per USD 100.
+ */
+const RATE_SCALE_PLACES = 2;
+
+/** The spend a rate with a known currency is stated per: 100 units, as in "per USD 100". */
+const RATE_SPEND_BASIS = '100';
+
+/** The fewest significant digits {@link rateMetricDigits} lets a non-zero rate show. */
+const MIN_RATE_SIGNIFICANT_DIGITS = 3;
 
 /**
  * Fraction digits of a percentage when the caller names none: {@link formatPercent}'s default,
@@ -192,11 +207,24 @@ const MIN_PERCENT_SIGNIFICANT_DIGITS = 2;
  */
 const MAX_EXACT_MONEY_DIGITS = 6;
 
-/** Below this a p-value renders as "< 0.001". */
-const P_VALUE_FLOOR = 0.001;
+/**
+ * The fraction digits a p-value is stated at, padded (`"0.0500"`), and the exponent of its bound
+ * (`"< 0.0001"`) for every α of at least 0.0001: the places of the backend's
+ * `analysis/stats.p_relation`, which words each p-value of a reason, label and flag message, so
+ * {@link formatPValue} states it with the same digits.
+ */
+const P_VALUE_PLACES = 4;
 
-/** Fraction digits of a p-value at or above {@link P_VALUE_FLOOR}. */
-const P_VALUE_DIGITS = 3;
+/**
+ * The deepest place the leading digit of a significance level α may occupy for
+ * {@link formatPValue} to judge a p-value against it: that of `Number.MIN_VALUE`
+ * (≈ 4.94 × 10⁻³²⁴). The backend reads each α from `thresholds.yaml` as a YAML float
+ * (`analysis/thresholds._number`), so no α it records, and no bound its `p_relation` writes,
+ * lies deeper. A deeper α, which only exponent notation such as `"1e-999999999"` carries in a few
+ * characters, is ignored as one outside (0, 1) is, so its bound never asks for a figure of
+ * millions of places.
+ */
+const MAX_LEVEL_PLACE = 324;
 
 /** Fraction digits of a significance level α. */
 const ALPHA_DIGITS = 3;
@@ -267,13 +295,31 @@ export interface MetricFormatOptions {
    * {@link formatPercent}'s default, at most one digit without padding. Other units ignore it.
    */
   readonly ratioDigits?: number;
+  /**
+   * The ISO 4217 code of the spend a {@link RATE_UNITS} value counts outcomes per: the item's
+   * account currency, which a rate metric does not carry itself (a `currency` on a metric makes
+   * it money). Given, the rate is stated per {@link RATE_SPEND_BASIS} units of that currency,
+   * its exact decimal moved two places: `"0.013652"` with `"USD"` → `"1.37 per USD 100"`.
+   * Omitted or blank, the rate is shown unscaled with no currency: `"0.0137"`. Either way it is
+   * never a percentage, because a rate per unit of spend is not a 0–1 share. Other units ignore
+   * it.
+   */
+  readonly rateCurrency?: string | null;
+  /**
+   * The fixed fraction digits of a {@link RATE_UNITS} value as shown, after any per-100 scaling
+   * by `rateCurrency`, shared by every rate of one evidence table and picked by
+   * {@link rateMetricDigits} with the same `rateCurrency`: `"0.013652"` with `"USD"` at 3 →
+   * `"1.365 per USD 100"`. Clamped to 0–20. Omitted, a rate takes the digits
+   * {@link rateMetricDigits} picks for it alone. Other units ignore it.
+   */
+  readonly rateDigits?: number;
 }
 
 /**
  * The fields of a sample line that {@link formatSample} reads: an evidence {@link Sample}, or a
- * withheld pattern's sample, whose unit may be `null` and which has no projection.
+ * withheld pattern's sample, whose unit may be `null` and which has no projection or floor.
  */
-export type SampleInput = Pick<Sample, 'observed' | 'required'> & {
+export type SampleInput = Pick<Sample, 'observed' | 'required' | 'floor'> & {
   unit?: string | null;
   projected?: Projection | null;
 };
@@ -594,9 +640,9 @@ function currencyFormat(code: string): Intl.NumberFormat | null {
 const exactMoneyFormats = new Map<number, Intl.NumberFormat>();
 
 /**
- * The grouped decimal formatter of {@link formatExactMoney} at exactly `places` fraction digits,
- * rounding half to even as the backend's `Decimal` context does, with no minus sign on a value
- * that rounds to zero.
+ * The grouped decimal formatter of {@link formatExactMoney}, and of a per-unit-of-spend rate
+ * ({@link RATE_UNITS}), at exactly `places` fraction digits, rounding half to even as the
+ * backend's `Decimal` context does, with no minus sign on a value that rounds to zero.
  */
 function exactMoneyFormat(places: number): Intl.NumberFormat {
   const cached = exactMoneyFormats.get(places);
@@ -920,8 +966,9 @@ export interface PercentDigitsOptions {
 }
 
 /**
- * The significant digits a formatted percentage shows, counted from its first non-zero digit:
- * `"0.070%"` → 2, `"12.39%"` → 4, `"1,234.0%"` → 5. A bound such as `"< 0.1%"` shows none.
+ * The significant digits a formatted percentage or rate figure shows, counted from its first
+ * non-zero digit: `"0.070%"` → 2, `"12.39%"` → 4, `"1,234.0%"` → 5, `"0.0137"` → 3. A bound such
+ * as `"< 0.1%"` shows none.
  */
 function significantDigits(text: string): number {
   if (BOUND_PREFIX.test(text)) {
@@ -1125,9 +1172,16 @@ export const RATIO_UNITS: ReadonlySet<string> = new Set([
 
 /**
  * Metric units whose value is a rate per unit of exposure rather than a 0–1 ratio: B4's
- * outcomes per unit of spend (backend unit `rate`, recorded at six places). They render as a
- * plain decimal at those six places (`"0.012345"`), because a percentage would misstate an
- * outcomes-per-currency-unit rate as a share.
+ * outcomes per unit of spend (backend unit `rate`, recorded at six places, with no `currency`
+ * of its own). {@link formatMetric} states such a rate per {@link RATE_SPEND_BASIS} units of
+ * the account currency its options name (`rateCurrency`), moving the exact decimal two places
+ * with no float conversion: `"0.013652"` and `"0.091546"` in USD read `"1.37 per USD 100"` and
+ * `"9.15 per USD 100"`. With no currency known it shows the rate unscaled and unlabelled
+ * (`"0.0137"`). The rates of one evidence table share one precision ({@link rateMetricDigits}):
+ * the fewest fraction digits at which every non-zero rate shows three significant digits and
+ * different rates read apart, at most the six recorded places (four once scaled), rounded half
+ * to even. Zero reads `"0 per USD 100"`. A rate is never a percentage, which would misstate
+ * outcomes per unit of currency as a share.
  */
 export const RATE_UNITS: ReadonlySet<string> = new Set(['rate']);
 
@@ -1160,18 +1214,108 @@ function withSuffix(text: string, suffix: string): string {
   return text === UNAVAILABLE ? text : `${text}${suffix}`;
 }
 
+/** A rate's currency as shown in its label: trimmed and upper-cased, or `null` when blank. */
+function rateCurrencyCode(currency: string | null | undefined): string | null {
+  return textOrNull(currency)?.toUpperCase() ?? null;
+}
+
+/**
+ * A rate as the decimal it is shown at: per {@link RATE_SPEND_BASIS} units of `code` when a
+ * currency is known, its exact decimal moved {@link RATE_SCALE_PLACES} places
+ * (`"0.013652"` → `"13652e-4"`, that is 1.3652), else the rate itself. The point moves on the
+ * exact coefficient and exponent, so no binary float ever rounds the figure.
+ *
+ * @returns The decimal, or `null` when a non-zero digit lies outside the places
+ *   ±{@link MAX_EXACT_PLACE} before or after the move, where `Intl` would render `"∞"`.
+ */
+function shownRate(value: Formattable, code: string | null): `${number}` | null {
+  const exact = toExactDecimal(value);
+  if (exact === null) {
+    return null;
+  }
+  const shift = code === null ? 0 : RATE_SCALE_PLACES;
+  const text = `${exact.coefficient.toString()}e${String(exact.exponent + shift)}`;
+  return isDecimalString(text) && toExactDecimal(text) !== null ? text : null;
+}
+
+/**
+ * A shown rate at exactly `digits` fraction digits, rounded half to even: `1.3652` at 2 →
+ * `"1.37"`, `0.91` at 3 → `"0.910"`. Zero in any form reads `"0"`. A non-zero rate that would
+ * round to zero reads as a bound at the same digits, `"< 0.0001"`, so it never reads as 0.
+ */
+function rateFigure(rate: `${number}`, digits: number): string {
+  if (isZero(rate)) {
+    return '0';
+  }
+  const places = fractionDigits(digits);
+  const text = normalizeSpaces(exactMoneyFormat(places).format(rate));
+  if (!/[1-9]/.test(text)) {
+    const step = stepText(places);
+    return isNegative(rate) ? `> -${step}` : `< ${step}`;
+  }
+  return text;
+}
+
+/**
+ * The fewest fraction digits, from 0 to the recorded six places less any per-100 scaling, at
+ * which every distinct non-zero shown rate has at least {@link MIN_RATE_SIGNIFICANT_DIGITS}
+ * significant digits and no two of them read alike; the most when none suffices.
+ */
+function rateDigitsOf(rates: ReadonlyMap<string, `${number}`>, code: string | null): number {
+  const max = RATE_RECORDED_DIGITS - (code === null ? 0 : RATE_SCALE_PLACES);
+  for (let digits = 0; digits < max; digits += 1) {
+    const texts = new Set<string>();
+    let readable = true;
+    for (const rate of rates.values()) {
+      const text = rateFigure(rate, digits);
+      if (!isZero(rate) && significantDigits(text) < MIN_RATE_SIGNIFICANT_DIGITS) {
+        readable = false;
+        break;
+      }
+      texts.add(text);
+    }
+    if (readable && texts.size === rates.size) {
+      return digits;
+    }
+  }
+  return max;
+}
+
+/**
+ * Formats a {@link RATE_UNITS} value: `"1.37 per USD 100"` with a currency, `"0.0137"` without,
+ * at `digits` fixed fraction digits when given, else at the digits {@link rateDigitsOf} picks
+ * for it alone. A value whose exact decimal is out of range renders {@link UNAVAILABLE}.
+ */
+function formatRate(
+  value: number | string,
+  currency: string | null | undefined,
+  digits: number | undefined,
+): string {
+  const amount = toFormattable(value);
+  const code = rateCurrencyCode(currency);
+  const rate = amount === null ? null : shownRate(amount, code);
+  if (rate === null) {
+    return UNAVAILABLE;
+  }
+  const places = digits ?? rateDigitsOf(new Map([[valueKey(rate), rate]]), code);
+  const figure = rateFigure(rate, places);
+  return code === null ? figure : `${figure} per ${code}${MONEY_SEPARATOR}${RATE_SPEND_BASIS}`;
+}
+
 /**
  * Formats a numeric metric value that is not money, by its unit. A ratio renders at
- * `ratioDigits` fixed fraction digits when given, else at {@link formatPercent}'s default.
+ * `options.ratioDigits` fixed fraction digits when given, else at {@link formatPercent}'s
+ * default; a rate per `options.rateCurrency` at `options.rateDigits` ({@link formatRate}).
  */
-function formatByUnit(value: number | string, unit: string, ratioDigits?: number): string {
+function formatByUnit(value: number | string, unit: string, options: MetricFormatOptions): string {
+  const { ratioDigits } = options;
   if (RATIO_UNITS.has(unit)) {
     return ratioDigits === undefined
       ? formatPercent(value)
       : formatPercent(value, ratioDigits, { fixed: true });
   }
   if (RATE_UNITS.has(unit)) {
-    return formatDecimal(value, RATE_DIGITS);
+    return formatRate(value, options.rateCurrency, options.rateDigits);
   }
   if (PERCENT_POINT_UNITS.has(unit)) {
     return withSuffix(formatDecimal(value, 1), '%');
@@ -1200,7 +1344,10 @@ function formatByUnit(value: number | string, unit: string, ratioDigits?: number
  *    `"unknown (3 deals not assessed)"`, which is never re-parsed.
  * 4. Money (a `currency` code, or a {@link MONEY_UNITS} unit) → {@link formatMoney}.
  * 5. {@link RATIO_UNITS} → {@link formatPercent}, at `options.ratioDigits` fixed fraction
- *    digits when given; {@link RATE_UNITS} → a six-place decimal;
+ *    digits when given; {@link RATE_UNITS} → outcomes per {@link RATE_SPEND_BASIS} units of
+ *    `options.rateCurrency` (`"1.37 per USD 100"`), or the unscaled rate when no currency is
+ *    given (`"0.0137"`), at `options.rateDigits` fixed fraction digits when given, else at the
+ *    precision {@link rateMetricDigits} picks for the value alone, never a percentage;
  *    {@link PERCENT_POINT_UNITS} → the decimal plus `%`; {@link DAY_UNITS} →
  *    {@link formatDays}; {@link P_VALUE_UNITS} → {@link formatPValue};
  *    {@link MULTIPLE_UNITS} → the decimal plus `×`.
@@ -1214,7 +1361,7 @@ function formatByUnit(value: number | string, unit: string, ratioDigits?: number
  *
  * @param metric - The metric, or any value paired with a unit and currency.
  * @param options - See {@link MetricFormatOptions}; omitted, a ratio renders at
- *   {@link formatPercent}'s default.
+ *   {@link formatPercent}'s default and a rate unscaled, with no currency.
  * @returns The display text.
  */
 export function formatMetric(metric: MetricInput, options: MetricFormatOptions = {}): string {
@@ -1231,9 +1378,7 @@ export function formatMetric(metric: MetricInput, options: MetricFormatOptions =
   }
   const currency = textOrNull(metric.currency);
   const isMoney = currency !== null || MONEY_UNITS.has(unit);
-  const text = isMoney
-    ? formatMoney(value, currency)
-    : formatByUnit(value, unit, options.ratioDigits);
+  const text = isMoney ? formatMoney(value, currency) : formatByUnit(value, unit, options);
   return metric.floor === true ? formatFloor(text, isMoney ? 'max' : 'min') : text;
 }
 
@@ -1273,6 +1418,65 @@ export function ratioMetricDigits(
   options?: PercentDigitsOptions,
 ): number {
   return percentDigits(metrics.map(percentValueOf), options);
+}
+
+/**
+ * The value of a metric that {@link formatMetric} renders as a rate: a numeric
+ * {@link RATE_UNITS} value with no currency that is not marked unavailable. Every other metric
+ * gives `null`.
+ */
+function rateValueOf(metric: MetricInput): NumericInput {
+  const { value } = metric;
+  if (metric.unavailable === true || value === undefined || typeof value === 'boolean') {
+    return null;
+  }
+  const isRate = RATE_UNITS.has(normalizeUnit(metric.unit));
+  return isRate && textOrNull(metric.currency) === null ? value : null;
+}
+
+/**
+ * The fixed fraction digits the rates among a set of metrics share, such as one evidence
+ * table's metrics and paired baselines (AAP 0.5.4.8: every cited number shown faithfully). Over
+ * the values {@link formatMetric} renders as rates ({@link RATE_UNITS}, no currency, not
+ * unavailable), each as shown per {@link RATE_SPEND_BASIS} units of `currency` when one is
+ * given, it returns the fewest digits at which both hold, and the most when none does:
+ *
+ * - every non-zero rate shows at least three significant digits;
+ * - rates that differ in value never render the same text.
+ *
+ * The most is the six places the backend records a rate at, four once the per-100 scaling has
+ * moved the point, so no digit the run did not record is ever shown. Every other metric of the
+ * set is ignored, so a table of mixed units can pass all its rows. Pass the result to
+ * {@link formatMetric} as `rateDigits`, with the same `currency` as `rateCurrency`, for each
+ * metric of the set. Decimal strings are compared and scaled exactly, without a float
+ * conversion.
+ *
+ * @param metrics - The metrics of the set.
+ * @param currency - The ISO 4217 code of the spend the rates are per; `null`, omitted or blank
+ *   for none, when the rates are shown unscaled.
+ * @returns The fraction digits.
+ *
+ * @example
+ * ```ts
+ * const digits = rateMetricDigits([weekendRate, weekdayRate, weekendSpend], 'USD'); // 2
+ * formatMetric(weekendRate, { rateCurrency: 'USD', rateDigits: digits }); // "1.37 per USD 100"
+ * rateMetricDigits([weekendRate, weekdayRate]); // 4: "0.0137" and "0.0915"
+ * ```
+ */
+export function rateMetricDigits(
+  metrics: readonly MetricInput[],
+  currency?: string | null,
+): number {
+  const code = rateCurrencyCode(currency);
+  const distinct = new Map<string, `${number}`>();
+  for (const metric of metrics) {
+    const amount = toFormattable(rateValueOf(metric));
+    const rate = amount === null ? null : shownRate(amount, code);
+    if (rate !== null) {
+      distinct.set(valueKey(rate), rate);
+    }
+  }
+  return rateDigitsOf(distinct, code);
 }
 
 /**
@@ -1331,6 +1535,9 @@ function formatProjection(projected: Projection | null | undefined): string {
  *   it or before its unit. The result is deliberately not passed through `normalizeSpaces`,
  *   which only replaces the spaces ICU emits inside `Intl` output.
  * - Counts render through {@link formatCount}; the unit is appended when present.
+ * - A floored observed count (`floor: true`, AAP 0.5.4.7) reads "≥ N" through
+ *   {@link formatFloor}, as its own column shows it: `"≥ 34 / 3 Qualified Leads"`. The minimum
+ *   is never a floor.
  * - A projection is labelled as one (AAP 0.5.4.6 CR3): `"3,100 / 4,200 form opens ·
  *   ≈ 52,000 impressions (projected through the observed open rate)"`.
  * - Both evidence samples and withheld samples (unit possibly `null`, no projection) are
@@ -1347,7 +1554,11 @@ export function formatSample(sample: SampleInput): string {
   if (noObserved && noRequired) {
     return '';
   }
-  let line = `${formatSampleValue(observed)}${FIGURE_SEPARATOR}${formatSampleValue(required)}`;
+  const seen =
+    sample.floor === true
+      ? formatFloor(formatSampleValue(observed), 'min')
+      : formatSampleValue(observed);
+  let line = `${seen}${FIGURE_SEPARATOR}${formatSampleValue(required)}`;
   const unit = textOrNull(sample.unit);
   if (unit !== null) {
     line += ` ${unit}`;
@@ -1357,22 +1568,158 @@ export function formatSample(sample: SampleInput): string {
 }
 
 /**
- * Formats a p-value (AAP 0.5.4.6 CR1, 0.5.4.5 B4): `"< 0.001"` below 0.001, otherwise up to
- * three fraction digits without padding (`"0.0321"` → `"0.032"`, `"0.05"` → `"0.05"`). An
- * absent or non-numeric value renders {@link UNAVAILABLE}.
- *
- * @param p - The p-value.
- * @returns The formatted p-value.
+ * An exact probability in [0, 1]: an {@link ExactDecimal} with the place of its leading digit,
+ * read from the digit text, so a bound is judged before any `BigInt` arithmetic.
  */
-export function formatPValue(p: NumericInput): string {
-  const value = toFormattable(p);
+interface ExactProbability extends ExactDecimal {
+  /**
+   * The place of the leading non-zero digit: `0.0312` → -2, `1` → 0, 3.12936 × 10⁻³⁰⁴ → -304.
+   * It is `-Infinity` for zero, and, with `exponent`, for a positive value whose exponent
+   * overflows a number (`"1e-"` followed by 400 nines). Both lie below every bound, so neither
+   * reaches any `BigInt` arithmetic.
+   */
+  readonly leading: number;
+}
+
+/** Zero as an exact probability, below every bound. */
+const ZERO_PROBABILITY: ExactProbability = {
+  coefficient: 0n,
+  exponent: 0,
+  leading: Number.NEGATIVE_INFINITY,
+};
+
+/**
+ * Compares two exact decimals with no float conversion: negative when `a` is below `b`, zero when
+ * they are equal (`0.05` and `0.0500`), positive when it is above.
+ */
+function compareExact(a: ExactDecimal, b: ExactDecimal): number {
+  const exponent = Math.min(a.exponent, b.exponent);
+  const left = a.coefficient * 10n ** BigInt(a.exponent - exponent);
+  const right = b.coefficient * 10n ** BigInt(b.exponent - exponent);
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+/**
+ * Rounds a non-negative exact decimal to `places` fraction digits, half to even as the backend's
+ * `Decimal` rounding does (`0.01245` → `0.0124`, `0.01235` → `0.0124`), exactly in `BigInt`.
+ */
+function roundHalfEven(value: ExactDecimal, places: number): ExactDecimal {
+  const dropped = -places - value.exponent;
+  if (dropped <= 0) {
+    return { coefficient: value.coefficient * 10n ** BigInt(-dropped), exponent: -places };
+  }
+  const divisor = 10n ** BigInt(dropped);
+  const quotient = value.coefficient / divisor;
+  const twiceRemainder = (value.coefficient % divisor) * 2n;
+  const up = twiceRemainder > divisor || (twiceRemainder === divisor && quotient % 2n === 1n);
+  return { coefficient: up ? quotient + 1n : quotient, exponent: -places };
+}
+
+/** A non-negative exact decimal at exponent `-places` in fixed point, padded: `"0.0500"`. */
+function fixedPointText(value: ExactDecimal, places: number): string {
+  const digits = value.coefficient.toString().padStart(places + 1, '0');
+  return places === 0 ? digits : `${digits.slice(0, -places)}.${digits.slice(-places)}`;
+}
+
+/**
+ * Reads a p-value or significance level as an exact probability in [0, 1], with a digit at any
+ * place. {@link toExactDecimal}'s ±{@link MAX_EXACT_PLACE} guard keeps money and rates inside
+ * what `Intl` renders; a probability never reaches `Intl`, and the backend's p-values reach below
+ * 10⁻³⁰⁷. B4's Poisson rate test gives 3.12936 × 10⁻³⁰⁴ for 0 against 1,390 outcomes on equal
+ * spend, which the API sends in fixed point (`"0.000…0312936"`) and the backend words
+ * `"p < 0.0001"`. Sign and range are decided on the digit text, so `"1e-999999"` costs a scan,
+ * and the only `BigInt` built holds the value's own significant digits.
+ *
+ * @param value - A p-value or α as the evidence records it.
+ * @returns The probability, or `null` when the value is absent, non-numeric, negative or above 1.
+ */
+function exactProbability(value: NumericInput): ExactProbability | null {
+  const formattable = toFormattable(value);
+  if (formattable === null) {
+    return null;
+  }
+  const text: `${number}` = typeof formattable === 'number' ? `${formattable}` : formattable;
+  const { mantissa, exponent } = splitDecimal(text);
+  const pointAt = mantissa.indexOf('.');
+  const fraction = pointAt === -1 ? 0 : mantissa.length - pointAt - 1;
+  const digits = mantissa.replace('.', '').replace(/^0+/, '');
+  const significant = digits.replace(/0+$/, '');
+  if (significant === '') {
+    return ZERO_PROBABILITY;
+  }
+  const lowest = exponent - fraction + (digits.length - significant.length);
+  const leading = lowest + significant.length - 1;
+  // Above 1: a digit above the units place, or a units digit with any other digit after it.
+  if (text.startsWith('-') || leading > 0 || (leading === 0 && significant !== '1')) {
+    return null;
+  }
+  return { coefficient: BigInt(significant), exponent: lowest, leading };
+}
+
+/**
+ * An exact significance level in (0, 1), or `null` when α is absent, non-numeric, outside it,
+ * or led by a digit deeper than {@link MAX_LEVEL_PLACE}, where no p-value is judged against it.
+ */
+function exactLevel(alpha: NumericInput): ExactProbability | null {
+  const level = exactProbability(alpha);
+  // In [0, 1], a leading digit at the units place is 1 itself; zero leads at -Infinity.
+  return level === null || level.leading === 0 || level.leading < -MAX_LEVEL_PLACE
+    ? null
+    : level;
+}
+
+/**
+ * Formats a p-value (AAP 0.5.4.6 CR1, 0.5.4.5 B4) by the backend's one p-value rule
+ * (`analysis/stats.p_relation`), which words every p-value of the B4 reason and withheld line
+ * and of the CR1 label, flag message and reason, so a card's test line and its sentence state
+ * the same p-value the same way (AAP 0.5.4: the reason never drifts from the evidence):
+ *
+ * - The bound is 0.0001, or, with an `alpha` below it, the first smaller power of ten that does
+ *   not exceed `alpha`. A p-value below it reads as the bound, however small it is:
+ *   `"< 0.0001"` for the B4 p-value `"0.0000000000127560"` (1.2756 × 10⁻¹¹) and for one of
+ *   3.12936 × 10⁻³⁰⁴ sent as `"0.000…0312936"`.
+ * - Any other p-value is rounded half to even at the bound's places, four for every `alpha` of
+ *   at least 0.0001, and padded to them: `"0.017600"` → `"0.0176"`, `"0.05"` → `"0.0500"`,
+ *   `1` → `"1.0000"`.
+ * - Given `alpha`, one place more is shown at a time until the figure lies on the same side of
+ *   `alpha` as the p-value, so it reads below `alpha` exactly when the p-value is: `"0.04996"`
+ *   against `"0.05"` → `"0.04996"`, never `"0.0500"`. Without `alpha` no place is added.
+ *
+ * The comparison and the rounding are exact on the API's fixed-point decimal strings, with no
+ * binary float and at any exponent ({@link exactProbability}). The bound's places come from
+ * the leading digit of `alpha`, and whether a p-value lies below the bound from its own, so a
+ * p-value of `"1e-999999"` costs a scan of its text; every place added after that is one of the
+ * p-value's own digits. An absent or non-numeric value, or one outside [0, 1], renders
+ * {@link UNAVAILABLE}. An `alpha` that is absent, non-numeric, outside (0, 1) or led by a digit
+ * deeper than {@link MAX_LEVEL_PLACE} is ignored.
+ *
+ * @param p - The raw or adjusted p-value.
+ * @param alpha - The significance level the p-value is judged at, such as `evidence.test.alpha`.
+ * @returns The p-value figure, or the bound with its `"<"`.
+ */
+export function formatPValue(p: NumericInput, alpha?: NumericInput): string {
+  const value = exactProbability(p);
   if (value === null) {
     return UNAVAILABLE;
   }
-  if (Number(value) < P_VALUE_FLOOR) {
-    return `< ${formatDecimal(P_VALUE_FLOOR, P_VALUE_DIGITS)}`;
+  const level = exactLevel(alpha);
+  // 10^-places, the first power of ten at or below alpha, sits at alpha's leading place.
+  let places = level === null ? P_VALUE_PLACES : Math.max(P_VALUE_PLACES, -level.leading);
+  // Below 10^-places exactly when led by a deeper digit, or zero: no power of ten is built.
+  if (value.leading < -places) {
+    return `< ${stepText(places)}`;
   }
-  return normalizeSpaces(numberFormat('decimal', 0, P_VALUE_DIGITS).format(value));
+  let shown = roundHalfEven(value, places);
+  if (level !== null) {
+    const below = compareExact(value, level) < 0;
+    // Ends: once `places` reaches the value's own last digit the rounding is exact, and the
+    // exact value lies on its own side of alpha.
+    while ((compareExact(shown, level) < 0) !== below) {
+      places += 1;
+      shown = roundHalfEven(value, places);
+    }
+  }
+  return fixedPointText(shown, places);
 }
 
 /**
@@ -1389,31 +1736,38 @@ export const TEST_LABELS: ReadonlyMap<string, string> = new Map([
   ['holm', 'Holm-adjusted'],
 ]);
 
-/** `"= 0.012"`, or the bound itself for `"< 0.001"`, so the line never reads `"p = < 0.001"`. */
+/**
+ * `"= 0.0123"`, or the bound itself for `"< 0.0001"`, so the line never reads `"p = < 0.0001"`:
+ * the relation the backend's `p_relation` writes after "p".
+ */
 function pRelation(text: string): string {
   return text.startsWith('<') ? text : `= ${text}`;
 }
 
 /**
  * Formats the test line of a card (AAP 0.5.5: "the test line where a test was used"), for
- * example `"Fisher's exact test · p = 0.012 · adjusted p = 0.036 · α 0.05"`. Known backend
+ * example `"Fisher's exact test · p = 0.0120 · adjusted p = 0.0360 · α 0.05"`. Known backend
  * method names map through {@link TEST_LABELS}; the adjusted segment appears only when an
- * adjusted p-value exists (Holm, AAP 0.5.4.6), and the α segment only when α is present.
+ * adjusted p-value exists (Holm, AAP 0.5.4.6), and the α segment only when α is present. Both
+ * p-values are judged against the test's α by {@link formatPValue}, the rule the backend words
+ * them by in the card's reason, label and flag message: `"p < 0.0001"` on both for a B4 p-value
+ * of 1.2756 × 10⁻¹¹, and `"adjusted p = 0.0176"` beside a CR1 label's
+ * `"(adjusted p = 0.0176)"`.
  *
  * @param test - The test from the item's evidence.
  * @returns The test line.
  */
 export function formatTestLine(test: StatTestInput): string {
   const name = test.name.trim();
+  const alpha = asNumeric(test.alpha);
   const segments = [
     TEST_LABELS.get(name) ?? name,
-    `p ${pRelation(formatPValue(asNumeric(test.p_value)))}`,
+    `p ${pRelation(formatPValue(asNumeric(test.p_value), alpha))}`,
   ];
   const adjusted = asNumeric(test.p_adjusted);
   if (adjusted !== null && adjusted !== undefined) {
-    segments.push(`adjusted p ${pRelation(formatPValue(adjusted))}`);
+    segments.push(`adjusted p ${pRelation(formatPValue(adjusted, alpha))}`);
   }
-  const alpha = asNumeric(test.alpha);
   if (alpha !== null && alpha !== undefined) {
     segments.push(`α ${formatDecimal(alpha, ALPHA_DIGITS)}`);
   }

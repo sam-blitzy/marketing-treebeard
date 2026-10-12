@@ -124,9 +124,10 @@ import {
   formatTestLine,
   formatWindowChip,
   isDecimalString,
+  rateMetricDigits,
   ratioMetricDigits,
 } from '../../src/lib/format';
-import type { MetricInput } from '../../src/lib/format';
+import type { MetricFormatOptions, MetricInput } from '../../src/lib/format';
 
 // ---------------------------------------------------------------------------------------------
 // API paths and timing
@@ -283,7 +284,7 @@ const WINDOW_CHIP_PATTERN = '^\\S+ \u2013 \\S+ \u00b7 ';
 
 // The white-paper tables, as `src/features/actions/sections/WhitePapersSection.tsx` labels them.
 const PER_CREATIVE_PREFIX = 'Per creative: ';
-/** The name of an asset row's notes list in its details, before the asset name. */
+/** The name of an asset row's notes list in its details, before the row's label. */
 const ROW_NOTES_PREFIX = 'Notes on ';
 const NO_CREATIVE_ROWS = 'No per-creative rows recorded for this white paper';
 const UNKNOWN_CREATIVE_LABEL = 'unknown creative';
@@ -859,10 +860,10 @@ const SNAPSHOT_LABELS: SnapshotLabels = {
  * Reads, inside the page, what each element shows, so a section of any size is compared in
  * one round trip: a card's evidence blocks, window chips and flag lists, or a table's caption,
  * headers and body rows, each with its expanded white-paper detail (per-creative table,
- * evidence, chip, flags and "Notes on {asset}" list). Texts are `textContent`, trimmed, without
- * the text of any `role="tooltip"` bubble: a metric label's `Tooltip` keeps its help text in
- * the DOM while closed, and the row header shows, and is named by, the label alone. It runs
- * through `evaluateAll`, so it reads only its arguments and the DOM.
+ * evidence, chip, flags and "Notes on {asset} ({scope})" list). Texts are `textContent`,
+ * trimmed, without the text of any `role="tooltip"` bubble: a metric label's `Tooltip` keeps its
+ * help text in the DOM while closed, and the row header shows, and is named by, the label alone.
+ * It runs through `evaluateAll`, so it reads only its arguments and the DOM.
  *
  * @param roots - the `article` cards or `table` elements to read
  * @param labels - the UI labels the parts are found by
@@ -1081,6 +1082,21 @@ function pairedBaselineInput(baseline: Baseline, metric: Metric): MetricInput {
   return { value: baseline.value, unit: metric.unit, currency: metric.currency };
 }
 
+/** The baselines each metric row shows, as {@link pairBaselines} pairs them. */
+interface BaselineRows {
+  readonly byMetric: readonly (readonly Baseline[])[];
+}
+
+/**
+ * Every baseline paired with a metric, each as the table formats it ({@link pairedBaselineInput};
+ * `pairedBaselineInputs` in `EvidenceTable.tsx`).
+ */
+function pairedBaselineInputs(metrics: readonly Metric[], pairing: BaselineRows): MetricInput[] {
+  return metrics.flatMap((metric, index) =>
+    (pairing.byMetric[index] ?? []).map((baseline) => pairedBaselineInput(baseline, metric)),
+  );
+}
+
 /**
  * The one fixed fraction-digit count of every percentage in an evidence table, as
  * `evidenceRatioDigits` in `EvidenceTable.tsx` picks it (`tableRatioDigits`):
@@ -1088,14 +1104,29 @@ function pairedBaselineInput(baseline: Baseline, metric: Metric): MetricInput {
  * formats it. CR1 lead rates of 0.000722 and 0.000698 therefore read "0.072%" and "0.070%",
  * never "0.1%" twice.
  */
-function tableRatioDigits(
-  metrics: readonly Metric[],
-  pairing: { readonly byMetric: readonly (readonly Baseline[])[] },
-): number {
-  const paired = metrics.flatMap((metric, index) =>
-    (pairing.byMetric[index] ?? []).map((baseline) => pairedBaselineInput(baseline, metric)),
-  );
-  return ratioMetricDigits([...metrics, ...paired]);
+function tableRatioDigits(metrics: readonly Metric[], pairing: BaselineRows): number {
+  return ratioMetricDigits([...metrics, ...pairedBaselineInputs(metrics, pairing)]);
+}
+
+/**
+ * The options every metric value and paired baseline of an evidence table is formatted with, as
+ * `tableFormatOptions` in `EvidenceTable.tsx` picks them: every percentage at the table's one
+ * precision ({@link tableRatioDigits}), and every rate per unit of spend stated per 100 units of
+ * the evidence's account currency (`evidenceCurrency`, which a rate metric does not carry
+ * itself), at the one precision `rateMetricDigits` picks for every metric and paired baseline in
+ * that currency. B4's weekend and weekday rates of 0.013652 and 0.091546 in USD therefore read
+ * "1.37 per USD 100" and "9.15 per USD 100" (a no-break space before "100"); with no currency
+ * recorded, unscaled at one precision, "0.0137" and "0.0915". A rate is never a percentage.
+ */
+function tableFormatOptions(evidence: Evidence, pairing: BaselineRows): MetricFormatOptions {
+  const { metrics } = evidence;
+  const rateCurrency = evidenceCurrency(evidence);
+  const cited = [...metrics, ...pairedBaselineInputs(metrics, pairing)];
+  return {
+    ratioDigits: tableRatioDigits(metrics, pairing),
+    rateCurrency,
+    rateDigits: rateMetricDigits(cited, rateCurrency),
+  };
 }
 
 /**
@@ -1182,27 +1213,29 @@ function datasetText(entry: DatasetCoverage, sourceDays: EvidenceWindow['source_
 /**
  * The evidence block an item's frozen evidence renders as (AAP 0.5.4.8; `EvidenceTable.tsx`):
  * one row per metric with its value and paired baselines, every percentage among them at the
- * table's one precision ({@link tableRatioDigits}), the unpaired baselines, the thresholds
- * applied and the datasets used, then the sample and test lines.
+ * table's one precision and every rate per unit of spend per 100 units of the evidence's
+ * currency at one shared precision ({@link tableFormatOptions}), the unpaired baselines, the
+ * thresholds applied and the datasets used, then the sample and test lines.
  *
  * @param evidence - the item's `evidence`, as the API returned it
- * @param caption - the table's caption: "Evidence" on a card, "Evidence for {asset}" on a row
+ * @param caption - the table's caption: "Evidence" on a card, "Evidence for {asset} ({scope})"
+ *   on a row ({@link assetRowLabel})
  * @returns the block, every text trimmed as the snapshot reads it
  */
 function expectedEvidenceBlock(evidence: Evidence, caption: string): EvidenceBlock {
   const { metrics, baselines, sample, test: statTest, thresholds, datasets } = evidence;
   const pairing = pairBaselines(metrics, baselines);
-  const ratioDigits = tableRatioDigits(metrics, pairing);
+  const options = tableFormatOptions(evidence, pairing);
   const rows = metrics.map((metric, index): EvidenceRow => {
     const paired = pairing.byMetric[index] ?? [];
     return {
       header: metricLabel(metric).trim(),
-      value: formatMetric(metric, { ratioDigits }).trim(),
+      value: formatMetric(metric, options).trim(),
       baselines:
         paired.length === 0
           ? [EM_DASH]
           : paired.map((baseline) => {
-              const value = formatMetric(pairedBaselineInput(baseline, metric), { ratioDigits });
+              const value = formatMetric(pairedBaselineInput(baseline, metric), options);
               return `${baselineLabel(baseline)}: ${value}`.trim();
             }),
     };
@@ -1532,17 +1565,22 @@ interface ExpectedAssetTable {
 }
 
 /**
- * The name of an expanded white-paper row's toggle, independently of `rowLabelOf` in
- * `WhitePapersSection.tsx`: "Hide details for {asset} ({scope})", and, when another row of the
- * table shows the same asset name, "Hide details for {asset} ({scope}, {asset id})", the item
- * id standing in for a blank asset id.
+ * A white-paper row's label, independently of `rowLabelOf` in `WhitePapersSection.tsx`:
+ * "{asset} ({scope})", and, when another row of the table shows the same asset name, "{asset}
+ * ({scope}, {asset id})", the item id standing in for a blank asset id. The row's toggle and its
+ * details' per-creative table, evidence table and notes list are each named for it.
  */
-function expandedToggleName(table: ExpectedAssetTable, item: Item): string {
+function assetRowLabel(table: ExpectedAssetTable, item: Item): string {
   const name = assetName(item);
   const shared = table.items.filter((other) => assetName(other) === name).length > 1;
   const entityId = item.entity.id?.trim() ?? '';
   const id = entityId === '' ? `item ${String(item.id)}` : entityId;
-  return `Hide details for ${name} (${shared ? `${table.scope}, ${id}` : table.scope})`;
+  return `${name} (${shared ? `${table.scope}, ${id}` : table.scope})`;
+}
+
+/** The name of an expanded white-paper row's toggle: "Hide details for {label}". */
+function expandedToggleName(table: ExpectedAssetTable, item: Item): string {
+  return `Hide details for ${assetRowLabel(table, item)}`;
 }
 
 /**
@@ -1710,8 +1748,9 @@ function entityKey(entity: EntityView): string | null {
 
 /**
  * The skipped-stage notes a rendered white-paper row lists first in its details' "Notes on
- * {asset}" (`placeSkippedFindings`, `assetNotes`): the message of each `skipped_stage` finding of
- * the section about the row's entity, in API order, or its code when the message is blank.
+ * {asset} ({scope})" (`placeSkippedFindings`, `assetNotes`): the message of each
+ * `skipped_stage` finding of the section about the row's entity, in API order, or its code when
+ * the message is blank.
  */
 function skippedStageNotes(section: Section, item: Item): string[] {
   const key = entityKey(item.entity);
@@ -1901,8 +1940,9 @@ function expectWhitePaperRendering(
  * every held disclosure, batch and row opened, the section shows one table per cohort and row
  * kind, in order; each table its column headers and exactly its rows, in API order; each row its
  * cells; and each row's detail its per-creative rows, its evidence, chip and flags
- * ({@link expectItemEvidence}), and its skipped-stage notes first in its "Notes on {asset}"
- * ({@link skippedStageNotes}).
+ * ({@link expectItemEvidence}), and its skipped-stage notes first in its "Notes on {asset}
+ * ({scope})" ({@link skippedStageNotes}), each part named for the row's label
+ * ({@link assetRowLabel}).
  *
  * @returns the rendered asset tables
  */
@@ -1934,6 +1974,8 @@ async function expectWhitePaperRows(
     ).toEqual(cohort.items.map((item) => expandedToggleName(cohort, item)));
     cohort.items.forEach((item, rowIndex) => {
       const name = assetName(item);
+      // The row's details are named for its label, its cohort's currency included.
+      const label = assetRowLabel(cohort, item);
       const where =
         `white paper "${name}" (item ${item.id}, "${cohort.caption}", ` +
         `run ${expected.run.id})`;
@@ -1954,13 +1996,13 @@ async function expectWhitePaperRows(
       expect(
         notes.map((list) => list.label),
         `${where} shows at most one notes list, its own`,
-      ).toEqual(notes.length === 0 ? [] : [`${ROW_NOTES_PREFIX}${name}`]);
+      ).toEqual(notes.length === 0 ? [] : [`${ROW_NOTES_PREFIX}${label}`]);
       expect(
         notes[0]?.entries.slice(0, skipped.length) ?? [],
         `${where}: its skipped-stage notes, verbatim and first among its notes`,
       ).toEqual(skipped);
       expect(creatives.caption, `${where}: its per-creative caption`).toBe(
-        `${PER_CREATIVE_PREFIX}${name}`,
+        `${PER_CREATIVE_PREFIX}${label}`,
       );
       const mql = frozenMqlHeader(item) ?? cohort.mql;
       expectHeaders(
@@ -1972,7 +2014,7 @@ async function expectWhitePaperRows(
         creatives.rows.map((creative) => creative.cells),
         `${where}: its per-creative rows`,
       ).toEqual(creativeTableRows(item));
-      expectItemEvidence(row.detail, item, `${EVIDENCE_FOR_PREFIX}${name}`, where);
+      expectItemEvidence(row.detail, item, `${EVIDENCE_FOR_PREFIX}${label}`, where);
     });
   });
   return tables;

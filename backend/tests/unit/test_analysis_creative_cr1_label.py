@@ -7,9 +7,11 @@ the observed difference", with the figure replaced by "not estimable" for identi
 estimated n, 0 included: when the current samples already reach ``cr.power`` at the observed
 difference, the label still reads "about 0 more …" and the evidence records the power reached
 (``evidence.extra.power`` and ``power_reached_at_observed_difference``). The figure is the
-p-value at 4 places ("adjusted p = 0.0865"); below 0.0001 it is the bound itself ("adjusted
-p < 0.0001"), never "adjusted p = < 0.0001", in the label, the ``not_distinguishable`` flag and
-the reason.
+p-value as ``stats.p_relation`` words it against ``cr.alpha``, the rule the card's test line
+shares: 4 places ("adjusted p = 0.0865"); below 0.0001 the bound itself ("adjusted
+p < 0.0001"), never "adjusted p = < 0.0001"; below a ``cr.alpha`` under 0.0001 the bound and
+places move to the next smaller power of ten ("adjusted p = 0.00004" against 0.00001), in the
+label, the ``not_distinguishable`` flag and the reason.
 
 Contexts come from the scenario catalogue (``SCENARIOS[name].build_context()``). The n = 0
 pair reuses the ``cr1.fisher`` world with 5 vs 0 leads on 1,000 impressions per variant
@@ -33,7 +35,11 @@ from ads_engine.analysis.context import (
     Candidate,
 )
 from ads_engine.analysis.creative import NOT_ESTIMABLE, NOT_ESTIMABLE_NO_DIFFERENCE, CreativeConfig
-from ads_engine.analysis.stats import additional_n_for_difference, compare_proportions
+from ads_engine.analysis.stats import (
+    additional_n_for_difference,
+    compare_proportions,
+    p_relation,
+)
 from ads_engine.simulation import scenarios
 from ads_engine.simulation.scenarios import SCENARIOS
 
@@ -70,10 +76,16 @@ P_PLACES: Final = Decimal("0.0001")
 BOUND_TEXT: Final = "< 0.0001"
 """How a p-value below :data:`P_PLACES` renders after "p": the bound, with no "=" before it."""
 
+STRICT_TEXT: Final = "= 0.00004"
+"""The bounded pair's p ≈ 0.000042 against :data:`STRICT_ALPHA`: 5 places, above alpha."""
 
-def _rendered_p(value: Decimal) -> str:
-    """A p-value with its relation as items render it: "= 0.0123", or "< 0.0001" below that."""
-    return BOUND_TEXT if value < P_PLACES else f"= {value.quantize(P_PLACES):f}"
+
+def _rendered_p(value: Decimal, alpha: Decimal) -> str:
+    """A p-value with its relation as items render it against ``alpha``: "= 0.0123", "< 0.0001".
+
+    The one rule of ``stats.p_relation``, whose cases ``test_stats.py`` pins.
+    """
+    return p_relation(value, alpha)
 
 
 def _powered_context() -> AnalysisContext:
@@ -176,7 +188,7 @@ def test_zero_more_impressions_keeps_the_prescribed_template() -> None:
     assert test.p_adjusted is not None
     assert test.p_adjusted >= config.alpha
 
-    shown_p = _rendered_p(test.p_adjusted)
+    shown_p = _rendered_p(test.p_adjusted, config.alpha)
     assert shown_p == f"= {test.p_adjusted.quantize(P_PLACES):f}"
     expected = f"{_leader_name(item)} {AHEAD_TEXT}{shown_p}); about 0 {NEEDED_TEXT}"
     assert label == expected
@@ -232,10 +244,8 @@ def test_not_estimable_figure_keeps_its_wording() -> None:
     test = item.evidence.test
     assert test is not None
     assert test.p_adjusted is not None
-    assert (
-        f"Level, not yet distinguishable (adjusted p {_rendered_p(test.p_adjusted)}); "
-        in item.action
-    )
+    shown_p = _rendered_p(test.p_adjusted, config.alpha)
+    assert f"Level, not yet distinguishable (adjusted p {shown_p}); " in item.action
     assert "about" not in item.action
     assert extra["sample_needed"] == NOT_ESTIMABLE
     assert extra["not_estimable_reason"] == NOT_ESTIMABLE_NO_DIFFERENCE
@@ -253,7 +263,9 @@ def test_distinguishable_label_is_unchanged() -> None:
     test = item.evidence.test
     assert test is not None
     assert test.p_adjusted is not None
-    assert extra["label"] == f"Distinguishable (adjusted p {_rendered_p(test.p_adjusted)})"
+    assert extra["label"] == (
+        f"Distinguishable (adjusted p {_rendered_p(test.p_adjusted, config.alpha)})"
+    )
     assert NEEDED_TEXT not in item.action
     assert extra["sample_needed"] is None
     assert extra["power"] == config.power
@@ -275,7 +287,8 @@ def test_bounded_pair_preconditions_hold_at_the_configured_thresholds() -> None:
     assert test is not None
     assert test.method == "two_proportion_z"
     assert STRICT_ALPHA <= test.p_value < P_PLACES <= config.alpha
-    assert _rendered_p(test.p_value) == BOUND_TEXT
+    assert _rendered_p(test.p_value, config.alpha) == BOUND_TEXT
+    assert _rendered_p(test.p_value, STRICT_ALPHA) == STRICT_TEXT
 
 
 def test_distinguishable_p_below_the_bound_reads_without_an_equals_sign() -> None:
@@ -305,7 +318,12 @@ def test_distinguishable_p_below_the_bound_reads_without_an_equals_sign() -> Non
         assert "= <" not in text
 
 
-def test_not_distinguishable_p_below_the_bound_reads_without_an_equals_sign() -> None:
+def test_not_distinguishable_p_below_0_0001_reads_above_a_smaller_alpha() -> None:
+    """Against cr.alpha 0.00001 the bound and places move to 0.00001: p reads "= 0.00004".
+
+    A "< 0.0001" here would not say on which side of alpha the p-value lies; the figure at the
+    smaller alpha's places reads above it, as the pair is not yet distinguishable.
+    """
     ctx = _bounded_context(STRICT_ALPHA)
     config = CreativeConfig.from_thresholds(ctx.thresholds)
     assert config.alpha == STRICT_ALPHA
@@ -320,21 +338,25 @@ def test_not_distinguishable_p_below_the_bound_reads_without_an_equals_sign() ->
     assert extra["distinguishable"] is False
     needed = extra["sample_needed"]
     assert isinstance(needed, int)
+    assert _rendered_p(test.p_value, config.alpha) == STRICT_TEXT
+    assert _rendered_p(test.p_adjusted, config.alpha) == STRICT_TEXT
+    assert Decimal(STRICT_TEXT.removeprefix("= ")) >= STRICT_ALPHA
 
-    label = f"{_leader_name(item)} {AHEAD_TEXT}{BOUND_TEXT}); about {needed:,} {NEEDED_TEXT}"
+    label = f"{_leader_name(item)} {AHEAD_TEXT}{STRICT_TEXT}); about {needed:,} {NEEDED_TEXT}"
     assert extra["label"] == label
     assert item.action == f"{_title(item)}: {label}"
     assert [(f.code, f.message) for f in item.flags] == [
-        (FLAG_NOT_DISTINGUISHABLE, f"Not yet distinguishable (adjusted p {BOUND_TEXT})")
+        (FLAG_NOT_DISTINGUISHABLE, f"Not yet distinguishable (adjusted p {STRICT_TEXT})")
     ]
     campaign = extra["campaign"]["name"]
     assert (
-        f"; {extra['test']['label']} p {BOUND_TEXT}, Holm-adjusted across 1 pair in {campaign} "
-        f"{BOUND_TEXT}, against \u03b1 {config.alpha.normalize():f}; "
+        f"; {extra['test']['label']} p {STRICT_TEXT}, Holm-adjusted across 1 pair in {campaign} "
+        f"{STRICT_TEXT}, against \u03b1 {config.alpha.normalize():f}; "
     ) in item.reason
     assert item.reason.endswith("the gap is not yet distinguishable from noise.")
     for text in (item.action, item.reason, *(f.message for f in item.flags)):
         assert "= <" not in text
+        assert BOUND_TEXT not in text
 
 
 def _leads_context(leads_a: int, leads_b: int) -> AnalysisContext:

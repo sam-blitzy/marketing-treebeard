@@ -526,6 +526,19 @@ def test_flag_metric_baseline_sample_and_test_rendering() -> None:
         "unit": "form opens",
         "projected": {"value": "15000", "unit": "impressions", "basis": "open rate"},
     }
+    # A floored CRM count keeps its floor ("≥ N", AAP 0.5.4.7); the key is added only then.
+    assert not sample.floor
+    assert "floor" not in Sample(5, 5, "days").to_json()
+    floored = Sample(34, 3, "Qualified Leads", floor=True)
+    assert floored.met
+    assert floored.to_json() == {
+        "observed": 34,
+        "required": 3,
+        "unit": "Qualified Leads",
+        "floor": True,
+    }
+    with pytest.raises(TypeError, match=r"Sample\.floor"):
+        Sample(34, 3, "Qualified Leads", floor=1)  # type: ignore[arg-type]
     test = TestResult("Fisher's exact test", Decimal("0.01"), None, Decimal("0.05"))
     assert test.to_json() == {"name": "Fisher's exact test", "p_value": "0.01", "alpha": "0.05"}
     assert TestResult.__test__ is False

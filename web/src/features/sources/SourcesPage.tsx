@@ -78,6 +78,7 @@ import {
   PageShell,
   Spinner,
   Stack,
+  withTokenBreaks,
 } from '../../design-system';
 import type { DataTableColumn, Tone } from '../../design-system';
 import {
@@ -430,8 +431,8 @@ function activeDatasetRows(source: Source): ActiveDatasetRow[] {
 /**
  * The columns of the active-datasets table. Mode and state are printed as the API returns them.
  * The numeric ID is end-aligned in tabular figures, as Rows is in the recent sync runs table.
- * The reason may break between any two characters, so an unbroken token in it, such as a
- * dataset or variable name, wraps inside the region instead of widening the table.
+ * The reason wraps between words, and a long token in it, such as `DATA_MODE=simulated` or a
+ * dataset name, after its separators (the `DataTable` default), so no word breaks inside itself.
  *
  * @param displayTimezone - the IANA zone instants are shown in
  * @returns Dataset (row header), ID (end-aligned), Mode, State, Activated and Reason
@@ -453,7 +454,6 @@ function activeDatasetColumns(displayTimezone: string): DataTableColumn<ActiveDa
     {
       key: 'reason',
       header: 'Reason',
-      wrap: 'anywhere',
       render: (row) => visibleText(row.dataset.reason) ?? EM_DASH,
     },
   ];
@@ -548,9 +548,12 @@ function dayBoundaryLine(source: SourceName, dayBoundary: string | null): string
  *   display zone has a slash;
  * - Reason (12): a reason of about 45 characters on two lines.
  *
- * Headers wrap between words in these columns, and a cell's text may break between any two
- * characters, so an unbroken token longer than its column, such as a long reason's variable
- * name, wraps inside the column instead of widening the table.
+ * Headers and cells wrap between words in these columns, and a long token, such as a dataset
+ * name or a long reason's variable name, after its separators (the `DataTable` default; a stale
+ * row's name, rendered beside its badge, takes {@link withTokenBreaks} itself), so a token
+ * longer than its column wraps between its parts instead of widening the table. Only a single
+ * part longer than its column would break inside itself; the widths above leave every name,
+ * date, zone part and reason word whole.
  *
  * @param displayTimezone - the IANA zone instants are shown in
  * @param source - the source whose datasets the table lists
@@ -572,7 +575,7 @@ function freshnessColumns(
       render: (row) =>
         row.stale ? (
           <Inline gap={2} align="center">
-            <span>{row.dataset}</span>
+            <span>{withTokenBreaks(row.dataset)}</span>
             <Badge tone="warning">{STALE_LABEL}</Badge>
           </Inline>
         ) : (
@@ -620,12 +623,13 @@ function freshnessColumns(
 
 /**
  * The columns of the recent sync runs table. Job, dataset, status and completeness are printed as
- * the API returns them; a run still in progress reads "Running" in Finished. The dataset and the
- * error may break between any two characters, as in the freshness table; the job, a single word,
- * breaks only between words. The dataset column takes a quarter of the table's width (its
- * `share`), so its names stay whole at desktop widths: without the share, a column that may
- * break anywhere is squeezed below its names whenever the other columns wrap. In a narrow region
- * the share yields to the other columns' minimums, and only there does a name break.
+ * the API returns them; a run still in progress reads "Running" in Finished. Every cell wraps
+ * between words, and a long dataset name or a token in an error after its separators (the
+ * `DataTable` default), as in the freshness table, so no word breaks inside itself. The dataset
+ * column takes a quarter of the table's width (its `share`), so its names stay on one line at
+ * desktop widths. In a narrow region the share yields to the other columns' minimums, and only
+ * there does a name wrap, after a dot or underscore ("hubspot." / "deal_search"); a region too
+ * narrow for every column's longest word scrolls the table.
  *
  * @param displayTimezone - the IANA zone instants are shown in
  * @returns Job, Dataset, Started, Finished, Status, Rows (end-aligned), Completeness and Error
@@ -637,7 +641,6 @@ function syncRunColumns(displayTimezone: string): DataTableColumn<SyncRunView>[]
       key: 'dataset',
       header: 'Dataset',
       share: 3,
-      wrap: 'anywhere',
       render: (run) => visibleText(run.dataset) ?? EM_DASH,
     },
     {
@@ -661,7 +664,6 @@ function syncRunColumns(displayTimezone: string): DataTableColumn<SyncRunView>[]
     {
       key: 'error',
       header: 'Error',
-      wrap: 'anywhere',
       render: (run) => visibleText(run.error) ?? EM_DASH,
     },
   ];

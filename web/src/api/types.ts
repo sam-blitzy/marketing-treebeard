@@ -574,6 +574,11 @@ export interface Projection {
 /**
  * A sample size against its minimum, in the unit the rule uses (`schemas.Sample`;
  * AAP 0.5.4.8), rendered as "observed / required".
+ *
+ * `floor` is optional although the API always sends it, `null` when unset: like
+ * {@link Baseline}'s `unit` and `currency`, it extends a shape that callers, test fixtures
+ * included, already build as `{ observed, required, unit, projected }`, and a missing key reads
+ * exactly as `null` does.
  */
 export interface Sample {
   /** The sample observed. */
@@ -584,6 +589,11 @@ export interface Sample {
   unit: string;
   /** A labelled projection; `null` when there is none. */
   projected: Projection | null;
+  /**
+   * Whether `observed` is a floored CRM count, such as W1's Qualified Leads under an
+   * attribution floor, rendered "≥ N" (AAP 0.5.4.7); `null` or absent when it is not.
+   */
+  floor?: boolean | null;
 }
 
 /** The statistical test behind an item (`schemas.StatTest`; AAP 0.5.4.6). */

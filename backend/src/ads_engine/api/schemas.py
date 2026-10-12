@@ -1095,12 +1095,15 @@ class Sample(ApiModel):
         required: The minimum the rule requires.
         unit: The unit, for example ``clicks``, ``impressions``, ``form opens`` or ``days``.
         projected: An optional labelled projection.
+        floor: Whether ``observed`` is a floored CRM count, rendered "≥ N" (AAP 0.5.4.7);
+            ``None`` when it is not, including every sample frozen before this key existed.
     """
 
     observed: MetricValue
     required: MetricValue
     unit: str
     projected: Projection | None = None
+    floor: bool | None = None
 
 
 class StatTest(ApiModel):

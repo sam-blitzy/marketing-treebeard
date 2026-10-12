@@ -789,7 +789,7 @@ export const FIXTURE_FLAGS: Readonly<Record<FlagCode, Readonly<Flag>>> = Object.
   } satisfies Flag),
   not_distinguishable: Object.freeze({
     code: 'not_distinguishable',
-    message: 'Not yet distinguishable (adjusted p = 0.21)',
+    message: 'Not yet distinguishable (adjusted p = 0.2100)',
   } satisfies Flag),
   search_term_coverage: Object.freeze({
     code: 'search_term_coverage',
@@ -2641,7 +2641,7 @@ function creativeSection(): Section {
   });
 
   const pairLabel =
-    'Variant A ahead, not yet distinguishable (adjusted p = 0.21); about 41,800 more ' +
+    'Variant A ahead, not yet distinguishable (adjusted p = 0.2100); about 41,800 more ' +
     'impressions per variant needed at the observed difference';
   const cr1Historical = makeItem({
     id: FIXTURE_ITEM_IDS.cr1Historical,
@@ -2650,8 +2650,8 @@ function creativeSection(): Section {
     action: `Variant A vs Variant B: ${pairLabel}`,
     reason:
       'Leads per impression: Variant A 0.53% (8 of 1,500) vs Variant B 0.25% (3 of 1,200); ' +
-      "Fisher's exact test p = 0.21, Holm-adjusted across 1 pair in Lead Gen — Pipeline Report " +
-      'EMEA = 0.21, against α 0.05; the gap is not yet distinguishable from noise.',
+      "Fisher's exact test p = 0.2100, Holm-adjusted across 1 pair in Lead Gen — Pipeline " +
+      'Report EMEA = 0.2100, against α 0.05; the gap is not yet distinguishable from noise.',
     entity: entity(
       'linkedin',
       'creative_pair',

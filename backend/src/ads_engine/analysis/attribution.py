@@ -1758,12 +1758,15 @@ def _build_row(
         )
     if deal_floor:
         messages[FLAG_DEAL_FLOOR] = f"Deal counts are a floor: orphan-deal share {orphan.label}"
-    if meetings.other > 0:
-        # Noun and pronoun agree with the count: "1 other meeting … it is", "2 … they are".
-        excluded = "it is" if meetings.other == 1 else "they are"
+    other = other_count.value
+    if other is not None and other > 0:
+        # The count keeps the floor its column shows ("≥ 21 other meetings"); noun and pronoun
+        # agree with it: "1 other meeting … it is", "2 … they are".
+        noun = "other meeting" if other == 1 else "other meetings"
+        excluded = "it is" if other == 1 else "they are"
         messages[FLAG_MEETING_TIME_PROXY] = (
-            f"{_plural(meetings.other, 'other meeting')} {_ORDERING_UNVERIFIED}: booking time is "
-            f"proxied by record creation, so {excluded} excluded from cost per meeting"
+            f"{other_count.render()} {noun} {_ORDERING_UNVERIFIED}: booking time is proxied by "
+            f"record creation, so {excluded} excluded from cost per meeting"
         )
     if bindings.ql_reason is not None:
         messages[FLAG_PIPELINE_UNAVAILABLE] = (

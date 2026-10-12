@@ -376,8 +376,42 @@ describe('EvidenceTable', () => {
     render(<EvidenceTable evidence={evidence} />);
 
     expect(
-      screen.getByText("Test: Fisher's exact test · p = 0.012 · adjusted p = 0.036 · α 0.05"),
+      screen.getByText("Test: Fisher's exact test · p = 0.0120 · adjusted p = 0.0360 · α 0.05"),
     ).toBeDefined();
+  });
+
+  it('states a B4 p-value as its reason does: "p < 0.0001", never "p < 0.001"', () => {
+    const evidence = makeEvidence({
+      test: {
+        name: 'two-sample Poisson rate test',
+        p_value: '0.0000000000127560',
+        p_adjusted: null,
+        alpha: '0.05',
+      },
+    });
+    render(<EvidenceTable evidence={evidence} />);
+
+    expect(
+      screen.getByText('Test: Two-sample Poisson rate test · p < 0.0001 · α 0.05'),
+    ).toBeDefined();
+  });
+
+  it('states a B4 p-value with digits past 10^-307 as "p < 0.0001", never "unavailable"', () => {
+    // poisson_rate_test(0, 1000, 1390, 1000) = 3.12936E-304, in the API's fixed point.
+    const evidence = makeEvidence({
+      test: {
+        name: 'two_sample_poisson_score',
+        p_value: `0.${'0'.repeat(303)}312936`,
+        p_adjusted: null,
+        alpha: '0.05',
+      },
+    });
+    render(<EvidenceTable evidence={evidence} />);
+
+    expect(
+      screen.getByText('Test: Two-sample Poisson rate test · p < 0.0001 · α 0.05'),
+    ).toBeDefined();
+    expect(screen.queryByText(/p = unavailable/u)).toBeNull();
   });
 
   it('names a test recorded with a blank name, so the line never starts with a separator', () => {
@@ -386,7 +420,7 @@ describe('EvidenceTable', () => {
     });
     render(<EvidenceTable evidence={evidence} />);
 
-    expect(screen.getByText('Test: Statistical test · p < 0.001')).toBeDefined();
+    expect(screen.getByText('Test: Statistical test · p = 0.0004')).toBeDefined();
   });
 
   it('defaults the caption, also for a blank one, and takes a custom one', () => {
@@ -775,6 +809,32 @@ describe('EvidenceTable inside the app providers', () => {
     expect(line.textContent).toBe(`Sample: ${formatSample(openSample)}`);
     expect(line.textContent).toMatch(/^Sample: \S+\u00A0\/\u00A0\S+ form opens · ≈ /u);
     expect(line.textContent).toContain('impressions (projected through the observed open rate)');
+  });
+
+  it('shows a floored sample count as "≥ N", as the metric it repeats', async () => {
+    // AAP 0.5.4.7/0.5.5: under an attribution floor W1's Qualified Leads read "≥ 34" in the
+    // table, so the sample line repeats that count with its floor, never "34 / 3".
+    const qlSample: Sample = {
+      observed: 34,
+      required: 3,
+      unit: 'Qualified Leads',
+      projected: null,
+      floor: true,
+    };
+    await renderWithProviders(
+      <EvidenceTable
+        evidence={makeEvidence({
+          metrics: [metric('ql', 'Qualified Lead', 34, 'contacts', { floor: true })],
+          sample: qlSample,
+        })}
+      />,
+    );
+
+    expect(screen.getByText('Sample: ≥ 34 / 3 Qualified Leads')).toBeDefined();
+    expect(screen.getByText(/^Sample: /u).textContent).toBe(
+      'Sample: ≥ 34\u00A0/\u00A03 Qualified Leads',
+    );
+    expect(metricCells('Qualified Lead').value.textContent).toBe('≥ 34');
   });
 
   it('shows the test line with the adjusted p-value', async () => {
@@ -1323,5 +1383,117 @@ describe('EvidenceTable ratio precision', () => {
     expect(valueColumn()).toEqual(
       stageEvidence.metrics.map((entry) => formatMetric(entry, { ratioDigits })),
     );
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// EvidenceTable rate precision: B4's rates per unit of spend, per 100 of the account currency
+// ---------------------------------------------------------------------------------------------
+
+describe('EvidenceTable rates per unit of spend', () => {
+  /** A rate metric as `budget._b4_candidate` records it: unit `rate`, no currency of its own. */
+  function rate(
+    key: string,
+    label: string,
+    value: Metric['value'],
+    extra: Partial<Metric> = {},
+  ): Metric {
+    return metric(key, label, value, 'rate', extra);
+  }
+
+  /** The money and rate metrics of the default world's "Benchmarks - Lead gen (NA)" B4 card. */
+  const b4Metrics: Metric[] = [
+    metric('weekend_spend', 'Weekend spend', '732.500000', 'currency', { currency: 'USD' }),
+    metric('weekday_spend', 'Weekday spend', '1856.990000', 'currency', { currency: 'USD' }),
+    metric('weekend_outcomes', 'Weekend leads', 10, 'leads'),
+    metric('weekday_outcomes', 'Weekday leads', 170, 'leads'),
+    rate('weekend_rate', 'Weekend leads per unit of spend', '0.013652'),
+    rate('weekday_rate', 'Weekday leads per unit of spend', '0.091546'),
+  ];
+
+  /** The Value cell of the row whose header is `label`. */
+  function valueOf(label: string): string | null {
+    return metricCells(label).value.textContent;
+  }
+
+  it('states B4 rates per USD 100 at three significant digits, never six raw places', () => {
+    render(<EvidenceTable evidence={makeEvidence({ metrics: b4Metrics })} />);
+
+    expect(valueOf('Weekend leads per unit of spend')).toBe('1.37 per USD\u00a0100');
+    expect(valueOf('Weekday leads per unit of spend')).toBe('9.15 per USD\u00a0100');
+    expect(valueOf('Weekend spend')).toBe('USD\u00a0732.50');
+    expect(screen.queryByText(/0\.013652|0\.091546|%/u)).toBeNull();
+  });
+
+  it('gives every rate of the table one precision, wide enough to tell a close pair apart', () => {
+    const metrics = [
+      metric('weekend_spend', 'Weekend spend', '732.500000', 'currency', { currency: 'EUR' }),
+      rate('weekend_rate', 'Weekend leads per unit of spend', '0.013652'),
+      rate('weekday_rate', 'Weekday leads per unit of spend', '0.013656'),
+      rate('other_rate', 'Other leads per unit of spend', '0.091546'),
+    ];
+    render(<EvidenceTable evidence={makeEvidence({ metrics })} />);
+
+    expect(valueOf('Weekend leads per unit of spend')).toBe('1.365 per EUR\u00a0100');
+    expect(valueOf('Weekday leads per unit of spend')).toBe('1.366 per EUR\u00a0100');
+    expect(valueOf('Other leads per unit of spend')).toBe('9.155 per EUR\u00a0100');
+  });
+
+  it("takes the currency from the evidence's extra when no metric carries one", () => {
+    const metrics = b4Metrics.filter((entry) => entry.unit === 'rate');
+    render(<EvidenceTable evidence={makeEvidence({ metrics, extra: { currency: 'GBP' } })} />);
+
+    expect(valueOf('Weekend leads per unit of spend')).toBe('1.37 per GBP\u00a0100');
+    expect(valueOf('Weekday leads per unit of spend')).toBe('9.15 per GBP\u00a0100');
+  });
+
+  it('shows the rates unscaled and unlabelled, still at one precision, with no currency known', () => {
+    const metrics = b4Metrics.filter((entry) => entry.unit === 'rate');
+    render(<EvidenceTable evidence={makeEvidence({ metrics })} />);
+
+    expect(valueOf('Weekend leads per unit of spend')).toBe('0.0137');
+    expect(valueOf('Weekday leads per unit of spend')).toBe('0.0915');
+  });
+
+  it('renders a zero rate as "0 per USD 100" and an unavailable one as "unavailable"', () => {
+    const metrics = [
+      metric('weekend_spend', 'Weekend spend', '0.000000', 'currency', { currency: 'USD' }),
+      rate('weekend_rate', 'Weekend leads per unit of spend', '0.000000'),
+      rate('weekday_rate', 'Weekday leads per unit of spend', null, { unavailable: true }),
+      rate('other_rate', 'Other leads per unit of spend', '0.091546'),
+    ];
+    render(<EvidenceTable evidence={makeEvidence({ metrics })} />);
+
+    expect(valueOf('Weekend leads per unit of spend')).toBe('0 per USD\u00a0100');
+    expect(valueOf('Weekday leads per unit of spend')).toBe(formatModule.UNAVAILABLE);
+    expect(valueOf('Other leads per unit of spend')).toBe('9.15 per USD\u00a0100');
+  });
+
+  it('end-aligns every rate figure, unavailable included, as it does every other figure', () => {
+    const metrics = [
+      ...b4Metrics,
+      rate('missing_rate', 'Missing leads per unit of spend', null, { unavailable: true }),
+    ];
+    render(<EvidenceTable evidence={makeEvidence({ metrics })} />);
+
+    for (const label of [
+      'Weekend leads per unit of spend',
+      'Weekday leads per unit of spend',
+      'Missing leads per unit of spend',
+    ]) {
+      expect(metricCells(label).value.classList.contains('ds-datatable__cell--end')).toBe(true);
+    }
+  });
+
+  it('formats each rate as formatMetric does with the evidence currency and shared digits', () => {
+    render(<EvidenceTable evidence={makeEvidence({ metrics: b4Metrics })} />);
+
+    const options = {
+      rateCurrency: 'USD',
+      rateDigits: formatModule.rateMetricDigits(b4Metrics, 'USD'),
+    };
+    for (const entry of b4Metrics.filter((each) => each.unit === 'rate')) {
+      expect(valueOf(entry.label)).toBe(formatMetric(entry, options));
+    }
   });
 });

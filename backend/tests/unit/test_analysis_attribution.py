@@ -1423,6 +1423,47 @@ def test_one_other_meeting_is_named_in_the_singular(make: MakeContext) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("count", "named"),
+    [
+        (
+            1,
+            "≥ 1 other meeting (ordering unverified): booking time is proxied by record "
+            "creation, so it is excluded from cost per meeting",
+        ),
+        (
+            2,
+            "≥ 2 other meetings (ordering unverified): booking time is proxied by record "
+            "creation, so they are excluded from cost per meeting",
+        ),
+    ],
+)
+def test_a_floored_other_meeting_count_keeps_its_floor_in_the_proxy_flag(
+    make: MakeContext, count: int, named: str
+) -> None:
+    # AAP 0.5.4.7/0.5.5: under a contact floor every count reads "≥ N", and the flag repeats
+    # the count exactly as the "Other meetings (ordering unverified)" column shows it.
+    touch = _t(10)
+    day = timedelta(days=1)
+    meetings = [
+        MeetingInfo(f"m-other-{index}", touch + day, touch + 2 * day, meeting_source="CRM_UI")
+        for index in range(count)
+    ]
+    crm = _crm(
+        [ContactInfo("c1", "salesqualifiedlead")],
+        meetings=meetings,
+        contact_meetings={"c1": [meeting.hs_id for meeting in meetings]},
+    )
+    leads = [_lead(1, touch, contact="c1"), _lead(2, touch)]
+    table = build_attribution(make(crm=crm, leads=leads, spend=[_spend(CR_A, "60.00")]))
+
+    row = _row(table)
+    assert row.contact_share == Decimal("0.5")
+    assert row.other_meetings.render() == f"≥ {count}"
+    assert row.flags == (FLAG_ATTRIBUTION_FLOOR, FLAG_MEETING_TIME_PROXY)
+    assert row.flag_messages[FLAG_MEETING_TIME_PROXY] == named
+
+
 def test_events_of_several_contacts_count_once_for_the_latest_qualifying_touch(
     make: MakeContext,
 ) -> None:

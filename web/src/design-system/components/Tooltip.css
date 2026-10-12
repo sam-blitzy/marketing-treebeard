@@ -25,6 +25,16 @@
  *   hovered one open), and never on a timer. This file declares no transition or animation,
  *   so dismissal is never delayed.
  *
+ * Target size (SC 2.5.5 and 2.5.8): the focusable trigger is at least 44 by 44 CSS px at a 16px
+ * root, through a min-block-size and min-inline-size of --space-8 + --space-3 (2.75rem), the
+ * same token-derived target as Button, Tabs and the SideNav links. 44px is the touch target
+ * minimum that applies when no design source specifies a smaller target; the Blitzy OS source
+ * is unavailable, so none does. It holds for every pointer type, not only coarse ones, so a
+ * short label such as "QS" is still 44px wide, and it is in rem, so it grows with the user's
+ * text size. Only the box grows: the label keeps its type size, the bubble opens against the
+ * larger box (see Placement), and the unstyled span around an element child with its own focus
+ * stop takes no size, because that child is already its own target.
+ *
  * Placement: while the content is open, Tooltip.tsx places it from the wrapper's viewport
  * rectangle. It opens below the trigger, aligned to its inline start; it flips above when
  * there is not enough room below and more room above, and shifts along the inline axis,
@@ -57,13 +67,34 @@
  * dotted underline and the help cursor mark the term as having help text. The underline offset
  * is a spacing token, so it scales with text resizing. inline-block makes the trigger's box,
  * and so its focus ring, enclose a wrapped element child such as a disabled Button or field;
- * it is the wrapper's only in-flow content, so text triggers lay out as before.
+ * it is the wrapper's only in-flow content, so the wrapper's box, which Tooltip.tsx places the
+ * bubble against, is the trigger's box. The minimum block and inline sizes give it the 44px
+ * target described in the header (--space-8 + --space-3), and align-content centres a shorter
+ * label on the block axis (except in a table cell, below); the label keeps its inline-start
+ * alignment, so it lines up with the text above and below it. The trigger stays a block
+ * container rather than a flex one: the underline then reaches its text and inline children
+ * only, as before, and never the label of a wrapped Button, which a flex container would pass
+ * it to as a flex item. An engine without align-content on block containers keeps the full
+ * target, with the label at its top.
  */
 .ds-tooltip__trigger {
   display: inline-block;
+  align-content: center;
+  min-block-size: calc(var(--space-8) + var(--space-3));
+  min-inline-size: calc(var(--space-8) + var(--space-3));
   text-decoration: underline dotted;
   text-underline-offset: var(--space-1);
   cursor: help;
+}
+
+/*
+ * In a table cell the label starts at the top of its target instead: DataTable cells align
+ * their content to the top, so a row header's label stays on the row's first line, level with
+ * the text in the row's other cells, and the target extends below the label. :where() keeps
+ * the specificity of the rule above, so this one wins by order alone.
+ */
+:where(th, td) .ds-tooltip__trigger {
+  align-content: start;
 }
 
 /*

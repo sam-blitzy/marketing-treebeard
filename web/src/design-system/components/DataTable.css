@@ -17,7 +17,9 @@
  *       tbody > tr > td | th[scope=row].ds-datatable__cell + .ds-datatable__cell--start | --end
  *         [+ .ds-datatable__cell--min-sm | --min-md | --min-lg | --min-xl]
  *         [+ .ds-datatable__cell--sticky]                       the first column, when sticky
- *         [+ .ds-datatable__cell--wrap-anywhere]
+ *         [> span]                                              a string value with a long token:
+ *                                                               its text runs and a <wbr> after
+ *                                                               each run of separators
  *         [> span.ds-datatable__cell-note]                      after the content, when noted
  *       tbody > tr > td.ds-datatable__toggle-cell > button.ds-button[aria-expanded]
  *         > span.ds-button__label > span.ds-datatable__toggle-state[data-alternate]
@@ -35,6 +37,8 @@
  * one, and its column's align otherwise; a header always follows align. Only the first column
  * can be sticky. The compact modifier styles only the table's own header, body and toggle
  * cells, through child combinators, so a table nested in its detail rows keeps its own density.
+ * The <wbr> span comes from withTokenBreaks (identifierBreaks.tsx), which DataTable.tsx applies
+ * to every string header, cell value and note; it carries no class and no styles.
  *
  * The region scrolls a table wider than its container on the inline axis, so the page itself
  * never scrolls sideways at a 320 CSS px viewport (WCAG 2.2 SC 1.4.10 Reflow). It is focusable
@@ -133,18 +137,15 @@
 
 /*
  * In a fixed table content no longer sets a column's minimum width, so content wider than its
- * column would spill into the next one. Headers therefore wrap between words, and a word longer
- * than its column, in a header or a cell, breaks instead. The status chip rule below still keeps
- * a chip's words whole, and numeric cells stay on one line, so a column holding either is sized
- * for its longest value.
+ * column would spill into the next one. Headers therefore wrap between words, a long token
+ * breaks after its separators (DataTable.tsx), and only a word longer than its column, in a
+ * header or a cell, breaks inside itself, through the shared cell rule's break-word below. Size
+ * a fixed column for its longest word. The status chip rule below still keeps a chip's words
+ * whole, and numeric cells stay on one line, so a column holding either is sized for its longest
+ * value.
  */
 .ds-datatable--fixed .ds-datatable__header {
   white-space: normal;
-  overflow-wrap: anywhere;
-}
-
-.ds-datatable--fixed .ds-datatable__cell {
-  overflow-wrap: anywhere;
 }
 
 .ds-datatable__caption {
@@ -175,26 +176,35 @@
   overflow-wrap: break-word;
 }
 
-/* Column headers and body cells share padding and the row separator. */
+/*
+ * Column headers and body cells share padding, the row separator and how they break text: they
+ * keep their words whole. break-word, unlike anywhere, adds no break opportunity to a cell's
+ * min-content width, so in the automatic layout every column is at least as wide as its longest
+ * word, or, for a long token, which DataTable.tsx breaks after its separators, its longest part.
+ * A table those widths do not fit grows past its region, which scrolls it (SC 1.4.10), instead
+ * of squeezing a column until its words break mid-word. break-word acts only on a word wider
+ * than its line, which happens only in a fixed-width column (above). Setting it on the cells
+ * also stops an ancestor that lets long words break anywhere, such as a Stack with
+ * breakLongWords, from passing that on to them.
+ */
 .ds-datatable__header,
 .ds-datatable__cell {
   padding: var(--space-2) var(--space-3);
   border-block-end: calc(var(--space-1) / 4) solid var(--color-border);
   vertical-align: top;
+  overflow-wrap: break-word;
 }
 
 /*
  * Headers wrap between words. A table that fits its region with every column at its widest
  * content keeps each header on one line; one that does not shrinks its columns towards their
  * narrowest content first, so a header's longest word, not its whole text, sets its column's
- * minimum width. overflow-wrap is reset, so an ancestor that lets long words break anywhere,
- * such as a Stack with breakLongWords, cannot split a header mid-word.
+ * minimum width.
  */
 .ds-datatable__header {
   font-weight: var(--font-weight-semibold);
   color: var(--color-text-muted);
   white-space: normal;
-  overflow-wrap: normal;
 }
 
 /* Row headers (th scope="row"), such as the asset name in a white paper row. */
@@ -326,19 +336,6 @@ th.ds-datatable__cell {
 }
 
 /*
- * Break-anywhere body cells (wrap: 'anywhere'), for identifier, key and reason columns: an
- * unbroken token such as HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY or a URN may break between any two
- * characters. Unlike break-word, anywhere also lowers the column's minimum width to one
- * character, which is what lets table layout fit the table to its region instead of
- * overflowing it. It is opt-in per column, never on every cell, because it lets table layout
- * squeeze a column until even ordinary words break mid-word (see the status chip rule below).
- * A numeric (end) body cell stays on one line, so it never breaks.
- */
-.ds-datatable__cell--wrap-anywhere {
-  overflow-wrap: anywhere;
-}
-
-/*
  * A status chip in a cell, such as "resolved" or "unavailable" on /settings, keeps its words
  * whole. Badge.css lets a chip break anywhere so a flex or grid track can shrink it, but in a
  * table that also lowers the column's min-content width, so table layout squeezes the column
@@ -349,6 +346,18 @@ th.ds-datatable__cell {
  */
 .ds-datatable__cell .ds-badge {
   overflow-wrap: normal;
+}
+
+/*
+ * A Stack or Inline with breakLongWords in a cell keeps its words whole too, as the cell does.
+ * Its anywhere (Stack.css, Inline.css) would lower the cell's min-content width in the same way,
+ * so a flex child such as a dataset name beside its Stale chip would be squeezed until it broke
+ * mid-word. Here it takes the cell's break-word instead, which every descendant inherits; the
+ * two classes of each selector outrank the primitive's one, whatever the stylesheet order.
+ */
+.ds-datatable__cell .ds-stack--break-long-words,
+.ds-datatable__cell .ds-inline--break-long-words {
+  overflow-wrap: break-word;
 }
 
 /*

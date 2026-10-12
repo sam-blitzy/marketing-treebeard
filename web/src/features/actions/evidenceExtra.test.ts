@@ -2319,22 +2319,40 @@ describe('whitePaperOrphanDealLabel', () => {
 });
 
 describe('cohortSummary', () => {
-  it("reads each currency cohort's spend total and overlap note", () => {
+  it("reads each currency cohort's spend total, the assets it covers and the overlap note", () => {
     expect(cohortSummary(pageItem(FIXTURE_ITEM_IDS.wEur))).toEqual({
       currency: 'EUR',
       spendTotal: '4340.00',
+      assets: 2,
       overlapNote: 'counts overlap across assets',
     });
     expect(cohortSummary(pageItem(FIXTURE_ITEM_IDS.wUsd))).toEqual({
       currency: 'USD',
       spendTotal: '1210.00',
+      assets: 1,
       overlapNote: 'counts overlap across assets',
     });
   });
 
   it('carries no MQL, QL, meeting or deal total', () => {
     const summary = cohortSummary(pageItem(FIXTURE_ITEM_IDS.wEur));
-    expect(Object.keys(summary ?? {})).toEqual(['currency', 'spendTotal', 'overlapNote']);
+    expect(Object.keys(summary ?? {})).toEqual(['currency', 'spendTotal', 'assets', 'overlapNote']);
+  });
+
+  it.each([
+    ['absent, as in a run that predates it', undefined, null],
+    ['zero', 0, 0],
+    ['a numeric string', '3', 3],
+    ['a fraction', 2.5, null],
+    ['negative', -1, null],
+    ['not a number', 'three', null],
+    ['a boolean', true, null],
+  ])('reads the assets the total covers when it is %s', (_case, assets, expected) => {
+    const summary = cohortSummary(
+      withExtra({ cohort: { currency: 'USD', spend_total: '11580.20', assets } }),
+    );
+    expect(summary?.assets).toBe(expected);
+    expect(summary?.spendTotal).toBe('11580.20');
   });
 
   it('nulls malformed fields and returns null without a cohort currency', () => {
@@ -2344,6 +2362,7 @@ describe('cohortSummary', () => {
     expect(cohortSummary(malformed)).toEqual({
       currency: 'EUR',
       spendTotal: null,
+      assets: null,
       overlapNote: null,
     });
     expect(cohortSummary(withExtra({ cohort: { spend_total: '10.00' } }))).toBeNull();

@@ -1695,14 +1695,21 @@ export interface CohortSummary {
   readonly currency: string;
   /** The cohort's spend total across assets, computed by the backend; `null` when absent. */
   readonly spendTotal: Money | null;
+  /**
+   * How many assets the spend total covers (`extra.cohort.assets`): every asset row the run
+   * computed for the cohort, counted before feedback or tracking suppression dropped any from
+   * the run, so it can exceed the rows the run lists. `null` when absent, as in runs that
+   * predate it, or when it is not a non-negative whole number.
+   */
+  readonly assets: number | null;
   /** The note that counts overlap across assets, as the backend words it. */
   readonly overlapNote: string | null;
 }
 
 /**
  * Reads the cross-asset view each white-paper row carries (`white_papers._cohort_extra`,
- * `extra.cohort`: `{currency, spend_total, overlap_note, …}`). Only spend is totalled, within
- * one currency; no MQL, QL, meeting or deal total exists, and nothing is summed here.
+ * `extra.cohort`: `{currency, assets, spend_total, overlap_note, …}`). Only spend is totalled,
+ * within one currency; no MQL, QL, meeting or deal total exists, and nothing is summed here.
  *
  * @param source - Any white-paper item of the cohort, or its evidence.
  * @returns The summary, or `null` when the evidence carries no cohort currency.
@@ -1713,9 +1720,11 @@ export function cohortSummary(source: MaybeSource): CohortSummary | null {
   if (cohort === null || currency === null) {
     return null;
   }
+  const assets = readInteger(cohort.assets);
   return {
     currency,
     spendTotal: readMoney(cohort.spend_total),
+    assets: assets !== null && assets >= 0 ? assets : null,
     overlapNote: readString(cohort.overlap_note),
   };
 }

@@ -318,10 +318,10 @@ interface DayRow extends DayCount {
  * - They take the evidence table's shares, {@link METRIC_SHARE}, {@link VALUE_SHARE} and
  *   {@link BASELINE_SHARE} twelfths, so in the card, whose evidence table is as wide as this one,
  *   the Observed counts end exactly where the evidence values end.
- * - A day type label may break anywhere: the counts' one-word headers set the other two columns'
- *   minimums, so only the label column can give way, and the table then fits its region at a
- *   320 CSS px viewport instead of hiding the Required column (WCAG 2.2 SC 1.4.10 Reflow). The
- *   label still breaks only between words wherever its share holds it.
+ * - A day type label wraps between words, never inside one, like every `DataTable` cell: the
+ *   counts' one-word headers set the other two columns' minimums, so the label column gives way
+ *   down to its longest word, and a region too narrow even for that scrolls the table in it
+ *   (WCAG 2.2 SC 1.4.10 Reflow).
  */
 const DAY_COLUMNS: readonly DataTableColumn<DayRow>[] = Object.freeze([
   {
@@ -329,7 +329,6 @@ const DAY_COLUMNS: readonly DataTableColumn<DayRow>[] = Object.freeze([
     header: 'Day type',
     isRowHeader: true,
     share: METRIC_SHARE,
-    wrap: 'anywhere',
     render: (row: DayRow) => row.label,
   },
   {

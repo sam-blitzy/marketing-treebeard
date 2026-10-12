@@ -53,6 +53,27 @@
  * the ring that room plus a margin, because browsers round the scroll position to whole pixels
  * while tab widths are fractional. overscroll-behavior-inline keeps a sideways swipe at the
  * row's end from navigating the page, and the thin scrollbar sits below the baseline.
+ *
+ * The scroll cue, the same one DataTable's region shows. Tabs scrolled out of view, like the
+ * Keywords section's later tabs beside its long first title on a narrow screen, leave no sign
+ * of themselves, and an overlay or hidden scrollbar gives none, so each edge beyond which tabs
+ * are hidden shows a shadow. The scroller paints the page background the tabs sit on
+ * (--color-bg, PageShell.css) and four background layers over it, topmost first:
+ * 1. and 2. covers in that background colour, attached local, so they sit at the left and right
+ *    ends of the scrolled row and move with it; each is solid for the shadow's width, then fades;
+ * 3. and 4. shadows from the border colour to transparent, attached scroll, so they stay on the
+ *    scroller's left and right edges.
+ * While an end of the row is in view, its cover lies over that edge's shadow and hides it;
+ * scrolling that end out of view, by pointer, touch or the arrow keys, Home and End, uncovers
+ * the shadow. A row that fits shows both ends, so no shadow at all. Physical left and right
+ * serve both directions: in right-to-left text the row starts at the right edge and overflows
+ * to the left, and the same covers and shadows follow it. The layers are the scroller's own
+ * background, so everything inside paints over them: the tabs, transparent at rest, show the
+ * shadow behind their labels, while the tab list's hairline, the accent bar and the focus ring
+ * stay whole on top. In forced colours the browser drops background images that are not url()
+ * based and repaints the background colour from the system palette, so the cue is absent there
+ * and the row otherwise behaves the same. Colours are tokens ending in transparent, and sizes
+ * are spacing tokens and the full-extent token.
  */
 .ds-tabs__scroller {
   display: flex;
@@ -61,6 +82,24 @@
   scrollbar-width: thin;
   padding-block: var(--space-1);
   scroll-padding-inline: var(--space-2);
+  background-color: var(--color-bg);
+  background-image:
+    linear-gradient(to right, var(--color-bg) var(--space-3), transparent),
+    linear-gradient(to left, var(--color-bg) var(--space-3), transparent),
+    linear-gradient(to right, var(--color-border), transparent),
+    linear-gradient(to left, var(--color-border), transparent);
+  background-position:
+    left center,
+    right center,
+    left center,
+    right center;
+  background-size:
+    var(--space-6) var(--size-full),
+    var(--space-6) var(--size-full),
+    var(--space-3) var(--size-full),
+    var(--space-3) var(--size-full);
+  background-repeat: no-repeat;
+  background-attachment: local, local, scroll, scroll;
 }
 
 /*

@@ -71,6 +71,7 @@ import {
   PageShell,
   Spinner,
   Stack,
+  withTokenBreaks,
   type DataTableColumn,
 } from '../../design-system';
 import { formatInstant } from '../../lib/format';
@@ -188,13 +189,16 @@ function hasText(value: string | null): value is string {
 }
 
 /**
- * An identifier (a property name, a stage id) in `<code>`, or "—" when it is absent.
+ * An identifier (a property name, a stage id) in `<code>`, or "—" when it is absent. A long
+ * identifier breaks after its separators ({@link withTokenBreaks}), such as
+ * `hs_v2_date_entered_` / `marketingqualifiedlead`, and never inside one of its parts; its text
+ * is unchanged.
  *
  * @param value - the identifier, or `null`
  * @returns the cell content
  */
 function codeOrDash(value: string | null): ReactNode {
-  return hasText(value) ? <code>{value}</code> : EM_DASH;
+  return hasText(value) ? <code>{withTokenBreaks(value)}</code> : EM_DASH;
 }
 
 /**
@@ -355,17 +359,17 @@ function thresholdRows(thresholds: ConfigView['thresholds']): readonly Threshold
 }
 
 /**
- * The thresholds table's columns: the dotted key as the row header, then the value. The key may
- * break between any two characters, so a long dotted key wraps inside a narrow region rather than
- * widening the table past it (WCAG 2.2 SC 1.4.10 Reflow).
+ * The thresholds table's columns: the dotted key as the row header, then the value. A long key
+ * breaks after its dots and underscores ({@link withTokenBreaks}), so it wraps between its parts
+ * inside a narrow region rather than widening the table past it (WCAG 2.2 SC 1.4.10 Reflow), and
+ * never inside one of them.
  */
 const THRESHOLD_COLUMNS: readonly DataTableColumn<ThresholdRow>[] = [
   {
     key: 'key',
     header: 'Key',
     isRowHeader: true,
-    wrap: 'anywhere',
-    render: (row) => <code>{row.key}</code>,
+    render: (row) => <code>{withTokenBreaks(row.key)}</code>,
   },
   { key: 'value', header: 'Value' },
 ];
@@ -454,12 +458,12 @@ function windowRows(settings: WindowConfig): readonly WindowRow[] {
 }
 
 /**
- * The window table's columns: the setting as the row header, its key and its value. The key may
- * break between any two characters, as in the thresholds table.
+ * The window table's columns: the setting as the row header, its key and its value. A long key
+ * breaks after its separators, as in the thresholds table.
  */
 const WINDOW_COLUMNS: readonly DataTableColumn<WindowRow>[] = [
   { key: 'label', header: 'Setting', isRowHeader: true },
-  { key: 'key', header: 'Key', wrap: 'anywhere', render: (row) => <code>{row.key}</code> },
+  { key: 'key', header: 'Key', render: (row) => <code>{withTokenBreaks(row.key)}</code> },
   { key: 'value', header: 'Value', render: (row) => row.value },
 ];
 
@@ -479,16 +483,16 @@ interface MappingRow {
  * The configured bindings' columns. MQL's single `stage_label` arrives as a one-element
  * `stage_labels` list, so both rows render their labels the same way. In `stage_label` mode the
  * labels are tried in order; in `property` mode any configured labels are kept for display only
- * and shown as configured. The cell shows "—" only when the binding has no label. The mode and
- * property identifiers may break between any two characters, so they wrap in a narrow region.
+ * and shown as configured. The cell shows "—" only when the binding has no label. A long mode or
+ * property identifier breaks after its separators, so it wraps between its parts in a narrow
+ * region and never inside one.
  */
 const MAPPING_COLUMNS: readonly DataTableColumn<MappingRow>[] = [
   { key: 'count', header: 'Count', isRowHeader: true },
   {
     key: 'mode',
     header: 'Mode',
-    wrap: 'anywhere',
-    render: (row) => <code>{row.binding.mode}</code>,
+    render: (row) => <code>{withTokenBreaks(row.binding.mode)}</code>,
   },
   {
     key: 'stage_labels',
@@ -498,7 +502,6 @@ const MAPPING_COLUMNS: readonly DataTableColumn<MappingRow>[] = [
   {
     key: 'property',
     header: 'Property',
-    wrap: 'anywhere',
     render: (row) => codeOrDash(row.binding.property),
   },
 ];
@@ -586,20 +589,21 @@ function bindingRows(bindings: CrmBindingsView): readonly BindingRow[] {
  * states which one the portal resolved. The two bindings resolve independently, and only the MQL
  * binding's label heads the white-paper MQL column.
  *
- * The property and reason columns may break between any two characters: they hold unbroken
- * identifiers, such as `hs_v2_date_entered_marketingqualifiedlead` or
- * `HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY` in a reason, that would otherwise set the table wider than
- * its region. Each takes a third of the table's width, so wherever the table has room a property
- * such as `hs_v2_date_entered_990100000` and the reason's variable names stay whole, and only in
- * a narrow region do they break; without a share, a column that may break anywhere is squeezed
- * below its identifiers whenever the other columns wrap. Where the table cannot hold both whole,
- * the reason, free text, breaks first. Each also holds the `'md'` minimum: in a region too narrow
- * for the table's other columns, where the table scrolls anyway, an identifier then breaks into
- * a few readable pieces rather than a handful of characters per line. The binding takes a sixth, so a name such as "Google
- * touch-date property" keeps two lines rather than a word per line. The stage id never breaks: a
- * lifecycle stage id is a numeric id such as `990100000` or a HubSpot stage name of at most 22
- * characters, such as `marketingqualifiedlead`, short enough that the table still fits a desktop
- * region with it whole.
+ * The property and reason columns hold long identifiers, such as
+ * `hs_v2_date_entered_marketingqualifiedlead` or `HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY` in a
+ * reason. Like every cell they wrap only between words, and an identifier only after its
+ * underscores ({@link withTokenBreaks}, which `DataTable` applies to the reason's text and
+ * {@link codeOrDash} to the property), so its longest part, not the whole identifier, sets the
+ * column's minimum width, and no part ever breaks inside itself. Each takes a third of the
+ * table's width, so wherever the table has room a property such as
+ * `hs_v2_date_entered_990100000` and the reason's variable names stay on one line, and only in
+ * a narrow region do they wrap. Each also holds the `'md'` minimum: in a region too narrow for
+ * the table's other columns, where the table scrolls anyway, an identifier then wraps into a few
+ * readable parts rather than one part per line. The binding takes a sixth, so a name such as
+ * "Google touch-date property" keeps two lines rather than a word per line. The stage id never
+ * breaks: a lifecycle stage id is a numeric id such as `990100000` or a HubSpot stage name of at
+ * most 22 characters, such as `marketingqualifiedlead`, with no separator, short enough that the
+ * table still fits a desktop region with it whole.
  */
 const BINDING_COLUMNS: readonly DataTableColumn<BindingRow>[] = [
   { key: 'binding', header: 'Binding', isRowHeader: true, share: 2 },
@@ -628,7 +632,6 @@ const BINDING_COLUMNS: readonly DataTableColumn<BindingRow>[] = [
     header: 'Property',
     share: 4,
     minWidth: 'md',
-    wrap: 'anywhere',
     render: (row) => (row.available ? codeOrDash(row.property) : EM_DASH),
   },
   {
@@ -636,7 +639,6 @@ const BINDING_COLUMNS: readonly DataTableColumn<BindingRow>[] = [
     header: 'Reason',
     share: 4,
     minWidth: 'md',
-    wrap: 'anywhere',
     render: (row) => {
       if (hasText(row.reason)) {
         return row.reason;
@@ -715,7 +717,10 @@ interface UrnListProps {
   label: string;
 }
 
-/** URNs as a list, each in `<code>`, or "—" when there are none. */
+/**
+ * URNs as a list, each in `<code>` and breaking after its colons ({@link withTokenBreaks}), or
+ * "—" when there are none.
+ */
 function UrnList({ urns, label }: UrnListProps): ReactNode {
   if (urns.length === 0) {
     return EM_DASH;
@@ -724,7 +729,7 @@ function UrnList({ urns, label }: UrnListProps): ReactNode {
     <Stack as="ul" gap={1} aria-label={label}>
       {urns.map((urn, index) => (
         <li key={`${String(index)}:${urn}`}>
-          <code>{urn}</code>
+          <code>{withTokenBreaks(urn)}</code>
         </li>
       ))}
     </Stack>
@@ -732,31 +737,29 @@ function UrnList({ urns, label }: UrnListProps): ReactNode {
 }
 
 /**
- * The registry table's columns: the slug as the row header, the title and both URN lists. The
- * slug and the URNs may break between any two characters, so they wrap in a narrow region; the
- * title breaks only between words. The title takes a sixth of the table's width and wraps within
- * it, which leaves the rest to the slug and URN columns, so at desktop widths a slug and a URN
- * such as `urn:li:sponsoredCreative:990001301` stay whole rather than sharing the squeeze.
+ * The registry table's columns: the slug as the row header, the title and both URN lists. A long
+ * slug or URN breaks after its separators ({@link withTokenBreaks}), so it wraps between its parts
+ * in a narrow region ("urn:li:" / "leadGenForm:7001") and never inside one; the title breaks only
+ * between words. The title takes a sixth of the table's width and wraps within it, which leaves
+ * the rest to the slug and URN columns, so at desktop widths a slug and a URN such as
+ * `urn:li:sponsoredCreative:990001301` stay on one line rather than sharing the squeeze.
  */
 const REGISTRY_COLUMNS: readonly DataTableColumn<ContentAssetView>[] = [
   {
     key: 'slug',
     header: 'Slug',
     isRowHeader: true,
-    wrap: 'anywhere',
-    render: (asset) => <code>{asset.slug}</code>,
+    render: (asset) => <code>{withTokenBreaks(asset.slug)}</code>,
   },
   { key: 'title', header: 'Title', share: 2 },
   {
     key: 'lead_forms',
     header: 'Lead forms',
-    wrap: 'anywhere',
     render: (asset) => <UrnList urns={asset.lead_forms} label={`Lead forms of ${asset.slug}`} />,
   },
   {
     key: 'creative_overrides',
     header: 'Creative overrides',
-    wrap: 'anywhere',
     render: (asset) => (
       <UrnList urns={asset.creative_overrides} label={`Creative overrides of ${asset.slug}`} />
     ),

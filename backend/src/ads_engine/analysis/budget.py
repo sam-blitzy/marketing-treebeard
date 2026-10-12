@@ -127,7 +127,7 @@ from ads_engine.analysis.metrics import (
     under_utilized,
     window_totals,
 )
-from ads_engine.analysis.stats import RateTest, percentile, poisson_rate_test
+from ads_engine.analysis.stats import RateTest, p_relation, percentile, poisson_rate_test
 from ads_engine.analysis.thresholds import THRESHOLDS_FILE, ConfigError, Thresholds
 from ads_engine.decisions import minor_unit_exponent, round_to_minor_unit
 
@@ -426,30 +426,15 @@ def _one_place(value: Decimal | int | str | None) -> str:
 def _p_value(value: Decimal, alpha: Decimal) -> str:
     """Render a p-value judged against ``alpha``: ``p = 0.0123``, ``p = 0.04996``, ``p < 0.0001``.
 
-    The bound is 0.0001, or the first smaller power of ten that does not exceed ``alpha``. A
-    p-value below it reads ``p < {bound}``, so the bound itself states that it is below
-    ``alpha``. Any other p-value is rounded half even to the bound's places (four for every
-    ``alpha`` of at least 0.0001), and to as many more as it takes for the shown number to lie
-    on the same side of ``alpha`` as the p-value: it reads below ``alpha`` exactly when the
-    p-value is below it. Against alpha 0.05, 0.04996 reads ``p = 0.04996`` (never
-    ``0.0500``) and 0.05 reads ``p = 0.0500``; against alpha 0.05005, 0.05006 reads
-    ``p = 0.0501`` (never ``0.0500``). ``value`` is a finite probability, as
-    ``analysis/stats.py`` returns.
+    ``p`` followed by :func:`~ads_engine.analysis.stats.p_relation`, the one p-value rule the
+    CR1 texts and the card's test line share: below 0.0001 (or the first smaller power of ten
+    not above ``alpha``) the bound itself, otherwise four places half even, extended until the
+    shown number lies on the side of ``alpha`` the p-value does. Against alpha 0.05, 0.04996
+    reads ``p = 0.04996`` (never ``0.0500``) and 0.05 reads ``p = 0.0500``; against alpha
+    0.05005, 0.05006 reads ``p = 0.0501`` (never ``0.0500``). ``value`` is a finite
+    probability, as ``analysis/stats.py`` returns.
     """
-    bound = _FOUR_PLACES
-    while bound > alpha:
-        bound = bound.scaleb(-1)
-    if value < bound:
-        return f"p < {format(bound, 'f')}"
-    below = value < alpha
-    places = bound
-    while True:
-        # Terminates: once ``places`` reaches the value's own exponent the quantize is exact,
-        # and the exact value lies on its own side of alpha.
-        shown = value.quantize(places, rounding=ROUND_HALF_EVEN, context=_EXACT)
-        if (shown < alpha) == below:
-            return f"p = {format(shown, 'f')}"
-        places = places.scaleb(-1)
+    return f"p {p_relation(value, alpha)}"
 
 
 def _singular(label: str) -> str:

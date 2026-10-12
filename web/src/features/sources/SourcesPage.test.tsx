@@ -18,10 +18,10 @@
  *   (Google's account zone, LinkedIn and HubSpot UTC, "not yet known" without one), apart from
  *   the display time zone of instants;
  * - the recent sync runs, finished, running and failed;
- * - table sizing: every freshness table, primary and companion, at the same fixed column widths,
- *   where a token longer than its column breaks; elsewhere only reasons and the sync runs'
- *   dataset names and errors break unbroken tokens anywhere, and the sync runs' dataset column
- *   takes a quarter of the table's width;
+ * - table sizing: every freshness table, primary and companion, at the same fixed column widths;
+ *   dataset names, a stale one beside its badge included, breaking only after their separators
+ *   with their text unchanged, and no cell breaking inside a word; and the sync runs' dataset
+ *   column taking a quarter of the table's width;
  * - "Sync now": the POST with its CSRF header, the 202, 409 `sync_pending` and failure outcomes
  *   kept to their own section, one POST for two presses within one frame, the button disabled
  *   and described by its outcome or the pending hint while the API reports a pending request,
@@ -962,50 +962,36 @@ describe('SourcesPage', () => {
   });
 
   describe('table sizing', () => {
-    /**
-     * Each column's header text paired with whether every one of its body cells may break
-     * unbroken tokens anywhere (the DataTable `wrap: 'anywhere'` class), in column order.
-     */
-    function breakAnywhereColumns(tableElement: HTMLElement): [string, boolean][] {
-      const rows = within(tableElement).getAllByRole('row').slice(1);
-      return headers(tableElement).map((header, index): [string, boolean] => [
-        header,
-        rows.every((row) =>
-          row.children[index]?.classList.contains('ds-datatable__cell--wrap-anywhere'),
-        ),
-      ]);
-    }
-
-    it('lets only the reasons, the sync runs\' dataset names and errors break unbroken tokens', async () => {
-      stubPage();
+    it('breaks dataset names only after their separators and never inside a word', async () => {
+      const google = makeSource('google', {
+        datasets: withStaleRow(makeSource('google').datasets, 1),
+      });
+      stubPage(json(200, [google, makeSource('linkedin'), makeSource('hubspot')]));
       await renderLoaded();
 
-      const google = section('Google');
-      expect(breakAnywhereColumns(table(google, 'Google active datasets'))).toEqual([
-        ['Dataset', false],
-        ['ID', false],
-        ['Mode', false],
-        ['State', false],
-        ['Activated', false],
-        ['Reason', true],
-      ]);
-      // The freshness table lays out at fixed widths, where any cell breaks a token longer than its
-      // column, so none of its columns needs the class.
-      const freshness = table(google, 'Google dataset freshness');
+      const region = section('Google');
+      // A sync run's dataset name wraps after its dot and underscore, with its text unchanged.
+      const runs = table(region, 'Recent sync runs (Google)');
+      const runDataset = within(runs).getAllByRole('row')[1]?.children[1];
+      expect(runDataset?.textContent).toBe('google.metrics_daily');
+      expect(runDataset?.innerHTML).toBe('<span>google.<wbr>metrics_<wbr>daily</span>');
+      // So does a freshness row's name, beside its Stale badge too.
+      const freshness = table(region, 'Google dataset freshness');
       expect(freshness.classList.contains('ds-datatable--fixed')).toBe(true);
-      expect(breakAnywhereColumns(freshness).filter(([, anywhere]) => anywhere)).toEqual([]);
-      expect(breakAnywhereColumns(table(google, 'Recent sync runs (Google)'))).toEqual([
-        ['Job', false],
-        ['Dataset', true],
-        ['Started', false],
-        ['Finished', false],
-        ['Status', false],
-        ['Rows', false],
-        ['Completeness', false],
-        ['Error', true],
-      ]);
-      for (const header of screen.getAllByRole('columnheader')) {
-        expect(header.classList.contains('ds-datatable__cell--wrap-anywhere')).toBe(false);
+      const [, stale, plain] = within(freshness).getAllByRole('rowheader');
+      expect(stale?.textContent).toBe('google.metrics_dailyStale');
+      expect(stale?.querySelector('span')?.innerHTML).toBe(
+        '<span>google.<wbr>metrics_<wbr>daily</span>',
+      );
+      expect(plain?.innerHTML).toBe('<span>google.<wbr>search_<wbr>terms</span>');
+      // A short name gets no break opportunity, every one in the section follows a separator,
+      // and no cell opts into breaking inside a word.
+      expect(within(freshness).getAllByRole('rowheader')[0]?.innerHTML).toBe('google.entities');
+      for (const cell of region.querySelectorAll('td, th')) {
+        expect(cell.className).not.toMatch(/anywhere/u);
+        for (const wbr of cell.querySelectorAll('wbr')) {
+          expect(wbr.previousSibling?.textContent).toMatch(/[._:=/]$/u);
+        }
       }
     });
 

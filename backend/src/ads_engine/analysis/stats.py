@@ -19,14 +19,17 @@ declares a winner from "currently ahead" counts or a time pattern from noise:
   two-sample Poisson score test. It is valid only for unweighted event counts.
 * B3 under-utilized: :func:`percentile` is the linear-interpolation percentile (NumPy's
   default ``"linear"`` method) of daily spend, computed exactly in ``Decimal``.
+* Reporting (B4, CR1): :func:`p_relation` words a p-value against its alpha, the one rule
+  every reason, label, flag message and the web's test line state p-values by.
 
 Libraries, never hand-written numerics: ``scipy.stats.fisher_exact`` and, from statsmodels,
 ``proportions_ztest``, ``multipletests(method="holm")``, ``proportion_confint(method="wilson")``,
 ``proportion_effectsize``, ``NormalIndPower`` with the root finder ``brentq_expanding`` and
 ``test_poisson_2indep(method="score")``.
 The only arithmetic done here is exact bookkeeping: expected cells as fractions, rates as
-decimal ratios and the percentile interpolation, plus the arguments of the power analysis
-(group sizes, their ratio, and power less its target for the root finder).
+decimal ratios, the percentile interpolation and the half-even rounding of a stated p-value,
+plus the arguments of the power analysis (group sizes, their ratio, and power less its target
+for the root finder).
 
 Conventions:
 
@@ -98,6 +101,7 @@ __all__ = [
     "cohens_h",
     "compare_proportions",
     "holm",
+    "p_relation",
     "percentile",
     "poisson_rate_test",
     "required_n",
@@ -126,6 +130,9 @@ _QUANTUM: Final = Decimal("0.000001")
 # Significant digits a positive p-value below _QUANTUM keeps, where 6 decimal places would
 # round it to 0: 5.7664369391539194e-12 becomes Decimal("5.76644E-12").
 _P_VALUE_DIGITS: Final = 6
+# Decimal places a p-value is stated at by p_relation, and the exponent of its bound
+# ("< 0.0001") for every alpha of at least 0.0001.
+_P_RELATION_PLACES: Final = 4
 # Working precision of the exact bookkeeping. 50 digits hold any count ratio or spend sum the
 # product stores (numeric(18,6) has at most 18 digits) with room for the 6-place quantum.
 _PRECISION: Final = 50
@@ -918,3 +925,69 @@ def percentile(values: Sequence[Decimal], q: Decimal) -> Decimal | None:
     weight = context.subtract(position, Decimal(lower))
     step = context.multiply(weight, context.subtract(ordered[upper], ordered[lower]))
     return _quantize(context.add(ordered[lower], step))
+
+
+# --- Reporting: the one wording of a p-value --------------------------------------------------
+
+
+def p_relation(value: Decimal, alpha: Decimal) -> str:
+    """A p-value judged against ``alpha``, with its relation: ``= 0.0123`` or ``< 0.0001``.
+
+    The one rendering of a p-value in every text a rule writes (the B4 reason and withheld
+    line; the CR1 label, ``not_distinguishable`` flag message and reason) and on the card's
+    test line, whose ``formatPValue`` in ``web/src/lib/format.ts`` applies this rule to the
+    same evidence, so one card states each p-value one way. Templates write ``p {relation}``,
+    so a bound never reads ``p = < 0.0001``.
+
+    * The bound is 0.0001, or the first smaller power of ten that does not exceed ``alpha``.
+      A p-value below it reads ``< {bound}``, so the bound itself states that it is below
+      ``alpha``.
+    * Any other p-value is rounded half even to the bound's places (four for every ``alpha``
+      of at least 0.0001), padded to them (``= 0.0500``), and to one more place at a time
+      until the shown number lies on the same side of ``alpha`` as the p-value: it reads
+      below ``alpha`` exactly when the p-value is below it. Against alpha 0.05, 0.04996 reads
+      ``= 0.04996``, never ``= 0.0500``, and 0.05 reads ``= 0.0500``.
+
+    Args:
+        value: The raw or adjusted p-value in [0, 1], at any scale, as this module returns
+            it (``Decimal("1.27560E-11")`` included).
+        alpha: The significance level the p-value is judged at, in (0, 1).
+
+    Returns:
+        ``"< {bound}"`` or ``"= {shown}"``, both in fixed-point notation.
+
+    Raises:
+        TypeError: ``value`` or ``alpha`` is not a ``Decimal``.
+        ValueError: ``value`` lies outside [0, 1] or ``alpha`` outside (0, 1), or either is
+            not finite.
+
+    Example:
+        >>> p_relation(Decimal("0.0176"), DEFAULT_ALPHA)
+        '= 0.0176'
+        >>> p_relation(Decimal("1.27560E-11"), DEFAULT_ALPHA)
+        '< 0.0001'
+        >>> p_relation(Decimal("0.04996"), DEFAULT_ALPHA)  # 4 places would read 0.0500
+        '= 0.04996'
+        >>> p_relation(Decimal("0.05"), DEFAULT_ALPHA)
+        '= 0.0500'
+        >>> p_relation(Decimal("0.000004"), Decimal("0.00005"))
+        '< 0.00001'
+    """
+    probability = _require_probability("value", value)
+    level = _require_level("alpha", alpha)
+    places = _P_RELATION_PLACES
+    while _ONE.scaleb(-places, _context()) > level:
+        places += 1
+    bound = _ONE.scaleb(-places, _context())
+    if probability < bound:
+        return f"< {bound:f}"
+    below = probability < level
+    while True:
+        # Terminates: once ``places`` reaches the value's own exponent the rounding is exact,
+        # and the exact value lies on its own side of alpha. A value in [0, 1] rounded to
+        # ``places`` places has at most ``places + 1`` digits, which the precision holds.
+        context = Context(prec=max(_PRECISION, places + 1), rounding=ROUND_HALF_EVEN)
+        shown = probability.quantize(_ONE.scaleb(-places, context), context=context)
+        if (shown < level) == below:
+            return f"= {shown:f}"
+        places += 1

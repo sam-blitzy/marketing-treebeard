@@ -53,8 +53,14 @@
  *   fixed `width` on the `--space-4` width scale instead, the table is laid out at those fixed
  *   widths (`table-layout: fixed`), so sibling tables line up column for column whatever their
  *   content; see {@link DataTableColumnWidth}. A `minWidth` from a token-derived scale holds a
- *   column open when the table overflows, and `wrap: 'anywhere'` lets one column's body cells
- *   break unbroken tokens, such as identifiers, so the table can fit.
+ *   column open when the table overflows.
+ * - Text breaks only between words: every header and body cell keeps its words whole, so a
+ *   column is at least as wide as its longest word, and a table that cannot fit its region
+ *   scrolls in it. A long token in a string header, cell or note, such as a dataset name, URN
+ *   or setting, also breaks after its separators ({@link withTokenBreaks}), so its longest part
+ *   rather than the whole token sets that width. Only in a table laid out at fixed widths, where
+ *   content never widens a column, does a word longer than its column break inside itself
+ *   rather than run into the next column.
  * - A table wider than its region shows a scroll cue: a shadow on each edge beyond which columns
  *   are hidden, which disappears at that end of the scroll and never shows on a table that fits.
  * - A `sticky` first column stays at the region's inline start while the rest scrolls beneath
@@ -72,8 +78,7 @@
  * `ds-datatable__col--share-1` to `--share-12` on the `<col>` of a column with a `share`,
  * `ds-datatable__header`, `ds-datatable__cell`, `ds-datatable__cell--start` and `--end`,
  * `ds-datatable__cell--min-sm`, `--min-md`, `--min-lg` and `--min-xl`,
- * `ds-datatable__cell--sticky`,
- * `ds-datatable__cell--wrap-anywhere`, `ds-datatable__cell-note`, `ds-datatable__toggle-cell`,
+ * `ds-datatable__cell--sticky`, `ds-datatable__cell-note`, `ds-datatable__toggle-cell`,
  * `ds-datatable__toggle-state`, `ds-datatable__detail-row`, `ds-datatable__detail-cell`,
  * `ds-datatable__detail-content` and `ds-datatable__empty`. The visually hidden "Details"
  * header of the expand column and each toggle's visually hidden row name use
@@ -103,6 +108,7 @@ import type { CSSProperties, ReactNode } from 'react';
 
 import { Button } from './Button';
 import { EmptyState } from './EmptyState';
+import { withTokenBreaks } from './identifierBreaks';
 
 /**
  * The inline alignment of a {@link DataTable} header or cell: `'end'` for numbers, which then
@@ -163,14 +169,6 @@ export type DataTableColumnWidth = (typeof COLUMN_WIDTH_STEPS)[number];
 export type DataTableColumnMinWidth = 'sm' | 'md' | 'lg' | 'xl';
 
 /**
- * How a column's body cells break text that does not fit: `'anywhere'` lets an unbroken token,
- * such as an environment variable name, a URN or a dotted key, break between any two characters.
- *
- * GAP: bind to Blitzy OS on source arrival.
- */
-export type DataTableColumnWrap = 'anywhere';
-
-/**
  * The spacing density of a {@link DataTable}'s own header and body cells.
  *
  * - `'default'`: a `--space-3` step of inline padding on each side of every cell, headers in the
@@ -206,6 +204,10 @@ export type DataTableDensity = 'default' | 'compact';
  * - Without `render`, a cell shows `row[key]` when that property is a string or a number, and is
  *   empty otherwise, so `null` or `undefined` never appear as visible text. Columns that format a
  *   value (currency, percentages, floors such as "≥ 12", "unavailable") pass `render`.
+ * - Cells wrap between words and never inside one. A string header, cell content or note also
+ *   gets a break opportunity after each separator of a long token ({@link withTokenBreaks}),
+ *   with its text unchanged. Content rendered as an element, such as an identifier in `<code>`,
+ *   is shown as given: pass the token through `withTokenBreaks` inside the element.
  * - `width` fixes the column's width on the table's width scale. Tables that share a column set
  *   and give every column the same width line up column for column; see
  *   {@link DataTableColumnWidth} for when the widths apply and how the table is then laid out.
@@ -221,10 +223,6 @@ export type DataTableDensity = 'default' | 'compact';
  *   its header and body cells, even when the table is wider than its region and every other
  *   column shrinks to its content's minimum. Use it for a column whose text would otherwise wrap
  *   to a word per line, such as an asset name or an action.
- * - `wrap: 'anywhere'` lets the column's body cells break an unbroken token between any two
- *   characters, which lowers the column's minimum width to a character, so a table holding long
- *   identifiers can fit its region. Opt in only for identifier, key or free-text reason columns:
- *   ordinary words and status chips keep breaking only between words.
  * - `note` adds a short plain-text note after a body cell's value, in muted text, such as the
  *   reason a cost is "—": "— (no QL yet)". The value keeps its alignment and, in an end-aligned
  *   column, stays on one line; the note wraps between words, its first word on the value's line,
@@ -275,11 +273,6 @@ export interface DataTableColumn<Row> {
    * its content's.
    */
   minWidth?: DataTableColumnMinWidth;
-  /**
-   * How the column's body cells break text: `'anywhere'` breaks unbroken tokens between any two
-   * characters. Omitted, or any other value, text breaks only between words.
-   */
-  wrap?: DataTableColumnWrap;
   /**
    * Returns the plain-text note shown after a row's body cell value, separated by a space, for
    * example "(no QL yet)" after "—". Returning `null`, `undefined`, a blank string or anything
@@ -609,8 +602,8 @@ function headerClassName<Row>(column: DataTableColumn<Row>, sticky: boolean): st
 
 /**
  * The class names of a column's body cell in one row: the cell class, the row's alignment (the
- * column's `alignCell` result when it is `'start'` or `'end'`, otherwise the column's `align`),
- * the column's size classes and, for `wrap: 'anywhere'`, the break-anywhere class.
+ * column's `alignCell` result when it is `'start'` or `'end'`, otherwise the column's `align`)
+ * and the column's size classes.
  *
  * @param column the column
  * @param row the row the cell renders
@@ -624,7 +617,6 @@ function cellClassName<Row>(column: DataTableColumn<Row>, row: Row, sticky: bool
     'ds-datatable__cell',
     `ds-datatable__cell--${align}`,
     ...sizeClassNames(column, sticky),
-    ...(column.wrap === 'anywhere' ? ['ds-datatable__cell--wrap-anywhere'] : []),
   ].join(' ');
 }
 
@@ -795,10 +787,11 @@ function unavailableReason(naming: CaptionNaming, hasColumns: boolean): string |
  * `<col>` per rendered column, in order: an expandable table's toggle column first, with no
  * class, then each data column, carrying `ds-datatable__col--share-{n}` when it has a share. A
  * table with neither renders no `<colgroup>`. A column's `minWidth` adds
- * `ds-datatable__cell--min-{step}` to its header and body cells, its `wrap: 'anywhere'` adds
- * `ds-datatable__cell--wrap-anywhere` to its body cells, and its `alignCell` picks each body
- * cell's `--start` or `--end` class. A row's `note`, when it has text, follows the cell's
- * content after a space, in a `ds-datatable__cell-note` span. When the first column has
+ * `ds-datatable__cell--min-{step}` to its header and body cells, and its `alignCell` picks each
+ * body cell's `--start` or `--end` class. A row's `note`, when it has text, follows the cell's
+ * content after a space, in a `ds-datatable__cell-note` span. A string header, cell content or
+ * note passes through {@link withTokenBreaks}, so a long token in it gets a `<wbr>` after each
+ * run of separators, and every other content is rendered as given. When the first column has
  * `sticky: true`, its header and body cells carry `ds-datatable__cell--sticky`. A `density` of
  * `'compact'` adds `ds-datatable--compact` to the `<table>`, and no class to the region or any
  * cell; any other `density` adds nothing.
@@ -850,7 +843,8 @@ function unavailableReason(naming: CaptionNaming, hasColumns: boolean): string |
  *   getRowKey={(r) => r.metric}
  * />
  *
- * // Sibling tables sharing one grid; a mixed Value column; an identifier column that may break.
+ * // Sibling tables sharing one grid; a mixed Value column; an identifier in <code>, which
+ * // breaks after its separators as a string cell does.
  * const gridColumns: readonly DataTableColumn<MetricRow>[] = [
  *   { key: 'metric', header: 'Metric', isRowHeader: true, share: 5, minWidth: 'sm' },
  *   {
@@ -860,7 +854,12 @@ function unavailableReason(naming: CaptionNaming, hasColumns: boolean): string |
  *     share: 3,
  *     alignCell: (r) => (typeof r.value === 'number' ? 'end' : 'start'),
  *   },
- *   { key: 'property', header: 'Property', share: 4, wrap: 'anywhere' },
+ *   {
+ *     key: 'property',
+ *     header: 'Property',
+ *     share: 4,
+ *     render: (r) => <code>{withTokenBreaks(r.property)}</code>,
+ *   },
  * ];
  *
  * // Sibling tables at fixed widths on the --space-4 scale, aligned whatever their content.
@@ -958,7 +957,7 @@ export function DataTable<Row>({
                 scope="col"
                 className={headerClassName(column, column.key === stickyKey)}
               >
-                {column.header}
+                {withTokenBreaks(column.header)}
               </th>
             ))}
           </tr>
@@ -1007,9 +1006,11 @@ export function DataTable<Row>({
                     ) : null}
                     {columns.map((column) => {
                       const className = cellClassName(column, row, column.key === stickyKey);
-                      const content = column.render
-                        ? column.render(row)
-                        : defaultCell(row, column.key);
+                      // A string value or note breaks only between words and after the
+                      // separators of a long token; any other content is shown as given.
+                      const content = withTokenBreaks(
+                        column.render ? column.render(row) : defaultCell(row, column.key),
+                      );
                       const note = plainText(column.note?.(row));
                       const body =
                         note === null ? (
@@ -1017,7 +1018,9 @@ export function DataTable<Row>({
                         ) : (
                           <>
                             {content}{' '}
-                            <span className="ds-datatable__cell-note">{note}</span>
+                            <span className="ds-datatable__cell-note">
+                              {withTokenBreaks(note)}
+                            </span>
                           </>
                         );
                       return column.isRowHeader === true ? (

@@ -361,10 +361,14 @@ describe('CreativeSection', () => {
         screen.getByRole('group', { name: 'Computed from replaced data (1)' }),
       ).getByRole('article', { name: cr1.action });
       expect(within(card).getByRole('heading', { level: 4 }).textContent).toBe(
-        'Variant A vs Variant B: Variant A ahead, not yet distinguishable (adjusted p = 0.21); ' +
+        'Variant A vs Variant B: Variant A ahead, not yet distinguishable (adjusted p = 0.2100); ' +
           'about 41,800 more impressions per variant needed at the observed difference',
       );
-      expect(within(card).getByText('Not yet distinguishable (adjusted p = 0.21)')).toBeTruthy();
+      expect(within(card).getByText('Not yet distinguishable (adjusted p = 0.2100)')).toBeTruthy();
+      // The test line states both p-values as the label and the reason do.
+      expect(
+        within(card).getByText("Test: Fisher's exact test · p = 0.2100 · adjusted p = 0.2100 · α 0.05"),
+      ).toBeTruthy();
       expect(within(card).getByText('Computed from replaced data')).toBeTruthy();
       for (const name of ['Mark done', 'Dismiss', 'Snooze for 7 days']) {
         expect(within(card).getByRole('button', { name }).hasAttribute('disabled')).toBe(true);

@@ -1472,16 +1472,21 @@ class Sample:
         required: The minimum the rule requires.
         unit: The unit, for example ``clicks``, ``impressions``, ``form opens`` or ``days``.
         projected: An optional labelled projection.
+        floor: Whether ``observed`` is a floored CRM count, such as W1's Qualified Leads under
+            an attribution floor, rendered "≥ N" as the count's own column shows it
+            (AAP 0.5.4.7). The minimum is never a floor.
 
     Raises:
         ValueError: On construction, for a blank unit.
-        TypeError: On construction, for a count that is not ``Decimal`` or ``int``.
+        TypeError: On construction, for a count that is not ``Decimal`` or ``int``, or a
+            ``floor`` that is not a ``bool``.
     """
 
     observed: Number
     required: Number
     unit: str
     projected: Projection | None = None
+    floor: bool = False
 
     def __post_init__(self) -> None:
         """Validate the fields."""
@@ -1490,6 +1495,8 @@ class Sample:
         _require_text(self.unit, "Sample.unit")
         if self.projected is not None and not isinstance(self.projected, Projection):
             raise TypeError(f"Sample.projected must be a Projection, found {self.projected!r}")
+        if not isinstance(self.floor, bool):
+            raise TypeError(f"Sample.floor must be a bool, found {self.floor!r}")
 
     @property
     def met(self) -> bool:
@@ -1497,7 +1504,11 @@ class Sample:
         return self.observed >= self.required
 
     def to_json(self) -> dict[str, Any]:
-        """Return ``{observed, required, unit, projected?}``."""
+        """Return ``{observed, required, unit, projected?, floor?}``.
+
+        ``floor`` is emitted only when true, so a sample without a floor keeps exactly the
+        AAP 0.5.3 ``{observed, required, unit, projected?}`` shape.
+        """
         rendered: dict[str, Any] = {
             "observed": json_value(self.observed),
             "required": json_value(self.required),
@@ -1505,6 +1516,8 @@ class Sample:
         }
         if self.projected is not None:
             rendered["projected"] = self.projected.to_json()
+        if self.floor:
+            rendered["floor"] = True
         return rendered
 
 

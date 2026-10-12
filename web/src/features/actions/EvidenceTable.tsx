@@ -11,7 +11,10 @@
  *    Floors render as "≥ N" for counts and "≤ X" for costs, and a missing value renders
  *    "unavailable", never `0` (AAP 0.5.4.7, 0.11.1). Every percentage in the table, value or
  *    paired baseline, shows one fixed precision ({@link evidenceRatioDigits}), so compared rates
- *    read apart. All of that formatting is {@link formatMetric}'s; this file formats no number
+ *    read apart. Every rate per unit of spend (B4's outcomes per unit of spend) is stated per
+ *    100 units of the evidence's account currency ({@link evidenceCurrency}) at one shared
+ *    precision too ({@link rateMetricDigits}): "1.37 per USD 100" beside "9.15 per USD 100".
+ *    All of that formatting is {@link formatMetric}'s; this file formats no number
  *    of its own. Figures align to the end and text values and baselines to the start, and the
  *    three columns take fixed shares of the table, so the Value column ends at the same place on
  *    every card of the same width.
@@ -82,9 +85,12 @@ import {
   formatSourceDate,
   formatTestLine,
   isDecimalString,
+  rateMetricDigits,
   ratioMetricDigits,
+  type MetricFormatOptions,
   type MetricInput,
 } from '../../lib/format';
+import { evidenceCurrency } from './evidenceExtra';
 import { metricHelp } from './metricHelp';
 
 // ---------------------------------------------------------------------------------------------
@@ -275,10 +281,22 @@ function pairedBaselineInput(baseline: Baseline, metric: Metric): MetricInput {
  * Formats a paired baseline in its metric's unit and currency: a cost-per-outcome baseline as
  * money in the metric's currency, a stage-rate baseline as a percentage at the evidence's
  * `ratioDigits` ({@link evidenceRatioDigits}), so a rate and its baseline read at one
- * precision. A `null` baseline still renders "unavailable", never `0`.
+ * precision; a per-spend rate's baseline per 100 units of the table's `rateCurrency` at its
+ * `rateDigits`. A `null` baseline still renders "unavailable", never `0`.
  */
-function formatPairedBaseline(baseline: Baseline, metric: Metric, ratioDigits: number): string {
-  return formatMetric(pairedBaselineInput(baseline, metric), { ratioDigits });
+function formatPairedBaseline(
+  baseline: Baseline,
+  metric: Metric,
+  options: MetricFormatOptions,
+): string {
+  return formatMetric(pairedBaselineInput(baseline, metric), options);
+}
+
+/** Every baseline paired with a metric, as the table formats it ({@link pairedBaselineInput}). */
+function pairedBaselineInputs(metrics: readonly Metric[], pairing: BaselinePairing): MetricInput[] {
+  return metrics.flatMap((metric, index) =>
+    (pairing.byMetric[index] ?? []).map((baseline) => pairedBaselineInput(baseline, metric)),
+  );
 }
 
 /**
@@ -286,10 +304,26 @@ function formatPairedBaseline(baseline: Baseline, metric: Metric, ratioDigits: n
  * metric and every baseline paired with one, each as the table formats it.
  */
 function tableRatioDigits(metrics: readonly Metric[], pairing: BaselinePairing): number {
-  const baselines = metrics.flatMap((metric, index) =>
-    (pairing.byMetric[index] ?? []).map((baseline) => pairedBaselineInput(baseline, metric)),
-  );
-  return ratioMetricDigits([...metrics, ...baselines]);
+  return ratioMetricDigits([...metrics, ...pairedBaselineInputs(metrics, pairing)]);
+}
+
+/**
+ * The options every value and paired baseline of a metrics table is formatted with: the digits
+ * its percentages share ({@link tableRatioDigits}), and for its rates per unit of spend the
+ * evidence's account currency ({@link evidenceCurrency}), which a rate metric does not carry
+ * itself, with the digits those rates share in it ({@link rateMetricDigits}). B4's weekend and
+ * weekday rates of 0.013652 and 0.091546 in USD then read "1.37 per USD 100" and "9.15 per USD
+ * 100"; with no currency recorded, unscaled at one precision, "0.0137" and "0.0915".
+ */
+function tableFormatOptions(evidence: Evidence, pairing: BaselinePairing): MetricFormatOptions {
+  const { metrics } = evidence;
+  const rateCurrency = evidenceCurrency(evidence);
+  const cited = [...metrics, ...pairedBaselineInputs(metrics, pairing)];
+  return {
+    ratioDigits: tableRatioDigits(metrics, pairing),
+    rateCurrency,
+    rateDigits: rateMetricDigits(cited, rateCurrency),
+  };
 }
 
 /**
@@ -508,10 +542,12 @@ interface MetricRow {
   /** The baselines the metric was compared against, in evidence order. */
   readonly baselines: readonly Baseline[];
   /**
-   * The fixed fraction digits of every percentage in the table ({@link evidenceRatioDigits}),
-   * the same on every row, so the Value and Baseline columns each read at one precision.
+   * The options of every value and paired baseline in the table ({@link tableFormatOptions}),
+   * the same on every row: the fixed fraction digits of every percentage
+   * ({@link evidenceRatioDigits}), and the account currency and shared digits of every rate per
+   * unit of spend, so the Value and Baseline columns each read at one precision.
    */
-  readonly ratioDigits: number;
+  readonly formatOptions: MetricFormatOptions;
 }
 
 /** The metric's display label, or its key when the label is blank, so no row header is empty. */
@@ -563,7 +599,7 @@ function BaselineCell({ row }: { row: MetricRow }): ReactNode {
         <BaselineEntry
           key={keys[index] ?? baseline.key}
           label={baselineLabel(baseline)}
-          value={formatPairedBaseline(baseline, row.metric, row.ratioDigits)}
+          value={formatPairedBaseline(baseline, row.metric, row.formatOptions)}
         />
       ))}
     </Stack>
@@ -662,7 +698,7 @@ const COLUMNS: readonly DataTableColumn<MetricRow>[] = [
     align: 'end',
     alignCell: valueAlign,
     share: VALUE_SHARE,
-    render: (row) => formatMetric(row.metric, { ratioDigits: row.ratioDigits }),
+    render: (row) => formatMetric(row.metric, row.formatOptions),
   },
   {
     key: 'baseline',
@@ -768,12 +804,12 @@ export const EvidenceTable = memo(function EvidenceTable({
   const { metrics, baselines, sample, test, thresholds, datasets } = evidence;
   const pairing = pairBaselines(metrics, baselines);
   const rowKeys = uniqueKeys(metrics.map((metric) => metric.key));
-  const ratioDigits = tableRatioDigits(metrics, pairing);
+  const formatOptions = tableFormatOptions(evidence, pairing);
   const rows: MetricRow[] = metrics.map((metric, index) => ({
     rowKey: rowKeys[index] ?? metric.key,
     metric,
     baselines: pairing.byMetric[index] ?? [],
-    ratioDigits,
+    formatOptions,
   }));
 
   const pairedCount = pairing.byMetric.reduce((count, list) => count + list.length, 0);

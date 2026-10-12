@@ -11,8 +11,10 @@
  * Fixtures are typed against `../api/types` with `satisfies`, so a schema change fails the
  * typecheck. The suite mocks nothing but `Intl.NumberFormat.prototype.formatToParts`, in the one
  * money test that stands in for ICU builds emitting another space beside the currency code. The
- * one file it reads is the backend's `decisions.py`, whose ISO 4217 minor-unit table the money
- * functions must mirror. It reads no clock, locale or `TZ`, and no test measures elapsed time:
+ * two files it reads are the backend's: `decisions.py`, whose ISO 4217 minor-unit table the money
+ * functions must mirror, and `tests/unit/p_value_relations.json`, the p-value table its
+ * `stats.p_relation` is held to as well, so the test line words each p-value as the reason
+ * does. It reads no clock, locale or `TZ`, and no test measures elapsed time:
  * the runner's per-test timeout is the only timing any test meets. It passes unchanged under
  * `TZ=Pacific/Auckland` and `TZ=America/Los_Angeles`.
  */
@@ -68,6 +70,7 @@ import {
   isDecimalString,
   joinSentences,
   percentDigits,
+  rateMetricDigits,
   ratioMetricDigits,
   sourceLabel,
 } from './format';
@@ -96,6 +99,16 @@ const SPECIAL_SPACES = /[\u202F\u00A0]/;
 
 /** The backend module whose `minor_unit_exponent` the API validates decided amounts with. */
 const DECISIONS_PY = new URL('../../../backend/src/ads_engine/decisions.py', import.meta.url);
+
+/**
+ * The p-value table the backend's `analysis/stats.p_relation` is held to in `test_stats.py`:
+ * formatPValue and formatTestLine must word every case exactly as the backend's reason, label
+ * and flag message texts do.
+ */
+const P_VALUE_RELATIONS_JSON = new URL(
+  '../../../backend/tests/unit/p_value_relations.json',
+  import.meta.url,
+);
 
 /** ISO 4217 currencies without a minor unit, as `decisions.py` lists them, sorted. */
 const ISO_ZERO_DIGITS: readonly string[] = [
@@ -243,6 +256,7 @@ describe('constants', () => {
         'isDecimalString',
         'joinSentences',
         'percentDigits',
+        'rateMetricDigits',
         'ratioMetricDigits',
         'sourceLabel',
       ].sort(),
@@ -958,13 +972,13 @@ describe('formatMetric', () => {
   it('formats ratios, rates, percentage points, days, p-values and multiples', () => {
     expect(formatMetric(metric('0.0909', { unit: 'ratio' }))).toBe('9.1%');
     expect(formatMetric(metric('1.15', { unit: ' Ratio ' }))).toBe('115%');
-    expect(formatMetric(metric('0.012345', { unit: 'rate' }))).toBe('0.012345');
+    expect(formatMetric(metric('0.012345', { unit: 'rate' }))).toBe('0.0123');
     expect(formatMetric(metric('79.1', { unit: 'percent' }))).toBe('79.1%');
     expect(formatMetric(metric(Number.NaN, { unit: 'pct' }))).toBe(UNAVAILABLE);
     expect(formatMetric(metric(28, { unit: 'days' }))).toBe('28 days');
     expect(formatMetric(metric(1, { unit: 'day' }))).toBe('1 day');
-    expect(formatMetric(metric('0.0321', { unit: 'p' }))).toBe('0.032');
-    expect(formatMetric(metric('0.0004', { unit: 'p_value' }))).toBe('< 0.001');
+    expect(formatMetric(metric('0.0321', { unit: 'p' }))).toBe('0.0321');
+    expect(formatMetric(metric('0.00004', { unit: 'p_value' }))).toBe('< 0.0001');
     expect(formatMetric(metric('1.5', { unit: 'x' }))).toBe('1.5×');
     expect(formatMetric(metric(Number.NaN, { unit: 'multiple' }))).toBe(UNAVAILABLE);
   });
@@ -979,8 +993,11 @@ describe('formatMetric', () => {
     expect(formatMetric(metric(1.4, { unit }))).toBe('140%');
   });
 
-  it.each([...RATE_UNITS])('formats the rate unit %j as a six-place decimal', (unit) => {
-    expect(formatMetric(metric('0.012345', { unit }))).toBe('0.012345');
+  it.each([...RATE_UNITS])('formats the rate unit %j per 100 units of its currency', (unit) => {
+    expect(formatMetric(metric('0.012345', { unit }))).toBe('0.0123');
+    expect(formatMetric(metric('0.012345', { unit }), { rateCurrency: 'USD' })).toBe(
+      '1.23 per USD\u00a0100',
+    );
   });
 
   it.each([...PERCENT_POINT_UNITS])('formats the percent-point unit %j with a % sign', (unit) => {
@@ -993,8 +1010,8 @@ describe('formatMetric', () => {
   });
 
   it.each([...P_VALUE_UNITS])('formats the p-value unit %j', (unit) => {
-    expect(formatMetric(metric('0.0321', { unit }))).toBe('0.032');
-    expect(formatMetric(metric(0.0004, { unit }))).toBe('< 0.001');
+    expect(formatMetric(metric('0.032100', { unit }))).toBe('0.0321');
+    expect(formatMetric(metric(0.00004, { unit }))).toBe('< 0.0001');
   });
 
   // A multiple renders through formatDecimal at two places without padding, the contract
@@ -1086,6 +1103,141 @@ describe('ratioMetricDigits', () => {
     expect(ratioMetricDigits([])).toBe(1);
     expect(ratioMetricDigits([], { min: 2 })).toBe(2);
     expect(ratioMetricDigits([metric('0.000722', { unit: 'ratio' })], { max: 2 })).toBe(2);
+  });
+});
+
+describe('rates per unit of spend (formatMetric rateCurrency and rateDigits, rateMetricDigits)', () => {
+  /** B4's weekend and weekday rates as `budget._b4_candidate` records them: no currency. */
+  const weekend = metric('0.013652', { key: 'weekend_rate', unit: 'rate' });
+  const weekday = metric('0.091546', { key: 'weekday_rate', unit: 'rate' });
+  const weekendSpend = metric('732.500000', { unit: 'currency', currency: 'USD' });
+
+  it('states B4 rates per USD 100 at one shared precision of three significant digits', () => {
+    const digits = rateMetricDigits([weekend, weekday, weekendSpend], 'USD');
+    expect(digits).toBe(2);
+    expect(formatMetric(weekend, { rateCurrency: 'USD', rateDigits: digits })).toBe(
+      '1.37 per USD\u00a0100',
+    );
+    expect(formatMetric(weekday, { rateCurrency: 'USD', rateDigits: digits })).toBe(
+      '9.15 per USD\u00a0100',
+    );
+  });
+
+  it('never renders a rate as a percentage or as six raw places', () => {
+    for (const options of [{}, { rateCurrency: 'USD' }, { rateCurrency: 'USD', rateDigits: 2 }]) {
+      const text = formatMetric(weekend, options);
+      expect(text).not.toContain('%');
+      expect(text).not.toContain('0.013652');
+    }
+  });
+
+  it('takes more digits for a close pair, so different rates never read alike', () => {
+    const close = metric('0.013656', { unit: 'rate' });
+    const digits = rateMetricDigits([weekend, close], 'USD');
+    expect(digits).toBe(3);
+    expect(formatMetric(weekend, { rateCurrency: 'USD', rateDigits: digits })).toBe(
+      '1.365 per USD\u00a0100',
+    );
+    expect(formatMetric(close, { rateCurrency: 'USD', rateDigits: digits })).toBe(
+      '1.366 per USD\u00a0100',
+    );
+  });
+
+  it('pads to three significant digits and stops at the places the backend recorded', () => {
+    const small = metric('0.0091', { unit: 'rate' });
+    expect(rateMetricDigits([small], 'USD')).toBe(3);
+    expect(formatMetric(small, { rateCurrency: 'USD' })).toBe('0.910 per USD\u00a0100');
+    // One recorded micro-unit: six places unscaled, four once per 100, never more.
+    const micro = metric('0.000001', { unit: 'rate' });
+    expect(rateMetricDigits([micro], 'USD')).toBe(4);
+    expect(formatMetric(micro, { rateCurrency: 'USD' })).toBe('0.0001 per USD\u00a0100');
+    expect(rateMetricDigits([micro])).toBe(6);
+    expect(formatMetric(micro)).toBe('0.000001');
+  });
+
+  it('scales the exact decimal, with no float drift and half-to-even rounding', () => {
+    // In binary floating point 0.0145 × 100 is 1.4500000000000002 and 0.0165 × 100 is
+    // 1.6500000000000001, which would round up; the exact 1.45 and 1.65 tie to the even digit.
+    const oneDigit = { rateCurrency: 'USD', rateDigits: 1 };
+    expect(formatMetric(metric('0.0145', { unit: 'rate' }), oneDigit)).toBe('1.4 per USD\u00a0100');
+    expect(formatMetric(metric('0.0165', { unit: 'rate' }), oneDigit)).toBe('1.6 per USD\u00a0100');
+    expect(formatMetric(metric('0.0155', { unit: 'rate' }), oneDigit)).toBe('1.6 per USD\u00a0100');
+    expect(formatMetric(metric(0.013652, { unit: 'rate' }), { rateCurrency: 'USD' })).toBe(
+      '1.37 per USD\u00a0100',
+    );
+    expect(formatMetric(metric('1.3652e-2', { unit: 'rate' }), { rateCurrency: 'USD' })).toBe(
+      '1.37 per USD\u00a0100',
+    );
+  });
+
+  it('shows the rate unscaled and unlabelled when no currency is known', () => {
+    const digits = rateMetricDigits([weekend, weekday]);
+    expect(digits).toBe(4);
+    expect(formatMetric(weekend, { rateDigits: digits })).toBe('0.0137');
+    expect(formatMetric(weekday, { rateDigits: digits })).toBe('0.0915');
+    expect(formatMetric(weekend, { rateCurrency: '  ', rateDigits: digits })).toBe('0.0137');
+    expect(formatMetric(weekend, { rateCurrency: null })).toBe('0.0137');
+    expect(rateMetricDigits([weekend, weekday], '')).toBe(4);
+  });
+
+  it('labels the trimmed, upper-cased currency, the code and its 100 kept on one line', () => {
+    expect(formatMetric(weekend, { rateCurrency: ' eur ' })).toBe('1.37 per EUR\u00a0100');
+    expect(formatMetric(weekend, { rateCurrency: 'JPY' })).toBe('1.37 per JPY\u00a0100');
+  });
+
+  it('renders zero as "0", unavailable as "unavailable" and keeps the floor marker', () => {
+    const zero = metric('0.000000', { unit: 'rate' });
+    expect(formatMetric(zero, { rateCurrency: 'USD', rateDigits: 2 })).toBe('0 per USD\u00a0100');
+    expect(formatMetric(zero)).toBe('0');
+    expect(rateMetricDigits([zero], 'USD')).toBe(0);
+    expect(rateMetricDigits([zero, weekend], 'USD')).toBe(2);
+    expect(formatMetric(metric(null, { unit: 'rate' }), { rateCurrency: 'USD' })).toBe(UNAVAILABLE);
+    expect(formatMetric(metric('0.013652', { unit: 'rate', unavailable: true }))).toBe(UNAVAILABLE);
+    expect(formatMetric(metric(Number.NaN, { unit: 'rate' }), { rateCurrency: 'USD' })).toBe(
+      UNAVAILABLE,
+    );
+    expect(formatMetric(metric('1e306', { unit: 'rate' }), { rateCurrency: 'USD' })).toBe(
+      UNAVAILABLE,
+    );
+    expect(formatMetric(metric('n/a', { unit: 'rate' }), { rateCurrency: 'USD' })).toBe('n/a');
+    expect(
+      formatMetric(metric('0.013652', { unit: 'rate', floor: true }), { rateCurrency: 'USD' }),
+    ).toBe('≥ 1.37 per USD\u00a0100');
+  });
+
+  it('bounds a non-zero rate that rounds to zero at the digits given', () => {
+    expect(formatMetric(metric('0.0000004', { unit: 'rate' }), { rateCurrency: 'USD' })).toBe(
+      '< 0.0001 per USD\u00a0100',
+    );
+    expect(formatMetric(weekend, { rateCurrency: 'USD', rateDigits: 0 })).toBe('1 per USD\u00a0100');
+  });
+
+  it('ignores every metric formatMetric does not render as a rate', () => {
+    const tiny = '0.0000001';
+    expect(
+      rateMetricDigits(
+        [
+          metric('2.5', { unit: 'rate' }),
+          metric(tiny, { unit: 'leads' }),
+          metric(tiny, { unit: 'ratio' }),
+          metric(tiny, { unit: 'rate', currency: 'USD' }),
+          metric(tiny, { unit: 'rate', unavailable: true }),
+          metric(true, { unit: 'rate' }),
+          metric('n/a', { unit: 'rate' }),
+          { value: undefined, unit: 'rate' },
+          { value: tiny },
+        ],
+        'USD',
+      ),
+    ).toBe(0);
+    expect(rateMetricDigits([])).toBe(0);
+  });
+
+  it('leaves every other unit unchanged under the rate options', () => {
+    const options = { rateCurrency: 'USD', rateDigits: 3 };
+    expect(formatMetric(weekendSpend, options)).toBe('USD\u00a0732.50');
+    expect(formatMetric(metric('0.0909', { unit: 'ratio' }), options)).toBe('9.1%');
+    expect(formatMetric(metric('0.3', { unit: 'conversions' }), options)).toBe('0.3');
   });
 });
 
@@ -1190,6 +1342,30 @@ describe('formatSample', () => {
     );
   });
 
+  it('renders a floored observed count as "≥ N", as its column does', () => {
+    const floored = {
+      observed: 34,
+      required: 3,
+      unit: 'Qualified Leads',
+      projected: null,
+      floor: true,
+    } satisfies Sample;
+    expect(formatSample(floored)).toBe('≥ 34\u00A0/\u00A03 Qualified Leads');
+    expect(formatSample({ ...floored, observed: 1200 })).toBe(
+      '≥ 1,200\u00A0/\u00A03 Qualified Leads',
+    );
+    // The minimum is never a floor; an unavailable count stays "unavailable", never "≥".
+    expect(formatSample({ ...floored, observed: null })).toBe(
+      'unavailable\u00A0/\u00A03 Qualified Leads',
+    );
+    // Without the floor, or with it null or absent, the count is plain.
+    expect(formatSample({ ...floored, floor: false })).toBe('34\u00A0/\u00A03 Qualified Leads');
+    expect(formatSample({ ...floored, floor: null })).toBe('34\u00A0/\u00A03 Qualified Leads');
+    expect(formatSample({ observed: 34, required: 3, unit: 'Qualified Leads' })).toBe(
+      '34\u00A0/\u00A03 Qualified Leads',
+    );
+  });
+
   it('accepts a withheld sample with no unit', () => {
     expect(formatSample({ observed: 3, required: 5, unit: null })).toBe('3\u00A0/\u00A05');
     expect(formatSample({ observed: '0.3', required: 10, unit: '  ' })).toBe(
@@ -1218,23 +1394,163 @@ describe('formatSample', () => {
   });
 });
 
+/** One case of the p-value table the backend's `stats.p_relation` is held to as well. */
+interface PValueRelationCase {
+  readonly p: string;
+  readonly alpha: string;
+  readonly relation: string;
+  /** Set on a case in exponent notation, which the API never emits. */
+  readonly pathological?: boolean;
+}
+
+/**
+ * B4 p-values with digits past the 10⁻³⁰⁷ place, in the fixed point the API sends them in:
+ * `poisson_rate_test(0, 1000, n, 1000)` for n = 1390, 1400 and 1410 outcomes gives
+ * 3.12936 × 10⁻³⁰⁴, 2.10101 × 10⁻³⁰⁶ and 1.41063 × 10⁻³⁰⁸, which the reason words "p < 0.0001".
+ */
+const DEEP_P_VALUES: readonly string[] = [
+  `0.${'0'.repeat(303)}312936`,
+  `0.${'0'.repeat(305)}210101`,
+  `0.${'0'.repeat(307)}141063`,
+];
+
+/**
+ * The shared p-value table, `backend/tests/unit/p_value_relations.json`: each case's `p` and
+ * `alpha` as the API emits them, and the relation the backend writes after "p" in a reason,
+ * label or flag message.
+ */
+const P_VALUE_RELATIONS: readonly PValueRelationCase[] = (
+  JSON.parse(readFileSync(P_VALUE_RELATIONS_JSON, 'utf8')) as {
+    cases: PValueRelationCase[];
+  }
+).cases;
+
 describe('formatPValue', () => {
-  it('rounds to at most three places without padding', () => {
-    expect(formatPValue('0.0321')).toBe('0.032');
-    expect(formatPValue('0.05')).toBe('0.05');
-    expect(formatPValue(0.001)).toBe('0.001');
-    expect(formatPValue(1)).toBe('1');
-    expect(formatPValue('0.123456')).toBe('0.123');
+  it('states four places, padded and rounded half to even, as the backend does', () => {
+    expect(formatPValue('0.0321')).toBe('0.0321');
+    expect(formatPValue('0.017600')).toBe('0.0176');
+    expect(formatPValue('0.956521')).toBe('0.9565');
+    expect(formatPValue('0.05')).toBe('0.0500');
+    expect(formatPValue(0.001)).toBe('0.0010');
+    expect(formatPValue(1)).toBe('1.0000');
+    expect(formatPValue('1.000000')).toBe('1.0000');
+    expect(formatPValue('0.123456')).toBe('0.1235');
+    expect(formatPValue('0.01245')).toBe('0.0124');
+    expect(formatPValue('0.01235')).toBe('0.0124');
+    expect(formatPValue('0.000100')).toBe('0.0001');
   });
 
-  it('bounds values below 0.001', () => {
-    expect(formatPValue(0.0004)).toBe('< 0.001');
-    expect(formatPValue('0.000999')).toBe('< 0.001');
-    expect(formatPValue(0)).toBe('< 0.001');
+  it('bounds values below 0.0001, the B4 p-value of 1.2756e-11 included', () => {
+    expect(formatPValue('0.0000000000127560')).toBe('< 0.0001');
+    expect(formatPValue(1.2756e-11)).toBe('< 0.0001');
+    expect(formatPValue('0.00000000000000000000122000')).toBe('< 0.0001');
+    expect(formatPValue('0.000099')).toBe('< 0.0001');
+    expect(formatPValue(0)).toBe('< 0.0001');
+    expect(formatPValue('-0.000')).toBe('< 0.0001');
   });
 
-  it.each([null, undefined, '', 'n/a'])('renders %j as unavailable', (value) => {
+  it.each(DEEP_P_VALUES)('bounds the B4 p-value %s, whose digits lie past 10^-307', (p) => {
+    expect(formatPValue(p)).toBe('< 0.0001');
+    expect(formatPValue(p, '0.05')).toBe('< 0.0001');
+  });
+
+  it('bounds a p-value at any depth from its digits, with no cost that grows with it', () => {
+    expect(formatPValue('1e-400')).toBe('< 0.0001');
+    expect(formatPValue(Number.MIN_VALUE)).toBe('< 0.0001');
+    expect(formatPValue('1e-999999', '0.05')).toBe('< 0.0001');
+    expect(formatPValue('1e-999999999999', '0.05')).toBe('< 0.0001');
+    // An exponent too long for a number still reads below the bound, never as unavailable.
+    expect(formatPValue(`1e-${'9'.repeat(400)}`, '0.05')).toBe('< 0.0001');
+    expect(formatPValue('0e999999')).toBe('< 0.0001');
+  });
+
+  it('judges p-values against an alpha whose digits lie past 10^-307', () => {
+    const [p1390, , p1410] = DEEP_P_VALUES;
+    expect(formatPValue(p1390, `0.${'0'.repeat(307)}1`)).toBe(`0.${'0'.repeat(303)}31294`);
+    expect(formatPValue(p1410, `0.${'0'.repeat(307)}141`)).toBe(`0.${'0'.repeat(307)}141`);
+    expect(formatPValue(p1410, `0.${'0'.repeat(306)}1`)).toBe(`< 0.${'0'.repeat(306)}1`);
+    // Number.MIN_VALUE's place is the deepest bound an alpha read from a YAML float can need.
+    expect(formatPValue('0.5', '5e-324')).toBe(`0.5${'0'.repeat(323)}`);
+  });
+
+  it('adds places until the figure lies on the side of alpha the p-value does', () => {
+    expect(formatPValue('0.04996', '0.05')).toBe('0.04996');
+    expect(formatPValue('0.04996')).toBe('0.0500');
+    expect(formatPValue('0.049999', 0.05)).toBe('0.049999');
+    expect(formatPValue('0.05', '0.05')).toBe('0.0500');
+    expect(formatPValue('0.050001', '0.05')).toBe('0.0500');
+    expect(formatPValue('0.05006', '0.05005')).toBe('0.0501');
+    expect(formatPValue('0.0176', '0.05')).toBe('0.0176');
+  });
+
+  it('moves the bound below an alpha smaller than 0.0001', () => {
+    expect(formatPValue('0.000041', '0.00001')).toBe('0.00004');
+    expect(formatPValue('0.000009', '0.00001')).toBe('< 0.00001');
+    expect(formatPValue('0.000004', '0.00005')).toBe('< 0.00001');
+    expect(formatPValue('0.5', '0.00000001')).toBe('0.50000000');
+  });
+
+  it.each([
+    null,
+    undefined,
+    '',
+    'n/a',
+    '0',
+    '1',
+    '-0.05',
+    '1.5',
+    '1e-325',
+    '1e-999999999',
+    `1e-${'9'.repeat(400)}`,
+  ])('ignores the alpha %j, which no p-value can be judged against', (alpha) => {
+    expect(formatPValue('0.04996', alpha)).toBe('0.0500');
+    expect(formatPValue('0.00004', alpha)).toBe('< 0.0001');
+  });
+
+  it.each([
+    null,
+    undefined,
+    '',
+    'n/a',
+    '-0.01',
+    '1.000001',
+    2,
+    Number.NaN,
+    '-1e-999999',
+    '1e999999',
+    `1e+${'9'.repeat(400)}`,
+  ])('renders %j as unavailable', (value) => {
     expect(formatPValue(value)).toBe(UNAVAILABLE);
+    expect(formatPValue(value, '0.05')).toBe(UNAVAILABLE);
+  });
+
+  it.each(P_VALUE_RELATIONS.map((entry) => [entry.p, entry.alpha, entry.relation] as const))(
+    'agrees with the backend table: p %s against α %s reads "p %s"',
+    (p, alpha, relation) => {
+      const figure = formatPValue(p, alpha);
+      expect(relation.startsWith('<') ? figure : `= ${figure}`).toBe(relation);
+      expect(formatTestLine({ name: 'fisher_exact', p_value: p, p_adjusted: p, alpha })).toBe(
+        `Fisher's exact test · p ${relation} · adjusted p ${relation} · α ${formatDecimal(alpha, 3)}`,
+      );
+    },
+  );
+
+  it('reads the whole backend table', () => {
+    expect(P_VALUE_RELATIONS.length).toBeGreaterThanOrEqual(20);
+    expect(P_VALUE_RELATIONS).toContainEqual({
+      p: '0.0000000000127560',
+      alpha: '0.05',
+      relation: '< 0.0001',
+    });
+    for (const p of DEEP_P_VALUES) {
+      expect(P_VALUE_RELATIONS).toContainEqual({ p, alpha: '0.05', relation: '< 0.0001' });
+    }
+    expect(P_VALUE_RELATIONS).toContainEqual({
+      p: '1e-999999',
+      alpha: '0.05',
+      relation: '< 0.0001',
+      pathological: true,
+    });
   });
 });
 
@@ -1242,7 +1558,38 @@ describe('formatTestLine', () => {
   it('renders the full line', () => {
     expect(
       formatTestLine({ name: 'fisher_exact', p_value: '0.012', p_adjusted: '0.036', alpha: '0.05' }),
-    ).toBe("Fisher's exact test · p = 0.012 · adjusted p = 0.036 · α 0.05");
+    ).toBe("Fisher's exact test · p = 0.0120 · adjusted p = 0.0360 · α 0.05");
+  });
+
+  it('states the p-values as the B4 reason and the CR1 label word them', () => {
+    // B4, 28-day default run: the reason reads "two-sample Poisson rate test p < 0.0001".
+    expect(
+      formatTestLine({
+        name: 'two-sample Poisson rate test',
+        p_value: '0.0000000000127560',
+        p_adjusted: null,
+        alpha: '0.05',
+      }),
+    ).toBe('Two-sample Poisson rate test · p < 0.0001 · α 0.05');
+    // B4 at 0 against 1,390 outcomes: 3.12936 × 10⁻³⁰⁴, never "p = unavailable".
+    for (const p of DEEP_P_VALUES) {
+      expect(
+        formatTestLine({ name: 'two_sample_poisson_score', p_value: p, p_adjusted: p, alpha: '0.05' }),
+      ).toBe('Two-sample Poisson rate test · p < 0.0001 · adjusted p < 0.0001 · α 0.05');
+    }
+    // CR1: the label reads "(adjusted p = 0.0176)" and the reason "p = 0.0087".
+    expect(
+      formatTestLine({
+        name: 'fisher_exact',
+        p_value: '0.008700',
+        p_adjusted: '0.017600',
+        alpha: '0.05',
+      }),
+    ).toBe("Fisher's exact test · p = 0.0087 · adjusted p = 0.0176 · α 0.05");
+    // Both p-values are judged against α: a Holm-adjusted 0.04996 never reads 0.0500.
+    expect(
+      formatTestLine({ name: 'fisher_exact', p_value: '0.04996', p_adjusted: '0.04996', alpha: 0.05 }),
+    ).toBe("Fisher's exact test · p = 0.04996 · adjusted p = 0.04996 · α 0.05");
   });
 
   it('renders a typed evidence test, with the adjusted segment only when present', () => {
@@ -1254,13 +1601,13 @@ describe('formatTestLine', () => {
     } satisfies StatTest;
     const line = formatTestLine(holm);
     expect(line).toContain("Fisher's exact test");
-    expect(line).toContain('p = 0.012');
-    expect(line).toContain('adjusted p = 0.036');
+    expect(line).toContain('p = 0.0120');
+    expect(line).toContain('adjusted p = 0.0360');
     expect(line).toContain('α 0.05');
 
     const unadjusted = formatTestLine({ ...holm, p_adjusted: null } satisfies StatTest);
     expect(unadjusted).not.toContain('adjusted');
-    expect(unadjusted).toBe("Fisher's exact test · p = 0.012 · α 0.05");
+    expect(unadjusted).toBe("Fisher's exact test · p = 0.0120 · α 0.05");
 
     expect(formatTestLine({ ...holm, name: 'mystery_test' } satisfies StatTest)).toContain(
       'mystery_test',
@@ -1278,18 +1625,18 @@ describe('formatTestLine', () => {
       'holm',
     ]);
     expect(formatTestLine({ name: 'two_proportion_z', p_value: 0.2, alpha: 0.05 })).toBe(
-      'Two-proportion z-test · p = 0.2 · α 0.05',
+      'Two-proportion z-test · p = 0.2000 · α 0.05',
     );
     expect(
-      formatTestLine({ name: 'two-sample Poisson rate test', p_value: '0.0004', alpha: '0.05' }),
-    ).toBe('Two-sample Poisson rate test · p < 0.001 · α 0.05');
-    expect(formatTestLine({ name: ' holm ', p_value: '0.5' })).toBe('Holm-adjusted · p = 0.5');
+      formatTestLine({ name: 'two-sample Poisson rate test', p_value: '0.00004', alpha: '0.05' }),
+    ).toBe('Two-sample Poisson rate test · p < 0.0001 · α 0.05');
+    expect(formatTestLine({ name: ' holm ', p_value: '0.5' })).toBe('Holm-adjusted · p = 0.5000');
   });
 
   it('shows an unknown name unchanged and omits absent segments', () => {
     expect(
       formatTestLine({ name: 'Wald test', p_value: '0.04', p_adjusted: null, alpha: null }),
-    ).toBe('Wald test · p = 0.04');
+    ).toBe('Wald test · p = 0.0400');
     expect(formatTestLine({ name: 'Wald test', p_value: null, alpha: '0.05' })).toBe(
       'Wald test · p = unavailable · α 0.05',
     );
@@ -1302,11 +1649,11 @@ describe('formatTestLine', () => {
     expect(
       formatTestLine({
         name: 'fisher_exact',
-        p_value: '0.0001',
-        p_adjusted: '0.0003',
+        p_value: '0.00001',
+        p_adjusted: '0.00003',
         alpha: '0.05',
       }),
-    ).toBe("Fisher's exact test · p < 0.001 · adjusted p < 0.001 · α 0.05");
+    ).toBe("Fisher's exact test · p < 0.0001 · adjusted p < 0.0001 · α 0.05");
   });
 });
 

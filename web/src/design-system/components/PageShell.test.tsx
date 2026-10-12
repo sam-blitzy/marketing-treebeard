@@ -197,6 +197,26 @@ describe('PageShell', () => {
     expect(window.location.hash).toBe(hashBefore);
   });
 
+  // Enter on a link dispatches a click whose detail is 0; a pointer click counts its presses.
+  it.each([
+    ['keyboard activation shows', 0, true],
+    ['a pointer click hides', 1, false],
+    ['a repeated pointer click hides', 2, false],
+  ])("%s main's focus ring (click detail %i)", (_name, detail, focusVisible) => {
+    renderShell(<p>Page content</p>);
+    const skip = screen.getByRole('link', { name: 'Skip to main content' });
+    skip.focus();
+    const focus = vi.spyOn(HTMLElement.prototype, 'focus');
+
+    fireEvent.click(skip, { detail });
+
+    const main = screen.getByRole('main');
+    expect(document.activeElement).toBe(main);
+    expect(focus.mock.contexts).toEqual([main]);
+    expect(focus.mock.calls).toEqual([[{ focusVisible }]]);
+    focus.mockRestore();
+  });
+
   it.each(EMPTY_SLOTS)('renders no side-navigation column for %s', (_name, slot) => {
     const { container } = render(
       <PageShell topBar={<TopBar productName="Ads Action Engine" />} sideNav={slot}>

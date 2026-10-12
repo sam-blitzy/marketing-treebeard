@@ -56,6 +56,8 @@ export interface StackProps {
    * narrow viewport (WCAG 2.2 SC 1.4.10 Reflow). The treatment is inherited by every descendant,
    * including a nested `Inline` row, whose items then shrink to fit their line. Defaults to
    * `false`. Leave it off on a stack that holds a `DataTable`, whose cells keep their own sizing.
+   * Inside a `DataTable` cell it has no effect: the stack keeps its words whole, as the cell does,
+   * and the table scrolls in its region instead.
    */
   breakLongWords?: boolean;
   /**

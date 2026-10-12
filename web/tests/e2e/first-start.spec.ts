@@ -29,7 +29,7 @@
  *    - White papers: the first visible asset row names an asset of the section that feedback
  *      does not hide, its Action cell reads that asset's action and every cell holds a value;
  *      its "Show details" toggle, named "Show details for {asset} ({currency})", opens the
- *      "Per creative: {asset}" table with at least one creative row.
+ *      "Per creative: {asset} ({currency})" table with at least one creative row.
  * 5. **Simulated labelling**: at least one source chip in the status bar reads "Simulated".
  *
  * Its second test, declared after the first so the first-start sign-in is never preceded by a
@@ -213,7 +213,10 @@ const ASSET_TOGGLE = /^(?:Show|Hide) details for /u;
  */
 const ASSET_TOGGLE_NAME = /^(?:Show|Hide) details for (.+) \(([^()]+)\)$/u;
 
-/** The start of an expanded white-paper row's table caption, "Per creative: {asset}". */
+/**
+ * The start of an expanded white-paper row's table caption, "Per creative: {asset} ({scope})",
+ * named for the row's toggle label.
+ */
 const PER_CREATIVE_CAPTION_PREFIX = 'Per creative: ';
 
 /** The badge a white-paper row computed from replaced data shows beside its action. */
@@ -617,7 +620,8 @@ async function expectRenderedCard(
  * its per-creative breakdown. The first visible row with a "Show details" toggle, or the
  * first held one when only held rows exist, must name an asset of this section that feedback
  * does not hide, with that asset's action in its Action cell and text in every cell; expanding
- * it must show the "Per creative: {asset}" table with at least one creative row.
+ * it must show the "Per creative: {asset} ({scope})" table, named for the row's toggle label,
+ * with at least one creative row.
  *
  * @param page - The test's page.
  * @param region - The section's region, `#section-white_papers`.
@@ -653,6 +657,8 @@ async function expectRenderedAssetRow(
     );
   }
   const name = toggleName[1] ?? '';
+  // What the row's details are named for: the asset, then the scope its toggle names.
+  const rowLabel = `${name} (${toggleName[2] ?? ''})`;
   const cells = row.getByRole('cell');
   const actionText = normalizeText(
     (await cells.last().textContent({ timeout: READ_TIMEOUT_MS })) ?? '',
@@ -700,7 +706,7 @@ async function expectRenderedAssetRow(
   const detail = page.locator(attributeSelector('id', detailId));
   await expect(detail, `the ${label} shows its details`).toBeVisible({ timeout: READ_TIMEOUT_MS });
   const perCreative = detail.getByRole('table', {
-    name: `${PER_CREATIVE_CAPTION_PREFIX}${name}`,
+    name: `${PER_CREATIVE_CAPTION_PREFIX}${rowLabel}`,
     exact: true,
   });
   await expect(perCreative, `the ${label} details its creatives`).toBeVisible({

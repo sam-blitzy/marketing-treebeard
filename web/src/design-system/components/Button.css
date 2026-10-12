@@ -71,7 +71,11 @@
   cursor: pointer;
 }
 
-/* Sizes. Both share the 44px target described in the header (--space-8 + --space-3). */
+/*
+ * Sizes. Both share the 44px target described in the header (--space-8 + --space-3). TopBar.css
+ * gives the product name the same min-block-size, so the top bar keeps one height with or
+ * without its "Sign out" Button; change the two together.
+ */
 .ds-button--md {
   padding: var(--space-2) var(--space-4);
   font-size: var(--font-size-md);

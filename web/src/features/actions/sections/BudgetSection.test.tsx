@@ -540,14 +540,14 @@ describe('B1 increase card', () => {
     ]);
     expect(shares('Budget days')).toEqual(shares('Evidence'));
 
-    // Only the day type labels may break anywhere; the counts stay whole and end-aligned.
+    // The day type labels are start-aligned text, which wraps between words only; the counts
+    // stay whole and end-aligned.
     const daysTable = within(b1).getByRole('table', { name: 'Budget days' });
     for (const row of within(daysTable).getAllByRole('row').slice(1)) {
       const [label, observed, required] = [...row.querySelectorAll('th, td')];
-      expect(label?.classList.contains('ds-datatable__cell--wrap-anywhere')).toBe(true);
+      expect(label?.className).toBe('ds-datatable__cell ds-datatable__cell--start');
       for (const count of [observed, required]) {
-        expect(count?.classList.contains('ds-datatable__cell--end')).toBe(true);
-        expect(count?.classList.contains('ds-datatable__cell--wrap-anywhere')).toBe(false);
+        expect(count?.className).toBe('ds-datatable__cell ds-datatable__cell--end');
       }
     }
   });

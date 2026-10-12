@@ -1371,6 +1371,16 @@ def test_the_contact_floor_holds_at_ten_percent_and_not_at_nine_point_nine(
     assert evidence.metric("ql").floor
     assert evidence.metric("cost_per_ql").floor
     assert FLAG_ATTRIBUTION_FLOOR in floored.item(row).flag_codes
+    # The QL sample is the floored count too, so it renders "≥ 900 / 3", never "900 / 3".
+    assert evidence.sample is not None
+    assert (evidence.sample.observed, evidence.sample.floor) == (900, True)
+    assert evidence.to_json()["sample"]["floor"] is True
+
+    clear_run = run_scenario(make_context, "wp.contact_floor.does_not_fire")
+    clear_sample = clear_run.item(clear_run.row()).evidence.sample
+    assert clear_sample is not None
+    assert (clear_sample.observed, clear_sample.floor) == (901, False)
+    assert "floor" not in clear_sample.to_json()
 
     clear = run_scenario(make_context, "wp.contact_floor.does_not_fire").row()
     assert clear.unmatched_leads == 99
@@ -1386,12 +1396,16 @@ def test_a_floored_zero_denominator_cost_is_a_dash_never_a_ceiling(
     make_context: MakeContext,
 ) -> None:
     """Under the contact floor, QL "≥ 0" and meetings "≥ 0" give "—" costs, never "≤ X"."""
-    row = run_scenario(make_context, "wp.contact_floor_no_outcomes.case").row()
+    run = run_scenario(make_context, "wp.contact_floor_no_outcomes.case")
+    row = run.row()
     assert row.has_flag(FLAG_ATTRIBUTION_FLOOR)
     assert (row.ql.render(), row.meetings_booked.render()) == ("≥ 0", "≥ 0")
     assert row.cost_per_ql == CostValue(None, note=NO_QL_NOTE)
     assert row.cost_per_meeting == CostValue(None, note=NO_MEETINGS_NOTE)
     assert (row.cost_per_ql.render(), row.cost_per_meeting.render()) == ("—", "—")
+    # The cohort's QL total sums a floored count, so its shortfall keeps the floor as well.
+    cohort_sample = dict(run.item(row).evidence.extra["cohort_sample"])
+    assert (cohort_sample["observed"], cohort_sample["floor"]) == (0, True)
 
 
 def test_the_creative_floor_labels_only_the_per_creative_breakdown(

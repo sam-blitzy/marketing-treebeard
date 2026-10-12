@@ -9,9 +9,10 @@
  * - `GET /decisions` with no filter, rendered as one `<h3>` section per subject (keyed by type
  *   and id) in the order of each subject's newest decision, rows kept newest first;
  * - the six columns, Decided, Origin, Decided by, Patch applied, Resulting expected state and
- *   Note, on one column grid shared by every subject's table (the same shares, minimums and
- *   breakable columns whatever the rows hold, sized for a short display zone such as UTC or a
- *   longer one such as America/New_York), with instants in the default run's time zone
+ *   Note, on one column grid shared by every subject's table (the same shares and minimums
+ *   whatever the rows hold, sized for a short display zone such as UTC or a longer one such as
+ *   America/New_York), every cell keeping its words whole and breaking a long author only after
+ *   its separators, with instants in the default run's time zone
  *   (UTC until one exists), amounts in each subject's own currency, the patch read defensively
  *   from stored JSON, and the expected state rendered by decision shape, tombstones included;
  * - the loading, failed, empty and row-limit states, and a failed refetch that keeps the log,
@@ -622,11 +623,6 @@ describe('DecisionLog subjects', () => {
         for (const row of within(table).getAllByRole('row').slice(1)) {
           const cells = Array.from(row.querySelectorAll('th, td'));
           expect(cells.map(minimumOf)).toEqual(minimums);
-          // Every column but Decided breaks long tokens anywhere, so no row's content sets a
-          // column's minimum; the instant breaks only between words.
-          expect(
-            cells.map((cell) => cell.classList.contains('ds-datatable__cell--wrap-anywhere')),
-          ).toEqual([false, true, true, true, true, true]);
         }
       }
     },
@@ -671,6 +667,25 @@ describe('DecisionLog subjects', () => {
       'daily budget USD\u00a0500.00',
       '—',
     ]);
+  });
+
+  it('keeps every word whole and breaks a long author only after its separators', async () => {
+    mockApi(logHandlers(defaultLog()));
+
+    await renderLog();
+
+    const table = await findTable('Brand Search — US');
+    const [userRow, baselineRow] = within(table).getAllByRole('row').slice(1);
+    const author = userRow?.querySelectorAll('th, td')[2];
+    // "admin@example.com" may wrap after its "@" and ".", and its text is unchanged.
+    expect(author?.textContent).toBe('admin@example.com');
+    expect(author?.innerHTML).toBe('<span>admin@<wbr>example.<wbr>com</span>');
+    // The baseline's patch is prose: no break opportunity is added inside "Platform".
+    const patch = baselineRow?.querySelectorAll('th, td')[3];
+    expect(patch?.textContent).toBe('Platform state at first sync');
+    expect(patch?.querySelector('wbr')).toBeNull();
+    // No cell of the log opts into breaking inside a word.
+    expect(document.querySelector('[class*="wrap-anywhere"]')).toBeNull();
   });
 
   it('formats instants in the default run time zone', async () => {

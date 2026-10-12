@@ -136,6 +136,13 @@
  * min-inline-size: 0 lets it shrink below the intrinsic width of long content, so text and
  * tables wrap inside it instead of widening the page. The gap spaces the title bar and the
  * sections.
+ *
+ * The block-start scroll margin keeps main's focus ring in view after the skip link. Focusing
+ * main scrolls it into view, and on a page taller than the viewport that puts main's top edge at
+ * the viewport's top, which would clip the base :focus-visible ring drawn outside it. The ring
+ * reaches --space-1 beyond the edge (its offset plus its width, half of --space-1 each), so a
+ * margin of --space-2 leaves the whole ring painted with a --space-1 gap above it, the same
+ * clearance the skip link's own block margin gives its ring (WCAG 2.2 SC 2.4.7 and 2.4.11).
  */
 .ds-pageshell__main {
   display: flex;
@@ -147,12 +154,14 @@
     calc(var(--space-8) * 23),
     (var(--size-full) - var(--space-8) * 30 - var(--space-6)) * 999
   );
+  scroll-margin-block-start: var(--space-2);
 }
 
 /*
  * Main receives focus from the skip link (tabindex="-1"). The ring is dropped only when the
- * browser judges the focus non-visible, as after a mouse click on the skip link; keyboard
- * activation keeps the base :focus-visible ring from ../tokens.css (WCAG 2.2 SC 2.4.7).
+ * browser judges the focus non-visible, as after a mouse click on the skip link, for which
+ * PageShell.tsx focuses main with focusVisible: false; keyboard activation keeps the base
+ * :focus-visible ring from ../tokens.css (WCAG 2.2 SC 2.4.7).
  */
 .ds-pageshell__main:focus:not(:focus-visible) {
   outline: 0;

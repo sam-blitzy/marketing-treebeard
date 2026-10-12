@@ -7,12 +7,44 @@
  * rendered only when `children` renders something: skipped for `undefined`, `null`, booleans,
  * `''` and arrays, at any depth, none of whose items renders; kept for `0`, for an array with
  * one rendering item, and for a non-array iterable, which is passed to React unread.
+ *
+ * They also hold `TopBar.css` to `Button.css`: the product name's line has the Button sizes'
+ * min-block-size, so the bar has one height with and without its "Sign out" Button. jsdom lays
+ * nothing out, so the declarations are compared as written.
  */
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { fireEvent, render, screen } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 
 import { TopBar } from './TopBar';
+
+/**
+ * Returns the value of one declaration in one rule of a stylesheet beside this file, with its
+ * whitespace collapsed, so a value the formatter wraps over several lines compares equal to the
+ * same value on one line.
+ *
+ * @param file - the stylesheet's file name, for example `'Button.css'`
+ * @param selector - the rule's exact selector, written at the start of a line
+ * @param property - the declared property
+ * @returns the declared value
+ */
+function declaredValue(file: string, selector: string, property: string): string {
+  const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), file), 'utf8');
+  const start = source.indexOf(`\n${selector} {\n`);
+  if (start === -1) {
+    throw new Error(`${file} has no "${selector}" rule`);
+  }
+  const block = source.slice(start, source.indexOf('\n}', start));
+  const match = new RegExp(`\\n\\s*${property}:\\s*([^;]+);`).exec(block);
+  if (match?.[1] === undefined) {
+    throw new Error(`${file} "${selector}" declares no ${property}`);
+  }
+  return match[1].replace(/\s+/g, ' ').replace(/\( /g, '(').replace(/ \)/g, ')').trim();
+}
 
 /** `children` values that render nothing, each of which must leave no actions row behind. */
 const EMPTY_CHILDREN: readonly [string, ReactNode][] = [
@@ -135,4 +167,14 @@ describe('TopBar', () => {
       'admin@example.com',
     );
   });
+
+  it.each(['.ds-button--md', '.ds-button--sm'])(
+    'gives the product name the min-block-size of %s, so signing in keeps the bar height',
+    (buttonSize) => {
+      const productFloor = declaredValue('TopBar.css', '.ds-topbar__product', 'min-block-size');
+
+      expect(productFloor).toBe('calc(var(--space-8) + var(--space-3))');
+      expect(declaredValue('Button.css', buttonSize, 'min-block-size')).toBe(productFloor);
+    },
+  );
 });

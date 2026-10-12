@@ -484,12 +484,15 @@ class _Insufficiency:
         withheld_reason: The reason of the cohort's withheld W1/W2 line.
         total_ql: The cohort's QL across its assets (the gate input); ``None`` when unavailable.
         required: ``w.cohort_min_total_ql``.
+        floor: Whether ``total_ql`` is a floor: it sums a row whose QL is a floor, so the true
+            total may be higher (AAP 0.5.4.7 "≥ N").
     """
 
     reason: str
     withheld_reason: str
     total_ql: int | None
     required: int
+    floor: bool = False
 
     @property
     def cohort_sample(self) -> dict[str, Any]:
@@ -497,13 +500,17 @@ class _Insufficiency:
 
         Observational only: a cohort that falls short of the minimum is a failed gate, so its
         rows carry no ``evidence.sample`` (P6); ``observed`` is ``None`` when the QL count is
-        unavailable.
+        unavailable. ``floor`` is present, and true, only when the total is a floor, as
+        :meth:`Sample.to_json` emits it.
         """
-        return {
+        sample: dict[str, Any] = {
             "observed": self.total_ql,
             "required": self.required,
             "unit": "Qualified Leads across the cohort's assets",
         }
+        if self.floor:
+            sample["floor"] = True
+        return sample
 
 
 def _insufficiency(cohort: Cohort, settings: _Settings) -> _Insufficiency | None:
@@ -533,10 +540,11 @@ def _insufficiency(cohort: Cohort, settings: _Settings) -> _Insufficiency | None
             total_ql=None,
             required=required,
         )
+    # A sum that includes a floor is itself a floor: the true total may be higher.
+    floored = any(row.ql.floor for row in cohort.rows)
     if cohort.total_ql < required:
         have = _plural(cohort.total_ql, "Qualified Lead")
-        if any(row.ql.floor for row in cohort.rows):
-            # A sum that includes a floor is itself a floor: the true total may be higher.
+        if floored:
             have = f"≥ {have}"
         return _Insufficiency(
             reason=(
@@ -549,6 +557,7 @@ def _insufficiency(cohort: Cohort, settings: _Settings) -> _Insufficiency | None
             ),
             total_ql=cohort.total_ql,
             required=required,
+            floor=floored,
         )
     if cohort.median_cost_per_ql is None:
         least = _plural(settings.median_min_ql, "Qualified Lead")
@@ -562,6 +571,7 @@ def _insufficiency(cohort: Cohort, settings: _Settings) -> _Insufficiency | None
             ),
             total_ql=cohort.total_ql,
             required=required,
+            floor=floored,
         )
     return None
 
@@ -636,6 +646,8 @@ def _decide_with_ql(
         f"cohort median of {median_text})"
     )
     ql_text = _count_text(row.ql, "Qualified Lead")
+    # The QL count against W1's minimum, keeping the floor its column shows ("≥ N").
+    sample = Sample(ql, settings.min_ql, "Qualified Leads", floor=row.ql.floor)
     if ql < settings.min_ql:
         # P6: a QL count below W1's minimum is a failed gate, never the item's sample. The
         # shortfall is kept in extra, and W1 is withheld with it when the cost pattern holds.
@@ -656,15 +668,8 @@ def _decide_with_ql(
             f"{ql_text}, below the {settings.min_ql} W1 needs; cost per Qualified Lead "
             f"{cost_text} against the {currency} cohort median of {median_text}.",
             withheld=below_minimum,
-            extra={
-                "w1_sample": {
-                    "observed": ql,
-                    "required": settings.min_ql,
-                    "unit": "Qualified Leads",
-                }
-            },
+            extra={"w1_sample": sample.to_json()},
         )
-    sample = Sample(ql, settings.min_ql, "Qualified Leads")
     if cost.value is None or cost.value > ceiling:
         # A ceiling ("≤ X", under a floor) above the threshold does not prove the true cost is.
         verdict = "is not shown to be within" if cost.ceiling else "is above"
@@ -799,8 +804,13 @@ def _decide_without_ql(
     multiple_text = _plain(settings.retire_multiple)
     ratio = None if median <= 0 else _plain_decimal(spend / median)
     extra: dict[str, Any] = {"spend_to_median": ratio}
+    # Under an attribution floor the zero is itself a floor ("≥ 0 Qualified Leads", as its
+    # column shows it): the true count may be higher, so no sentence says there is none.
+    floored = _count_text(row.ql, "Qualified Lead") if row.ql.floor else None
     if spend <= 0:
-        return _no_change("No spend and no Qualified Lead in the window.", extra=extra)
+        return _no_change(
+            f"No spend and {floored or 'no Qualified Lead'} in the window.", extra=extra
+        )
     if ratio is None:
         # The median is 0: "spend >= multiple x 0" would retire any paid row, so W2's
         # spend-to-median comparison is reported unavailable instead of judged.
@@ -818,7 +828,8 @@ def _decide_without_ql(
             unit="x cohort median cost per Qualified Lead",
         )
         return _no_change(
-            f"No Qualified Lead yet after {spend_text} of spend, but W2 is withheld: {why}.",
+            f"{floored or 'No Qualified Lead yet'} after {spend_text} of spend, but W2 is "
+            f"withheld: {why}.",
             withheld=(unavailable,),
             extra=extra,
         )
@@ -829,7 +840,7 @@ def _decide_without_ql(
     )
     if spend < retire_at:
         return _no_change(
-            f"No Qualified Lead yet; spend {spend_text} is {ratio_text}, below the "
+            f"{floored or 'No Qualified Lead yet'}; spend {spend_text} is {ratio_text}, below the "
             f"{multiple_text} x ({_money(retire_at, currency)}) at which W2 retires.",
             extra=extra,
         )
@@ -837,8 +848,8 @@ def _decide_without_ql(
     if guards:
         reasons = "; ".join(item.reason for item in guards)
         return _no_change(
-            f"No Qualified Lead after {spend_text} of spend, {ratio_text}, but W2 is withheld: "
-            f"{reasons}.",
+            f"{floored or 'No Qualified Lead'} after {spend_text} of spend, {ratio_text}, but W2 "
+            f"is withheld: {reasons}.",
             withheld=guards,
             extra=extra,
         )

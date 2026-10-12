@@ -132,7 +132,7 @@ const FIXTURE_BADGE_TEXTS: Readonly<Record<FlagCode, string>> = {
   meeting_time_proxy: MEETING_PROXY_BADGE,
   pipeline_unavailable: FIXTURE_FLAGS.pipeline_unavailable.message,
   no_crm_link: FIXTURE_FLAGS.no_crm_link.message,
-  not_distinguishable: 'Not yet distinguishable (adjusted p = 0.21)',
+  not_distinguishable: 'Not yet distinguishable (adjusted p = 0.2100)',
   search_term_coverage: 'Low search-term coverage: 74% of keyword spend',
   shared_budget: 'Shared budget across 2 campaigns: decided at budget level',
 };

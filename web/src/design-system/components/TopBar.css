@@ -44,22 +44,20 @@
  * and overflow-wrap then breaks an unbroken name rather than letting it push the bar wider than
  * the viewport.
  *
- * Its line is as tall as the md Button's border box, so the bar keeps one height and the name
- * one position whether or not the actions row holds a "Sign out" Button: block padding of two
- * --space-2 steps, one --font-size-md line at --line-height-tight, and two hairline borders of a
- * quarter of --space-1 (38px at the 16px root). This mirrors .ds-button and .ds-button--md in
- * Button.css, so change the two together. The floor sits on the name rather than on the bar,
- * because a bar-level floor would let the name sit higher when the actions wrap onto a line of
- * their own on a narrow viewport. The name is centred in that line by a column flex box, not by
- * align-items: a row flex box would keep its text at its longest word and defeat overflow-wrap.
+ * Its line is as tall as a Button, so the bar keeps one height and the name one position whether
+ * or not the actions row holds a "Sign out" Button: the floor is the --space-8 + --space-3 target
+ * (44px at the 16px root) that .ds-button--md and .ds-button--sm set as their min-block-size in
+ * Button.css, so change the two together (TopBar.test.tsx compares them). The floor sits on the
+ * name rather than on the bar, because a bar-level floor would let the name sit higher when the
+ * actions wrap onto a line of their own on a narrow viewport. The name is centred in that line
+ * by a column flex box, not by align-items: a row flex box would keep its text at its longest
+ * word and defeat overflow-wrap.
  */
 .ds-topbar__product {
   display: flex;
   flex-direction: column;
   justify-content: center;
-  min-block-size: calc(
-    2 * var(--space-2) + var(--font-size-md) * var(--line-height-tight) + var(--space-1) / 2
-  );
+  min-block-size: calc(var(--space-8) + var(--space-3));
   min-inline-size: 0;
   overflow-wrap: break-word;
   font-size: var(--font-size-lg);

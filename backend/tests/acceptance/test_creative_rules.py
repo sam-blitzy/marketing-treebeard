@@ -153,9 +153,6 @@ WEAK_STAGE_REASON: Final = re.compile(
 RATE_PLACES: Final = Decimal("0.000001")
 """Rates, shortfalls and baselines are stored at 6 places."""
 
-P_PLACES: Final = Decimal("0.0001")
-"""Labels render p-values at 4 places, or "< 0.0001" below that."""
-
 
 # ---------------------------------------------------------------------------------------------
 # Helpers
@@ -311,9 +308,13 @@ def _shows(percent: str, rate: Decimal) -> bool:
     return (rate * 100).quantize(shown) == shown
 
 
-def _rendered_p(value: Decimal) -> str:
-    """A p-value with its relation as labels render it: "= 0.0123", or "< 0.0001" below that."""
-    return "< 0.0001" if value < P_PLACES else f"= {value.quantize(P_PLACES):f}"
+def _rendered_p(value: Decimal, alpha: Decimal) -> str:
+    """A p-value with its relation as labels render it against ``alpha``: "= 0.0123", "< 0.0001".
+
+    The one rule of ``stats.p_relation`` (pinned case by case in ``test_stats.py``), which the
+    reason, the ``not_distinguishable`` flag and the card's test line share.
+    """
+    return stats.p_relation(value, alpha)
 
 
 def _daily_delivery(variants: Sequence[CreativeTotals]) -> Decimal:
@@ -574,7 +575,7 @@ def test_cr1_distinguishable_pair_is_labelled_with_its_adjusted_p_and_test(
     assert test.alpha == cr.alpha
     assert test.p_adjusted < cr.alpha
 
-    label = f"Distinguishable (adjusted p {_rendered_p(test.p_adjusted)})"
+    label = f"Distinguishable (adjusted p {_rendered_p(test.p_adjusted, cr.alpha)})"
     assert extra["label"] == label
     assert item.action == f"{_title(item)}: {label}"
     assert extra["distinguishable"] is True
@@ -602,8 +603,9 @@ def test_cr1_ahead_but_not_distinguishable_states_the_impressions_still_needed(
     assert needed > 0
 
     leader, other = run.name("cr-a"), run.name("cr-b")
+    shown_p = _rendered_p(test.p_adjusted, cr.alpha)
     label = (
-        f"{leader} ahead, not yet distinguishable (adjusted p {_rendered_p(test.p_adjusted)}); "
+        f"{leader} ahead, not yet distinguishable (adjusted p {shown_p}); "
         f"about {needed:,} more impressions per variant needed at the observed difference"
     )
     assert extra["ahead"] == run.urn("cr-a")
@@ -650,9 +652,8 @@ def test_cr1_holm_adjustment_flips_a_raw_significant_pair_to_not_distinguishable
     assert recomputed.p_value == test.p_value
     assert flip.evidence.extra["distinguishable"] is False
     assert flip.has_flag(FLAG_NOT_DISTINGUISHABLE)
-    assert f"ahead, not yet distinguishable (adjusted p {_rendered_p(test.p_adjusted)})" in (
-        flip.action
-    )
+    shown_p = _rendered_p(test.p_adjusted, cr.alpha)
+    assert f"ahead, not yet distinguishable (adjusted p {shown_p})" in flip.action
     assert "Holm-adjusted across 3 pairs" in flip.reason
     assert {item.evidence.extra["comparisons"] for item in items} == {3}
 
@@ -671,7 +672,7 @@ def test_cr1_significance_level_is_read_from_the_configuration(
     assert test.p_adjusted < test.alpha
     assert item.evidence.extra["distinguishable"] is True
     assert item.evidence.extra["label"] == (
-        f"Distinguishable (adjusted p {_rendered_p(test.p_adjusted)})"
+        f"Distinguishable (adjusted p {_rendered_p(test.p_adjusted, test.alpha)})"
     )
     assert not item.has_flag(FLAG_NOT_DISTINGUISHABLE)
     assert item.evidence.thresholds["cr.alpha"] == 0.2
@@ -703,7 +704,7 @@ def test_cr1_uses_fisher_below_five_expected_and_the_z_test_otherwise(
     assert (recomputed.method, recomputed.expected_min) == (method, expected_min)
     assert test.name == item.evidence.extra["test"]["method"] == method
     assert item.evidence.extra["test"]["label"] == label
-    assert f"{label} p {_rendered_p(recomputed.p_value)}" in item.reason
+    assert f"{label} p {_rendered_p(recomputed.p_value, cr.alpha)}" in item.reason
 
 
 def test_cr1_identical_rates_leave_the_impressions_needed_not_estimable(

@@ -16,9 +16,10 @@
  *   `<col>` per column (an expandable table's toggle col first, classless), classed
  *   `ds-datatable__col--share-{n}`, and no colgroup without a valid share; `minWidth` classes the
  *   column's header and body cells; `alignCell` sets each body cell's alignment while the header
- *   keeps `align`; `wrap: 'anywhere'` classes the column's body cells only; a `note` follows the
- *   cell's content after a space in its note span; `sticky` classes the first column's header and
- *   body cells only;
+ *   keeps `align`; a long token in a string header, cell or note gets a `<wbr>` after each run of
+ *   separators, its text and accessible name unchanged, element content is rendered as given, and
+ *   no cell takes a class to break inside a word; a `note` follows the cell's content after a
+ *   space in its note span; `sticky` classes the first column's header and body cells only;
  * - density: `density: 'compact'` adds `ds-datatable--compact` to its own `<table>` only, leaving
  *   the region, every cell's classes and the toggle as they are, and never reaches a table nested
  *   in a detail row; any other value renders the default density;
@@ -1052,26 +1053,53 @@ describe('DataTable', () => {
       expect(at(firstRowCells(), 4).classList).toContain('ds-datatable__cell--end');
     });
 
-    it("adds the break-anywhere class to a wrap: 'anywhere' column's body cells only", () => {
-      renderAssets({ columns: withColumn(5, { wrap: 'anywhere', minWidth: 'sm' }) });
+    it('breaks a long token of a string header, cell or note only after its separators', () => {
+      renderAssets({
+        columns: [
+          { key: 'asset', header: 'HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY', isRowHeader: true },
+          { key: 'slug', header: 'Slug', note: () => '(DATA_MODE=simulated)' },
+          at(COLUMNS, 1),
+        ],
+        rows: [{ ...at(ROWS, 0), asset: 'urn:li:leadGenForm:7001', slug: 'hubspot.deal_search' }],
+      });
 
-      expect(at(screen.getAllByRole('columnheader'), 5).className).toBe(
-        'ds-datatable__header ds-datatable__cell--start ds-datatable__cell--min-sm',
+      const [assetHeader, slugHeader] = screen.getAllByRole('columnheader');
+      expect(assetHeader?.innerHTML).toBe(
+        '<span>HUBSPOT_<wbr>GOOGLE_<wbr>CAMPAIGN_<wbr>PROPERTY</span>',
       );
-      for (const row of screen.getAllByRole('row').slice(1)) {
-        expect(at(cellsOf(row), 5).className).toBe(
-          'ds-datatable__cell ds-datatable__cell--start ds-datatable__cell--min-sm ds-datatable__cell--wrap-anywhere',
-        );
-      }
-      expect(document.querySelectorAll('.ds-datatable__cell--wrap-anywhere')).toHaveLength(
-        ROWS.length,
+      expect(slugHeader?.innerHTML).toBe('Slug');
+      const [asset, slug, spend] = firstRowCells();
+      expect(asset?.innerHTML).toBe('<span>urn:<wbr>li:<wbr>leadGenForm:<wbr>7001</span>');
+      expect(slug?.innerHTML).toBe(
+        '<span>hubspot.<wbr>deal_<wbr>search</span> <span class="ds-datatable__cell-note">' +
+          '<span>(DATA_<wbr>MODE=<wbr>simulated)</span></span>',
       );
+      // A short figure with a separator stays whole.
+      expect(spend?.innerHTML).toBe('EUR 1200.00');
+      // <wbr> adds no character: the text and the accessible names are exactly as given.
+      expect(slug?.textContent).toBe('hubspot.deal_search (DATA_MODE=simulated)');
+      expect(
+        screen.getByRole('columnheader', { name: 'HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY' }),
+      ).toBe(assetHeader);
+      expect(screen.getByRole('rowheader', { name: 'urn:li:leadGenForm:7001' })).toBe(asset);
+      // Breaking a token adds no class: every cell keeps its words whole.
+      expect(slug?.className).toBe('ds-datatable__cell ds-datatable__cell--start');
     });
 
-    it('breaks no cell anywhere and holds no column open by default', () => {
+    it('renders element content as given, for the feature to break a token inside it', () => {
+      const code = <code>hubspot.deal_search</code>;
+      renderAssets({ columns: withColumn(0, { render: () => code }) });
+
+      for (const row of screen.getAllByRole('row').slice(1)) {
+        expect(at(cellsOf(row), 0).innerHTML).toBe('<code>hubspot.deal_search</code>');
+      }
+    });
+
+    it('breaks no cell inside a word and holds no column open by default', () => {
       renderAssets({ renderExpanded: () => 'detail' });
 
-      expect(document.querySelector('.ds-datatable__cell--wrap-anywhere')).toBeNull();
+      expect(document.querySelector('[class*="anywhere"]')).toBeNull();
+      expect(document.querySelector('wbr')).toBeNull();
       expect(document.querySelector('[class*="ds-datatable__cell--min-"]')).toBeNull();
       expect(document.querySelector('colgroup')).toBeNull();
       expect(document.querySelector('.ds-datatable__cell--sticky')).toBeNull();

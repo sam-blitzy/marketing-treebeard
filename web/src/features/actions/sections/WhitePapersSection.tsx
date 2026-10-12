@@ -16,10 +16,11 @@
  *    simulated-data badge and its floor badges ({@link floorFlags}: attribution, creative and
  *    deal floors and unknown CRM evidence) beside the "≥ N" and "≤ X" cells they explain;
  * 2. each row expands from its "Show details" toggle, named for its row ("Show details for
- *    {asset} ({currency})", {@link AssetTable}), to its per-creative rows, "unknown creative"
- *    included, then the reason, the evidence it was judged on in the shared
- *    {@link EvidenceTable} (metrics against baselines, sample, test, thresholds applied, data
- *    used), the flags (floor flags among them), the row's notes ("Notes on {asset}": first its
+ *    {asset} ({currency})", {@link AssetTable}), to its per-creative rows ("Per creative:
+ *    {asset} ({currency})"), "unknown creative" included, then the reason, the evidence it was
+ *    judged on in the shared {@link EvidenceTable} ("Evidence for {asset} ({currency})":
+ *    metrics against baselines, sample, test, thresholds applied, data used), the flags (floor
+ *    flags among them), the row's notes ("Notes on {asset} ({currency})": first its
  *    `skipped_stage` notes, "{stage}: N contacts skipped this stage (not counted)" (AAP 0.5.4.7
  *    "The row reports …"), each on the row of the asset and currency it counts
  *    ({@link placeSkippedFindings}) rather than as an anonymous section banner; then the
@@ -33,7 +34,8 @@
  *    replaced data", each with its replaced-data badge in the Action cell. A row a refetch moves
  *    there keeps keyboard focus that was on it or in its details, on its toggle in the new table
  *    ({@link AssetCell}, WCAG 2.2 SC 2.4.3);
- * 4. the cohort's notes: its spend total in its own currency, as the backend computed it, the
+ * 4. the cohort's notes: its spend total in its own currency, as the backend computed it, saying
+ *    how many of the assets it covers the page does not list ({@link spendTotalNote}), the
  *    note that counts overlap across assets, and what the LinkedIn leads and meetings booked
  *    columns count;
  * 5. last in the group (AAP 0.5.5 "Held cards appear collapsed at the end of their group"),
@@ -410,7 +412,7 @@ function cellText(cell: CellView | undefined): string {
 interface AssetRowView {
   /** The white-paper item the row shows. */
   readonly item: Item;
-  /** The asset's display name: the row header and the per-creative caption. */
+  /** The asset's display name: the row header, and what its toggle and details are named for. */
   readonly name: string;
   /** Each metric's value and note, keyed by `WHITE_PAPER_METRIC_KEYS`. */
   readonly cells: ReadonlyMap<WhitePaperMetricKey, CellView>;
@@ -581,10 +583,10 @@ interface PlacedFindings {
  * counts would read identically and none would say which row it qualifies.
  *
  * - A skipped-stage finding about a row the section renders becomes one of that row's notes,
- *   its message verbatim, in API order, listed first in the row's "Notes on {asset}" when the
- *   row is expanded ({@link AssetDetails}), and leaves the section's findings. A rendered row is
- *   an item of any group, visible, computed from replaced data or held, that feedback does not
- *   hide ({@link isHidden}): the frame never renders a hidden one.
+ *   its message verbatim, in API order, listed first in the row's "Notes on {asset}
+ *   ({currency})" when the row is expanded ({@link AssetDetails}), and leaves the section's
+ *   findings. A rendered row is an item of any group, visible, computed from replaced data or
+ *   held, that feedback does not hide ({@link isHidden}): the frame never renders a hidden one.
  * - A skipped-stage finding about an entity no rendered row has stays a section banner, its
  *   message prefixed with the asset and currency it counts ({@link namedSkippedMessage}).
  * - Every other finding, `pipeline_unavailable` and any finding without an entity among them,
@@ -727,9 +729,9 @@ function rowDetails(tableRow: Element): HTMLElement | null {
  * row's skipped-stage notes are not here but first among its details' notes
  * ({@link AssetDetails}), so the cell stays as narrow as its name and badges.
  *
- * Captions and the toggle's row name keep the plain name. In a batched table the name is the
- * row's focus target ({@link BatchEntryAnchor}), so focus lands on the row when a reveal shows it
- * first.
+ * Captions and the toggle's row name keep the plain name, without the badges, followed by the
+ * row's scope ({@link rowLabelOf}). In a batched table the name is the row's focus target
+ * ({@link BatchEntryAnchor}), so focus lands on the row when a reveal shows it first.
  *
  * A row React mounts in place of a row of the same asset that left the page holding keyboard
  * focus, on its toggle, its cells or its expanded details, takes that focus on its own toggle
@@ -976,6 +978,14 @@ interface AssetDetailsProps {
   /** The asset row to detail. */
   row: AssetRowView;
   /**
+   * What the details' per-creative table, evidence table and notes list are named for: the
+   * asset's name with what tells this row apart from the same asset's rows elsewhere on the
+   * page, its cohort's currency first, "The 2026 B2B Pipeline Report (EUR)" (in a table, the
+   * row's toggle label, {@link rowLabelOf}), so the EUR and USD rows of one asset never name
+   * their tables and notes alike.
+   */
+  label: string;
+  /**
    * The per-creative table's MQL header: the header the asset row's frozen evidence records,
    * else the one its asset table is headed with.
    */
@@ -985,12 +995,12 @@ interface AssetDetailsProps {
 /**
  * An asset row's expanded detail (AAP 0.5.5 "Each row expands to per-creative rows, including
  * 'unknown creative'"), top to bottom: the per-creative table captioned "Per creative:
- * {asset}", whose rows partition the asset's events; the reason sentence; the evidence it was
+ * {label}", whose rows partition the asset's events; the reason sentence; the evidence it was
  * judged on, as every recommendation shows it ({@link EvidenceTable} captioned "Evidence for
- * {asset}", AAP 0.5.4.8): the cited metrics against their baselines (the cohort median cost per
+ * {label}", AAP 0.5.4.8): the cited metrics against their baselines (the cohort median cost per
  * Qualified Lead beside the cost per Qualified Lead), the sample and test lines, the thresholds
  * applied and the datasets used with their completeness and coverage; the flags, recorded and
- * current (floor flags among them); the row's notes, a list named "Notes on {asset}"
+ * current (floor flags among them); the row's notes, a list named "Notes on {label}"
  * ({@link assetNotes}): first its skipped-stage notes, read from the section being rendered
  * ({@link RowNotesContext}), then what the causal check excluded and the orphan-deal share, the
  * list left out when it has no line; the window chip; a historical row's "Computed from replaced
@@ -998,12 +1008,17 @@ interface AssetDetailsProps {
  * row. A held row's hold reason and its link to the blocking discrepancy are not repeated here:
  * its Action cell shows them on the collapsed row ({@link ActionCell}).
  *
+ * The label is the asset's name with its row's scope in parentheses, the cohort's currency
+ * first, "The 2026 B2B Pipeline Report (EUR)" ({@link AssetDetailsProps.label}), so the
+ * per-creative table, the evidence table and the notes list of the same asset's EUR and USD rows
+ * each have their own accessible name (WCAG 2.2 SC 1.3.1, 2.4.6).
+ *
  * The per-creative table shows `ROW_BATCH_SIZE` rows at a time, in stored order, followed by a
  * "Show {n} more creatives" control when the asset has more (`../batches`), so an asset with
  * hundreds of creatives mounts a bounded table when it is expanded.
  */
-function AssetDetails({ row, mql }: AssetDetailsProps): ReactElement {
-  const { item, name } = row;
+function AssetDetails({ row, label, mql }: AssetDetailsProps): ReactElement {
+  const { item } = row;
   const rowNotes = useContext(RowNotesContext);
   const entity = entityKey(item.entity);
   const skipped = entity === null ? NO_SKIPPED_NOTES : (rowNotes.get(entity) ?? NO_SKIPPED_NOTES);
@@ -1023,7 +1038,7 @@ function AssetDetails({ row, mql }: AssetDetailsProps): ReactElement {
   return (
     <Stack gap={3}>
       <DataTable
-        caption={`Per creative: ${name}`}
+        caption={`Per creative: ${label}`}
         columns={columns}
         rows={creatives}
         getRowKey={(creative) => `${creative.index}-${creative.row.key}`}
@@ -1032,10 +1047,10 @@ function AssetDetails({ row, mql }: AssetDetailsProps): ReactElement {
       />
       <BatchControl batches={batches} noun={CREATIVE_ROW_NOUN} />
       {reason === null ? null : <div>{reason}</div>}
-      <EvidenceTable evidence={item.evidence} caption={`Evidence for ${name}`} />
+      <EvidenceTable evidence={item.evidence} caption={`Evidence for ${label}`} />
       <FlagList flags={item.flags} current={item.current.flags_now} />
       {notes.length === 0 ? null : (
-        <Stack as="ul" gap={1} aria-label={`Notes on ${name}`}>
+        <Stack as="ul" gap={1} aria-label={`Notes on ${label}`}>
           {notes.map((note) => (
             <li key={note.key}>{note.text}</li>
           ))}
@@ -1100,7 +1115,8 @@ function sharedNames(items: readonly Item[]): ReadonlySet<string> {
  * in parentheses, the cohort's currency first, so the same asset's rows in the EUR and USD
  * tables, or in a cohort's visible, replaced-data and held tables, never share a name. When
  * another row of the table shows the same name, the asset's id follows the scope ("{asset}
- * (EUR, {id})"), else the item's.
+ * (EUR, {id})"), else the item's. The row's details are named for the same label
+ * ({@link AssetDetails}: "Per creative: {label}", "Evidence for {label}", "Notes on {label}").
  *
  * @param row - the asset row
  * @param scope - the table's scope ({@link AssetTableProps.scope})
@@ -1164,7 +1180,13 @@ function AssetTable({ caption, scope, items, mql }: AssetTableProps): ReactEleme
         columns={columns}
         rows={rows}
         getRowKey={(row) => rowKeys.get(row.item) ?? itemIdentity(row.item)}
-        renderExpanded={(row) => <AssetDetails row={row} mql={row.frozenMql ?? header} />}
+        renderExpanded={(row) => (
+          <AssetDetails
+            row={row}
+            label={rowLabelOf(row, scope, shared)}
+            mql={row.frozenMql ?? header}
+          />
+        )}
         getRowLabel={(row) => rowLabelOf(row, scope, shared)}
         density="compact"
       />
@@ -1182,10 +1204,17 @@ function AssetTable({ caption, scope, items, mql }: AssetTableProps): ReactEleme
  * its default group body, which {@link WhitePapersSection} replaces with the cohort tables, so
  * the row stays readable wherever the frame falls back to it, held rows included. Its MQL label
  * is the one the row's frozen evidence records, else `mql`, the current configuration's.
+ *
+ * Its figures list and its details are named for the asset and its currency, as a table row's
+ * are ({@link rowLabelOf}): "Figures for {asset} ({currency})", "Per creative: {asset}
+ * ({currency})", the currency the row's cohort view names, else its evidence's
+ * ({@link cohortCurrency}), and the name alone when the row records neither.
  */
 function WhitePaperItemFallback({ item, mql }: { item: Item; mql: string }): ReactElement {
   const row = assetRowOf(item);
   const header = row.frozenMql ?? mql;
+  const currency = cohortSummary(item)?.currency ?? evidenceCurrency(item);
+  const label = currency === null ? row.name : `${row.name} (${currency})`;
   const fields: FieldItem[] = [
     ...WHITE_PAPER_METRIC_KEYS.map((key) => ({
       key,
@@ -1199,8 +1228,8 @@ function WhitePaperItemFallback({ item, mql }: { item: Item; mql: string }): Rea
       <div>
         <AssetCell row={row} />
       </div>
-      <FieldList fields={fields} label={`Figures for ${row.name}`} />
-      <AssetDetails row={row} mql={header} />
+      <FieldList fields={fields} label={`Figures for ${label}`} />
+      <AssetDetails row={row} label={label} mql={header} />
     </Stack>
   );
 }
@@ -1237,6 +1266,36 @@ function cohortCurrency(parts: GroupParts, summary: CohortSummary | null): strin
   return textOrNull(parts.group.title) ?? parts.group.key;
 }
 
+/**
+ * The cohort's spend-total note: "Spend total ({currency}): {amount}", the backend's frozen
+ * total (`extra.cohort.spend_total`) in the cohort's currency, "unavailable" when absent, and
+ * never summed or adjusted here.
+ *
+ * The total covers every asset row the run computed ({@link CohortSummary.assets}), while the
+ * page can list fewer: feedback and tracking suppression drop rows from the run, and feedback
+ * given since the run hides more, a row hidden on this page showing only its confirmation. When
+ * the total covers more assets than the page lists, the note says how many it covers unlisted,
+ * singular for 1: "Spend total (USD): USD 11,580.20, including the spend of 1 asset not listed
+ * here". It is the total alone when that count is absent (runs that predate it), when the page
+ * lists every asset it covers, or when the total itself is unavailable.
+ *
+ * @param summary - the cohort's cross-asset view ({@link findCohortSummary}), `null` without one
+ * @param currency - the cohort's currency ({@link cohortCurrency})
+ * @param listed - how many of the cohort's assets the page lists as rows: its visible,
+ *   replaced-data and held rows
+ * @returns the note's text
+ */
+function spendTotalNote(summary: CohortSummary | null, currency: string, listed: number): string {
+  const spendTotal = summary?.spendTotal ?? null;
+  const note = `Spend total (${currency}): ${formatMoney(spendTotal, currency)}`;
+  const covered = summary?.assets ?? null;
+  if (spendTotal === null || covered === null || covered <= listed) {
+    return note;
+  }
+  const unlisted = countWithNoun(covered - listed, 'asset', 'assets');
+  return `${note}, including the spend of ${unlisted} not listed here`;
+}
+
 /** Props of {@link CohortTables}. */
 interface CohortTablesProps {
   /** The `cohort:{CUR}` group as the frame partitioned it. */
@@ -1254,6 +1313,8 @@ interface CohortTablesProps {
  * the held rows' table behind the held disclosure. Every amount is in the cohort's one currency.
  * The spend total is the backend's (`extra.cohort.spend_total`), shown as "unavailable" when
  * absent and never summed here; no other total is shown, because counts overlap across assets.
+ * When it covers assets the cohort's tables do not list, its note says how many
+ * ({@link spendTotalNote}).
  *
  * A row a feedback recorded on this page has hidden leaves its confirmation ("Dismissed:
  * {action} ({asset})") directly after the table that held it ({@link ConfirmedItems}), because a
@@ -1264,6 +1325,7 @@ function CohortTables({ parts, mql }: CohortTablesProps): ReactElement {
   const currency = cohortCurrency(parts, summary);
   const overlapNote = textOrNull(summary?.overlapNote) ?? OVERLAP_NOTE_FALLBACK;
   const { placed, confirmations } = parts;
+  const listed = parts.visible.length + parts.historical.length + parts.held.length;
 
   return (
     <Stack gap={4}>
@@ -1286,7 +1348,7 @@ function CohortTables({ parts, mql }: CohortTablesProps): ReactElement {
       ) : null}
       <ConfirmedItems items={placed.historical} confirmations={confirmations} />
       <Stack as="ul" gap={1} aria-label={`Notes on the ${currency} white papers`}>
-        <li>{`Spend total (${currency}): ${formatMoney(summary?.spendTotal, currency)}`}</li>
+        <li>{spendTotalNote(summary, currency, listed)}</li>
         <li>{overlapNote}</li>
         <li>{LINKEDIN_LEADS_NOTE}</li>
         <li>{MEETINGS_BOOKED_NOTE}</li>
@@ -1330,7 +1392,7 @@ function CohortTables({ parts, mql }: CohortTablesProps): ReactElement {
  * QL ≥ 1 by cost per QL, then zero-QL rows by spend); the section never re-sorts them.
  *
  * Each `skipped_stage` finding about a rendered row is reported on that row, first in the
- * "Notes on {asset}" list of its details, rather than as a section banner
+ * "Notes on {asset} ({currency})" list of its details, rather than as a section banner
  * ({@link placeSkippedFindings}, {@link RowNotesContext}); one about an asset no rendered row
  * shows stays a banner naming its asset and currency, and every other finding stays a banner at
  * the top of the section.

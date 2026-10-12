@@ -1528,7 +1528,8 @@ def test_evidence_round_trips_exactly_what_the_runner_freezes(thresholds: Thresh
         "unit": "currency",
         "currency": "USD",
     }
-    assert set(dumped["sample"]) == {"observed", "required", "unit", "projected"}
+    assert set(dumped["sample"]) == {"observed", "required", "unit", "projected", "floor"}
+    assert dumped["sample"]["floor"] is None
     assert set(dumped["sample"]["projected"]) == {"value", "unit", "basis"}
     assert set(dumped["test"]) == {"name", "p_value", "p_adjusted", "alpha"}
     assert set(dumped["datasets"][0]) == {"dataset", "completeness", "covered_through", "boundary"}
@@ -1559,6 +1560,22 @@ def test_evidence_keeps_an_unavailable_metric_null_and_flagged(thresholds: Thres
 def test_evidence_without_sample_test_or_extra_leaves_them_null() -> None:
     evidence = Evidence.model_validate(_evidence())
     assert (evidence.sample, evidence.test, evidence.extra) == (None, None, None)
+
+
+def test_a_floored_sample_round_trips_its_floor_and_an_older_one_reads_null() -> None:
+    # A floored CRM count in the sample ("≥ 34 / 3 Qualified Leads", AAP 0.5.4.7) keeps its
+    # floor through the API; a sample frozen before the key existed reads floor null.
+    stored = context.Sample(34, 3, "Qualified Leads", floor=True).to_json()
+    dumped = Sample.model_validate(stored).model_dump(mode="json")
+    assert dumped == {
+        "observed": 34,
+        "required": 3,
+        "unit": "Qualified Leads",
+        "projected": None,
+        "floor": True,
+    }
+    older = Sample.model_validate({"observed": 34, "required": 3, "unit": "Qualified Leads"})
+    assert older.floor is None
 
 
 @pytest.mark.parametrize("missing", ["window", "metrics", "thresholds", "datasets", "provenance"])
@@ -3077,7 +3094,11 @@ _DEFAULTED_RESPONSE_KEYS: tuple[
         lambda: {"key": "account_cpa", "label": "Account CPA", "value": "38.200000"},
         ("unit", "currency"),
     ),
-    (Sample, lambda: {"observed": 240, "required": 300, "unit": "clicks"}, ("projected",)),
+    (
+        Sample,
+        lambda: {"observed": 240, "required": 300, "unit": "clicks"},
+        ("projected", "floor"),
+    ),
     (DatasetCoverage, lambda: _evidence()["datasets"][0], ("boundary",)),
     (
         StatTest,
@@ -3111,10 +3132,10 @@ _DEFAULTED_RESPONSE_KEYS: tuple[
 )
 """Every response model with a defaulted field: a minimal payload and its ``None``-default
 keys, which ``web/src/api/types.ts`` declares as required ``X | null`` properties, except
-``Baseline.unit``, ``Baseline.currency`` and ``DatasetCoverage.boundary``: optional ``X | null``
-there, because they extend the ``{key, label, value}`` and ``{dataset, completeness,
-covered_through}`` shapes clients already build. The API emits them as ``null`` all the
-same."""
+``Baseline.unit``, ``Baseline.currency``, ``DatasetCoverage.boundary`` and ``Sample.floor``:
+optional ``X | null`` there, because they extend the ``{key, label, value}``, ``{dataset,
+completeness, covered_through}`` and ``{observed, required, unit, projected}`` shapes clients
+already build. The API emits them as ``null`` all the same."""
 
 _DEFAULTED_REQUEST_KEYS: tuple[tuple[type[schemas.RequestModel], tuple[str, ...]], ...] = (
     (DecisionPatchIn, ("status", "daily_budget", "total_budget")),
@@ -3129,7 +3150,7 @@ _DEFAULTED_REQUEST_KEYS: tuple[tuple[type[schemas.RequestModel], tuple[str, ...]
 def test_the_defaulted_response_keys_cover_every_defaulted_response_field() -> None:
     listed = {model: set(keys) for model, _, keys in _DEFAULTED_RESPONSE_KEYS}
     assert len(listed) == 14
-    assert sum(len(keys) for keys in listed.values()) == 26
+    assert sum(len(keys) for keys in listed.values()) == 27
     for model, keys in listed.items():
         defaulted = {name for name, field in model.model_fields.items() if not field.is_required()}
         assert defaulted == keys, model.__name__

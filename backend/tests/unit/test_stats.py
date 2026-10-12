@@ -10,16 +10,19 @@ from SciPy or statsmodels (the Holm and Wilson boundary values are also checked 
   including samples of 1 and 2 per group, which the library solver cannot size, and tiny
   levels and effects, where it fails;
 * B4: the two-sample Poisson score test on unweighted counts; B3: the linear-interpolation
-  percentile of daily spend, exact in ``Decimal``.
+  percentile of daily spend, exact in ``Decimal``;
+* the one p-value wording of the B4 and CR1 texts (``p_relation``), held to the table
+  ``p_value_relations.json`` that the web's test-line formatter is held to as well.
 
 Degenerate input returns ``None`` ("not estimable"), invalid input raises, and no result
 depends on the caller's decimal context. Everything here is pure and synchronous: no database
-and no network.
+and no network; the one file read is that table.
 """
 
 import ast
 import doctest
 import inspect
+import json
 import math
 import sys
 import warnings
@@ -27,6 +30,7 @@ from collections.abc import Sequence
 from dataclasses import FrozenInstanceError
 from decimal import ROUND_DOWN, ROUND_HALF_EVEN, Context, Decimal, localcontext
 from fractions import Fraction
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, SupportsFloat
 
@@ -58,6 +62,7 @@ from ads_engine.analysis.stats import (
     cohens_h,
     compare_proportions,
     holm,
+    p_relation,
     percentile,
     poisson_rate_test,
     required_n,
@@ -65,6 +70,8 @@ from ads_engine.analysis.stats import (
 )
 
 QUANTUM = Decimal("0.000001")
+# The p-value table web/src/lib/format.test.ts holds formatPValue and formatTestLine to as well.
+P_VALUE_RELATIONS = Path(__file__).with_name("p_value_relations.json")
 ZERO = Decimal("0.000000")
 ONE = Decimal("1.000000")
 ALPHA = Decimal("0.05")
@@ -1774,6 +1781,118 @@ def test_percentile_rejects_invalid_input(
         percentile(values, q)
 
 
+# --- p_relation (B4, CR1 texts; the web's test line) ----------------------------------------
+
+
+def _p_value_relation_cases() -> list[tuple[str, str, str, bool]]:
+    """The shared table of ``p_value_relations.json``: (p, alpha, relation, pathological)."""
+    table = json.loads(P_VALUE_RELATIONS.read_text(encoding="utf-8"))
+    return [
+        (case["p"], case["alpha"], case["relation"], case.get("pathological", False))
+        for case in table["cases"]
+    ]
+
+
+@pytest.mark.parametrize(("p", "alpha", "relation", "pathological"), _p_value_relation_cases())
+def test_p_relation_matches_the_table_the_web_test_line_shares(
+    p: str, alpha: str, relation: str, pathological: bool
+) -> None:
+    """B4/CR1: every case of the table ``web/src/lib/format.test.ts`` also holds formatPValue to.
+
+    Each ``p`` is in the fixed-point form the API emits for ``evidence.test``, at any depth, so
+    the backend's sentence and the web's test line word the same evidence the same way. A
+    pathological ``p`` is in exponent notation instead, which the API never emits.
+    """
+    if pathological:
+        assert "e" in p.lower()
+    else:
+        assert format(Decimal(p), "f") == p
+    assert p_relation(Decimal(p), Decimal(alpha)) == relation
+
+
+@pytest.mark.parametrize(
+    ("weekday_outcomes", "p_value"),
+    [(1390, "3.12936E-304"), (1400, "2.10101E-306"), (1410, "1.41063E-308")],
+)
+def test_p_relation_bounds_the_deepest_p_values_the_poisson_rate_test_gives(
+    weekday_outcomes: int, p_value: str
+) -> None:
+    """B4: p-values with digits past the 10^-307 place read ``< 0.0001`` against alpha 0.05.
+
+    Their fixed-point text, as the API sends it, is a case of the shared table, so the web's
+    test line is held to reading them as the reason does.
+    """
+    result = poisson_rate_test(0, Decimal(1000), weekday_outcomes, Decimal(1000))
+
+    assert result is not None
+    assert result.p_value == Decimal(p_value)
+    assert p_relation(result.p_value, ALPHA) == "< 0.0001"
+    shared = {case[:3] for case in _p_value_relation_cases()}
+    assert (format(result.p_value, "f"), "0.05", "< 0.0001") in shared
+
+
+def test_p_relation_states_the_findings_values_one_way() -> None:
+    """B4 and CR1 values: 4 padded places, the 0.0001 bound, and a figure on alpha's side."""
+    assert p_relation(Decimal("1.27560E-11"), ALPHA) == "< 0.0001"
+    assert p_relation(Decimal("0.0176"), ALPHA) == "= 0.0176"
+    assert p_relation(Decimal("0.956521"), ALPHA) == "= 0.9565"
+    assert p_relation(Decimal("0.04996"), ALPHA) == "= 0.04996"
+    assert p_relation(Decimal("0.05"), ALPHA) == "= 0.0500"
+    assert p_relation(Decimal("0.0001"), ALPHA) == "= 0.0001"
+    assert p_relation(Decimal("0.00009999"), ALPHA) == "< 0.0001"
+    assert p_relation(1, ALPHA) == "= 1.0000"
+    assert p_relation(0, ALPHA) == "< 0.0001"
+    # Half even at the fourth place, as every Decimal here rounds: 0.01245 keeps its even 4.
+    assert p_relation(Decimal("0.01245"), ALPHA) == "= 0.0124"
+    assert p_relation(Decimal("0.01235"), ALPHA) == "= 0.0124"
+
+
+@pytest.mark.parametrize("alpha", ["0.05", "0.05005", "0.2", "0.01", "0.0001", "0.00001"])
+def test_p_relation_never_reads_on_the_wrong_side_of_alpha(alpha: str) -> None:
+    """A shown figure is below alpha exactly when the p-value is; a bound never exceeds alpha."""
+    level = Decimal(alpha)
+    step = Decimal("0.000001")
+    values = {level + step * offset for offset in range(-150, 151)} | {ZERO, ONE, level}
+    for value in sorted(value for value in values if ZERO <= value <= ONE):
+        relation = p_relation(value, level)
+        sign, _, figure = relation.partition(" ")
+        shown = Decimal(figure)
+        if sign == "<":
+            assert value < shown <= level, (value, relation)
+            continue
+        assert sign == "="
+        assert (shown < level) == (value < level), (value, relation)
+        assert -shown.as_tuple().exponent >= 4, (value, relation)
+
+
+def test_p_relation_bound_moves_below_a_small_alpha() -> None:
+    """Below alpha 0.0001 the bound is the first smaller power of ten not above alpha."""
+    assert p_relation(Decimal("0.000041"), Decimal("0.00001")) == "= 0.00004"
+    assert p_relation(Decimal("0.000009"), Decimal("0.00001")) == "< 0.00001"
+    assert p_relation(Decimal("0.000004"), Decimal("0.00005")) == "< 0.00001"
+    assert p_relation(Decimal("0.5"), Decimal("1E-8")) == "= 0.50000000"
+
+
+@pytest.mark.parametrize(
+    ("value", "alpha", "error", "match"),
+    [
+        (Decimal("1.5"), ALPHA, ValueError, r"value must be in \[0, 1\]"),
+        (Decimal("-0.01"), ALPHA, ValueError, r"value must be in \[0, 1\]"),
+        (Decimal("NaN"), ALPHA, ValueError, "value must be finite"),
+        (0.05, ALPHA, TypeError, "value must be a Decimal, got float"),
+        (Decimal("0.5"), Decimal(0), ValueError, r"alpha must be in \(0, 1\)"),
+        (Decimal("0.5"), Decimal(1), ValueError, r"alpha must be in \(0, 1\)"),
+        (Decimal("0.5"), 0.05, TypeError, "alpha must be a Decimal, got float"),
+    ],
+)
+def test_p_relation_rejects_invalid_input(
+    value: Any, alpha: Any, error: type[Exception], match: str
+) -> None:
+    """A p-value outside [0, 1] or an alpha outside (0, 1) raises, as every function here does."""
+    with pytest.raises(error, match=match):
+        p_relation(value, alpha)
+
+
 # --- conversion helpers --------------------------------------------------------------------
 
 
@@ -1853,6 +1972,9 @@ def test_results_do_not_depend_on_the_callers_decimal_context() -> None:
             poisson_rate_test(3, Decimal("0.75"), 17, Decimal("123456.789012")),
             poisson_rate_test(16, Decimal(800), 200, Decimal(2000)),
             percentile([Decimal("1000000000.000001"), Decimal("1000000000.000003")], HALF),
+            p_relation(Decimal("0.04996"), ALPHA),
+            p_relation(Decimal("0.012350"), ALPHA),
+            p_relation(Decimal("0.5"), Decimal("1E-60")),
         ]
 
     baseline = every_result()
@@ -1953,7 +2075,7 @@ def test_module_namespace_holds_no_collectable_test_name() -> None:
 
 
 def test_public_names_are_exactly_the_documented_api() -> None:
-    """The stats module's __all__ is exactly the 16 documented names, each of them defined."""
+    """The stats module's __all__ is exactly the 17 documented names, each of them defined."""
     assert sorted(stats.__all__) == [
         "DEFAULT_ALPHA",
         "DEFAULT_CONFIDENCE",
@@ -1967,6 +2089,7 @@ def test_public_names_are_exactly_the_documented_api() -> None:
         "cohens_h",
         "compare_proportions",
         "holm",
+        "p_relation",
         "percentile",
         "poisson_rate_test",
         "required_n",

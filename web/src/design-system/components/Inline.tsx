@@ -52,7 +52,8 @@ export interface InlineProps {
    * may break at any point, so a child wraps inside its line instead of widening the row past a
    * narrow viewport (WCAG 2.2 SC 1.4.10 Reflow). The treatment is inherited by every descendant.
    * Defaults to `false`. Leave it off on a row that holds a `DataTable`, whose cells keep their
-   * own sizing.
+   * own sizing. Inside a `DataTable` cell it has no effect: the row keeps its words whole, as the
+   * cell does, and the table scrolls in its region instead.
    */
   breakLongWords?: boolean;
   /**

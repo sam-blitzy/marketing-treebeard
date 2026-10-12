@@ -19,6 +19,7 @@ built with its white-paper helpers. Threshold values are read from ``ctx.thresho
 database and no network.
 """
 
+import dataclasses
 from collections.abc import Callable, Mapping
 from decimal import Decimal
 from functools import cache
@@ -27,7 +28,7 @@ from typing import Final
 import pytest
 
 from ads_engine.analysis import white_papers
-from ads_engine.analysis.attribution import attribution_for, bounded_decimal
+from ads_engine.analysis.attribution import CountValue, attribution_for, bounded_decimal
 from ads_engine.analysis.context import (
     W1,
     AnalysisContext,
@@ -256,6 +257,88 @@ def test_low_ql_row_above_the_ceiling_withholds_nothing() -> None:
     assert _cost_per_ql(item) > item.evidence.extra["cohort"]["double_down_ceiling"]
     assert _withheld_for(result, item) == []
     assert "withheld_reasons" not in item.evidence.extra
+
+
+def test_a_floored_ql_keeps_its_floor_in_the_w1_shortfall_and_the_w1_sample() -> None:
+    """Under an attribution floor QL is "≥ N" (AAP 0.5.4.7), in its samples as in its column.
+
+    Guide D of :data:`LOW_QL` with its 1 QL floored: the shortfall in ``extra.w1_sample`` and
+    the W1 withheld reason keep the floor. Guide A's 5 QL floored pass the gate, and the item's
+    ``evidence.sample`` carries the floor. The floor is the row's, so only its QL changes.
+    """
+    ctx, _ = _evaluated(LOW_QL)
+    settings = white_papers._Settings.of(ctx.thresholds)
+    (cohort,) = attribution_for(ctx).cohorts
+    median = cohort.median_cost_per_ql
+    assert median is not None
+    rows = {row.slug: row for row in cohort.rows}
+
+    low = dataclasses.replace(rows["guide-d"], ql=CountValue(1, floor=True))
+    decision = white_papers._decide_with_ql(ctx, low, median, 1, settings)
+    assert decision.sample is None
+    assert decision.extra["w1_sample"] == {
+        "observed": 1,
+        "required": settings.min_ql,
+        "unit": "Qualified Leads",
+        "floor": True,
+    }
+    assert [line.reason for line in decision.withheld] == [
+        f"≥ 1 Qualified Lead of the {settings.min_ql} W1 needs"
+    ]
+
+    passed = dataclasses.replace(rows["guide-a"], ql=CountValue(5, floor=True))
+    decision = white_papers._decide_with_ql(ctx, passed, median, 5, settings)
+    assert decision.sample is not None
+    assert decision.sample.floor
+    assert decision.sample.to_json() == {
+        "observed": 5,
+        "required": settings.min_ql,
+        "unit": "Qualified Leads",
+        "floor": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("spend", "median_factor", "opening"),
+    [
+        ("0", 1, "No spend and ≥ 0 Qualified Leads in the window."),
+        ("1", 0, "≥ 0 Qualified Leads after USD 1.00 of spend, but W2 is withheld: "),
+        ("1", 1, "≥ 0 Qualified Leads; spend USD 1.00 is "),
+        ("300", 1, "≥ 0 Qualified Leads after USD 300.00 of spend, "),
+    ],
+)
+def test_a_floored_zero_ql_is_stated_as_a_floor_never_as_none(
+    spend: str, median_factor: int, opening: str
+) -> None:
+    """Under a contact floor QL "≥ 0" is a floor, so no W reason says "No Qualified Lead".
+
+    Guide D of :data:`NO_CAMPAIGN` (no QL) with half its leads unmatched: every "No change
+    warranted" branch W2 can take states the count as its column does (AAP 0.5.4.7). The
+    unfloored row keeps its "No Qualified Lead" sentence.
+    """
+    ctx, _ = _evaluated(NO_CAMPAIGN)
+    settings = white_papers._Settings.of(ctx.thresholds)
+    (cohort,) = attribution_for(ctx).cohorts
+    median = cohort.median_cost_per_ql
+    assert median is not None
+    assert median > 0
+    row = next(row for row in cohort.rows if row.slug == "guide-d")
+    floored = dataclasses.replace(
+        row,
+        spend=Decimal(spend),
+        ql=CountValue(0, floor=True),
+        contact_share=Decimal("0.5"),
+    )
+
+    decision = white_papers._decide_without_ql(ctx, floored, median * median_factor, settings)
+    assert decision.reason.startswith(opening), decision.reason
+    assert "No Qualified Lead" not in decision.reason
+    assert "no Qualified Lead" not in decision.reason
+    clear = white_papers._decide_without_ql(
+        ctx, dataclasses.replace(floored, ql=CountValue(0)), median * median_factor, settings
+    )
+    assert "o Qualified Lead" in clear.reason
+    assert "≥" not in clear.reason
 
 
 def test_insufficient_cohort_rows_carry_the_shortfall_without_a_sample() -> None:

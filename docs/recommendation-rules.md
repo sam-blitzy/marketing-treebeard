@@ -1198,8 +1198,10 @@ member days.
   reads "unavailable".
 - **Reason and extra output**: day counts, outcome counts and the p-value of the "two-sample
   Poisson rate test", the source's day boundary and, for Google, the counting contract ("all
-  included actions last-click on all {N} days"). The evidence sample is the outcome total against
-  `b4.min_outcomes` and the test line carries the p-value against `b4.alpha`; `extra.gate` holds
+  included actions last-click on all {N} days"). The p-value is stated against `b4.alpha` by the
+  one [p-value rule](#p-values), in the reason, the withheld line and the card's test line alike
+  ("p < 0.0001"). The evidence sample is the outcome total against `b4.min_outcomes` and the
+  test line carries the p-value against `b4.alpha`; `extra.gate` holds
   weekend days, weekdays and outcomes, each observed against required. Beside the pattern the
   card shows the utilization block of the campaign's budget history (the shared budget's for a
   Google campaign on an explicitly shared budget) with its latest effective daily budget,
@@ -1291,14 +1293,17 @@ baseline".
     not estimable (target power unreachable at the observed difference)" when no sample reaches
     `cr.power` at the observed difference.
 
-  The adjusted p-value is shown at 4 places ("adjusted p = 0.0865"). Below 0.0001 the bound
-  replaces it, with no equals sign: "adjusted p < 0.0001".
+  The adjusted p-value is stated against `cr.alpha` by the one [p-value rule](#p-values): 4
+  places ("adjusted p = 0.0865"), more when 4 would put it on the wrong side of `cr.alpha`
+  ("adjusted p = 0.04996"), and below 0.0001 the bound, with no equals sign: "adjusted
+  p < 0.0001".
 - **Reason and extra output**: each variant's rate with its counts, the test, its raw p-value,
   the Holm-adjusted p-value across the campaign's pairs and `cr.alpha`, also recorded in
-  `evidence.test`. The reason renders both p-values the same way, for example "two-proportion
-  z-test p < 0.0001, Holm-adjusted across 1 pair in {campaign} < 0.0001". A pair that is not
+  `evidence.test`. The reason states both p-values by the same rule against `cr.alpha`, for
+  example "two-proportion z-test p < 0.0001, Holm-adjusted across 1 pair in {campaign}
+  < 0.0001", and the card's test line states them identically. A pair that is not
   distinguishable carries `not_distinguishable`, whose message repeats the label's figure
-  ("Not yet distinguishable (adjusted p < 0.0001)"); no other wording calls it a winner (P7).
+  ("Not yet distinguishable (adjusted p = 0.0622)"); no other wording calls it a winner (P7).
 - **Ranking**: after the `CR2`/`CR3` card, by adjusted p-value, ascending.
 
 ### CR2 Weak stage
@@ -1613,7 +1618,7 @@ recommendation showed. The shape is the `Evidence` schema of `GET /api/v1/recomm
 | `window` | `start`, `end`, `days` and `source_days`: each source's `start`, `end` and day `boundary`; `boundaries_differ`, whether those boundaries differ; `description`, each source's range and boundary as one sentence |
 | `metrics[]` | Every number the reason cites: `key`, `label`, `value`, `unit`, optional `currency`, `floor` (renders "≥ N" or "≤ X") and `unavailable` (renders "unavailable", never 0) |
 | `baselines[]` | `key`, `label`, `value` of what the metrics were compared against, plus optional `unit` and `currency`. `C1`, `C1b` and `C2` record their cost-per-outcome baselines with unit `currency` and the account currency, so `C1`'s and `C1b`'s, which no metric of the card pairs with, still show in the account currency. A baseline without a `unit` is shown in the unit of the metric it pairs with or, unpaired, as the six-place decimal it was recorded at |
-| `sample` | `observed`, `required` and `unit` in the rule's own unit, with an optional labelled `projected` (`value`, `unit`, `basis`) |
+| `sample` | `observed`, `required` and `unit` in the rule's own unit, with an optional labelled `projected` (`value`, `unit`, `basis`) and an optional `floor`, set when `observed` is a floored CRM count such as `W1`'s Qualified Leads under an attribution floor (renders "≥ N", as the count's column does) |
 | `test` | `name`, `p_value`, optional `p_adjusted` and `alpha`, where a statistical test was used |
 | `thresholds` | `{dotted key: configured value}` for every threshold the rule applied |
 | `datasets[]` | Each required dataset with its `completeness` and `covered_through` at compute time, plus an optional `boundary`: the time zone whose midnight ends `covered_through`, recorded with every coverage date. Google and LinkedIn datasets record the boundary the window lists for their source in `source_days`. HubSpot datasets record `UTC`, because HubSpot's sync jobs record their coverage as UTC dates and the window lists no HubSpot day. A dataset without a `boundary` shows its date with the boundary `source_days` lists for its source, or with the source's day alone |
@@ -1623,6 +1628,23 @@ recommendation showed. The shape is the `Evidence` schema of `GET /api/v1/recomm
 Each item also stores `data_status` (`live`, `simulated`, `stale` or `mixed`). Reason sentences
 are rendered from a per-rule template filled only from the item's own evidence, so the conclusion
 can never drift from the numbers.
+
+### P-values
+
+Every p-value a card states, in its reason, action label, flag message or test line ("Test: … ·
+p = … · adjusted p = … · α …"), follows one rule, applied to `evidence.test` against its `alpha`
+(`b4.alpha` for `B4`, `cr.alpha` for both the raw and the adjusted p-value of `CR1`). The
+backend's `analysis/stats.p_relation` writes the texts and the web's `formatPValue` the test
+line, and a shared table of cases holds both to the same output:
+
+- The bound is 0.0001, or, for an `alpha` below 0.0001, the first smaller power of ten that does
+  not exceed `alpha`. A p-value below the bound reads as the bound, with no equals sign, however
+  small it is: "p < 0.0001" (`B4` p-values of 1.2756 × 10⁻¹¹ and 3.12936 × 10⁻³⁰⁴ included).
+- Any other p-value reads at the bound's places, 4 for every `alpha` of at least 0.0001,
+  rounded half to even and padded: "p = 0.0176", "p = 0.0500", "p = 1.0000".
+- When those places would show the p-value on the wrong side of `alpha`, one more place is
+  added at a time until the figure lies on the side the p-value does: against `alpha` 0.05,
+  0.04996 reads "p = 0.04996", never "p = 0.0500", and 0.05 reads "p = 0.0500".
 
 ### Headline number
 
