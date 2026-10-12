@@ -17,8 +17,14 @@
  * - a reader re-renders only when a confirmation among its own identities changes, and keeps
  *   the same map between renders otherwise, so a feedback in one memoized section leaves the
  *   others as they are;
- * - `FeedbackConfirmation`: a success banner titled with the message, never a live region, an
- *   alert or a Tab stop;
+ * - `FeedbackConfirmation`: a success banner titled with the message in an unstyled
+ *   `tabindex="-1"` focus target carrying the recommendation identity, never a live region, an
+ *   alert or a Tab stop; it takes the focus of a card of its recommendation that leaves holding
+ *   it, scrolled into view as far as needed (`block: 'nearest'`), never focus the user put
+ *   elsewhere, keeps it under StrictMode's replayed effects, and hands focus it holds as it
+ *   leaves to the card now in its place, on its `<article>` (or a row's first enabled action
+ *   outside every card), revealed as far as needed, a card taller than the viewport with its top
+ *   aligned (`block: 'start'`);
  * - a card records its feedback's confirmation, under its item's identity, only once the
  *   feedback is recorded: a refused feedback leaves none.
  *
@@ -27,9 +33,9 @@
 import { apiError, json, mockApi } from '../../test/mockApi';
 
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { useState } from 'react';
+import { StrictMode, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Item, RunId } from '../../api/types';
 import { Button } from '../../design-system';
@@ -49,6 +55,7 @@ import {
   useRecordFeedbackConfirmation,
 } from './ActionOutcomes';
 import type { AnnounceActionOutcome, FeedbackConfirmations } from './ActionOutcomes';
+import { useFocusLeaving } from './carriedFocus';
 import { FEEDBACK_LABELS, RecommendationCard } from './RecommendationCard';
 import { itemIdentity } from './sections/SectionFrame';
 
@@ -467,15 +474,281 @@ describe("ActionOutcomes: the outcome's run view and recommendation", () => {
 });
 
 describe('FeedbackConfirmation', () => {
-  it('renders a success banner titled with the message, as plain content', () => {
+  /** The identity the confirmations below carry, shaped as `itemIdentity` builds one. */
+  const IDENTITY = '["K1","google","search_term","61000201|7700119|crm \\"demo\\""]';
+
+  /** A stand-in for `Element.prototype.scrollIntoView`, which jsdom does not implement. */
+  let scrollIntoView: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    scrollIntoView = vi.fn();
+    Object.defineProperty(Element.prototype, 'scrollIntoView', {
+      configurable: true,
+      writable: true,
+      value: scrollIntoView,
+    });
+  });
+
+  afterEach(() => {
+    Reflect.deleteProperty(Element.prototype, 'scrollIntoView');
+  });
+
+  /**
+   * A card's stand-in: an action row holding one button, which notes, as a card does, that it
+   * leaves the page holding focus (`./carriedFocus`).
+   */
+  function FocusHolder({ label }: { label: string }): ReactNode {
+    const rowRef = useRef<HTMLDivElement>(null);
+    useFocusLeaving(IDENTITY, () => rowRef.current?.contains(document.activeElement) === true);
+    return (
+      <div ref={rowRef} data-recommendation-actions="">
+        <Button>{label}</Button>
+      </div>
+    );
+  }
+
+  /**
+   * What stands in the card's place: the card, its confirmation once the feedback hides it, or
+   * nothing once a rerun no longer lists the recommendation.
+   */
+  type Place = 'card' | 'confirmation' | 'gone';
+
+  /** Options of {@link renderPlace}. */
+  interface PlaceOptions {
+    /** Wraps the whole in `StrictMode`, which replays every effect on mount, as in development. */
+    strict?: boolean;
+    /**
+     * Whether the next action row stands inside its card's `<article>` ("Next card"), as a
+     * recommendation card's does, or outside every card, as a white-paper row's details do.
+     */
+    nextInCard?: boolean;
+  }
+
+  /**
+   * Renders, inside one `<section>`, the card stand-in, the confirmation of {@link IDENTITY} in
+   * its place, or neither, followed by the next action row, and returns `show`, which changes the
+   * place as a refetch does.
+   */
+  function renderPlace({ strict = false, nextInCard = true }: PlaceOptions = {}): (
+    place: Place,
+  ) => void {
+    const control: { show?: (place: Place) => void } = {};
+    function Host(): ReactNode {
+      const [place, setPlace] = useState<Place>('card');
+      control.show = setPlace;
+      return (
+        <>
+          <Button>Elsewhere</Button>
+          <section aria-label="Keywords to adjust">
+            {place === 'card' ? <FocusHolder label="Dismiss" /> : null}
+            {place === 'confirmation' ? (
+              <FeedbackConfirmation
+                identity={IDENTITY}
+                message="Dismissed: Pause (Generic CRM — US)"
+              />
+            ) : null}
+            {nextInCard ? (
+              <article aria-label="Next card">
+                <div data-recommendation-actions="">
+                  <Button>Next action</Button>
+                </div>
+              </article>
+            ) : (
+              <div data-recommendation-actions="">
+                <Button>Next action</Button>
+              </div>
+            )}
+          </section>
+        </>
+      );
+    }
+    render(
+      strict ? (
+        <StrictMode>
+          <Host />
+        </StrictMode>
+      ) : (
+        <Host />
+      ),
+    );
+    return (place) => {
+      act(() => {
+        control.show?.(place);
+      });
+    };
+  }
+
+  /** The confirmation's focus target, the element carrying {@link IDENTITY}. */
+  function confirmationTarget(): HTMLElement {
+    const title = screen.getByText('Dismissed: Pause (Generic CRM — US)');
+    const target = title.closest<HTMLElement>('[data-feedback-confirmation]');
+    if (target === null) {
+      throw new Error('the confirmation has no focus target');
+    }
+    return target;
+  }
+
+  it('renders a success banner titled with the message in an unstyled focus target that carries the identity', () => {
     const { container } = render(
-      <FeedbackConfirmation message="Snoozed: Pause (Generic CRM — US)" />,
+      <FeedbackConfirmation identity={IDENTITY} message="Snoozed: Pause (Generic CRM — US)" />,
     );
 
     const title = screen.getByText('Snoozed: Pause (Generic CRM — US)');
-    expect(container.firstElementChild?.className).toBe('ds-banner ds-banner--success');
-    expect(container.querySelector('[role], [aria-live], [tabindex], button, a')).toBeNull();
+    const root = container.firstElementChild;
+    expect(root?.localName).toBe('div');
+    expect(root?.getAttribute('data-feedback-confirmation')).toBe(IDENTITY);
+    // Reachable by script only: never a Tab stop, never styled.
+    expect(root?.getAttribute('tabindex')).toBe('-1');
+    expect(root?.getAttribute('class')).toBeNull();
+    expect(root?.getAttribute('style')).toBeNull();
+    expect(root?.firstElementChild?.className).toBe('ds-banner ds-banner--success');
+    // No live region (the provider announces the outcome), no alert and no control.
+    expect(container.querySelector('[role], [aria-live], button, a')).toBeNull();
     expect(title.closest('[role="alert"]')).toBeNull();
+    expect(scrollIntoView).not.toHaveBeenCalled();
+  });
+
+  it('takes the focus of a card of its recommendation that leaves holding it, scrolled into view as far as needed', () => {
+    const show = renderPlace();
+    act(() => {
+      screen.getByRole('button', { name: 'Dismiss' }).focus();
+    });
+
+    show('confirmation');
+
+    const target = confirmationTarget();
+    expect(document.activeElement).toBe(target);
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(scrollIntoView.mock.contexts[0]).toBe(target);
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' });
+  });
+
+  it('keeps the focus it took under StrictMode, whose replayed effects leave it on the page', async () => {
+    const show = renderPlace({ strict: true });
+    act(() => {
+      screen.getByRole('button', { name: 'Dismiss' }).focus();
+    });
+
+    show('confirmation');
+
+    const target = confirmationTarget();
+    expect(document.activeElement).toBe(target);
+    // A zero-delay timer queued now runs after any recovery the replayed cleanup queued.
+    await act(async () => {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+    expect(document.activeElement).toBe(target);
+    expect(scrollIntoView.mock.contexts.every((context) => context === target)).toBe(true);
+
+    // It still hands focus on when it does leave the page.
+    show('gone');
+    const next = screen.getByRole('article', { name: 'Next card' });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(next);
+    });
+  });
+
+  it('leaves focus the user has put elsewhere when the card leaves', () => {
+    const show = renderPlace();
+    const elsewhere = screen.getByRole('button', { name: 'Elsewhere' });
+    act(() => {
+      elsewhere.focus();
+    });
+
+    show('confirmation');
+
+    expect(document.activeElement).toBe(elsewhere);
+    expect(scrollIntoView).not.toHaveBeenCalled();
+  });
+
+  it('hands its focus to the card now in its place when it leaves holding it, revealed without a jump', async () => {
+    const show = renderPlace();
+    show('confirmation');
+    act(() => {
+      confirmationTarget().focus();
+    });
+    scrollIntoView.mockClear();
+
+    // A rerun no longer lists the recommendation, so the confirmation leaves the page.
+    show('gone');
+
+    // The card itself, never one of its actions, so Enter acts on nothing the user did not choose.
+    const next = screen.getByRole('article', { name: 'Next card' });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(next);
+    });
+    expect(next.getAttribute('tabindex')).toBe('-1');
+    expect(scrollIntoView.mock.contexts).toEqual([next]);
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' });
+  });
+
+  it.each([
+    { height: 977, block: 'start', fit: 'taller than the viewport, top aligned' },
+    { height: 700, block: 'nearest', fit: 'that fits the viewport, as far as needed' },
+  ])('hands its focus to a card $fit', async ({ height, block }) => {
+    const clientHeight = vi.spyOn(document.documentElement, 'clientHeight', 'get');
+    clientHeight.mockReturnValue(800);
+    try {
+      const show = renderPlace();
+      show('confirmation');
+      act(() => {
+        confirmationTarget().focus();
+      });
+      scrollIntoView.mockClear();
+      // The card spans the viewport from above it, as a tall card does once the confirmation
+      // above it leaves: `nearest` would leave its heading out of view.
+      const next = screen.getByRole('article', { name: 'Next card' });
+      Object.defineProperty(next, 'getBoundingClientRect', {
+        configurable: true,
+        value: () => new DOMRect(0, -124, 800, height),
+      });
+
+      show('gone');
+
+      await waitFor(() => {
+        expect(document.activeElement).toBe(next);
+      });
+      expect(scrollIntoView.mock.contexts).toEqual([next]);
+      expect(scrollIntoView).toHaveBeenCalledWith({ block });
+    } finally {
+      clientHeight.mockRestore();
+    }
+  });
+
+  it('hands its focus to the first enabled action of a next row outside every card', async () => {
+    const show = renderPlace({ nextInCard: false });
+    show('confirmation');
+    act(() => {
+      confirmationTarget().focus();
+    });
+
+    show('gone');
+
+    const next = screen.getByRole('button', { name: 'Next action' });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(next);
+    });
+  });
+
+  it('moves no focus when it leaves without holding it', async () => {
+    const show = renderPlace();
+    show('confirmation');
+    const elsewhere = screen.getByRole('button', { name: 'Elsewhere' });
+    act(() => {
+      elsewhere.focus();
+    });
+
+    show('gone');
+
+    // A zero-delay timer queued now runs after any recovery the removal could have queued.
+    await act(async () => {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+    expect(document.activeElement).toBe(elsewhere);
   });
 });
 

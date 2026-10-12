@@ -27,6 +27,9 @@
  *   their outdated overlay, a resolved discrepancy's `role="alert"` banner included, until
  *   the refetch landed. Mutations set no `retry`. The app's `QueryClient` (`src/main.tsx`)
  *   does not retry them, because a POST is not idempotent from the UI's point of view.
+ * - **Offline writes.** Every mutation runs in {@link WRITE_NETWORK_MODE} (`'always'`): one made
+ *   while the browser is offline fails at once with status 0 `network_error`, which the screen
+ *   shows, and is never paused to send itself on reconnect.
  * - **Polling.** {@link useDefaultRun} and {@link useRecommendations}, with or without a run
  *   id, refetch every {@link CURRENT_STATE_POLL_MS} while they are shown, so a new default
  *   run and the live overlay (holds, discrepancy count, source modes, freshness, feedback and
@@ -82,7 +85,7 @@ import {
   useQuery,
   useQueryClient,
 } from '@tanstack/react-query';
-import type { InfiniteData, QueryClient, QueryKey } from '@tanstack/react-query';
+import type { InfiniteData, NetworkMode, QueryClient, QueryKey } from '@tanstack/react-query';
 import { useCallback, useEffect, useSyncExternalStore } from 'react';
 
 import { ApiError, apiFetch, apiFetchPage, isApiError } from './client';
@@ -175,6 +178,24 @@ export const CURRENT_STATE_POLL_MS = 30_000;
  * (AAP 0.5.5 `/sources`).
  */
 export const SOURCES_POLL_MS = 30_000;
+
+/**
+ * The network mode of every write hook: {@link useLogin}, {@link useLogout},
+ * {@link useCreateRun}, {@link useRecordDecision}, {@link useResolveDiscrepancy},
+ * {@link useFeedback} and {@link useRequestSync}. A write is sent the moment it is made, whatever
+ * the browser reports about the connection.
+ *
+ * TanStack Query's default, `'online'`, would pause a write made while the browser reports it is
+ * offline and send it by itself once the connection returns: the screen would show a loading
+ * button with no explanation and keep its other actions disabled for as long as the connection
+ * stays down, then record a feedback, decision, resolution, run or sync request the user may no
+ * longer want. Under `'always'` the request fails at once instead, with the error
+ * {@link apiFetch} gives a request that never reached the server: status 0 `network_error`, "The
+ * server could not be reached. Check your connection and try again." Every screen shows that
+ * message and frees its actions, so the user retries when ready, and nothing is ever sent
+ * without them. Reads keep the default: a query pauses while offline and refetches on reconnect.
+ */
+export const WRITE_NETWORK_MODE: NetworkMode = 'always';
 
 /**
  * The discrepancy states {@link useDiscrepancies} lists by default: the unresolved ones the
@@ -1285,13 +1306,15 @@ function invalidateDecisionState(queryClient: QueryClient): Promise<unknown> {
  * Status codes: 200; 401 `invalid_credentials` for an unknown email or a wrong password (one
  * message for both); 429 `rate_limited` from the 6th attempt within a minute, with
  * {@link ApiError.retryAfter} in seconds; 422 `validation_error` for an empty field.
- * `LoginPage` shows each. Invalidates nothing.
+ * `LoginPage` shows each. Invalidates nothing. Offline it fails at once with status 0
+ * `network_error` and is never sent later ({@link WRITE_NETWORK_MODE}).
  *
  * @returns The mutation; call `mutate({ email, password })`.
  */
 export function useLogin() {
   const queryClient = useQueryClient();
   return useMutation({
+    networkMode: WRITE_NETWORK_MODE,
     mutationFn: (body: LoginRequest) =>
       apiFetch<Me>('/auth/login', { method: 'POST', body }),
     onSuccess: (me) => {
@@ -1310,13 +1333,15 @@ export function useLogin() {
  * since the user is still signed in.
  *
  * Status codes: 200 with the signed-out `{email}`; 401 `unauthenticated` without a valid
- * session.
+ * session. Offline it fails at once with status 0 `network_error`, leaving the cache intact, and
+ * is never sent later ({@link WRITE_NETWORK_MODE}).
  *
  * @returns The mutation; call `mutate()`. It resolves `void`.
  */
 export function useLogout() {
   const queryClient = useQueryClient();
   return useMutation({
+    networkMode: WRITE_NETWORK_MODE,
     // The API answers 200 with the signed-out `{email}`; nothing reads it, so the body is
     // discarded and the mutation resolves `void` whether the response is 200 or 204.
     mutationFn: async (): Promise<void> => {
@@ -1352,12 +1377,15 @@ export function useLogout() {
  * `end_before_start`, `end_after_default_end`, `start_before_earliest` (before the earliest
  * date the analysis's lookbacks allow, which the message names), `too_long` (over
  * `window.max_days`), `too_short` or `invalid_window` for a window outside its bounds.
+ * Offline it fails at once with status 0 `network_error` and is never sent later
+ * ({@link WRITE_NETWORK_MODE}).
  *
  * @returns The mutation; call `mutate({ window_start, window_end })`.
  */
 export function useCreateRun() {
   const queryClient = useQueryClient();
   return useMutation({
+    networkMode: WRITE_NETWORK_MODE,
     mutationFn: (body: CreateRunRequest) => apiFetch<Run>('/runs', { method: 'POST', body }),
     onSuccess: (run) => {
       queryClient.setQueryData<Run>(queryKeys.runs.byId(run.id), run);
@@ -1385,13 +1413,15 @@ export function useCreateRun() {
  * has reported yet; 422 for the patch rules, among them `empty_patch`, `no_change`,
  * `sub_minor_unit`, `field_not_allowed`, `shared_budget_amount`, `budget_changed`,
  * `untracked_subject` (a reported subject with no decision yet), `decision_not_offered` and
- * `subject_mismatch`.
+ * `subject_mismatch`. Offline it fails at once with status 0 `network_error` and is never sent
+ * later ({@link WRITE_NETWORK_MODE}).
  *
  * @returns The mutation; call `mutate({ subject, patch, recommendation_id?, note? })`.
  */
 export function useRecordDecision() {
   const queryClient = useQueryClient();
   return useMutation({
+    networkMode: WRITE_NETWORK_MODE,
     mutationFn: (body: DecisionRequest) =>
       apiFetch<Decision>('/decisions', { method: 'POST', body }),
     onSuccess: () => invalidateDecisionState(queryClient),
@@ -1416,13 +1446,16 @@ export function useRecordDecision() {
  * `subject_retired` when its dataset is no longer active, `discrepancy_resolved` when it is
  * already closed, `platform_state_unknown` while the platform state to adopt is not yet
  * known; 422 `resolution_not_allowed` for a resolution not valid for its kind and shape, and
- * `intended_state_invalid` for an incomplete or ill-fitting `record_intended` state.
+ * `intended_state_invalid` for an incomplete or ill-fitting `record_intended` state. Offline it
+ * fails at once with status 0 `network_error` and is never sent later
+ * ({@link WRITE_NETWORK_MODE}).
  *
  * @returns The mutation; call `mutate({ id, body: { resolution, intended_state?, note? } })`.
  */
 export function useResolveDiscrepancy() {
   const queryClient = useQueryClient();
   return useMutation({
+    networkMode: WRITE_NETWORK_MODE,
     mutationFn: ({ id, body }: ResolveDiscrepancyVariables) =>
       apiFetch<Discrepancy>(`/discrepancies/${pathSegment(id)}/resolve`, {
         method: 'POST',
@@ -1444,13 +1477,16 @@ export function useResolveDiscrepancy() {
  *
  * Status codes: 201; 404 `not_found` for an unknown item; 409 `subject_retired` for a
  * historical item computed from replaced data; 422 `feedback_not_allowed` for a C0
- * discrepancy item, which must be resolved instead.
+ * discrepancy item, which must be resolved instead. Offline it fails at once with status 0
+ * `network_error`, which the card shows while its actions are freed for a retry, and is never
+ * sent later ({@link WRITE_NETWORK_MODE}).
  *
  * @returns The mutation; call `mutate({ recommendationId, body: { kind, note? } })`.
  */
 export function useFeedback() {
   const queryClient = useQueryClient();
   return useMutation({
+    networkMode: WRITE_NETWORK_MODE,
     mutationFn: ({ recommendationId, body }: FeedbackVariables) =>
       apiFetch<Feedback>(`/recommendations/${pathSegment(recommendationId)}/feedback`, {
         method: 'POST',
@@ -1474,13 +1510,15 @@ export function useFeedback() {
  * of a shown sources query has settled: the refetched `sync_pending` is in the cache by then.
  *
  * Status codes: 202; 409 `sync_pending` while a request for that source is already pending;
- * 422 `validation_error` for an unknown source.
+ * 422 `validation_error` for an unknown source. Offline it fails at once with status 0
+ * `network_error`, invalidating nothing, and is never sent later ({@link WRITE_NETWORK_MODE}).
  *
  * @returns The mutation; call `mutate('google' | 'linkedin' | 'hubspot')`.
  */
 export function useRequestSync() {
   const queryClient = useQueryClient();
   return useMutation({
+    networkMode: WRITE_NETWORK_MODE,
     mutationFn: (source: SourceName) =>
       apiFetch<SyncRequestView>(`/sources/${pathSegment(source)}/sync`, { method: 'POST' }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: queryKeys.sources }),

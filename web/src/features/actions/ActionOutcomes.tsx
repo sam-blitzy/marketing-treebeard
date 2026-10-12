@@ -15,7 +15,9 @@
  *   item's recommendation identity (`SectionFrame`'s `itemIdentity`), with the same message.
  *   The sections read them ({@link useFeedbackConfirmations}) and show a
  *   {@link FeedbackConfirmation} where the hidden card stood, so the outcome is visible where
- *   the user acted, not only at the top of the page.
+ *   the user acted, not only at the top of the page. Keyboard focus, which the hidden card took
+ *   with it, moves to that confirmation, scrolled into view as far as needed
+ *   (`./focusRecovery`).
  *
  * Both belong to the run view and the recommendation the user acted on. Each is dropped once
  * the page's run no longer lists its recommendation (the provider's `identities`), as after the
@@ -24,6 +26,7 @@
  *
  * This module imports neither `RecommendationCard` nor `SectionFrame`, so both can import it:
  * the card records, the frame reads, and no import cycle forms (the card imports the frame).
+ * Focus handling comes from `./focusRecovery` and `./carriedFocus`, which import neither.
  * UI comes only from the design-system index (AAP 0.4.4): no raw buttons, headings or tables,
  * no inline styles and no stylesheet. Nothing here fetches (AAP 0.11.1); the outcome and the
  * confirmations are client state of the provider, which on `/actions` is the loaded page.
@@ -35,7 +38,9 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
+  useRef,
   useState,
   useSyncExternalStore,
 } from 'react';
@@ -43,6 +48,13 @@ import type { ReactElement, ReactNode } from 'react';
 
 import type { RunId } from '../../api/types';
 import { Banner } from '../../design-system';
+import { useCarriedFocus } from './carriedFocus';
+import {
+  captureFocusOrigin,
+  focusIsLostOrWithin,
+  handOffFocus,
+  revealFocus,
+} from './focusRecovery';
 
 // ---------------------------------------------------------------------------------------------
 // Types
@@ -282,8 +294,8 @@ function outcomeBelongs(
  * nothing is announced twice. A feedback is also recorded under the item's recommendation
  * identity ({@link useRecordFeedbackConfirmation}), and while the hidden item is still in the
  * run's list, its section shows the same message in the item's place
- * ({@link FeedbackConfirmation}), visible beside the cards the user was working on. That
- * confirmation is no live region either.
+ * ({@link FeedbackConfirmation}), visible beside the cards the user was working on, and takes
+ * the keyboard focus the hidden card lost. That confirmation is no live region either.
  *
  * The region is a `<div role="status">` rendered before the children from the first render, so
  * every message lands in a region that already exists. It is never `role="alert"`, which
@@ -462,6 +474,21 @@ export function useFeedbackConfirmations(identities: readonly string[]): Feedbac
 export interface FeedbackConfirmationProps {
   /** The confirmation, for example "Dismissed: Pause (Generic CRM — US)". */
   message: string;
+  /**
+   * The recommendation identity of the item the feedback hid (`SectionFrame`'s
+   * `itemIdentity`), by which the card that recorded it finds this confirmation to focus.
+   */
+  identity: string;
+}
+
+/**
+ * Whether keyboard focus is on `element` or inside it.
+ *
+ * @param element - the confirmation's root
+ * @returns `true` while `element` holds focus
+ */
+function holdsFocus(element: HTMLElement | null): boolean {
+  return element !== null && element.contains(element.ownerDocument.activeElement);
 }
 
 /**
@@ -469,18 +496,79 @@ export interface FeedbackConfirmationProps {
  * hidden: a success `Banner` titled with the outcome, the action and the entity, for example
  * "Snoozed: Pause (Generic CRM — US)", so the outcome is visible where the user acted.
  *
- * It is plain content: no live region (the provider's region announces the outcome once), no
- * `role="alert"` (AAP 0.5.5 reserves it for discrepancies) and no control, so it adds no Tab
- * stop and keyboard focus moves past it to the next card's action.
+ * It is no live region (the provider's region announces the outcome once), no `role="alert"`
+ * (AAP 0.5.5 reserves it for discrepancies) and no control. Its root is an unstyled `<div>`
+ * carrying the recommendation identity (`data-feedback-confirmation`) and `tabindex="-1"`, a
+ * focus target script can reach but no Tab stop, from which the next Tab continues to the card
+ * that follows. Keyboard focus comes to it (WCAG 2.2 SC 2.4.3, `./focusRecovery`):
+ *
+ * - from the card that recorded the feedback, once the refetched page has replaced the card with
+ *   this confirmation: focused where it stands, then scrolled into view only as far as needed,
+ *   so a tall card's outcome is not left above the viewport;
+ * - from a card of the same recommendation that leaves the page holding focus in the commit that
+ *   mounts this confirmation, such as a card a later refetch hides while focus is on its status
+ *   line (`./carriedFocus`), the same way.
+ *
+ * Either way only when focus is lost or already inside it, never from where the user has put
+ * it. When the confirmation itself leaves the page holding focus, as when the rerun that follows
+ * the feedback no longer lists its recommendation, focus moves on to the card that now stands in
+ * its place, the next card, else the previous one, on its `<article>` and scrolled into view as
+ * far as needed, a card taller than the viewport to its top, so the page does not jump to a
+ * footer and no action the user did not choose waits on Enter;
+ * without a card, to the section heading (`handOffFocus` in `./focusRecovery`).
  *
  * @param props - see {@link FeedbackConfirmationProps}
- * @returns the banner
+ * @returns the banner in its focus target
  *
  * @example
  * ```tsx
- * <FeedbackConfirmation message="Dismissed: Pause (Generic CRM — US)" />
+ * <FeedbackConfirmation
+ *   identity={itemIdentity(item)}
+ *   message="Dismissed: Pause (Generic CRM — US)"
+ * />
  * ```
  */
-export function FeedbackConfirmation({ message }: FeedbackConfirmationProps): ReactElement {
-  return <Banner tone="success" title={message} />;
+export function FeedbackConfirmation({
+  message,
+  identity,
+}: FeedbackConfirmationProps): ReactElement {
+  const rootRef = useRef<HTMLDivElement>(null);
+  useCarriedFocus(identity, {
+    holdsFocus: () => holdsFocus(rootRef.current),
+    takeFocus: () => {
+      const root = rootRef.current;
+      if (root !== null && focusIsLostOrWithin(root)) {
+        revealFocus(root);
+      }
+    },
+  });
+  // Run as the confirmation leaves, while it and the cards around it are still on the page:
+  // focus it holds would otherwise fall to the page once it is gone.
+  useLayoutEffect(() => {
+    const root = rootRef.current;
+    return () => {
+      if (!holdsFocus(root)) {
+        return;
+      }
+      const origin = captureFocusOrigin(root);
+      if (origin !== null) {
+        // After the commit that removes it, and after a card of the same recommendation that
+        // mounts in its place has taken focus over (`./carriedFocus`). A cleanup that leaves the
+        // confirmation on the page, as React StrictMode's replay of its effects in development
+        // does, moves nothing: the focus it holds stays on it.
+        window.setTimeout(() => {
+          if (!origin.element.isConnected) {
+            handOffFocus(origin);
+          }
+        }, 0);
+      }
+    };
+  }, []);
+  return (
+    // Unstyled focus target found by its recommendation identity; the Banner carries no
+    // live-region role (AAP 0.5.5 reserves role="alert" for discrepancies).
+    <div ref={rootRef} data-feedback-confirmation={identity} tabIndex={-1}>
+      <Banner tone="success" title={message} />
+    </div>
+  );
 }

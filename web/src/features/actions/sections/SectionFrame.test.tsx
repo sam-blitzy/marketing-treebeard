@@ -2502,10 +2502,18 @@ describe('confirmations of items hidden on the page', () => {
     return true;
   }
 
-  /** Asserts the confirmation is plain content: no live region, no alert and no Tab stop. */
-  function expectPlainContent(confirmation: Element): void {
+  /**
+   * Asserts the confirmation of `item` is plain content: no live region, no alert, no control
+   * and no Tab stop. Its one focus target, `tabindex="-1"`, carries the item's recommendation
+   * identity, by which the card that recorded the feedback moves focus to it.
+   */
+  function expectPlainContent(confirmation: Element, item: Item): void {
     expect(confirmation.closest('[role="status"], [role="alert"], [aria-live]')).toBeNull();
-    expect(confirmation.closest('button, a, [tabindex]')).toBeNull();
+    expect(confirmation.closest('button, a')).toBeNull();
+    const target = confirmation.closest('[tabindex]');
+    expect(target?.getAttribute('tabindex')).toBe('-1');
+    expect(target?.getAttribute('data-feedback-confirmation')).toBe(itemIdentity(item));
+    expect(target?.parentElement?.closest('[tabindex]') ?? null).toBeNull();
   }
 
   /** Records the dismissal of `item` in the nearest provider when pressed, as a card does. */
@@ -2628,8 +2636,8 @@ describe('confirmations of items hidden on the page', () => {
       screen.getByRole('article', { name: 'Fifth' }),
     ];
     expect(inOrder(...places)).toBe(true);
-    for (const message of [dismissal(leading), dismissal(third), dismissal(fourth)]) {
-      expectPlainContent(screen.getByText(message));
+    for (const confirmed of [leading, third, fourth]) {
+      expectPlainContent(screen.getByText(dismissal(confirmed)), confirmed);
     }
     // A hidden item without a confirmation on this page shows nothing, and no hidden card renders.
     expect(screen.queryByText(dismissal(elsewhere))).toBeNull();
@@ -2763,7 +2771,7 @@ describe('confirmations of items hidden on the page', () => {
     const pause = screen.getByRole('region', { name: 'Pause' });
     expect(pause.id).toBe('group-campaigns-pause');
     const confirmation = within(pause).getByText(dismissal(c1));
-    expectPlainContent(confirmation);
+    expectPlainContent(confirmation, c1);
     expect(within(pause).queryByRole('article')).toBeNull();
     expect(
       screen.getAllByRole('heading', { level: 3 }).map((heading) => heading.textContent),
@@ -2842,8 +2850,8 @@ describe('confirmations of items hidden on the page', () => {
     expect(
       within(pause).queryByRole('button', { name: /^Held until discrepancies are resolved/u }),
     ).toBeNull();
-    expectPlainContent(replacedConfirmation);
-    expectPlainContent(heldConfirmation);
+    expectPlainContent(replacedConfirmation, replaced);
+    expectPlainContent(heldConfirmation, held);
     expect(listLines('Not shown')).toEqual(['2 hidden since this run']);
   });
 

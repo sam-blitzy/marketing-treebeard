@@ -22,14 +22,14 @@
  *   card outcomes are announced in, then all five sections in the user's order, from one
  *   `GET /recommendations` response. A section the API omits is skipped and a repeated key
  *   renders once. A recorded feedback whose refetch hides its card is still announced there,
- *   and focus moves to the next card's action. A C2 "Scale" card links the B1 card for its
- *   subject in Budget changes, found in the same response, also while a discrepancy holds both:
- *   following the link expands the Budget held disclosure, scrolls to the still-held B1 and
- *   moves focus to it.
+ *   and focus moves to its confirmation in the card's place, before the next card's action. A
+ *   C2 "Scale" card links the B1 card for its subject in Budget changes, found in the same
+ *   response, also while a discrepancy holds both: following the link expands the Budget held
+ *   disclosure, scrolls to the still-held B1 and moves focus to it.
  * - **The confirmation where a card stood.** That feedback's outcome also shows, as plain
- *   content (no second live region, no alert), in the hidden card's place inside its own
- *   section and group, right before the action focus moves to, while the navigation counts and
- *   "Not shown" count the item as hidden. The outcome and the confirmation stay through a
+ *   content (no second live region, no alert, no Tab stop), in the hidden card's place inside
+ *   its own section and group, where focus moves to, right before the next card's action, while
+ *   the navigation counts and "Not shown" count the item as hidden. The outcome and the confirmation stay through a
  *   refetch that still lists the item, and both leave once a rerun no longer lists it or
  *   another run is opened, while the outcome region stays mounted, the same element, empty.
  * - **States.** "Loading actions" until the first response; "No analysis run yet" (404
@@ -706,7 +706,7 @@ describe('ActionsPage', () => {
       expect(region.closest('article')).toBeNull();
     });
 
-    it('announces a recorded feedback after its card leaves and focuses the next card', async () => {
+    it("announces a recorded feedback after its card leaves and focuses its confirmation in the card's place", async () => {
       const hidden = new Set<number>();
       const pageNow = (): RecommendationsPage => {
         const page = makeRecommendationsPage();
@@ -745,18 +745,26 @@ describe('ActionsPage', () => {
       await waitFor(() => {
         expect(card(pause.id)).toBeNull();
       });
-      expect(outcomeRegion().textContent).toBe(
-        `Dismissed: ${pause.action} (${String(pause.entity.name)})`,
-      );
-      // The held card next in the Pause group is collapsed, so the Scale group's card is next.
+      const text = `Dismissed: ${pause.action} (${String(pause.entity.name)})`;
+      expect(outcomeRegion().textContent).toBe(text);
+      // Focus lands on the confirmation that stands where the card did, not on a later card.
+      const confirmation = screen
+        .getAllByText(text)
+        .find((node) => !outcomeRegion().contains(node))
+        ?.closest('[data-feedback-confirmation]');
+      await waitFor(() => {
+        expect(document.activeElement).toBe(confirmation);
+      });
+      // The next Tab continues from there: the held card next in the Pause group is collapsed,
+      // so the Scale group's card follows.
       const holdCard = card(hold.id);
-      if (holdCard === null) {
-        throw new Error('the C2 Hold card is not on the page');
+      if (holdCard === null || confirmation === null || confirmation === undefined) {
+        throw new Error('the confirmation or the C2 Hold card is not on the page');
       }
       const next = within(holdCard).getByRole('button', { name: 'Mark done' });
-      await waitFor(() => {
-        expect(document.activeElement).toBe(next);
-      });
+      expect(confirmation.compareDocumentPosition(next)).toBe(
+        Node.DOCUMENT_POSITION_FOLLOWING,
+      );
     });
 
     it('links a C2 "Scale" card to its B1 card in Budget changes, from the one page read', async () => {
@@ -1611,7 +1619,7 @@ describe('ActionsPage polls', () => {
 });
 
 describe('ActionsPage: the confirmation where a card stood', () => {
-  it("shows a recorded feedback in the hidden card's place, beside the announcement and the next card's action", async () => {
+  it("shows a recorded feedback in the hidden card's place, beside the announcement, and focuses it before the next card's action", async () => {
     const flow = feedbackFlow();
     const { api } = await renderPage(defaultHandlers(flow.handlers));
     await loadedPage();
@@ -1639,13 +1647,19 @@ describe('ActionsPage: the confirmation where a card stood', () => {
     // The announcement stays in the polite region above the sections.
     expect(outcomeRegion().textContent).toBe(text);
     // The visible confirmation stands where the card did: in Campaigns' Pause group, before the
-    // group's held disclosure, and it is no live region, alert or Tab stop.
+    // group's held disclosure, and it is no live region, alert, control or Tab stop. Its one
+    // focus target, `tabindex="-1"`, carries the item's recommendation identity.
     const campaigns = screen.getByRole('region', { name: 'Campaigns to pause or launch' });
     const group = within(campaigns).getByRole('region', { name: 'Pause' });
     const confirmation = within(group).getByText(text);
     expect(outcomeRegion().contains(confirmation)).toBe(false);
     expect(confirmation.closest('[role="status"], [role="alert"], [aria-live]')).toBeNull();
-    expect(confirmation.closest('button, a, [tabindex]')).toBeNull();
+    expect(confirmation.closest('button, a')).toBeNull();
+    const target = confirmation.closest('[tabindex]');
+    expect(target?.getAttribute('tabindex')).toBe('-1');
+    expect(target?.getAttribute('data-feedback-confirmation')).toBe(
+      sectionFrameModule.itemIdentity(pause),
+    );
     expect(
       precedes(
         confirmation,
@@ -1653,15 +1667,15 @@ describe('ActionsPage: the confirmation where a card stood', () => {
       ),
     ).toBe(true);
     expect(screen.getAllByText(text)).toHaveLength(2);
-    // Focus moves to the next card's action, which follows the confirmation.
+    // Focus moves to the confirmation, where the user acted; the next card's action follows it.
+    await waitFor(() => {
+      expect(document.activeElement).toBe(target);
+    });
     const holdCard = document.getElementById(`item-${String(hold.id)}`);
     if (holdCard === null) {
       throw new Error('the C2 Hold card is not on the page');
     }
     const next = within(holdCard).getByRole('button', { name: 'Mark done' });
-    await waitFor(() => {
-      expect(document.activeElement).toBe(next);
-    });
     expect(precedes(confirmation, next)).toBe(true);
     // Every count still counts the item as hidden.
     expect(campaignsLink().textContent).toBe('Campaigns to pause or launch 4');

@@ -28,10 +28,7 @@ import { CAMPAIGN_STATUS_LABELS } from './DecisionForm';
 // Constants
 // ---------------------------------------------------------------------------------------------
 
-/**
- * Separator between the parts of an expected state, and of a subject title in the decision
- * log.
- */
+/** Separator between the parts of an expected state. */
 export const PART_SEPARATOR = ' · ';
 
 /** The expected state of a row recording an acknowledged removal (`tombstone`). */

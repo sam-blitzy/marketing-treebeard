@@ -1102,6 +1102,28 @@ describe('DecisionLog "Record decision"', () => {
     expect(logRegion().textContent).toBe('');
   });
 
+  it('names the subject in its dialog exactly once, before and after the form loads', async () => {
+    const shared = makeDecision('budget');
+    const form = deferred<MockResponse>();
+    mockApi({
+      ...logHandlers([shared]),
+      [formKey('budget', shared.subject.id)]: () => form.promise,
+    });
+
+    await renderLog();
+    await findTable('Search Shared Budget');
+    fireEvent.click(budgetRecord());
+
+    // The log names the subject above the form, which leaves its own subject line off.
+    const title = 'Search Shared Budget · Shared budget · Google';
+    const dialog = await screen.findByRole('dialog', { name: 'Record decision' });
+    expect(within(dialog).getAllByText(title)).toHaveLength(1);
+
+    form.resolve(json(200, [shared]));
+    expect(await within(dialog).findByLabelText('Daily budget')).toBeTruthy();
+    expect(within(dialog).getAllByText(title)).toHaveLength(1);
+  });
+
   it("opens the form in the subject's own currency, with the fields of its shape", async () => {
     const emea = makeDecision('own_budget', {
       subject: subject({

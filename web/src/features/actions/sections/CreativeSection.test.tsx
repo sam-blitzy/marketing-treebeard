@@ -25,7 +25,8 @@
  *
  * - **A card hidden on the page** by its own Dismiss, Snooze or Mark done leaves its
  *   confirmation where it stood in the campaign block, after the variants table and before the
- *   cards computed from replaced data, until a rerun no longer lists it.
+ *   cards computed from replaced data, focused, until a rerun no longer lists it; the focus it
+ *   held then moves to the card now in its place.
  *
  * The section fetches nothing, so every test stubs the API with no handler: any request fails
  * the test. The feedback-flow tests alone render the section from a stubbed
@@ -67,7 +68,7 @@ import {
   VariantsTable,
   formatVariantRate,
 } from './CreativeSection';
-import { groupAnchorId } from './SectionFrame';
+import { groupAnchorId, itemIdentity } from './SectionFrame';
 
 // ---------------------------------------------------------------------------------------------
 // Fixtures and helpers
@@ -1150,9 +1151,12 @@ describe('CreativeSection: the confirmation of a card hidden on the page', () =>
       const text = feedbackConfirmationText(kind, cr3);
       const confirmation = within(block).getByText(text);
       // Plain content: neither a live region (the provider announces it) nor an alert, nor a
-      // Tab stop.
+      // control or Tab stop. Its one focus target, `tabindex="-1"`, carries the identity.
       expect(confirmation.closest('[role="status"], [role="alert"], [aria-live]')).toBeNull();
-      expect(confirmation.closest('button, a, [tabindex]')).toBeNull();
+      expect(confirmation.closest('button, a')).toBeNull();
+      const target = confirmation.closest('[tabindex]');
+      expect(target?.getAttribute('tabindex')).toBe('-1');
+      expect(target?.getAttribute('data-feedback-confirmation')).toBe(itemIdentity(cr3));
       expect(within(block).queryAllByRole('alert')).toEqual([]);
       // Where the card stood: after the variants table, before the replaced-data cards.
       const variants = within(block).getByRole('table', { name: /^Variants in / });
@@ -1166,12 +1170,9 @@ describe('CreativeSection: the confirmation of a card hidden on the page', () =>
       expect(within(section).getByRole('list', { name: 'Not shown' }).textContent).toContain(
         '1 hidden since this run',
       );
-      // Focus did not fall to the page: the next card offers no enabled action (computed from
-      // replaced data), so it is on the block's heading.
+      // Focus did not fall to the page: it is on the confirmation, where the user acted.
       await waitFor(() => {
-        expect(document.activeElement).toBe(
-          within(block).getByRole('heading', { name: 'Lead Gen — Pipeline Report EMEA' }),
-        );
+        expect(document.activeElement).toBe(target);
       });
       expect(api.calls.filter((call) => call.method === 'POST')).toHaveLength(1);
 
@@ -1184,6 +1185,14 @@ describe('CreativeSection: the confirmation of a card hidden on the page', () =>
         expect(within(section).queryByText(text)).toBeNull();
       });
       expect(within(section).queryByRole('list', { name: 'Not shown' })).toBeNull();
+      // The focus it held does not fall to the page either: it moves to the card now in its
+      // place, the one computed from replaced data, on the card itself.
+      const [nextCard] = within(
+        within(block).getByRole('group', { name: /^Computed from replaced data/u }),
+      ).getAllByRole('article');
+      await waitFor(() => {
+        expect(document.activeElement).toBe(nextCard);
+      });
     },
   );
 });

@@ -19,8 +19,9 @@
  *   "Resolution disabled: this discrepancy belongs to data that has since been replaced"
  *   (AAP 0.3.2, 0.5.5). C0 is exempt from holds too, so a historical C0 stays pinned in place
  *   rather than moved below the group's other cards with the ones computed from replaced data.
- *   Each card's resolver keeps one polite status line, which carries every outcome of its reads
- *   and takes focus when the controls leave while focus went with them.
+ *   Each card's resolver keeps one polite status line, which carries every outcome of its reads,
+ *   names a discrepancy awaiting the platform as `/decisions` does ("Awaiting platform"), and
+ *   takes focus when the controls leave while focus went with them.
  * - **C1 Pause, C1b Pipeline pause, C2 Scale or Hold**: a "Campaign evidence" list of spend,
  *   outcomes, expected outcomes and CRM Qualified Leads, each metric that the evidence carries.
  * - **C1b and C2 "Hold"**: a one-row "Pipeline evidence" table of matured leads, matched and
@@ -89,7 +90,12 @@ import type {
 import { Button, DataTable, Inline, Spinner, Stack } from '../../../design-system';
 import type { DataTableColumn } from '../../../design-system';
 import { formatCount, formatMetric, formatMoney } from '../../../lib/format';
-import { DiscrepancyResolution, RESOLUTION_LABELS } from '../../decisions/DiscrepancyResolver';
+import {
+  DiscrepancyResolution,
+  OUTCOME_TEXT,
+  RESOLUTION_LABELS,
+  STATE_LABELS,
+} from '../../decisions/DiscrepancyResolver';
 import type { FeedbackConfirmations } from '../ActionOutcomes';
 import { useLinkedB1Card } from '../B1Cards';
 import type { B1Card } from '../B1Cards';
@@ -613,7 +619,8 @@ function liveDiscrepancyState(
 
 /**
  * The status line of a current C0 card in `state`: empty while the first read runs, which the
- * `Spinner` shows, and while the resolution controls are shown.
+ * `Spinner` shows, and for a listed discrepancy, whose line {@link listedStatusText} words
+ * beside the resolution controls.
  */
 function liveStatusText(state: LiveDiscrepancyState): string | null {
   switch (state.status) {
@@ -629,6 +636,31 @@ function liveStatusText(state: LiveDiscrepancyState): string | null {
     case 'not_listed':
       return DISCREPANCY_NOT_LISTED_TEXT;
   }
+}
+
+/**
+ * The status line of a current C0 card whose discrepancy the open list holds, beside its
+ * resolution controls, in the `/decisions` resolver's words (`STATE_LABELS`, `OUTCOME_TEXT`):
+ *
+ * - `open`: empty;
+ * - `awaiting_platform`, which "Decision is correct" and "Record intended state" set until a
+ *   later snapshot matches the decision (AAP 0.5.4.4): "Awaiting platform: Waiting for the
+ *   platform to match the decision", or the state label alone, "Awaiting platform", when
+ *   `explainedByControls` says the controls account for that state, as their outcome line reads
+ *   "Waiting for the platform to match the decision" after a resolution of their own; the
+ *   explanation is then never on the card twice.
+ *
+ * @param discrepancy - The discrepancy as the open list holds it now.
+ * @param explainedByControls - Whether the card's controls account for its awaiting state.
+ * @returns The line, or `null` for an empty one.
+ */
+function listedStatusText(discrepancy: Discrepancy, explainedByControls: boolean): string | null {
+  if (discrepancy.state !== 'awaiting_platform') {
+    return null;
+  }
+  const label = STATE_LABELS.awaiting_platform;
+  const explanation = OUTCOME_TEXT.awaiting_platform;
+  return explainedByControls || explanation === null ? label : `${label}: ${explanation}`;
 }
 
 /** Props of {@link DiscrepancyIndexReader}. */
@@ -812,10 +844,14 @@ interface DiscrepancyResolverSlotBodyProps extends DiscrepancyResolverSlotProps 
  *   discrepancies of the active datasets, so a replaced one is never in it, and its absence says
  *   nothing about a resolution.
  * - **Current item**, by {@link liveDiscrepancyState}: a `Spinner` "Loading discrepancy" while
- *   the first read runs; the {@link DiscrepancyResolution} of the listed discrepancy; or, in the
- *   status line, "Checking whether this discrepancy was resolved", "Resolved since this run",
- *   "This discrepancy is no longer listed, so it cannot be resolved here" or "Could not load
- *   this discrepancy: {message}".
+ *   the first read runs; the {@link DiscrepancyResolution} of the listed discrepancy, its
+ *   resolutions offered whether it is open or awaiting the platform, as on `/decisions`, with
+ *   an awaiting state named in the status line ({@link listedStatusText}): "Awaiting platform:
+ *   Waiting for the platform to match the decision", or "Awaiting platform" alone once the
+ *   controls have shown it open or reported that outcome, because their own outcome line then
+ *   explains it; or, in the status line, "Checking whether this discrepancy was resolved",
+ *   "Resolved since this run", "This discrepancy is no longer listed, so it cannot be resolved
+ *   here" or "Could not load this discrepancy: {message}".
  *
  * When the resolution controls leave, after a resolution that closed the discrepancy for
  * example, and focus left with them (onto the page, or an element no longer in it), the status
@@ -828,8 +864,28 @@ function DiscrepancyResolverSlotBody({
   lookup,
 }: DiscrepancyResolverSlotBodyProps): ReactElement {
   const live = historical ? null : liveDiscrepancyState(frozen.discrepancyId, lookup);
-  const statusText = live === null ? HISTORICAL_RESOLUTION_NOTICE : liveStatusText(live);
-  const controlsShown = live?.status === 'open';
+  const listed = live?.status === 'open' ? live.discrepancy : null;
+  const controlsShown = listed !== null;
+
+  // The discrepancy whose awaiting state the controls account for, so the status line gives its
+  // label alone and never repeats their outcome line's explanation. It is recorded once they
+  // show it open, because only a resolution, normally theirs, moves it to awaiting_platform and
+  // the refetched list can render before their report (onResolved), and from that report. It
+  // lasts as long as the controls, and so their outcome line, do. State adjusted while
+  // rendering: React's pattern for information kept from earlier renders, rendered again at
+  // once, before it commits.
+  const [explainedId, setExplainedId] = useState<Discrepancy['id'] | null>(null);
+  const nextExplainedId =
+    listed !== null && (listed.state === 'open' || explainedId === listed.id) ? listed.id : null;
+  if (nextExplainedId !== explainedId) {
+    setExplainedId(nextExplainedId);
+  }
+  const statusText =
+    live === null
+      ? HISTORICAL_RESOLUTION_NOTICE
+      : listed === null
+        ? liveStatusText(live)
+        : listedStatusText(listed, nextExplainedId === listed.id);
 
   const statusRef = useRef<HTMLDivElement>(null);
   const controlsWereShown = useRef(false);
@@ -855,7 +911,16 @@ function DiscrepancyResolverSlotBody({
         {statusText}
       </div>
       {live?.status === 'loading' ? <Spinner label={LOADING_DISCREPANCY_LABEL} /> : null}
-      {live?.status === 'open' ? <DiscrepancyResolution discrepancy={live.discrepancy} /> : null}
+      {listed === null ? null : (
+        <DiscrepancyResolution
+          discrepancy={listed}
+          onResolved={(updated) => {
+            if (updated.state === 'awaiting_platform') {
+              setExplainedId(updated.id);
+            }
+          }}
+        />
+      )}
       {live === null ? <FrozenResolutions resolutions={frozen.resolutions} /> : null}
     </Stack>
   );

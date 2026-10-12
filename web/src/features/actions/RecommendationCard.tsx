@@ -54,8 +54,11 @@
  * {@link ActionOutcomeProvider} above the cards, which outlives them (WCAG 2.2 SC 4.1.3), and
  * recorded there under the item's recommendation identity, so the section shows the same
  * confirmation ("Dismissed: {action} ({entity})") where the card stood (`./ActionOutcomes`).
- * Keyboard focus, which the disabled or removed button lost, moves to the next card's first
- * enabled action, else the previous card's, else the section heading (WCAG 2.2 SC 2.4.3).
+ * Keyboard focus, which the disabled or removed button lost, moves to that confirmation and
+ * scrolls it into view as far as needed, so a tall card's outcome is shown where the user acted;
+ * while the card stays on the page, to its own status line the same way; and only without
+ * either, to the next card's first enabled action, else the previous card's, else the section
+ * heading (WCAG 2.2 SC 2.4.3, `./focusRecovery`).
  *
  * A refetch that finds an item computed from replaced data moves its card into the group's
  * "Computed from replaced data" block, where React mounts it anew, so the card that left takes
@@ -78,6 +81,7 @@
  */
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
+import { flushSync } from 'react-dom';
 
 import { isApiError, useFeedback } from '../../api/queries';
 import type {
@@ -100,6 +104,13 @@ import { useCarriedFocus, useFocusLeaving } from './carriedFocus';
 import { EvidenceTable, evidenceRatioDigits } from './EvidenceTable';
 import { decisionContextFor, headlineMetric, type DecisionContext } from './evidenceExtra';
 import { FlagList } from './FlagList';
+import {
+  captureFocusOrigin,
+  firstEnabledAction,
+  focusIsLostOrWithin,
+  moveFocusTo,
+  recoverFocus,
+} from './focusRecovery';
 import { isHeld, itemAnchorId, itemIdentity } from './sections/SectionFrame';
 
 // ---------------------------------------------------------------------------------------------
@@ -424,165 +435,11 @@ export type { ActionOutcomeProviderProps, AnnounceActionOutcome } from './Action
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Finds the action rows of the cards: {@link RecommendationActionsBody} marks its row root with
- * the attribute `data-recommendation-actions`.
+ * Whether keyboard focus is lost or still inside `scope`, re-exported from `./focusRecovery` for
+ * the white-paper rows, which hand focus to their row's toggle by the same rule when a refetch
+ * moves a row into its replaced-data table (`./carriedFocus`).
  */
-const ACTIONS_ROW_SELECTOR = '[data-recommendation-actions]';
-
-/** Where a feedback action was pressed, captured on the click while its card is on the page. */
-interface FocusOrigin {
-  /** The pressed action's row. */
-  row: HTMLElement;
-  /** The row's ancestor `<section>` elements, nearest first. */
-  sections: readonly HTMLElement[];
-  /**
-   * Every action row inside the outermost of those sections, or the whole document when there
-   * is none, in document order.
-   */
-  rows: readonly HTMLElement[];
-  /** The position of `row` in `rows`. */
-  index: number;
-}
-
-/**
- * Captures where focus can go once a feedback is recorded: the pressed action's row, its
- * enclosing sections and the action rows around it.
- *
- * @param row - the pressed action's row, or `null` before it is attached
- * @returns the origin, or `null` without a row
- */
-function captureFocusOrigin(row: HTMLElement | null): FocusOrigin | null {
-  if (row === null) {
-    return null;
-  }
-  const sections: HTMLElement[] = [];
-  for (let node = row.parentElement; node !== null; node = node.parentElement) {
-    if (node.localName === 'section') {
-      sections.push(node);
-    }
-  }
-  const scope: ParentNode = sections.at(-1) ?? row.ownerDocument;
-  const rows = Array.from(scope.querySelectorAll<HTMLElement>(ACTIONS_ROW_SELECTOR));
-  return { row, sections, rows, index: rows.indexOf(row) };
-}
-
-/**
- * Whether keyboard focus is lost or still inside `scope`: on no element, on the body (where a
- * browser leaves it once the focused button is disabled or removed), on an element no longer in
- * the document, or inside `scope`. Anywhere else the user has moved focus, and it stays there.
- *
- * Exported for the white-paper rows, which hand focus to their row's toggle by the same rule
- * when a refetch moves a row into its replaced-data table (`./carriedFocus`).
- *
- * @param scope - the element focus counts as still being in, such as a card's action row
- * @returns `true` when focus may be moved without taking it from where the user put it
- *
- * @example
- * ```ts
- * if (focusIsLostOrWithin(card)) {
- *   card.focus();
- * }
- * ```
- */
-export function focusIsLostOrWithin(scope: Element): boolean {
-  const { activeElement, body } = scope.ownerDocument;
-  return (
-    activeElement === null ||
-    activeElement === body ||
-    !activeElement.isConnected ||
-    scope.contains(activeElement)
-  );
-}
-
-/**
- * The first action of a row that can take focus: an enabled button, neither `disabled` nor
- * `aria-disabled="true"`, outside every `[hidden]` or `[inert]` subtree, such as a collapsed
- * held disclosure, an inactive tab panel or a collapsed table detail row.
- *
- * @param row - an action row
- * @returns the button, or `null` when the row offers none
- */
-function firstEnabledAction(row: HTMLElement): HTMLButtonElement | null {
-  const buttons = Array.from(row.querySelectorAll('button'));
-  return (
-    buttons.find(
-      (button) =>
-        !button.disabled &&
-        button.getAttribute('aria-disabled') !== 'true' &&
-        button.closest('[hidden], [inert]') === null,
-    ) ?? null
-  );
-}
-
-/**
- * The heading that names a section: the element its `aria-labelledby` points at.
- * `PageShell.Section` labels each section by its `${id}-title` heading.
- *
- * @param section - a `<section>` element
- * @returns the heading, or `null` when the section names none on the page
- */
-function sectionHeading(section: HTMLElement): HTMLElement | null {
-  const [id] = (section.getAttribute('aria-labelledby') ?? '').split(/\s+/u).filter(Boolean);
-  return id === undefined ? null : section.ownerDocument.getElementById(id);
-}
-
-/**
- * Focuses `element`. With `fromScript`, an element without a `tabindex` of its own (a heading,
- * `<main>`) first gets `tabindex="-1"`, which lets script focus it without adding a tab stop.
- *
- * @param element - the element to focus
- * @param fromScript - whether the element may need `tabindex="-1"` to take focus
- * @returns whether focus is now on `element`: a browser refuses focus to an element that is not
- *   rendered, which sends recovery on to the next candidate
- */
-function moveFocusTo(element: HTMLElement, fromScript = false): boolean {
-  if (fromScript && !element.hasAttribute('tabindex')) {
-    element.setAttribute('tabindex', '-1');
-  }
-  element.focus();
-  return element.ownerDocument.activeElement === element;
-}
-
-/**
- * Gives keyboard focus a stable place after a recorded feedback has disabled the action that
- * had it, and often removed its card (WCAG 2.2 SC 2.4.3): the first enabled action of the next
- * card row still on the page, else of the previous rows, nearest first, else the heading of
- * the nearest enclosing section still on the page, else the page's `<main>`. Rows are looked
- * for inside the outermost enclosing section only, so focus stays in the section the user was
- * working in.
- *
- * Focus the user has moved away from the card in the meantime is left where it is
- * ({@link focusIsLostOrWithin}).
- *
- * @param origin - what {@link captureFocusOrigin} captured on the click
- */
-function recoverFocus(origin: FocusOrigin): void {
-  const { row, sections, rows, index } = origin;
-  if (!focusIsLostOrWithin(row)) {
-    return;
-  }
-  const following = rows.slice(index + 1);
-  const preceding = rows.slice(0, Math.max(index, 0)).reverse();
-  for (const candidate of [...following, ...preceding]) {
-    if (candidate === row || !candidate.isConnected) {
-      continue;
-    }
-    const action = firstEnabledAction(candidate);
-    if (action !== null && moveFocusTo(action)) {
-      return;
-    }
-  }
-  for (const section of sections) {
-    const heading = section.isConnected ? sectionHeading(section) : null;
-    if (heading !== null && moveFocusTo(heading, true)) {
-      return;
-    }
-  }
-  const main = row.ownerDocument.querySelector('main');
-  if (main !== null) {
-    moveFocusTo(main, true);
-  }
-}
+export { focusIsLostOrWithin } from './focusRecovery';
 
 // ---------------------------------------------------------------------------------------------
 // Footer actions
@@ -705,8 +562,12 @@ function closeDialogSession(current: DialogSession): DialogSession {
  * identity, so its section shows the same confirmation in the item's place once the refetched
  * recommendations hide it. Keyboard focus, which the pressed button keeps while
  * its request runs and after it is disabled, or which is lost with a removed card, then moves
- * to the next card's first enabled action, else the previous card's, else the enclosing
- * section's heading, else `<main>`, unless the user has moved it elsewhere (WCAG 2.2 SC 2.4.3).
+ * to that confirmation in the hidden card's place, else, while the card stays on the page, to
+ * its status line, each focused where it stands and scrolled into view only as far as needed
+ * (`block: 'nearest'`), so the outcome is visible where the user acted however tall the card
+ * was; without either, to the next card's first enabled action, else the previous card's, else
+ * the enclosing section's heading, else `<main>`. Focus the user has moved elsewhere stays
+ * there (WCAG 2.2 SC 2.4.3, `./focusRecovery`).
  * Every refused action, of a feedback or
  * of a decision save, shows its explanation in a warning `Banner` until the next action starts:
  * {@link HISTORICAL_LABEL} for every 409 `subject_retired`, whether or not it locked the item
@@ -790,6 +651,9 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
   const rowRef = useRef<HTMLDivElement>(null);
   const messageRef = useRef<HTMLDivElement>(null);
   const openerRef = useRef<HTMLButtonElement>(null);
+  // The card's status line, which takes focus once a feedback is recorded while the card stays
+  // on the page (`recoverFocus` in `./focusRecovery`).
+  const statusRef = useRef<HTMLDivElement>(null);
   // The id of the item the row showed at its latest commit. A retirement locks the row only
   // while the recommendation its request submitted is still the item shown
   // ({@link learnRetirement}).
@@ -921,7 +785,12 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
     // and a refetched item carrying `current.hidden_by` removes the card.
     void feedback.mutateAsync({ recommendationId: item.id, body: { kind } }).then(
       () => {
-        setRecorded(kind);
+        // Committed at once, so the status line is on the page by the time focus is recovered
+        // below whichever way React schedules this update, for a card the refetch left in place.
+        // A card already gone renders nothing.
+        flushSync(() => {
+          setRecorded(kind);
+        });
         const confirmation = outcomeMessage(FEEDBACK_STATUS_MESSAGES[kind], item);
         const identity = itemIdentity(item);
         // Announced for the recommendation, so it leaves the region once the run no longer
@@ -933,9 +802,11 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
         if (origin !== null) {
           // This continuation runs before React commits the refetched page, because TanStack
           // Query notifies its observers from a zero-delay timer scheduled before it. A timer
-          // scheduled now runs after that commit, once a hidden card has left the page.
+          // scheduled now runs after that commit, once a hidden card has left the page and its
+          // confirmation stands in its place: that confirmation takes focus, else this card's
+          // status line while the card stays, else the next card's first enabled action.
           window.setTimeout(() => {
-            recoverFocus(origin);
+            recoverFocus(origin, { identity, statusLine: () => statusRef.current });
           }, 0);
         }
       },
@@ -1038,6 +909,9 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
           }}
           onCancel={closeDialog}
           disabled={locked}
+          // The dialog names its subject as `/decisions` does, from the subject the API reads:
+          // the card's entity need not be it, as a shared budget's decision is on the budget.
+          showSubject
         />
       </Dialog>
     );
@@ -1079,7 +953,7 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
           : null;
 
   return (
-    // The unstyled row root focus recovery finds the card's actions by (ACTIONS_ROW_SELECTOR);
+    // The unstyled row root focus recovery finds the card's actions by (`./focusRecovery`);
     // the Stack inside it does all the layout.
     <div ref={rowRef} data-recommendation-actions="">
       <Stack gap={2}>
@@ -1097,12 +971,13 @@ function RecommendationActionsBody({ item, decisionContext }: RecommendationActi
         {announce === null ? (
           // Outside an ActionOutcomeProvider: a polite status region (WCAG 2.2 SC 4.1.3),
           // rendered from the start so assistive technology announces the text when it appears;
-          // while empty it adds no Stack gap.
-          <div role="status">{statusText}</div>
+          // while empty it adds no Stack gap. A recorded feedback the card outlives focuses it.
+          <div ref={statusRef} role="status">{statusText}</div>
         ) : statusText === null ? null : (
           // Inside one, the provider's region announces the outcome and outlives this card, so
-          // this line stays visible without being a second live region.
-          <div>{statusText}</div>
+          // this line stays visible without being a second live region. A recorded feedback the
+          // card outlives focuses it.
+          <div ref={statusRef}>{statusText}</div>
         )}
         {decisionDialog}
       </Stack>

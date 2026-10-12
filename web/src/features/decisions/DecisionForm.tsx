@@ -6,7 +6,9 @@
  * It opens from three places: the "Record decision" footer action of a recommendation card
  * (`features/actions/RecommendationCard.tsx`, prefilled with the item's proposed change), the
  * "Record decision" action of a subject on `/decisions` (`DecisionLog.tsx`) and the "Record
- * intended state" resolution of a C0 discrepancy (`DiscrepancyResolver.tsx`).
+ * intended state" resolution of a C0 discrepancy (`DiscrepancyResolver.tsx`). Each dialog names
+ * its subject in the same words, {@link subjectTitle}: the decision log above the form, and the
+ * card and C0 dialogs, whose openers do not name it, through the form's `showSubject` line.
  *
  * Rules this file keeps:
  *
@@ -42,10 +44,11 @@
  * - **Errors are the API's.** 422 messages are shown as returned; a failure that is not an
  *   `ApiError`, whose text may carry internal detail, reads "The save failed." instead. A 409
  *   `subject_retired`, whether a save or the subject's decision-log read answers it, locks the
- *   form as "Computed from replaced data" for as long as it records about that subject (AAP
- *   0.3.2, 0.5.5) and is reported once through `onRetired`, so the consumer locks its own
- *   actions too. The lock outranks every state without a form: a later read that lists no
- *   decision never turns it into "No decided state is recorded for this subject yet."; a 409
+ *   form's fields and submit as "Computed from replaced data" for as long as it records about
+ *   that subject (AAP 0.3.2, 0.5.5), leaving Cancel, which writes nothing, usable, and is
+ *   reported once through `onRetired`, so the consumer locks its own write actions too. The
+ *   lock outranks every state without a form: a later read that lists no decision never turns
+ *   it into "No decided state is recorded for this subject yet."; a 409
  *   `discrepancy_resolved` reads "Already resolved". Every failure but `subject_retired` is
  *   reported through `onFailed` with the text the form shows. Error banners never take
  *   `role="alert"`, which AAP 0.5.5 reserves for the discrepancy banner on `/actions`.
@@ -85,7 +88,7 @@
  *
  * @packageDocumentation
  */
-import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useId, useRef, useState, type FormEvent, type ReactElement } from 'react';
 
 import {
   isApiError,
@@ -107,6 +110,8 @@ import type {
   ResolveRequest,
   SourceName,
   SubjectIn,
+  SubjectType,
+  SubjectView,
 } from '../../api/types';
 import {
   Banner,
@@ -118,7 +123,13 @@ import {
   TextField,
   type SelectOption,
 } from '../../design-system';
-import { currencyMinorDigits, currencyStep, formatCount, formatMoney } from '../../lib/format';
+import {
+  currencyMinorDigits,
+  currencyStep,
+  formatCount,
+  formatMoney,
+  sourceLabel,
+} from '../../lib/format';
 import { useSettledFailure } from './readState';
 
 // ---------------------------------------------------------------------------------------------
@@ -209,6 +220,17 @@ export interface DecisionFormProps {
   onCancel?: () => void;
   /** Disables every field and the submit button, for example on a historical item. */
   disabled?: boolean;
+  /**
+   * Names the subject above whatever the form shows, as its {@link subjectTitle} line, for
+   * example "Product - Analytics platform · Campaign · Google", so a dialog whose opener does
+   * not name the subject still says what it records about: the recommendation card's "Record
+   * decision" and the C0 "Record intended state". The subject is the one the API names: the
+   * latest decision's, else the discrepancy's (the discrepancy's first in intended-state
+   * mode), so a shared budget reads as the budget, never as the item's entity. Nothing is
+   * shown while neither is known. Defaults to `false`, for a consumer that names the subject
+   * itself, as the decision log on `/decisions` does.
+   */
+  showSubject?: boolean;
 }
 
 /**
@@ -220,6 +242,38 @@ export const CAMPAIGN_STATUS_LABELS: Readonly<Record<CampaignStatus, string>> = 
   paused: 'Paused',
   ended: 'Ended',
 });
+
+/**
+ * The display name of a subject: its name, or "Unnamed campaign (id 12)" / "Unnamed shared
+ * budget (id 7)" when the API could not name it, so a caption or title never reads "null".
+ *
+ * @param subject - The subject as the API names it.
+ * @returns The name.
+ */
+export function subjectName(subject: SubjectView): string {
+  return (
+    textOrNull(subject.name) ??
+    `Unnamed ${subjectTypeLabel(subject.type).toLowerCase()} (id ${subject.id})`
+  );
+}
+
+/**
+ * The one line that names a subject: "{name} · {Campaign | Shared budget} · {source}", for
+ * example "Product - Analytics platform · Campaign · Google", without the source when the API
+ * names none. The decision log's subject sections and its "Record decision" dialog, and the
+ * form's own subject line (`showSubject`) in the dialogs opened from `/actions`, all use it, so
+ * every dialog names its subject in the same words.
+ *
+ * @param subject - The subject as the API names it.
+ * @returns The title.
+ */
+export function subjectTitle(subject: SubjectView): string {
+  const parts = [subjectName(subject), subjectTypeLabel(subject.type)];
+  if (subject.source !== null) {
+    parts.push(sourceLabel(subject.source));
+  }
+  return parts.join(SUBJECT_TITLE_SEPARATOR);
+}
 
 // ---------------------------------------------------------------------------------------------
 // Constants
@@ -248,6 +302,15 @@ const NO_STATE_MESSAGE = 'No decided state is recorded for this subject yet.';
 
 /** Shown under the submit button while the patch would change nothing. */
 const NO_CHANGE_MESSAGE = 'No change from the last decided state';
+
+/** The label of each subject type, as {@link subjectTitle} shows it. */
+const SUBJECT_TYPE_LABELS: Readonly<Record<SubjectType, string>> = Object.freeze({
+  campaign: 'Campaign',
+  budget: 'Shared budget',
+});
+
+/** Joins the parts of a {@link subjectTitle}, as the parts of a described state are joined. */
+const SUBJECT_TITLE_SEPARATOR = ' · ';
 
 /** An amount as the form accepts it: a non-negative plain decimal, such as `120` or `120.50`. */
 const AMOUNT_PATTERN = /^\d+(\.\d+)?$/;
@@ -543,6 +606,11 @@ function summarizeErrors(errors: readonly FieldError[]): string | null {
 // Subject state
 // ---------------------------------------------------------------------------------------------
 
+/** The label of a subject type; an unknown type received at run time is shown as sent. */
+function subjectTypeLabel(type: SubjectType): string {
+  return Object.hasOwn(SUBJECT_TYPE_LABELS, type) ? SUBJECT_TYPE_LABELS[type] : String(type);
+}
+
 /**
  * How a decision row names the shared budget a `shared_member` decision assigns, as the rest of
  * the product words it: "shared budget {Google id}" from `budget_external_id`, else, for a
@@ -771,8 +839,9 @@ function focusIsLost(): boolean {
  * `onPendingChange(false)` before the outcome's callback. Success calls `onDone`, with the saved
  * `Decision` in decision mode, and puts "Decision saved" or "Intended state saved" in the form's
  * polite status region. A 409 `subject_retired`, to a save or to the subject's decision-log
- * read, disables every control while the form records about that subject and calls `onRetired`
- * once; the enclosing `Dialog` keeps its own Close button. Every other failed save calls
+ * read, disables every field and the submit button while the form records about that subject
+ * and calls `onRetired` once; Cancel, which writes nothing, stays enabled and still calls
+ * `onCancel`, beside the enclosing `Dialog`'s own Close button. Every other failed save calls
  * `onFailed` with the message the form shows. Each save callback is the one the form had when
  * the user saved, and each is called even when the form unmounted while the request ran.
  *
@@ -796,6 +865,11 @@ function focusIsLost(): boolean {
  * submit button references it through `aria-describedby`; otherwise it holds the success text
  * after a save, or nothing. An unchanged patch disables the button with the visible "No change
  * from the last decided state" hint as its description instead.
+ *
+ * With `showSubject`, every one of those states sits under the subject's {@link subjectTitle}
+ * line, such as "Search Shared Budget · Shared budget · Google", from the first render that
+ * knows the subject: at once in intended-state mode, whose discrepancy names it, and once the
+ * decision log is read in decision mode.
  */
 export function DecisionForm(props: DecisionFormProps) {
   return <DecisionFormBody key={formIdentity(props)} {...props} />;
@@ -843,6 +917,7 @@ function DecisionFormBody(props: DecisionFormProps) {
     onFailed,
     onCancel,
     disabled = false,
+    showSubject = false,
   } = props;
 
   const decisions = useDecisions({ subject_type: subject.type, subject_id: subject.id });
@@ -917,44 +992,69 @@ function DecisionFormBody(props: DecisionFormProps) {
     </div>
   ) : null;
 
+  // The subject as the API names it, for the subject line (`showSubject`): the latest decision's,
+  // else the discrepancy's, in the order the form's state comes from (resolveSubjectState). The
+  // log is read for this subject alone, and a refused refetch keeps the rows of the last read.
+  const loggedSubject = decisions.data?.[0]?.subject;
+  const namedSubject =
+    mode === 'intended_state'
+      ? (discrepancy?.subject ?? loggedSubject)
+      : (loggedSubject ?? discrepancy?.subject);
+  // Every state the form shows sits under the subject line once the subject is known, so the
+  // dialog names what it records about whether it holds the fields, a notice or the spinner.
+  // BLITZY [DESIGN_SYSTEM_GAP]: the design system has no text primitive and feature code
+  // carries no CSS (AAP 0.4.4), so the line is an unstyled <div> spaced by the Stack gap alone,
+  // as the decision log's dialog spaces its own subject line.
+  const framed = (content: ReactElement): ReactElement =>
+    showSubject && namedSubject !== undefined ? (
+      <Stack gap={4} breakLongWords>
+        <div>{subjectTitle(namedSubject)}</div>
+        {content}
+      </Stack>
+    ) : (
+      content
+    );
+
   if (decisions.data === undefined) {
     if (loadFailure !== null) {
-      return retiredNotice ?? <Banner tone="critical" title={saveErrorMessage(loadFailure)} />;
+      return framed(
+        retiredNotice ?? <Banner tone="critical" title={saveErrorMessage(loadFailure)} />,
+      );
     }
-    return retiredNotice ?? <Spinner label="Loading decision" />;
+    return framed(retiredNotice ?? <Spinner label="Loading decision" />);
   }
 
   if (mode === 'intended_state' && discrepancy === undefined) {
-    return (
+    return framed(
       retiredNotice ?? (
         <Banner tone="critical" title="No discrepancy was given to record an intended state for." />
-      )
+      ),
     );
   }
 
   const latest = decisions.data[0];
   const state = resolveSubjectState(mode, latest, discrepancy);
   if (state === null) {
-    return retiredNotice ?? <Banner tone="warning" title={NO_STATE_MESSAGE} />;
+    return framed(retiredNotice ?? <Banner tone="warning" title={NO_STATE_MESSAGE} />);
   }
   if (mode === 'decision' && latest?.tombstone === true) {
     // The API refuses every patch on a tombstoned subject (422 subject_removed).
     const name = textOrNull(latest.subject.name) ?? 'This subject';
-    return (
+    return framed(
       retiredNotice ?? (
         <Banner tone="warning" title={`${name} was acknowledged as removed`}>
           It takes no further decisions.
         </Banner>
-      )
+      ),
     );
   }
 
   const fields = shapeFields(state);
   if (!fields.status && fields.amounts.length === 0) {
-    return (
+    return framed(
       retiredNotice ?? (
         <Banner tone="warning" title="No budget amount is known for this shared budget yet." />
-      )
+      ),
     );
   }
 
@@ -1142,7 +1242,7 @@ function DecisionFormBody(props: DecisionFormProps) {
       ? null
       : saveErrorMessage(saveError);
 
-  return (
+  return framed(
     <form noValidate onSubmit={handleSubmit}>
       {/*
         BLITZY [DESIGN_SYSTEM_GAP]: the design system has no text primitive, and feature code
@@ -1223,7 +1323,9 @@ function DecisionFormBody(props: DecisionFormProps) {
               {saveLabel}
             </Button>
             {onCancel === undefined ? null : (
-              <Button variant="secondary" onClick={onCancel} disabled={subjectRetired}>
+              // Cancel writes nothing, so a retired subject leaves it usable: only the writes
+              // lock (AAP 0.3.2), and the form can still be dismissed from its own buttons.
+              <Button variant="secondary" onClick={onCancel}>
                 Cancel
               </Button>
             )}
@@ -1242,6 +1344,6 @@ function DecisionFormBody(props: DecisionFormProps) {
           </div>
         </Stack>
       </Stack>
-    </form>
+    </form>,
   );
 }

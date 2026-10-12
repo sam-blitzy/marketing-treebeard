@@ -15,7 +15,8 @@
  *   carry the reason once.
  * - **Footer**: "Record decision" only on items with a `decision_subject`, opening the
  *   `DecisionForm` prefilled with the proposed change (status `paused` for C1; the proposed daily
- *   budget on a shared budget, with every member listed); "Mark done" on every other action;
+ *   budget on a shared budget, with every member listed) under the subject's line as `/decisions`
+ *   names it; "Mark done" on every other action;
  *   "Dismiss" and "Snooze for 7 days" on all but C0, whose resolver renders instead. Each
  *   feedback posts once to `POST /recommendations/{id}/feedback` with the CSRF header, also
  *   when pressed twice, or with another action, before React renders again; a failed one
@@ -24,14 +25,18 @@
  *   every action, whether a feedback or the decision form received it, also once the dialog has
  *   closed and when it was closed while the save ran; any other failure shows the API's
  *   message, and a failure that is not an `ApiError` the generic text, never its own message;
+ *   a feedback made offline fails at once with the network message, frees the actions and is
+ *   never sent on reconnect;
  *   a historical item shows the badge and its frozen provenance with every action disabled,
  *   the C0 resolver too.
  * - **Outcomes and focus**: inside an `ActionOutcomeProvider`, a recorded feedback or decision is
  *   announced in the provider's polite region, which outlives the card a refetch removes, naming
  *   the entity once: after the action unless the action already contains its name, and always
  *   after a decision's recorded state; and
- *   focus moves to the next card's first enabled action, else the previous card's, else the
- *   section heading, unless the user has moved it elsewhere.
+ *   focus moves to the feedback's confirmation in the removed card's place, else to the card's
+ *   own status line while the card stays, each scrolled into view only as far as needed
+ *   (`block: 'nearest'`); without either, to the next card's first enabled action, else the
+ *   previous card's, else the section heading; never from where the user has moved it.
  * - **Decision saves**: the dialog may close while its save runs, but every action stays
  *   disabled and "Record decision" loading until the save settles, so nothing reopens it or
  *   posts again. A late success is reported and announced, a late failure of any kind is shown
@@ -57,8 +62,9 @@
 import { apiError, html, json, mockApi, type ApiMock, type MockResponse } from '../../test/mockApi';
 import { KEEP_SPACES, renderWithProviders } from '../../test/render';
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
+import { onlineManager } from '@tanstack/react-query';
 import { useState, type ReactNode } from 'react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { useRecommendations } from '../../api/queries';
 import type {
@@ -71,6 +77,7 @@ import type {
 } from '../../api/types';
 import { Button, PageShell, Stack } from '../../design-system';
 import { formatWindowChip } from '../../lib/format';
+import { useFeedbackConfirmations } from './ActionOutcomes';
 import { OPEN_DISCREPANCIES_LINK_LABEL } from './BlockingDiscrepancies';
 import {
   FIXTURE_BUDGET_IDS,
@@ -102,6 +109,7 @@ import {
   historicalProvenanceText,
   useActionOutcome,
 } from './RecommendationCard';
+import { CardList, itemIdentity } from './sections/SectionFrame';
 
 // ---------------------------------------------------------------------------------------------
 // Fixtures and helpers
@@ -1031,6 +1039,47 @@ describe('RecommendationCard: footer actions', () => {
     expect(posts(api).map((call) => call.body)).toEqual([{ kind: 'done' }, { kind: 'dismiss' }]);
   });
 
+  it('shows the network message at once for a Dismiss made offline, frees the actions, and sends nothing on reconnect', async () => {
+    const item = makeItem();
+    await renderCard(<RecommendationCard item={item} />);
+    // A browser offline rejects every request before it leaves, as this stub does.
+    const offlineFetch = vi.fn(() => Promise.reject(new TypeError('Failed to fetch')));
+    vi.stubGlobal('fetch', offlineFetch);
+    onlineManager.setOnline(false);
+    try {
+      fireEvent.click(within(cardOf(item)).getByRole('button', { name: FEEDBACK_LABELS.dismiss }));
+
+      // No endless loading state: the write fails at once with the client's network message,
+      // which takes focus, and every action is free for a retry.
+      const message = await within(cardOf(item)).findByText(
+        'The server could not be reached. Check your connection and try again.',
+      );
+      await waitFor(() => {
+        expect(document.activeElement?.contains(message)).toBe(true);
+      });
+      cardButtons(item).forEach((button) => {
+        expect(button).toHaveProperty('disabled', false);
+        expect(isInactive(button)).toBe(false);
+        expect(button.getAttribute('aria-busy')).toBeNull();
+      });
+      expect(offlineFetch).toHaveBeenCalledTimes(1);
+    } finally {
+      onlineManager.setOnline(true);
+    }
+
+    // Back online, nothing paused sends itself: the item is not dismissed behind the user.
+    await act(async () => {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+    expect(offlineFetch).toHaveBeenCalledTimes(1);
+    expect(within(cardOf(item)).queryByText(FEEDBACK_STATUS_MESSAGES.dismiss)).toBeNull();
+    cardButtons(item).forEach((button) => {
+      expect(button).toHaveProperty('disabled', false);
+    });
+  });
+
   it('shows the generic text, never the message, of a failure that is not an ApiError', async () => {
     // Assembled at run time, so the secret scan never meets a literal secret assignment.
     const secret = `${['SESSION', 'SECRET'].join('_')}=${'9f3c'.repeat(8)}`;
@@ -1190,6 +1239,40 @@ describe('RecommendationCard: record decision', () => {
 
     expect(posts(api)).toEqual([]);
     expect(within(cardOf(item)).queryByText(RECORDED_LINE_PATTERN)).toBeNull();
+  });
+
+  it.each([
+    ['the C1 campaign', c1Item, genericCrmDecision(), 'Generic CRM — US · Campaign · Google'],
+    [
+      // The API names a shared budget subject "Shared budget {Google id}", not as the card's
+      // entity ("Search Shared Budget"), and the dialog names the subject the decision is on.
+      'a shared budget as the API names the subject',
+      sharedB1Item,
+      makeDecision('budget', {
+        subject: {
+          type: 'budget',
+          id: FIXTURE_BUDGET_IDS.search,
+          name: 'Shared budget 31000402',
+          source: 'google',
+          currency: 'USD',
+        },
+      }),
+      'Shared budget 31000402 · Shared budget · Google',
+    ],
+  ] as const)('names %s in its dialog as /decisions does', async (_label, build, latest, title) => {
+    api.use({ 'GET /decisions': json(200, [latest]) });
+    const item = build();
+    await renderCard(<RecommendationCard item={item} />);
+
+    const opener = within(cardOf(item)).getByRole('button', { name: RECORD_DECISION_LABEL });
+    expect(opener.getAttribute('aria-haspopup')).toBe('dialog');
+    const dialog = await openDecisionDialog(item);
+
+    // The dialog keeps its title, and names its subject once, above the form.
+    expect(screen.getByRole('dialog', { name: RECORD_DECISION_LABEL })).toBe(dialog);
+    const lines = within(dialog).getAllByText(title);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.closest('form')).toBeNull();
   });
 
   it('prefills the proposed daily budget on a shared budget and lists every member', async () => {
@@ -2191,6 +2274,52 @@ async function renderLiveCards(ids: readonly number[]): Promise<Item[]> {
   return items;
 }
 
+/**
+ * The cards of `ids` from the live recommendations query as a section lists them: a
+ * `SectionFrame` `CardList`, which shows the confirmation of a feedback recorded on the page in
+ * place of the card it hid.
+ */
+function ConfirmedCards({ ids }: { ids: readonly number[] }) {
+  const { data } = useRecommendations();
+  const items = data === undefined ? [] : ids.map((id) => findPageItem(data, id));
+  const confirmations = useFeedbackConfirmations(items.map(itemIdentity));
+  return (
+    <Stack>
+      <CardList
+        items={items}
+        confirmations={confirmations}
+        renderCard={(item) => <RecommendationCard item={item} />}
+      />
+    </Stack>
+  );
+}
+
+/**
+ * {@link LiveCards} listed by {@link ConfirmedCards}: inside one `PageShell.Section` and an
+ * `ActionOutcomeProvider`, after an "Elsewhere" button outside both.
+ */
+function LiveCardList({ ids }: { ids: readonly number[] }) {
+  return (
+    <Stack>
+      <Button>Elsewhere</Button>
+      <ActionOutcomeProvider>
+        <PageShell.Section id="section-keywords" title="Keywords to adjust">
+          <ConfirmedCards ids={ids} />
+        </PageShell.Section>
+      </ActionOutcomeProvider>
+    </Stack>
+  );
+}
+
+/** Renders {@link LiveCardList} and waits for its cards. */
+async function renderLiveCardList(ids: readonly number[]): Promise<Item[]> {
+  const page = makeRecommendationsPage();
+  const items = ids.map((id) => findPageItem(page, id));
+  await renderCard(<LiveCardList ids={ids} />);
+  await screen.findByRole('article', { name: items[0]?.action ?? '' });
+  return items;
+}
+
 /** Presses a card's action as a keyboard user does: focus first, then activate. */
 function press(item: Item, label: string): void {
   const button = within(cardOf(item)).getByRole('button', { name: label });
@@ -2201,6 +2330,22 @@ function press(item: Item, label: string): void {
 }
 
 describe('RecommendationActions: outcome announcement and focus after feedback', () => {
+  /** A stand-in for `Element.prototype.scrollIntoView`, which jsdom does not implement. */
+  let scrollIntoView: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    scrollIntoView = vi.fn();
+    Object.defineProperty(Element.prototype, 'scrollIntoView', {
+      configurable: true,
+      writable: true,
+      value: scrollIntoView,
+    });
+  });
+
+  afterEach(() => {
+    Reflect.deleteProperty(Element.prototype, 'scrollIntoView');
+  });
+
   it('starts with an empty provider region before the cards', async () => {
     serveLiveOverlay();
     const [first] = await renderLiveCards(KEYWORD_IDS);
@@ -2376,7 +2521,7 @@ describe('RecommendationActions: outcome announcement and focus after feedback',
     expect(document.activeElement).toBe(elsewhere);
   });
 
-  it('keeps the recorded card locked with its status line while it stays on the page', async () => {
+  it('keeps the recorded card locked with its status line, which takes focus, while it stays on the page', async () => {
     api.use({ 'POST /recommendations/:id/feedback': json(201, makeFeedback('dismiss')) });
     const item = pageItem(FIXTURE_ITEM_IDS.k1);
     await renderCard(
@@ -2390,15 +2535,142 @@ describe('RecommendationActions: outcome announcement and focus after feedback',
     const line = await within(cardOf(item)).findByText(FEEDBACK_STATUS_MESSAGES.dismiss);
     expect(line.getAttribute('role')).toBeNull();
     expect(outcomeRegion().textContent).toBe(feedbackOutcome('dismiss', item));
-    // With no other card, heading or main to move to, focus stays on the pressed Dismiss, which
-    // is aria-disabled until focus leaves it; the other actions are natively disabled.
-    const dismiss = within(cardOf(item)).getByRole('button', { name: FEEDBACK_LABELS.dismiss });
-    expect(document.activeElement).toBe(dismiss);
-    expect(dismiss.getAttribute('aria-disabled')).toBe('true');
-    for (const button of cardButtons(item)) {
-      expect(isInactive(button)).toBe(true);
-      expect(button).toHaveProperty('disabled', button !== dismiss);
+    // The card outlives its feedback, so its own status line takes the focus the pressed button
+    // held: focused where it stands, scrolled into view as far as needed, and no Tab stop.
+    await waitFor(() => {
+      expect(document.activeElement).toBe(line);
+    });
+    expect(line.getAttribute('tabindex')).toBe('-1');
+    expect(scrollIntoView.mock.contexts).toEqual([line]);
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' });
+    // Once the pressed button has lost focus, it is natively disabled like the others.
+    await waitFor(() => {
+      for (const button of cardButtons(item)) {
+        expect(isInactive(button)).toBe(true);
+        expect(button).toHaveProperty('disabled', true);
+      }
+    });
+  });
+
+  it('keeps focus on the status line of a card outside a provider, its polite region', async () => {
+    api.use({ 'POST /recommendations/:id/feedback': json(201, makeFeedback('snooze')) });
+    const item = pageItem(FIXTURE_ITEM_IDS.k1);
+    await renderCard(<RecommendationCard item={item} />);
+
+    press(item, FEEDBACK_LABELS.snooze);
+
+    const region = within(cardOf(item)).getByRole('status');
+    await waitFor(() => {
+      expect(region.textContent).toBe(FEEDBACK_STATUS_MESSAGES.snooze);
+    });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(region);
+    });
+    expect(scrollIntoView.mock.contexts).toEqual([region]);
+  });
+
+  it.each(FEEDBACK_KINDS)(
+    'focuses the "%s" confirmation in the removed card\'s place, scrolled into view as far as needed',
+    async (kind) => {
+      serveLiveOverlay();
+      const [first, second] = await renderLiveCardList(KEYWORD_IDS);
+      if (first === undefined || second === undefined) {
+        throw new Error('missing cards');
+      }
+
+      press(first, FEEDBACK_LABELS[kind]);
+
+      await waitFor(() => {
+        expect(screen.queryByRole('article', { name: first.action })).toBeNull();
+      });
+      const title = screen.getByText(feedbackOutcome(kind, first), {
+        selector: '.ds-banner__title',
+      });
+      const confirmation = title.closest('[data-feedback-confirmation]');
+      expect(confirmation?.getAttribute('data-feedback-confirmation')).toBe(itemIdentity(first));
+      await waitFor(() => {
+        expect(document.activeElement).toBe(confirmation);
+      });
+      // Where the card stood, right before the next card, which no longer takes focus.
+      expect(
+        confirmation?.compareDocumentPosition(cardOf(second)) ?? 0,
+      ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+      expect(scrollIntoView.mock.contexts).toEqual([confirmation]);
+      expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' });
+      expect(outcomeRegion().textContent).toBe(feedbackOutcome(kind, first));
+    },
+  );
+
+  it('focuses the confirmation also when focus was lost before the card left', async () => {
+    let release: (response: MockResponse) => void = () => {
+      throw new Error('the pending feedback response was never created');
+    };
+    const pending = new Promise<MockResponse>((resolve) => {
+      release = resolve;
+    });
+    serveLiveOverlay(() => pending);
+    const [first] = await renderLiveCardList(KEYWORD_IDS);
+    if (first === undefined) {
+      throw new Error('missing card');
     }
+
+    press(first, FEEDBACK_LABELS.snooze);
+    await waitFor(() => {
+      expect(posts(api)).toHaveLength(1);
+    });
+    // Focus falls to the page while the request runs, so the card leaves holding none.
+    act(() => {
+      const active = document.activeElement;
+      if (active instanceof HTMLElement) {
+        active.blur();
+      }
+    });
+    expect(document.activeElement).toBe(document.body);
+    release(json(201, makeFeedback('snooze', { recommendation_id: first.id })));
+
+    const title = await screen.findByText(feedbackOutcome('snooze', first), {
+      selector: '.ds-banner__title',
+    });
+    const confirmation = title.closest('[data-feedback-confirmation]');
+    await waitFor(() => {
+      expect(document.activeElement).toBe(confirmation);
+    });
+    expect(scrollIntoView.mock.contexts).toEqual([confirmation]);
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' });
+  });
+
+  it('leaves focus the user moved elsewhere while the feedback was pending, with a confirmation shown', async () => {
+    let release: (response: MockResponse) => void = () => {
+      throw new Error('the pending feedback response was never created');
+    };
+    const pending = new Promise<MockResponse>((resolve) => {
+      release = resolve;
+    });
+    serveLiveOverlay(() => pending);
+    const [first] = await renderLiveCardList(KEYWORD_IDS);
+    if (first === undefined) {
+      throw new Error('missing card');
+    }
+
+    press(first, FEEDBACK_LABELS.done);
+    await waitFor(() => {
+      expect(posts(api)).toHaveLength(1);
+    });
+    const elsewhere = screen.getByRole('button', { name: 'Elsewhere' });
+    act(() => {
+      elsewhere.focus();
+    });
+    release(json(201, makeFeedback('done', { recommendation_id: first.id })));
+
+    await screen.findByText(feedbackOutcome('done', first), { selector: '.ds-banner__title' });
+    // The recovery timer queued with the announcement runs before this one.
+    await act(async () => {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+    expect(document.activeElement).toBe(elsewhere);
+    expect(scrollIntoView).not.toHaveBeenCalled();
   });
 });
 

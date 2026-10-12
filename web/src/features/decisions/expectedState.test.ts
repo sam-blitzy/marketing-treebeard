@@ -9,8 +9,8 @@
  *   for acknowledged removals, with statuses as their labels, amounts in the subject's own
  *   currency, and a member's shared budget named from the log's budget names (the API's
  *   "Shared budget " prefix dropped), else by its Google id, else by its internal id;
- * - `statusLabel`, `textOrNull`, `FIELD_LABELS` and `PART_SEPARATOR`, which `DecisionLog.tsx`
- *   reuses for its subject titles and patch cells.
+ * - `statusLabel`, `textOrNull` and `FIELD_LABELS`, which `DecisionLog.tsx` reuses for its
+ *   patch cells, and `PART_SEPARATOR`, which joins the parts of a state.
  *
  * The expected texts are the exact strings the decision log rendered before this module was
  * split out of it, so both screens keep wording a decision byte for byte as before.

@@ -42,7 +42,10 @@
  * - every mutation's request (CSRF header, JSON body, encoded path) and its cache effects: the
  *   exact `invalidateQueries` keys (spied), the seeded and invalidated entries, the keys left
  *   alone, nothing touched on failure, and `mutateAsync` of a decision write or resolution
- *   still pending while the refetch of a shown list is held, resolving only once it has landed.
+ *   still pending while the refetch of a shown list is held, resolving only once it has landed;
+ * - every write while `onlineManager` reports the browser offline: it fails at once with status
+ *   0 `network_error` and its message, is never paused, invalidates nothing, and sends nothing
+ *   more once the browser is back online.
  *
  * The file is self-contained. It imports only `./queries`, `./client` and `./types`: the shared
  * helpers in `src/test/` import this folder, so importing them here would close a cycle.
@@ -51,7 +54,12 @@
  * The discriminators a payload does carry stay ones the API can produce: a decision's shape fits
  * its subject, and a discrepancy's kind and shape form a pair C0 raises.
  */
-import { QueryClient, QueryClientProvider, focusManager } from '@tanstack/react-query';
+import {
+  QueryClient,
+  QueryClientProvider,
+  focusManager,
+  onlineManager,
+} from '@tanstack/react-query';
 import type { QueryKey } from '@tanstack/react-query';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
@@ -66,6 +74,7 @@ import {
   DISCREPANCY_PAGE_SIZE,
   FIRST_RUN_POLL_MS,
   SOURCES_POLL_MS,
+  WRITE_NETWORK_MODE,
   configQueryOptions,
   defaultRunQueryOptions,
   isApiError,
@@ -3488,4 +3497,129 @@ describe('useRequestSync', () => {
     expect(invalidate).not.toHaveBeenCalled();
     expect(invalidated(queryClient, queryKeys.sources)).toBe(false);
   });
+});
+
+describe('writes while the browser is offline', () => {
+  /** The message `apiFetch` gives a request that never reached the server. */
+  const NETWORK_MESSAGE = 'The server could not be reached. Check your connection and try again.';
+
+  /** One write hook under test: its mutation's state and a call that sends one write. */
+  interface OfflineWrite {
+    send: () => Promise<unknown>;
+    isPaused: boolean;
+    isError: boolean;
+    error: ApiError | null;
+  }
+
+  /** The mutation's state and `send`, from any of the write hooks. */
+  function offlineWrite(
+    mutation: Pick<OfflineWrite, 'isPaused' | 'isError' | 'error'>,
+    send: () => Promise<unknown>,
+  ): OfflineWrite {
+    return { send, isPaused: mutation.isPaused, isError: mutation.isError, error: mutation.error };
+  }
+
+  /** {@link useLogin}, signing in. */
+  function useLoginWrite(): OfflineWrite {
+    const mutation = useLogin();
+    return offlineWrite(mutation, () =>
+      mutation.mutateAsync({ email: 'admin@example.com', password: 'correct horse' }),
+    );
+  }
+
+  /** {@link useLogout}, signing out. */
+  function useLogoutWrite(): OfflineWrite {
+    const mutation = useLogout();
+    return offlineWrite(mutation, () => mutation.mutateAsync());
+  }
+
+  /** {@link useCreateRun}, for a custom window. */
+  function useCreateRunWrite(): OfflineWrite {
+    const mutation = useCreateRun();
+    return offlineWrite(mutation, () =>
+      mutation.mutateAsync({ window_start: '2026-07-08', window_end: '2026-10-05' }),
+    );
+  }
+
+  /** {@link useRecordDecision}, pausing a campaign. */
+  function useRecordDecisionWrite(): OfflineWrite {
+    const mutation = useRecordDecision();
+    return offlineWrite(mutation, () =>
+      mutation.mutateAsync({
+        subject: { type: 'campaign', id: CAMPAIGN_ID },
+        patch: { status: 'paused' },
+      }),
+    );
+  }
+
+  /** {@link useResolveDiscrepancy}, confirming the platform state. */
+  function useResolveDiscrepancyWrite(): OfflineWrite {
+    const mutation = useResolveDiscrepancy();
+    return offlineWrite(mutation, () =>
+      mutation.mutateAsync({ id: DISCREPANCY_ID, body: { resolution: 'platform_correct' } }),
+    );
+  }
+
+  /** {@link useFeedback}, dismissing an item. */
+  function useFeedbackWrite(): OfflineWrite {
+    const mutation = useFeedback();
+    return offlineWrite(mutation, () =>
+      mutation.mutateAsync({ recommendationId: ITEM_ID, body: { kind: 'dismiss' } }),
+    );
+  }
+
+  /** {@link useRequestSync}, for Google. */
+  function useRequestSyncWrite(): OfflineWrite {
+    const mutation = useRequestSync();
+    return offlineWrite(mutation, () => mutation.mutateAsync('google'));
+  }
+
+  it('runs every write in the always network mode', () => {
+    expect(WRITE_NETWORK_MODE).toBe('always');
+  });
+
+  it.each([
+    ['useLogin', useLoginWrite],
+    ['useLogout', useLogoutWrite],
+    ['useCreateRun', useCreateRunWrite],
+    ['useRecordDecision', useRecordDecisionWrite],
+    ['useResolveDiscrepancy', useResolveDiscrepancyWrite],
+    ['useFeedback', useFeedbackWrite],
+    ['useRequestSync', useRequestSyncWrite],
+  ] as const)(
+    '%s fails at once with network_error, never paused, and sends nothing on reconnect',
+    async (_name, useWrite) => {
+      // A browser offline rejects every fetch, as this stub does.
+      const mock = stubFetch(() => Promise.reject(new TypeError('Failed to fetch')));
+      const { result, queryClient } = renderWithWrapper(useWrite);
+      seed(queryClient, [queryKeys.recommendations('default'), queryKeys.sources]);
+      const invalidate = spyOnInvalidate(queryClient);
+      let settled: Promise<unknown> = Promise.resolve();
+      onlineManager.setOnline(false);
+      try {
+        act(() => {
+          settled = rejection(result.current.send());
+        });
+
+        await waitFor(() => expect(result.current.isError).toBe(true));
+        expect(result.current.isPaused).toBe(false);
+        expect(result.current.error?.status).toBe(0);
+        expect(result.current.error?.code).toBe('network_error');
+        expect(result.current.error?.message).toBe(NETWORK_MESSAGE);
+        const rejected = await settled;
+        expect(isApiError(rejected) && rejected.code).toBe('network_error');
+        expect(mock).toHaveBeenCalledTimes(1);
+        expect(invalidate).not.toHaveBeenCalled();
+      } finally {
+        onlineManager.setOnline(true);
+      }
+
+      // Back online, nothing paused resumes: the write is sent again only when the user retries.
+      await act(async () => {
+        await queryClient.resumePausedMutations();
+      });
+      expect(mock).toHaveBeenCalledTimes(1);
+      expect(queryClient.getMutationCache().getAll().some((m) => m.state.isPaused)).toBe(false);
+    },
+  );
 });

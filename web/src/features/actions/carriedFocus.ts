@@ -15,8 +15,10 @@
  *    a decision dialog of its own is open, since that modal dialog then owns focus. The note is
  *    taken in a layout-effect cleanup, which React runs while the removed elements, the dialog's
  *    included, are still in the document;
- * 2. a card or row of the same identity that mounts in that commit claims the note in a layout
- *    effect and takes focus in a passive effect ({@link useCarriedFocus}). React runs the passive
+ * 2. a card or row of the same identity that mounts in that commit, or the feedback confirmation
+ *    that takes the place of a card a feedback recorded on the page has hidden
+ *    (`FeedbackConfirmation` in `./ActionOutcomes`), claims the note in a layout effect and
+ *    takes focus in a passive effect ({@link useCarriedFocus}). React runs the passive
  *    cleanup of the removed dialog, which frees the page behind it from `inert` and finds no
  *    opener to return focus to, before any passive effect of a mounting component, so the new
  *    card or row can take focus;
@@ -25,8 +27,8 @@
  *    runs for a layout-effect update, before its note is dropped.
  *
  * Notes are dropped in a microtask, which runs once the commit, and every re-render it started
- * synchronously, has finished. A note nothing claimed, such as that of a card a feedback has
- * hidden or of a page left behind, therefore never moves focus later.
+ * synchronously, has finished. A note nothing claimed, such as that of a card a feedback given
+ * elsewhere has hidden or of a page left behind, therefore never moves focus later.
  *
  * Each caller decides what holds focus and where it goes, with its own elements; the module
  * imports React alone, so the card, the section frame and the white-paper section share it

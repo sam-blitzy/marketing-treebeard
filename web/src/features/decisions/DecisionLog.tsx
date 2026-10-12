@@ -58,7 +58,6 @@ import type {
   DecisionOrigin,
   DecisionPatchView,
   SubjectIn,
-  SubjectType,
   SubjectView,
 } from '../../api/types';
 import {
@@ -72,15 +71,9 @@ import {
   Stack,
   type DataTableColumn,
 } from '../../design-system';
-import { EM_DASH, formatInstant, formatMoney, sourceLabel } from '../../lib/format';
-import { DecisionForm } from './DecisionForm';
-import {
-  FIELD_LABELS,
-  PART_SEPARATOR,
-  describeExpectedState,
-  statusLabel,
-  textOrNull,
-} from './expectedState';
+import { EM_DASH, formatInstant, formatMoney } from '../../lib/format';
+import { DecisionForm, subjectName, subjectTitle } from './DecisionForm';
+import { FIELD_LABELS, describeExpectedState, statusLabel, textOrNull } from './expectedState';
 import { RETRY_LABEL, lastLoadedText, useRetry, useSettledFailure } from './readState';
 
 // ---------------------------------------------------------------------------------------------
@@ -152,12 +145,6 @@ const PATCH_SEPARATOR = '; ';
 
 /** The title of the dialog that hosts `DecisionForm`; the e2e suite finds the dialog by it. */
 const DIALOG_TITLE = 'Record decision';
-
-/** The label of each subject type, as the subject title shows it. */
-const SUBJECT_TYPE_LABELS: Readonly<Record<SubjectType, string>> = Object.freeze({
-  campaign: 'Campaign',
-  budget: 'Shared budget',
-});
 
 /** The label of each decision origin (`db.models.decisions.DECISION_ORIGINS`). */
 const ORIGIN_LABELS: Readonly<Record<DecisionOrigin, string>> = Object.freeze({
@@ -294,31 +281,6 @@ function groupBySubject(decisions: readonly Decision[]): SubjectGroup[] {
  */
 function subjectSectionId(subject: SubjectView): string {
   return `decision-subject-${subject.type}-${subject.id}`.replace(NON_ID_CHARACTERS, '-');
-}
-
-/** The label of a subject type; an unknown type received at run time is shown as sent. */
-function subjectTypeLabel(type: SubjectType): string {
-  return Object.hasOwn(SUBJECT_TYPE_LABELS, type) ? SUBJECT_TYPE_LABELS[type] : String(type);
-}
-
-/**
- * The display name of a subject: its name, or "Unnamed campaign (id 12)" / "Unnamed shared
- * budget (id 7)" when the API could not name it, so a caption never reads "null".
- */
-function subjectName(subject: SubjectView): string {
-  return (
-    textOrNull(subject.name) ??
-    `Unnamed ${subjectTypeLabel(subject.type).toLowerCase()} (id ${subject.id})`
-  );
-}
-
-/** The section title of a subject: "{name} · {Campaign | Shared budget} · {source}". */
-function subjectTitle(subject: SubjectView): string {
-  const parts = [subjectName(subject), subjectTypeLabel(subject.type)];
-  if (subject.source !== null) {
-    parts.push(sourceLabel(subject.source));
-  }
-  return parts.join(PART_SEPARATOR);
 }
 
 /**

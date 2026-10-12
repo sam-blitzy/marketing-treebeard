@@ -517,6 +517,11 @@ export interface CardListProps {
 interface ListConfirmation {
   /** Unique among the confirmations shown at the same place. */
   readonly key: string;
+  /**
+   * The hidden item's recommendation identity ({@link itemIdentity}), by which the card that
+   * recorded the feedback finds the confirmation to focus.
+   */
+  readonly identity: string;
   /** The confirmation, for example "Dismissed: Pause (Generic CRM — US)". */
   readonly message: string;
 }
@@ -566,6 +571,7 @@ function cardListLayout(
     occurrences.set(identity, seen + 1);
     const confirmation: ListConfirmation = {
       key: seen === 0 ? `confirmation:${identity}` : `confirmation:${identity}#${String(seen)}`,
+      identity,
       message,
     };
     const previous = cards.at(-1);
@@ -583,10 +589,13 @@ function cardListLayout(
   return { cards, leading, after };
 }
 
-/** Each confirmation as its {@link FeedbackConfirmation}, keyed. */
+/**
+ * Each confirmation as its {@link FeedbackConfirmation}, keyed, carrying its recommendation
+ * identity, so the card that recorded the feedback can move keyboard focus to it.
+ */
 function renderConfirmations(confirmations: readonly ListConfirmation[]): ReactNode {
-  return confirmations.map(({ key, message }) => (
-    <FeedbackConfirmation key={key} message={message} />
+  return confirmations.map(({ key, identity, message }) => (
+    <FeedbackConfirmation key={key} identity={identity} message={message} />
   ));
 }
 
@@ -617,9 +626,11 @@ function renderConfirmations(confirmations: readonly ListConfirmation[]): ReactN
  * place, its {@link FeedbackConfirmation} from `confirmations`: "Dismissed: {action}
  * ({entity})", directly after the card before it, so the outcome is visible where the user
  * acted (WCAG 2.2 SC 4.1.3, beside the polite announcement of `../ActionOutcomes`). It is no
- * card: it is no batched entry, counts in no status, holds no control and takes no focus, so
- * keyboard focus, recovered to the next card's first action, lands right after it. A list that
- * holds only confirmations renders them alone. Any other hidden item is left out.
+ * card: it is no batched entry, counts in no status and holds no control. It carries the item's
+ * recommendation identity, so keyboard focus, which the hidden card lost, is recovered to it and
+ * it is scrolled into view as far as needed (`../focusRecovery`); it is no Tab stop, and the
+ * next Tab continues to the card that follows it. A list that holds only confirmations renders
+ * them alone. Any other hidden item is left out.
  *
  * Exported so a section that builds a group body of its own (Campaigns' discrepancy group)
  * bounds its lists the same way.
@@ -683,7 +694,8 @@ export interface ConfirmedItemsProps {
  * The {@link FeedbackConfirmation} of each confirmed item among `items` ({@link isConfirmed}),
  * in API order, for a section whose items stand where no confirmation can: the rows of a
  * `DataTable`, such as the white-paper asset tables. The section renders them directly after
- * the table that held the rows, so each outcome shows beside where it was given.
+ * the table that held the rows, so each outcome shows beside where it was given, and keyboard
+ * focus the hidden row's action lost is recovered to it, as in a {@link CardList}.
  *
  * @param props - see {@link ConfirmedItemsProps}
  * @returns the confirmations, or `null` when there is none

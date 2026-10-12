@@ -20,9 +20,9 @@
  *   budget, and for lifetime, `CUSTOM_PERIOD` and dual-budget campaigns with only the changed
  *   fields in a patch and the complete state in an intended state.
  * - **Errors.** A 422 shows the API's message and takes focus; a 409 `subject_retired` locks
- *   the form as "Computed from replaced data"; a 409 `discrepancy_resolved` reads "Already
- *   resolved"; a failure that is not an `ApiError` reads "The save failed.", never its own
- *   message. No error takes `role="alert"`.
+ *   the form's fields and submit as "Computed from replaced data" and leaves Cancel usable; a
+ *   409 `discrepancy_resolved` reads "Already resolved"; a failure that is not an `ApiError`
+ *   reads "The save failed.", never its own message. No error takes `role="alert"`.
  * - **Outcomes.** `onPendingChange` reports `true` when a save is sent and `false` when it
  *   settles, before `onDone`, `onRetired` or `onFailed`; `onFailed` receives every failure but
  *   `subject_retired`, with the form's message; each reaches the consumer after an unmount too.
@@ -51,7 +51,7 @@ import {
   makeDecision,
   makeDiscrepancy,
 } from '../../test/fixtures';
-import { DecisionForm } from './DecisionForm';
+import { DecisionForm, subjectName, subjectTitle } from './DecisionForm';
 import type { DecisionFormProps } from './DecisionForm';
 
 // ---------------------------------------------------------------------------------------------
@@ -1073,7 +1073,7 @@ describe('DecisionForm', () => {
       expect(statusSelect()).toHaveProperty('disabled', false);
     });
 
-    it('locks every control on a 409 subject_retired', async () => {
+    it('locks every field and the submit, but not Cancel, on a 409 subject_retired', async () => {
       const onDone = vi.fn<() => void>();
       const onCancel = vi.fn<() => void>();
       mockApi({
@@ -1090,9 +1090,11 @@ describe('DecisionForm', () => {
       expect(amountInput('Daily budget')).toHaveProperty('disabled', true);
       expect(noteField()).toHaveProperty('disabled', true);
       expect(saveButton()).toHaveProperty('disabled', true);
-      expect(screen.getByRole('button', { name: 'Cancel' })).toHaveProperty('disabled', true);
+      // Cancel writes nothing, so the retirement leaves it usable (AAP 0.3.2).
+      expect(screen.getByRole('button', { name: 'Cancel' })).toHaveProperty('disabled', false);
       expect(screen.queryByRole('alert')).toBeNull();
       expect(onDone).not.toHaveBeenCalled();
+      expect(onCancel).not.toHaveBeenCalled();
     });
 
     it('calls onCancel from its Cancel button', async () => {
@@ -2457,14 +2459,15 @@ describe('DecisionForm: the retired lock outlasts every later read (AAP 0.5.5)',
       await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
       expect(log.reads.count).toBe(2);
 
-      // The last decided state is still shown, under the retired banner, with every control off.
+      // The last decided state is still shown, under the retired banner, with every field and
+      // the submit off; Cancel, which writes nothing, stays usable.
       expect(await screen.findByText(RETIRED)).toBeDefined();
       expect(screen.getByText('Last decided: Active · daily budget USD 200.00')).toBeDefined();
       expect(statusSelect()).toHaveProperty('disabled', true);
       expect(amountInput('Daily budget')).toHaveProperty('disabled', true);
       expect(noteField()).toHaveProperty('disabled', true);
       expect(saveButton()).toHaveProperty('disabled', true);
-      expect(screen.getByRole('button', { name: 'Cancel' })).toHaveProperty('disabled', true);
+      expect(screen.getByRole('button', { name: 'Cancel' })).toHaveProperty('disabled', false);
       expect(screen.queryByText(NO_STATE)).toBeNull();
       expect(screen.queryByRole('alert')).toBeNull();
       await waitFor(() => {
@@ -2476,6 +2479,56 @@ describe('DecisionForm: the retired lock outlasts every later read (AAP 0.5.5)',
         await Promise.resolve();
       });
       expect(postsOf(api)).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Cancel writes nothing, so a retirement, however the form learns it, leaves it usable: only
+  // the writes lock (AAP 0.3.2), and the form can still be dismissed from its own buttons.
+  it.each([
+    ['a refused save', 'save'],
+    ['a refused later read of the log', 'read'],
+  ] as const)('keeps Cancel usable, calling onCancel, after %s', async (_label, refusal) => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const log = logThen(
+        refusal === 'read' ? retiredError() : json(200, [makeDecision('own_budget')]),
+      );
+      const onRetired = vi.fn<() => void>();
+      const onCancel = vi.fn<() => void>();
+      const api = mockApi({
+        [logKey(OWN_BUDGET)]: log.handler,
+        ...(refusal === 'save' ? { 'POST /decisions': retiredError() } : {}),
+      });
+      await renderForm({
+        subject: OWN_BUDGET,
+        prefill: { daily_budget: '251.00' },
+        onRetired,
+        onCancel,
+      });
+
+      if (refusal === 'save') {
+        fireEvent.click(saveButton());
+      } else {
+        await act(() => vi.advanceTimersByTimeAsync(CURRENT_STATE_POLL_MS));
+        expect(log.reads.count).toBe(2);
+      }
+      expect(await screen.findByText(RETIRED)).toBeDefined();
+      await waitFor(() => {
+        expect(onRetired).toHaveBeenCalledTimes(1);
+      });
+      expect(saveButton()).toHaveProperty('disabled', true);
+      expect(amountInput('Daily budget')).toHaveProperty('disabled', true);
+
+      const cancel = screen.getByRole('button', { name: 'Cancel' });
+      expect(cancel).toHaveProperty('disabled', false);
+      expect(cancel.getAttribute('aria-disabled')).toBeNull();
+      fireEvent.click(cancel);
+
+      expect(onCancel).toHaveBeenCalledTimes(1);
+      // Only the refused save was ever posted; Cancel posts nothing.
+      expect(postsOf(api)).toHaveLength(refusal === 'save' ? 1 : 0);
     } finally {
       vi.useRealTimers();
     }
@@ -2586,4 +2639,180 @@ describe('DecisionForm: the retired lock outlasts every later read (AAP 0.5.5)',
     expect(statusSelect()).toHaveProperty('disabled', false);
     expect(onRetired).toHaveBeenCalledTimes(1);
   });
+});
+
+// The dialogs opened from /actions name their subject as the decision log names it on
+// /decisions, through the form's own line, because their openers do not.
+describe('DecisionForm: the subject line (showSubject)', () => {
+  /** The title of the own-budget campaign, as the decision log names it. */
+  const OWN_BUDGET_TITLE = 'Brand Search — US · Campaign · Google';
+
+  /**
+   * The only element showing `text`, which must sit before, and outside, the form element.
+   *
+   * @throws Error when the text is shown other than once.
+   */
+  function lineAboveForm(text: string): HTMLElement {
+    const [line, ...others] = screen.getAllByText(text);
+    if (line === undefined || others.length > 0) {
+      throw new Error(`expected "${text}" once, found ${String(others.length + 1)}`);
+    }
+    const form = document.querySelector('form');
+    expect(line.closest('form')).toBeNull();
+    if (form !== null) {
+      expect(line.compareDocumentPosition(form) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    }
+    return line;
+  }
+
+  it.each([
+    ['an own-budget campaign', OWN_BUDGET, makeDecision('own_budget'), OWN_BUDGET_TITLE],
+    [
+      'a shared budget',
+      SHARED_BUDGET,
+      makeDecision('budget'),
+      'Search Shared Budget · Shared budget · Google',
+    ],
+    [
+      'a LinkedIn campaign',
+      LINKEDIN_CAMPAIGN,
+      linkedinDecision(),
+      'Lead Gen — Pipeline Report EMEA · Campaign · LinkedIn',
+    ],
+  ] as const)('names %s above its fields', async (_label, subject, decision, title) => {
+    mockApi({ [logKey(subject)]: json(200, [decision]) });
+    await renderForm({ subject, showSubject: true });
+
+    expect(await screen.findByRole('button', { name: 'Save decision' })).toBeDefined();
+    lineAboveForm(title);
+  });
+
+  it("names a shared budget as the API names the subject, never as the card's entity", async () => {
+    // The API names a shared budget subject "Shared budget {Google id}" (`_SHARED_BUDGET_NAME`).
+    const decision = makeDecision('budget', {
+      subject: {
+        type: 'budget',
+        id: FIXTURE_BUDGET_IDS.search,
+        name: 'Shared budget 31000402',
+        source: 'google',
+        currency: 'USD',
+      },
+    });
+    mockApi({ [logKey(SHARED_BUDGET)]: json(200, [decision]) });
+    await renderForm({ subject: SHARED_BUDGET, showSubject: true });
+
+    lineAboveForm('Shared budget 31000402 · Shared budget · Google');
+  });
+
+  it('shows no subject line without showSubject, for a consumer that names it itself', async () => {
+    mockApi({ [logKey(OWN_BUDGET)]: json(200, [makeDecision('own_budget')]) });
+    await renderForm({ subject: OWN_BUDGET });
+
+    expect(screen.getByRole('button', { name: 'Save decision' })).toBeDefined();
+    expect(screen.queryByText(OWN_BUDGET_TITLE)).toBeNull();
+  });
+
+  it("names an intended state's subject from its discrepancy while the log loads", async () => {
+    const log = deferredResponse();
+    mockApi({ [logKey(OWN_BUDGET)]: () => log.promise });
+    await renderWithProviders(
+      <DecisionForm
+        subject={OWN_BUDGET}
+        mode="intended_state"
+        discrepancy={makeDiscrepancy('untracked')}
+        showSubject
+      />,
+      { path: '/decisions' },
+    );
+
+    expect(screen.getByRole('status').textContent).toBe('Loading decision');
+    lineAboveForm(OWN_BUDGET_TITLE);
+
+    log.resolve(json(200, []));
+    expect(await screen.findByRole('button', { name: 'Save intended state' })).toBeDefined();
+    lineAboveForm(OWN_BUDGET_TITLE);
+  });
+
+  it('names nothing in decision mode until the log names the subject', async () => {
+    const log = deferredResponse();
+    mockApi({ [logKey(OWN_BUDGET)]: () => log.promise });
+    await renderWithProviders(<DecisionForm subject={OWN_BUDGET} showSubject />, {
+      path: '/decisions',
+    });
+
+    expect(screen.getByRole('status').textContent).toBe('Loading decision');
+    expect(screen.queryByText(OWN_BUDGET_TITLE)).toBeNull();
+
+    log.resolve(json(200, [makeDecision('own_budget')]));
+    expect(await screen.findByRole('button', { name: 'Save decision' })).toBeDefined();
+    lineAboveForm(OWN_BUDGET_TITLE);
+  });
+
+  it('keeps naming the subject over the retired lock, with Cancel still usable', async () => {
+    const onCancel = vi.fn<() => void>();
+    mockApi({
+      [logKey(OWN_BUDGET)]: json(200, [makeDecision('own_budget')]),
+      'POST /decisions': apiError(409, 'subject_retired', 'The dataset is no longer active.'),
+    });
+    await renderForm({
+      subject: OWN_BUDGET,
+      prefill: { status: 'paused' },
+      onCancel,
+      showSubject: true,
+    });
+
+    fireEvent.click(saveButton());
+
+    expect(await screen.findByText('Computed from replaced data')).toBeDefined();
+    lineAboveForm(OWN_BUDGET_TITLE);
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('names a subject whose removal was acknowledged above its notice', async () => {
+    mockApi({
+      [logKey(OWN_BUDGET)]: json(200, [
+        makeDecision('own_budget', { tombstone: true, status: 'ended', origin: 'resolution' }),
+      ]),
+    });
+    await renderForm({ subject: OWN_BUDGET, showSubject: true });
+
+    expect(screen.getByText('Brand Search — US was acknowledged as removed')).toBeDefined();
+    lineAboveForm(OWN_BUDGET_TITLE);
+  });
+});
+
+describe('subjectName and subjectTitle', () => {
+  it.each([
+    [
+      'a named campaign',
+      {
+        type: 'campaign',
+        id: 12,
+        name: ' Product - Analytics platform ',
+        source: 'google',
+        currency: 'USD',
+      },
+      'Product - Analytics platform',
+      'Product - Analytics platform · Campaign · Google',
+    ],
+    [
+      'an unnamed shared budget',
+      { type: 'budget', id: 7, name: '  ', source: 'google', currency: 'USD' },
+      'Unnamed shared budget (id 7)',
+      'Unnamed shared budget (id 7) · Shared budget · Google',
+    ],
+    [
+      'a subject of no named source',
+      { type: 'campaign', id: 12, name: null, source: null, currency: null },
+      'Unnamed campaign (id 12)',
+      'Unnamed campaign (id 12) · Campaign',
+    ],
+  ] as const satisfies readonly (readonly [string, SubjectView, string, string])[])(
+    'names %s',
+    (_label, subject, name, title) => {
+      expect(subjectName(subject)).toBe(name);
+      expect(subjectTitle(subject)).toBe(title);
+    },
+  );
 });

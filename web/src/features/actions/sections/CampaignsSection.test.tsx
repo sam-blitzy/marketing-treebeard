@@ -10,7 +10,9 @@
  *   actions, exactly the resolutions `GET /discrepancies` lists for the live discrepancy, read
  *   once for the whole group, with its loading, failed, checking, resolved-since-run (only when
  *   `GET /discrepancies?state=resolved` lists it), no-longer-listed and missing-id states, each
- *   in one persistent polite status line that takes focus when the controls leave with it; a
+ *   in one persistent polite status line that takes focus when the controls leave with it; that
+ *   line names a discrepancy awaiting the platform as `/decisions` does, its resolutions still
+ *   offered, and never repeats the controls' own outcome line after an inline resolution; a
  *   historical C0 stays pinned with its frozen resolutions disabled and reads no list;
  * - held cards collapsed at the end of their group; one without a recorded blocker links the
  *   discrepancy group as "View open discrepancies";
@@ -742,6 +744,180 @@ describe('C0 discrepancy cards', () => {
     }
   });
 
+  /** The `/decisions` resolver's label of an awaiting-platform discrepancy. */
+  const AWAITING_LABEL = 'Awaiting platform';
+
+  /** The `/decisions` resolver's outcome line after a resolution that waits for the platform. */
+  const AWAITING_OUTCOME = 'Waiting for the platform to match the decision';
+
+  /** The status line of a C0 card met already awaiting the platform. */
+  const AWAITING_LINE = `${AWAITING_LABEL}: ${AWAITING_OUTCOME}`;
+
+  /** The default discrepancy awaiting the platform after "Decision is correct". */
+  function awaitingDiscrepancy(): Discrepancy {
+    return makeDiscrepancy('status', { state: 'awaiting_platform', resolution: 'decision_correct' });
+  }
+
+  /** How many times `text` occurs in the text of `scope`. */
+  function occurrences(scope: HTMLElement, text: string): number {
+    return scope.textContent.split(text).length - 1;
+  }
+
+  /** Listed discrepancy states, with the status line each reads beside the resolutions. */
+  const listedStates: readonly [string, () => Discrepancy, string][] = [
+    ['open, an empty line', () => makeDiscrepancy('status'), ''],
+    ['awaiting the platform, its state and why', awaitingDiscrepancy, AWAITING_LINE],
+  ];
+
+  it.each(listedStates)(
+    'reads a listed discrepancy %s, and offers every resolution as /decisions does',
+    async (_, discrepancy, text) => {
+      mockApi({ 'GET /discrepancies': json(200, [discrepancy()]) });
+      await renderCampaigns(
+        oneGroup('discrepancies', 'Discrepancies', [pageItem(FIXTURE_ITEM_IDS.c0)]),
+      );
+
+      const c0 = card(C0_ACTION);
+      await within(c0).findByRole('button', { name: 'Platform is correct' });
+      const line = statusLine(c0);
+      expect(line.textContent).toBe(text);
+      if (text === '') {
+        expect(line.childNodes).toHaveLength(0);
+      }
+      // Both resolutions stay offered and usable: the API accepts one of an awaiting row.
+      expect(buttonNames(c0)).toEqual(['Platform is correct', 'Decision is correct']);
+      for (const button of within(c0).getAllByRole('button')) {
+        expect((button as HTMLButtonElement).disabled).toBe(false);
+      }
+      // Nothing was resolved here, so the controls' own outcome line is empty.
+      const statuses = within(c0).getAllByRole('status');
+      expect(statuses).toHaveLength(2);
+      expect(statuses[1]?.textContent).toBe('');
+      expect(screen.queryByRole('alert')).toBeNull();
+    },
+  );
+
+  /** States a C0 card's discrepancy can be listed in before "Decision is correct". */
+  const statesBeforeDecisionCorrect: readonly [string, () => Discrepancy, string][] = [
+    ['open', () => makeDiscrepancy('status'), ''],
+    ['already awaiting the platform', awaitingDiscrepancy, AWAITING_LINE],
+  ];
+
+  it.each(statesBeforeDecisionCorrect)(
+    'names the awaiting state once after an inline "Decision is correct" on a discrepancy %s',
+    async (_, before, initialLine) => {
+      let resolved = false;
+      const api = mockApi({
+        'GET /discrepancies': () =>
+          json(200, [resolved ? awaitingDiscrepancy() : before()]),
+        'POST /discrepancies/:id/resolve': (call) => {
+          resolved = true;
+          return json(200, { ...awaitingDiscrepancy(), id: Number(call.params.id) });
+        },
+      });
+      await renderCampaigns(
+        oneGroup('discrepancies', 'Discrepancies', [pageItem(FIXTURE_ITEM_IDS.c0)]),
+      );
+
+      const c0 = card(C0_ACTION);
+      const decisionCorrect = await within(c0).findByRole('button', { name: 'Decision is correct' });
+      const line = statusLine(c0);
+      expect(line.textContent).toBe(initialLine);
+      // Every text the status line takes from the click on, so a moment's repeat shows too.
+      const seen: string[] = [];
+      const observer = new MutationObserver(() => {
+        seen.push(line.textContent);
+      });
+      observer.observe(line, { childList: true, characterData: true, subtree: true });
+      try {
+        fireEvent.click(decisionCorrect);
+        const outcome = within(c0).getAllByRole('status').at(-1);
+        await waitFor(() => {
+          expect(outcome?.textContent).toBe(AWAITING_OUTCOME);
+          expect(line.textContent).toBe(AWAITING_LABEL);
+        });
+        await settle();
+      } finally {
+        observer.disconnect();
+      }
+
+      // The persistent line names the state; the outcome line alone says why, once.
+      expect(statusLine(c0)).toBe(line);
+      expect(line.textContent).toBe(AWAITING_LABEL);
+      expect(occurrences(c0, AWAITING_OUTCOME)).toBe(1);
+      expect(seen.filter((text) => text.includes(AWAITING_OUTCOME))).toEqual([]);
+      // The resolutions stay offered, as /decisions keeps them for an awaiting discrepancy.
+      expect(buttonNames(c0)).toEqual(['Platform is correct', 'Decision is correct']);
+      for (const button of within(c0).getAllByRole('button')) {
+        expect((button as HTMLButtonElement).disabled).toBe(false);
+      }
+      const post = api.calls.find((call) => call.method === 'POST');
+      expect(post?.body).toEqual({ resolution: 'decision_correct' });
+      expect(screen.queryByRole('alert')).toBeNull();
+    },
+  );
+
+  it('never repeats the explanation when the awaiting list lands before the controls report', async () => {
+    const post = heldResponse();
+    const api = mockApi({
+      'GET /discrepancies': openDiscrepancies(),
+      'POST /discrepancies/:id/resolve': post.handler,
+    });
+    const { queryClient } = await renderCampaigns(
+      oneGroup('discrepancies', 'Discrepancies', [pageItem(FIXTURE_ITEM_IDS.c0)]),
+    );
+    const c0 = card(C0_ACTION);
+    const decisionCorrect = await within(c0).findByRole('button', { name: 'Decision is correct' });
+    const line = statusLine(c0);
+    fireEvent.click(decisionCorrect);
+
+    // The list reads the discrepancy awaiting the platform while the resolution's own request,
+    // and so its outcome line, is still pending: the line names the state alone.
+    api.use({ 'GET /discrepancies': json(200, [awaitingDiscrepancy()]) });
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.discrepanciesAll });
+    });
+    await waitFor(() => {
+      expect(line.textContent).toBe(AWAITING_LABEL);
+    });
+
+    post.release(json(200, awaitingDiscrepancy()));
+    await waitFor(() => {
+      expect(within(c0).getAllByRole('status').at(-1)?.textContent).toBe(AWAITING_OUTCOME);
+    });
+    expect(line.textContent).toBe(AWAITING_LABEL);
+    expect(occurrences(c0, AWAITING_OUTCOME)).toBe(1);
+  });
+
+  it('explains an awaiting state again once the controls that showed it open have left', async () => {
+    const api = mockApi({ 'GET /discrepancies': openDiscrepancies() });
+    const { queryClient } = await renderCampaigns(
+      oneGroup('discrepancies', 'Discrepancies', [pageItem(FIXTURE_ITEM_IDS.c0)]),
+    );
+    const c0 = card(C0_ACTION);
+    await within(c0).findByRole('button', { name: 'Platform is correct' });
+
+    // A read leaves it out, as the API does while its subject cannot be loaded, and the
+    // resolved list lacks it, so its controls leave.
+    api.use({ 'GET /discrepancies': json(200, []), [RESOLVED_KEY]: json(200, []) });
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.discrepanciesAll });
+    });
+    await waitFor(() => {
+      expect(statusLine(c0).textContent).toBe(DISCREPANCY_NOT_LISTED_TEXT);
+    });
+    expect(within(c0).queryByRole('button')).toBeNull();
+
+    // Listed again, awaiting the platform: the new controls show no outcome, so the line says why.
+    api.use({ 'GET /discrepancies': json(200, [awaitingDiscrepancy()]) });
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.discrepanciesAll });
+    });
+    await within(c0).findByRole('button', { name: 'Platform is correct' });
+    expect(statusLine(c0).textContent).toBe(AWAITING_LINE);
+    expect(occurrences(c0, AWAITING_OUTCOME)).toBe(1);
+  });
+
   /** Unresolved lists that no longer hold the C0 card's discrepancy. */
   const listsWithoutIt: readonly [string, () => Discrepancy[]][] = [
     ['is empty', () => []],
@@ -974,6 +1150,19 @@ describe('C0 discrepancy cards', () => {
     expect(within(article).queryByText(DISCREPANCY_NOT_LISTED_TEXT)).toBeNull();
     expect(within(article).queryByText(LOADING_DISCREPANCY_LABEL)).toBeNull();
     expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('keeps the history-only notice on a historical C0 that froze awaiting the platform', async () => {
+    const api = mockApi({});
+    await renderCampaigns(
+      oneGroup('discrepancies', 'Discrepancies', [historicalC0({ state: 'awaiting_platform' })]),
+    );
+
+    const article = card(C0_ACTION);
+    expect(statusLine(article).textContent).toBe(HISTORICAL_RESOLUTION_NOTICE);
+    expect(article.textContent).not.toContain('Awaiting platform');
+    await settle();
+    expect(api.calls).toHaveLength(0);
   });
 
   it('shows a historical C0 its labelled frozen resolutions once each, in order', async () => {

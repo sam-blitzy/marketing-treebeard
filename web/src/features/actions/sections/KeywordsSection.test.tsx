@@ -32,7 +32,7 @@
  *   before the evidence table.
  *
  * - **A card hidden on the page.** Dismissing a sub-list's only card leaves its confirmation in
- *   the tab's panel, not an empty state, and the tab stays selected with its count of 0.
+ *   the tab's panel, not an empty state, focused, and the tab stays selected with its count of 0.
  *
  * The section fetches nothing, so every test stubs the API with no handler: any request fails
  * the test. The feedback-flow test alone renders the section from a stubbed
@@ -1318,16 +1318,16 @@ describe('KeywordsSection: the confirmation of a card hidden on the page', () =>
     expect(screen.getByRole('tab', { name: 'Review 1' })).toBeDefined();
     // Its panel shows the confirmation where the card stood, not an empty state.
     const panel = screen.getByRole('tabpanel');
-    expect(within(panel).getByText(feedbackConfirmationText('dismiss', k1))).toBeDefined();
+    const confirmation = within(panel).getByText(feedbackConfirmationText('dismiss', k1));
     expect(panel.querySelector('.ds-emptystate')).toBeNull();
     expect(panel.textContent).not.toContain('No actions to show');
-    // The other sub-lists' cards sit in hidden panels, so focus goes to the section heading.
+    // Focus goes to that confirmation, in the selected panel where the user acted, never to a
+    // card in the other sub-lists' hidden panels.
     const region = screen.getByRole('region', { name: 'Keywords to adjust' });
     await waitFor(() => {
-      expect(document.activeElement).toBe(
-        within(region).getByRole('heading', { level: 2, name: 'Keywords to adjust' }),
-      );
+      expect(document.activeElement).toBe(confirmation.closest('[data-feedback-confirmation]'));
     });
+    expect(panel.contains(document.activeElement)).toBe(true);
     expect(within(region).getByRole('list', { name: 'Not shown' }).textContent).toContain(
       '1 hidden since this run',
     );

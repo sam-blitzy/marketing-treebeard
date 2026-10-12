@@ -190,8 +190,12 @@ const FALLBACK_TIMEZONE = 'UTC';
 /** How many digits of an integer micro amount are fractional: 1 unit = 1,000,000 micros. */
 const MICRO_DIGITS = 6;
 
-/** The outcome line shown after a resolution was accepted, by the state the API returned. */
-const OUTCOME_TEXT: Readonly<Record<DiscrepancyState, string | null>> = Object.freeze({
+/**
+ * The outcome line shown after a resolution was accepted, by the state the API returned. A C0
+ * card on `/actions` explains an awaiting-platform discrepancy with the same words when its
+ * controls have not shown that outcome themselves.
+ */
+export const OUTCOME_TEXT: Readonly<Record<DiscrepancyState, string | null>> = Object.freeze({
   open: null,
   awaiting_platform: 'Waiting for the platform to match the decision',
   resolved: 'Resolved',
@@ -208,8 +212,11 @@ export const KIND_LABELS: Readonly<Record<DiscrepancyKind, string>> = Object.fre
   missing: 'Missing from platform',
 });
 
-/** The label of each discrepancy state, as the card body shows it. */
-const STATE_LABELS: Readonly<Record<DiscrepancyState, string>> = Object.freeze({
+/**
+ * The label of each discrepancy state, as the card body shows it, and as a C0 card on
+ * `/actions` names an awaiting-platform discrepancy in its resolver's status line.
+ */
+export const STATE_LABELS: Readonly<Record<DiscrepancyState, string>> = Object.freeze({
   open: 'Open',
   awaiting_platform: 'Awaiting platform',
   resolved: 'Resolved',
@@ -515,10 +522,12 @@ function closeDialogSession(current: DialogSession): DialogSession {
  * `discrepancy.resolutions`, in the API's order, the first `primary` and the rest `secondary`,
  * labelled from {@link RESOLUTION_LABELS}.
  *
- * - "Record intended state" opens a `Dialog` titled "Record intended state" holding
- *   `DecisionForm` (`mode="intended_state"`) for the discrepancy's subject, with its own Save and
- *   Cancel buttons. Saving closes the dialog; Cancel, Escape, the Close button and the backdrop
- *   close it without posting, and may close it while its save runs. Until that save settles,
+ * - "Record intended state", which carries `aria-haspopup="dialog"`, opens a `Dialog` titled
+ *   "Record intended state" holding `DecisionForm` (`mode="intended_state"`, `showSubject`) for
+ *   the discrepancy's subject, which the form names above its fields as the decision log does
+ *   ("Brand Search — US · Campaign · Google"), with its own Save and Cancel buttons. Saving
+ *   closes the dialog; Cancel, Escape, the Close button and the backdrop close it without
+ *   posting, and may close it while its save runs. Until that save settles,
  *   "Record intended state" shows its loading state and every other resolution is disabled, so
  *   neither a second intended state nor another resolution can be posted. A save that ends
  *   after its dialog was closed is still reported. The closed dialog returns focus to "Record
@@ -747,6 +756,8 @@ function DiscrepancyResolutionBody({
             variant={index === 0 ? 'primary' : 'secondary'}
             loading={busyResolution === resolution}
             disabled={locked || (busyResolution !== null && busyResolution !== resolution)}
+            // Only "Record intended state" opens a dialog; every other resolution posts at once.
+            aria-haspopup={resolution === 'record_intended' ? 'dialog' : undefined}
             onClick={() => {
               handleClick(resolution);
             }}
@@ -798,6 +809,7 @@ function DiscrepancyResolutionBody({
           }}
           onCancel={closeIntendedState}
           disabled={locked}
+          showSubject
         />
       </Dialog>
     </Stack>

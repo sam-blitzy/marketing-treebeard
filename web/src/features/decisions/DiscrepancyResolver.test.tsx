@@ -14,7 +14,8 @@
  *   `{ resolution }` alone and the CSRF header, shows its outcome in a polite status region and
  *   reports the API's response to `onResolved`; two presses before React renders again post
  *   once and open no dialog, and a settled request, either way, frees a later press;
- * - "Record intended state" opens a dialog holding `DecisionForm` with exactly the fields of the
+ * - "Record intended state", declared with `aria-haspopup="dialog"`, opens a dialog naming the
+ *   subject as the decision log does and holding `DecisionForm` with exactly the fields of the
  *   subject's decision shape, and posts the complete intended state; the dialog may close while
  *   its save runs, but until the save settles every resolution stays disabled and the dialog
  *   does not reopen, and a late outcome is still reported, shown and focused outside the dialog;
@@ -2266,6 +2267,38 @@ describe('DiscrepancyResolution "Record intended state"', () => {
     expect(onResolved).not.toHaveBeenCalled();
     expect(outcomeRegion().textContent).toBe('');
   });
+
+  it.each([
+    [
+      'an own-budget campaign',
+      makeDiscrepancy('untracked'),
+      'Brand Search — US · Campaign · Google',
+    ],
+    [
+      'a shared budget',
+      makeDiscrepancy('untracked', { shape: 'budget' }),
+      'Search Shared Budget · Shared budget · Google',
+    ],
+  ] as const)(
+    'names %s in its dialog, which its trigger declares as a popup',
+    async (_label, discrepancy, title) => {
+      mockApi(intendedHandlers(json(200, { ...discrepancy, state: 'awaiting_platform' })));
+      await renderResolution(discrepancy);
+
+      // Only "Record intended state" opens a dialog; "Adopt platform state" posts at once.
+      expect(buttonNamed('Record intended state').getAttribute('aria-haspopup')).toBe('dialog');
+      expect(buttonNamed('Adopt platform state').hasAttribute('aria-haspopup')).toBe(false);
+
+      const dialog = await openIntendedState();
+
+      // The dialog keeps its title, and names its subject once, above the form, as the
+      // decision log names it on /decisions.
+      expect(screen.getByRole('dialog', { name: 'Record intended state' })).toBe(dialog);
+      const lines = within(dialog).getAllByText(title);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]?.closest('form')).toBeNull();
+    },
+  );
 
   it('closes without posting on Cancel and on the dialog Close button', async () => {
     const api = mockApi(intendedHandlers(json(200, makeDiscrepancy('untracked'))));
