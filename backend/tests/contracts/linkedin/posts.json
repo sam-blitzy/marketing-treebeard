@@ -1,0 +1,275 @@
+{
+  "surface": "linkedin.posts",
+  "source": "linkedin",
+  "reference_url": "https://learn.microsoft.com/en-us/linkedin/marketing/community-management/shares/posts-api?view=li-lms-2026-09",
+  "api_version": "202609",
+  "last_modified": "2026-05-13",
+  "request": {
+    "method": "GET",
+    "url": "posts?ids=List({post_urns})",
+    "required_headers": [
+      "Authorization",
+      "Linkedin-Version",
+      "X-Restli-Protocol-Version",
+      "X-RestLi-Method"
+    ],
+    "required_query": [
+      "ids"
+    ],
+    "optional_query": [],
+    "fields": null,
+    "body": null,
+    "gaql": null,
+    "limits": {}
+  },
+  "response": {
+    "status": [
+      200
+    ],
+    "body": {
+      "description": "LinkedIn Posts API, Batch Get Posts: reads the posts that creatives reference (creative content.reference) for the creative headline and intro text. Read only; creating, updating or deleting posts is out of scope. Served view li-lms-2026-09 (ms.date 2026-05-07, updated_at 2026-05-13); post field definitions from the linked Post Schema page (post-api-schema, li-lms-2026-09, updated_at 2026-04-30) and, for content.article, the Article Ads page (article-ads-integrations, li-lms-2026-09, updated_at 2025-10-16). Request: GET posts?ids=List({post_urns}) relative to https://api.linkedin.com/rest/. {post_urns} stands for URL-encoded urn:li:share: or urn:li:ugcPost: URNs (urn:li:ugcPost:12345 becomes urn%3Ali%3AugcPost%3A12345) joined by literal, unencoded commas. Besides the Rest.li header X-Restli-Protocol-Version: 2.0.0, the page requires X-RestLi-Method with the value BATCH_GET. It is kept required although a one-off live check returned the same result without it. The page states no maximum number of ids (the count maximum of 100 belongs to the author finder), so limits is empty. A URL over the maximum length uses query tunneling. The page documents an optional viewContext (READER default, or AUTHOR); it is deliberately not sent, because READER returns the published version, which is the one served as the ad. Permissions: reading posts needs r_organization_social (organization posts; the member must hold an ADMINISTRATOR, DIRECT_SPONSORED_CONTENT_POSTER or CONTENT_ADMIN page role) or r_member_social (restricted); w_ scopes are for writes. PERMISSION RISK: the product's LinkedIn scopes are r_ads, r_ads_reporting and r_marketing_leadgen_automation, and include neither read scope. Any 403 on a LinkedIn endpoint switches all of LinkedIn to simulated (AAP 0.3.3), so a posts 403 could flip LinkedIn although ads, analytics and leads are readable. The one-off live check (token also holding r_organization_social) returned HTTP 200 with a per-key 403 in statuses and errors for an unreadable post. A per-key 403 is therefore a failed read for that creative, never a source-wide access denial; an HTTP-level 403 on the whole call remains the risk. The client raises that HTTP 403 as AccessDenied and never swallows it. The recovery probe does not read posts, so the probe can pass while the live build's entity sync is denied; that build then fails, and LinkedIn stays on its simulated dataset rather than flipping back and forth. Undeclared keys fail validation, so a field a newer version adds must be declared here from the page once a live capture shows it. Rest.li batch-get envelope. A requested URN that is missing from results, or present in errors, is a failed read: PostBatch.failed records it, and the creative keeps a null headline and intro_text. A failed key never fails the whole call.",
+      "type": "object",
+      "properties": {
+        "results": {
+          "type": "object",
+          "description": "Map keyed by the requested post URN (decoded), each value one post.",
+          "properties": {},
+          "additionalProperties": {
+            "type": "object",
+            "description": "One post (Post Schema page, li-lms-2026-09, updated 2026-04-30). The creative's intro text is commentary. Its headline is content.media.title, else content.article.title, else null. Unknown top-level keys are a contract violation. The page marks commentary required, but it is deliberately left out of required so that a post without it still validates and yields a null intro_text.",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Post URN: urn:li:share:{id} or urn:li:ugcPost:{id}. Read-only."
+              },
+              "author": {
+                "type": "string",
+                "description": "Organization URN (urn:li:organization:{id}) or person URN (urn:li:person:{id})."
+              },
+              "commentary": {
+                "type": "string",
+                "description": "User-generated commentary in LinkedIn 'little' text format. Stored as the creative's intro_text."
+              },
+              "container": {
+                "type": "string",
+                "description": "Container entity URN. Absent when the post belongs to no container."
+              },
+              "content": {
+                "type": "object",
+                "description": "Union of content types: media, poll, multiImage, article, carousel, celebration, reference. At most one is set, and the object is empty for a commentary-only post, as in the documented sample. Only media and article carry a headline, so only they are declared; other members pass through unvalidated.",
+                "properties": {
+                  "media": {
+                    "type": "object",
+                    "description": "MediaContent: an image, video or document.",
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "description": "Media URN (image, video or document)."
+                      },
+                      "title": {
+                        "type": "string",
+                        "description": "Media title. Headline source when present."
+                      },
+                      "altText": {
+                        "type": "string",
+                        "description": "Alternate text for the media."
+                      }
+                    }
+                  },
+                  "reference": {
+                    "type": "object",
+                    "description": "Reference content such as an event.",
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "description": "Reference URN, for example urn:li:reference:123."
+                      }
+                    }
+                  },
+                  "article": {
+                    "type": "object",
+                    "description": "ArticleContent (Article Ads page, li-lms-2026-09). thumbnailAltText comes from that page and is not on the Post Schema page.",
+                    "properties": {
+                      "source": {
+                        "type": "string",
+                        "description": "Article URL; maps to Campaign Manager's Destination URL."
+                      },
+                      "thumbnail": {
+                        "type": "string",
+                        "description": "Image URN of the thumbnail."
+                      },
+                      "thumbnailAltText": {
+                        "type": "string",
+                        "description": "Alt text for the custom thumbnail."
+                      },
+                      "title": {
+                        "type": "string",
+                        "description": "Article title. Headline source when content.media is absent."
+                      },
+                      "description": {
+                        "type": "string",
+                        "description": "Article description."
+                      }
+                    }
+                  }
+                },
+                "additionalProperties": true
+              },
+              "contentLandingPage": {
+                "type": "string",
+                "description": "Landing page URL opened from the content."
+              },
+              "contentCallToActionLabel": {
+                "type": "string",
+                "description": "Call-to-action label: APPLY, DOWNLOAD, VIEW_QUOTE, LEARN_MORE, SIGN_UP, SUBSCRIBE, REGISTER, JOIN, ATTEND, REQUEST_DEMO, SEE_MORE, BUY_NOW or SHOP_NOW. Kept as an open string."
+              },
+              "lifecycleState": {
+                "type": "string",
+                "description": "Open string. Documented values: DRAFT, PUBLISHED, PUBLISH_REQUESTED, PUBLISH_FAILED. The default READER view returns the published version; the page notes that an AUTHOR view may also return PROCESSING, which is why the string stays open."
+              },
+              "lifecycleStateInfo": {
+                "type": "object",
+                "description": "Extra lifecycle detail, chiefly for PUBLISH_REQUESTED or PUBLISH_FAILED.",
+                "properties": {
+                  "contentStatus": {
+                    "type": "string",
+                    "description": "ProcessingState of the content: PENDING, PROCESSING or FAILED."
+                  },
+                  "isEditedByAuthor": {
+                    "type": "boolean"
+                  },
+                  "reviewStatus": {
+                    "type": "string",
+                    "description": "ProcessingState of review: PENDING, PROCESSING or FAILED."
+                  }
+                }
+              },
+              "visibility": {
+                "type": "string",
+                "description": "MemberNetworkVisibility: CONNECTIONS, PUBLIC, LOGGED_IN or CONTAINER."
+              },
+              "distribution": {
+                "type": "object",
+                "properties": {
+                  "feedDistribution": {
+                    "type": "string",
+                    "description": "NONE or MAIN_FEED."
+                  },
+                  "thirdPartyDistributionChannels": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "targetEntities": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  }
+                }
+              },
+              "adContext": {
+                "type": "object",
+                "description": "Ads metadata. Present on sponsored and direct sponsored content (dark) posts.",
+                "properties": {
+                  "dscAdAccount": {
+                    "type": "string",
+                    "description": "urn:li:sponsoredAccount:{id} that created the post."
+                  },
+                  "dscAdType": {
+                    "type": "string",
+                    "description": "VIDEO, STANDARD, CAROUSEL, JOB_POSTING, NATIVE_DOCUMENT or EVENT."
+                  },
+                  "dscName": {
+                    "type": "string",
+                    "description": "Plain-text name of the direct sponsored content."
+                  },
+                  "dscStatus": {
+                    "type": "string",
+                    "description": "ACTIVE or ARCHIVED."
+                  },
+                  "isDsc": {
+                    "type": "boolean"
+                  }
+                }
+              },
+              "reshareContext": {
+                "type": "object",
+                "description": "Set only on re-shares: parent and root post URNs.",
+                "properties": {
+                  "parent": {
+                    "type": "string"
+                  },
+                  "root": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": true
+              },
+              "isReshareDisabledByAuthor": {
+                "type": "boolean"
+              },
+              "createdAt": {
+                "type": "integer",
+                "description": "Epoch milliseconds."
+              },
+              "lastModifiedAt": {
+                "type": "integer",
+                "description": "Epoch milliseconds."
+              },
+              "publishedAt": {
+                "type": "integer",
+                "description": "Epoch milliseconds."
+              }
+            },
+            "required": [
+              "id",
+              "author",
+              "lifecycleState"
+            ]
+          }
+        },
+        "statuses": {
+          "type": "object",
+          "description": "Map of URN -> HTTP status for failed keys. It may also list successful keys with 200.",
+          "additionalProperties": true
+        },
+        "errors": {
+          "type": "object",
+          "description": "Map of URN -> error record, for example {message, status}.",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "results"
+      ]
+    },
+    "documented_sample": {
+      "results": {
+        "urn:li:share:6844785523593134080": {
+          "lifecycleState": "PUBLISHED",
+          "lastModifiedAt": 1631924039162,
+          "visibility": "PUBLIC",
+          "publishedAt": 1631924038940,
+          "author": "urn:li:organization:5515715",
+          "distribution": {
+            "feedDistribution": "NONE",
+            "thirdPartyDistributionChannels": []
+          },
+          "content": {},
+          "lifecycleStateInfo": {
+            "isEditedByAuthor": false
+          },
+          "isReshareDisabledByAuthor": true,
+          "createdAt": 1631924038940,
+          "id": "urn:li:share:6844785523593134080",
+          "commentary": "Test Org commentary-Updated Config"
+        }
+      },
+      "statuses": {},
+      "errors": {}
+    }
+  }
+}

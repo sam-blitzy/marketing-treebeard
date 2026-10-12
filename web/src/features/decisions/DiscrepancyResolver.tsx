@@ -1,0 +1,1628 @@
+/**
+ * The C0 discrepancy resolution controls (AAP 0.5.4.4, 0.5.5).
+ *
+ * Two components share one label map:
+ *
+ * - {@link DiscrepancyResolution}: the controls of one discrepancy. `/decisions` renders it in
+ *   every resolver card, and `features/actions/sections/CampaignsSection.tsx` renders it inline
+ *   on C0 cards, disabled for historical items.
+ * - {@link DiscrepancyResolver}: the `/decisions` list of open and awaiting-platform
+ *   discrepancies, oldest first, one card each, a page at a time with "Show more" (AAP 0.5.5
+ *   "`DiscrepancyResolver` lists open and awaiting-platform discrepancies with the resolutions
+ *   valid for each kind and subject type"). Its load, empty, refresh and closure outcomes are
+ *   announced through one persistent polite status region. When a resolution closes a
+ *   discrepancy and its card leaves, or a refresh drops the card that holds focus, focus moves
+ *   to the next card, else the previous one, else that region. A link to
+ *   `/decisions#discrepancy-{id}` loads pages until that card is shown, then scrolls it into
+ *   view, or says the discrepancy is no longer unresolved.
+ *
+ * Rules this file keeps:
+ *
+ * - **The API decides the resolutions.** The buttons are exactly `Discrepancy.resolutions`, in
+ *   the order the API lists them. The API computes them from the discrepancy's kind and the
+ *   subject's decision shape (`RESOLUTIONS[(kind, shape)]`), so nothing here adds, drops,
+ *   reorders or derives a resolution. An `untracked` campaign therefore offers only "Adopt
+ *   platform state" and "Record intended state".
+ * - **"Record intended state" goes through `DecisionForm`.** It opens a `Dialog` holding
+ *   `DecisionForm` in `intended_state` mode, which offers exactly the subject's shape fields and
+ *   posts the complete intended state. Every other resolution posts at once with only
+ *   `{ resolution }`; "Acknowledge removal" and "Platform is correct" close the discrepancy on
+ *   the server immediately, so the refetched lists drop it.
+ * - **Errors are the API's.** A 409 `subject_retired` reads "Computed from replaced data" and
+ *   locks every control of that discrepancy (AAP 0.3.2); a 409 `discrepancy_resolved` reads
+ *   "Already resolved" and locks them too; any other failure, a 422 included, shows the API's
+ *   own message. This holds whether a resolution posted here or the intended-state form
+ *   received the error, and the form's error stays shown outside its dialog once that closes.
+ * - **One resolution at a time.** While a resolution runs, an intended-state save included
+ *   after its dialog was closed, no other resolution starts and the dialog does not reopen.
+ * - **No `alert` role.** AAP 0.5.5 reserves `role="alert"` for the discrepancy banner on
+ *   `/actions`. Errors are plain critical banners that take focus; the outcome is a polite
+ *   status message, and the list's own notices go to its polite status region.
+ * - **Values come from the API only.** Each side of a discrepancy is rendered from its stored
+ *   keys, statuses with `CAMPAIGN_STATUS_LABELS` and amounts with `formatExactMoney` in the
+ *   side's currency, every significant digit up to one micro, because C0 has no tolerance and
+ *   rounding must not hide the mismatch it reports. The wording is the backend's `render_value`
+ *   (`analysis/discrepancy.py`), so this card and the C0 card on `/actions` read alike.
+ *
+ * Server state goes only through `../../api/queries` (AAP 0.11.1); the resolve mutation there
+ * already invalidates recommendations, discrepancies and decisions. UI comes only from the
+ * design-system index (AAP 0.4.4) and formatting only from `../../lib/format`.
+ *
+ * @example
+ * ```tsx
+ * // /decisions
+ * <PageShell.Section id="discrepancies" title="Discrepancies">
+ *   <DiscrepancyResolver />
+ * </PageShell.Section>
+ *
+ * // A C0 card on /actions
+ * <DiscrepancyResolution discrepancy={discrepancy} disabled={item.current.historical} />
+ * ```
+ *
+ * @packageDocumentation
+ */
+import { useLocation } from '@tanstack/react-router';
+import { useEffect, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
+
+import {
+  isApiError,
+  useDefaultRun,
+  useDiscrepancyPages,
+  useResolveDiscrepancy,
+} from '../../api/queries';
+import type { ApiError } from '../../api/queries';
+import type {
+  CampaignStatus,
+  DecisionShape,
+  Discrepancy,
+  DiscrepancyKind,
+  DiscrepancyState,
+  DiscrepancyValue,
+  Money,
+  Resolution,
+  SubjectType,
+} from '../../api/types';
+import {
+  Banner,
+  Button,
+  Card,
+  Dialog,
+  EmptyState,
+  Inline,
+  Spinner,
+  Stack,
+} from '../../design-system';
+import {
+  UNAVAILABLE,
+  formatCount,
+  formatExactMoney,
+  formatInstant,
+  isDecimalString,
+  sourceLabel,
+} from '../../lib/format';
+import { CAMPAIGN_STATUS_LABELS, DecisionForm } from './DecisionForm';
+import { RETRY_LABEL, lastLoadedText, useRetry, useSettledFailure } from './readState';
+
+// ---------------------------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The label of each C0 resolution, the single map every screen uses (AAP 0.5.4.4). It equals
+ * `_RESOLUTION_LABELS` in the backend's `decisions.py`, and the end-to-end test
+ * `web/tests/e2e/decisions.spec.ts` clicks the buttons by these labels.
+ *
+ * Typed `Record<Resolution, string>`, so a resolution added to the API contract fails to
+ * compile until it is labelled here.
+ */
+export const RESOLUTION_LABELS: Readonly<Record<Resolution, string>> = Object.freeze({
+  platform_correct: 'Platform is correct',
+  decision_correct: 'Decision is correct',
+  adopt_platform: 'Adopt platform state',
+  record_intended: 'Record intended state',
+  acknowledge_removal: 'Acknowledge removal',
+});
+
+/** Props of {@link DiscrepancyResolution}. */
+export interface DiscrepancyResolutionProps {
+  /** The discrepancy to resolve, as `GET /discrepancies` returned it. */
+  discrepancy: Discrepancy;
+  /**
+   * Disables every resolution and keeps the intended-state dialog from opening, for example on
+   * a historical C0 item computed from replaced data (AAP 0.3.2). Defaults to `false`.
+   */
+  disabled?: boolean;
+  /**
+   * Called once a resolution has been accepted, with the discrepancy as it now stands. For the
+   * resolutions posted here that is the API's response (`resolved` or `awaiting_platform`).
+   * "Record intended state" is posted by `DecisionForm`, which reports success without the
+   * response, so that call receives this discrepancy advanced by the transition the API applies
+   * to `record_intended`, `state: 'awaiting_platform'` and `resolution: 'record_intended'`; the
+   * refetched discrepancy lists carry its newly recorded decided side.
+   */
+  onResolved?: (updated: Discrepancy) => void;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------------------------
+
+/** Shown when a resolution is refused because the subject's dataset was replaced (AAP 0.3.2). */
+const RETIRED_MESSAGE = 'Computed from replaced data';
+
+/** Shown when the discrepancy was closed before this resolution reached the server. */
+const RESOLVED_MESSAGE = 'Already resolved';
+
+/**
+ * Shown for a failure that carries no API message of its own: a blank `ApiError` message, or a
+ * rejection that is not an `ApiError`.
+ */
+const FALLBACK_ERROR_MESSAGE = 'The resolution failed.';
+
+/** The platform side of a `missing` discrepancy, worded as the backend's C0 item words it. */
+const NOT_RETURNED_TEXT = 'not returned by the platform';
+
+/**
+ * The decided side of an `untracked` discrepancy, which has no decision yet, worded as the
+ * backend's C0 item words it (`NO_DECISION_TEXT`).
+ */
+const NO_DECISION_TEXT = 'no decision recorded';
+
+/**
+ * A side recording an acknowledged removal (`tombstone: true`), worded as `DecisionLog` words
+ * the same decided state on this screen and as the backend's C0 item words it.
+ */
+const REMOVAL_TEXT = 'Removal acknowledged';
+
+/** The status `acknowledge_removal` writes on a campaign, shown when a tombstone carries none. */
+const TOMBSTONE_STATUS = 'ended';
+
+/** A side whose status the platform did not report, worded as `DecisionLog` and `DecisionForm`. */
+const STATUS_NOT_REPORTED = 'status not reported';
+
+/** Joins the parts of one state, as `DecisionLog` and `DecisionForm` join them. */
+const PART_SEPARATOR = ' · ';
+
+/** The zone instants are shown in until the default run names `DISPLAY_TIMEZONE`. */
+const FALLBACK_TIMEZONE = 'UTC';
+
+/** How many digits of an integer micro amount are fractional: 1 unit = 1,000,000 micros. */
+const MICRO_DIGITS = 6;
+
+/**
+ * The outcome line shown after a resolution was accepted, by the state the API returned. A C0
+ * card on `/actions` explains an awaiting-platform discrepancy with the same words when its
+ * controls have not shown that outcome themselves.
+ */
+export const OUTCOME_TEXT: Readonly<Record<DiscrepancyState, string | null>> = Object.freeze({
+  open: null,
+  awaiting_platform: 'Waiting for the platform to match the decision',
+  resolved: 'Resolved',
+});
+
+/**
+ * The label of each discrepancy kind, as the card's entity line names it, and as a held card's
+ * link to its blocking discrepancy names it on `/actions`.
+ */
+export const KIND_LABELS: Readonly<Record<DiscrepancyKind, string>> = Object.freeze({
+  status: 'Status mismatch',
+  budget: 'Budget mismatch',
+  untracked: 'Untracked entity',
+  missing: 'Missing from platform',
+});
+
+/**
+ * The label of each discrepancy state, as the card body shows it, and as a C0 card on
+ * `/actions` names an awaiting-platform discrepancy in its resolver's status line.
+ */
+export const STATE_LABELS: Readonly<Record<DiscrepancyState, string>> = Object.freeze({
+  open: 'Open',
+  awaiting_platform: 'Awaiting platform',
+  resolved: 'Resolved',
+});
+
+/**
+ * The label of each subject type: a campaign, or a Google explicitly shared budget. It names an
+ * unnamed subject ("Campaign 12") here and in a held card's blocking-discrepancy link.
+ */
+export const SUBJECT_TYPE_LABELS: Readonly<Record<SubjectType, string>> = Object.freeze({
+  campaign: 'Campaign',
+  budget: 'Shared budget',
+});
+
+// ---------------------------------------------------------------------------------------------
+// Value rendering (pure; mirrors `render_value` in the backend's `analysis/discrepancy.py`)
+// ---------------------------------------------------------------------------------------------
+
+/** A trimmed, non-empty string, or `null`. */
+function textOrNull(value: string | null | undefined): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed === '' ? null : trimmed;
+}
+
+/**
+ * An amount a side reports as decimal text, trimmed; `null` for an absent, `null` or malformed
+ * one, which is unknown and never zero (the backend's `_amount`).
+ */
+function storedAmount(raw: Money | null | undefined): Money | null {
+  const text = textOrNull(raw);
+  return text !== null && isDecimalString(text) ? text : null;
+}
+
+/**
+ * An integer micro amount as an exact decimal string, `200000001` → `"200.000001"`, built
+ * from its digits so no binary float touches it. `null` for a value that is not a safe integer.
+ */
+function microsToDecimal(micros: number): Money | null {
+  if (!Number.isSafeInteger(micros)) {
+    return null;
+  }
+  const digits = String(Math.abs(micros)).padStart(MICRO_DIGITS + 1, '0');
+  const sign = micros < 0 ? '-' : '';
+  return `${sign}${digits.slice(0, -MICRO_DIGITS)}.${digits.slice(-MICRO_DIGITS)}`;
+}
+
+/** Whether a status is one of the normalised campaign statuses `CAMPAIGN_STATUS_LABELS` labels. */
+function isCampaignStatus(status: string): status is CampaignStatus {
+  return Object.hasOwn(CAMPAIGN_STATUS_LABELS, status);
+}
+
+/**
+ * A normalised status by its label ("Paused"), as the backend's `_status_text` words it; an
+ * absent or blank status is "status not reported".
+ */
+function statusText(status: string | null | undefined): string {
+  const text = textOrNull(status);
+  if (text === null) {
+    return STATUS_NOT_REPORTED;
+  }
+  // A status outside the contract's vocabulary is shown as sent rather than mislabelled.
+  return isCampaignStatus(text) ? CAMPAIGN_STATUS_LABELS[text] : text;
+}
+
+/** Whether a side describes a budget assignment, shared or not, rather than an amount. */
+function hasAssignment(value: DiscrepancyValue): boolean {
+  return value.budget_id !== undefined || value.budget_external_id !== undefined;
+}
+
+/**
+ * A campaign's budget assignment, worded as the backend's C0 text words it:
+ *
+ * - "shared budget {Google id}" when the side carries `budget_external_id`, which the API fills
+ *   only for a shared budget the subject knows;
+ * - "budget (internal id {id})" for a `budget_id` without a Google id. The id alone does not
+ *   establish shared ownership: a member moved onto a budget that is not shared reports the new
+ *   budget's internal id with `budget_external_id: null`, so calling it shared would misstate
+ *   the platform state;
+ * - "own budget (not shared)" for a `null` `budget_id`;
+ * - "budget assignment unavailable" when the side has neither assignment key.
+ */
+function assignmentText(value: DiscrepancyValue): string {
+  if (!hasAssignment(value)) {
+    return `budget assignment ${UNAVAILABLE}`;
+  }
+  const externalId = textOrNull(value.budget_external_id);
+  if (externalId !== null) {
+    return `shared budget ${externalId}`;
+  }
+  const budgetId = value.budget_id;
+  if (typeof budgetId === 'number') {
+    return `budget (internal id ${budgetId})`;
+  }
+  return 'own budget (not shared)';
+}
+
+/**
+ * The amounts of an `own_budget` or `budget` side, each named by its field, never zero for an
+ * amount the side does not report, worded as the backend's `_money_text` words them. Each
+ * amount goes through `formatExactMoney` in the side's own currency, else the subject's: every
+ * significant digit up to one micro ("USD 200.000001"), because C0 compares at native precision
+ * with no tolerance (AAP 0.5.4.4) and a one-micro mismatch must never read as two equal amounts.
+ *
+ * - "budget unavailable" when the side has none of the `daily_budget`, `total_budget` and
+ *   `amount_micros` keys;
+ * - a Google side's `amount_micros`, when it is a safe integer, converted exactly: "daily
+ *   budget {amount}" when only `daily_budget` holds an amount, "total budget {amount}" when only
+ *   `total_budget` does, otherwise "budget {amount}";
+ * - otherwise "daily budget {amount}" and "total budget {amount}" for each of `daily_budget`
+ *   and `total_budget` that holds an amount, daily first;
+ * - otherwise "budget unavailable" when the side has an `amount_micros` key (`null`, or beyond
+ *   exact integer precision) or reports an amount that is not a number;
+ * - otherwise "no budget set", as a side whose `daily_budget` and `total_budget` are `null` reads.
+ *
+ * @returns The parts to join, in display order.
+ */
+function moneyParts(value: DiscrepancyValue, currency: string | null): string[] {
+  const { daily_budget: dailyRaw, total_budget: totalRaw, amount_micros: micros } = value;
+  if (dailyRaw === undefined && totalRaw === undefined && micros === undefined) {
+    return [`budget ${UNAVAILABLE}`];
+  }
+  const code = textOrNull(value.currency) ?? currency;
+  const daily = storedAmount(dailyRaw);
+  const total = storedAmount(totalRaw);
+  const exact = typeof micros === 'number' ? microsToDecimal(micros) : null;
+  if (exact !== null) {
+    const amount = formatExactMoney(exact, code);
+    if (daily !== null && total === null) {
+      return [`daily budget ${amount}`];
+    }
+    if (total !== null && daily === null) {
+      return [`total budget ${amount}`];
+    }
+    return [`budget ${amount}`];
+  }
+  const parts: string[] = [];
+  if (daily !== null) {
+    parts.push(`daily budget ${formatExactMoney(daily, code)}`);
+  }
+  if (total !== null) {
+    parts.push(`total budget ${formatExactMoney(total, code)}`);
+  }
+  if (parts.length > 0) {
+    return parts;
+  }
+  const reported = (dailyRaw ?? null) !== null || (totalRaw ?? null) !== null;
+  return micros !== undefined || reported ? [`budget ${UNAVAILABLE}`] : ['no budget set'];
+}
+
+/**
+ * One side of a discrepancy as one line, exactly as the backend's `render_value` renders it for
+ * the C0 card on `/actions`: the status label, then each amount in the side's currency, or the
+ * budget a member is assigned to, joined by " · ".
+ *
+ * - `status`: the status alone.
+ * - `budget`: the assignment of a shared member (or of any side carrying assignment keys),
+ *   otherwise the amounts.
+ * - `untracked` and `missing`: the complete state the shape owns, status first except on a
+ *   shared budget, which has none.
+ * - A tombstone side is "Removal acknowledged", followed by the campaign's decided status
+ *   (" · Ended") on a campaign subject, as `DecisionLog` renders the same decision.
+ * - An absent side (`null`) is "unavailable".
+ *
+ * @param kind - The discrepancy kind.
+ * @param shape - The subject's decision shape.
+ * @param value - The stored side, or `null`.
+ * @param currency - The subject's account currency, used when the side names none, or `null`.
+ * @returns The display text.
+ */
+function describeValue(
+  kind: DiscrepancyKind,
+  shape: DecisionShape,
+  value: DiscrepancyValue | null,
+  currency: string | null,
+): string {
+  if (value === null) {
+    return UNAVAILABLE;
+  }
+  if (value.tombstone === true) {
+    // acknowledge_removal writes status `ended` on campaigns; a shared budget has no status.
+    return shape === 'budget'
+      ? REMOVAL_TEXT
+      : [REMOVAL_TEXT, statusText(textOrNull(value.status) ?? TOMBSTONE_STATUS)].join(
+          PART_SEPARATOR,
+        );
+  }
+  if (kind === 'status') {
+    return statusText(value.status);
+  }
+  const assignment = shape === 'shared_member' || hasAssignment(value);
+  const budgetParts = assignment ? [assignmentText(value)] : moneyParts(value, currency);
+  if (kind === 'budget' || shape === 'budget') {
+    return budgetParts.join(PART_SEPARATOR);
+  }
+  return [statusText(value.status), ...budgetParts].join(PART_SEPARATOR);
+}
+
+/**
+ * The "Platform shows {platform}, last decided {decided}" line of a discrepancy, worded as the
+ * backend words the C0 item "Resolve: platform shows …, last decided …": the platform side of a
+ * `missing` discrepancy is "not returned by the platform", and the absent decided side of an
+ * `untracked` one is "no decision recorded".
+ */
+function comparisonText(discrepancy: Discrepancy): string {
+  const { kind, shape, subject, platform_value: platform, decided_value: decided } = discrepancy;
+  const currency = textOrNull(subject.currency);
+  const platformText =
+    kind === 'missing' ? NOT_RETURNED_TEXT : describeValue(kind, shape, platform, currency);
+  const decidedText =
+    kind === 'untracked' && decided === null
+      ? NO_DECISION_TEXT
+      : describeValue(kind, shape, decided, currency);
+  return `Platform shows ${platformText}, last decided ${decidedText}`;
+}
+
+/** The card headline: the subject's name, else its type and internal id. */
+function subjectTitle(discrepancy: Discrepancy): string {
+  const { subject } = discrepancy;
+  return textOrNull(subject.name) ?? `${SUBJECT_TYPE_LABELS[subject.type]} ${subject.id}`;
+}
+
+/** The card's entity line: "{source} · {Campaign or Shared budget} · {kind label}". */
+function subjectMeta(discrepancy: Discrepancy): string {
+  const { subject, kind } = discrepancy;
+  const parts = [SUBJECT_TYPE_LABELS[subject.type], KIND_LABELS[kind]];
+  if (subject.source !== null) {
+    parts.unshift(sourceLabel(subject.source));
+  }
+  return parts.join(PART_SEPARATOR);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------------------------
+
+/** Whether a failed resolution means the subject's dataset was replaced (409 `subject_retired`). */
+function isRetiredError(error: unknown): boolean {
+  return isApiError(error) && error.status === 409 && error.code === 'subject_retired';
+}
+
+/**
+ * Whether a failed resolution means the discrepancy is already closed. The backend names it
+ * 409 `discrepancy_resolved` (`decisions.py`, `ApiErrorCode` in `api/client.ts`); it sends no
+ * `discrepancy_closed`, so that is the code read here, as `DecisionForm` reads it.
+ */
+function isResolvedError(error: unknown): boolean {
+  return isApiError(error) && error.status === 409 && error.code === 'discrepancy_resolved';
+}
+
+/**
+ * The text of a failed resolution: "Computed from replaced data" for `subject_retired`,
+ * "Already resolved" for `discrepancy_resolved`, otherwise an `ApiError`'s message, which is the
+ * API's envelope message (for a 422 such as `resolution_not_allowed` it names the rule it broke)
+ * or the client's own fallback text, both safe to show. A blank `ApiError` message, and any
+ * rejection that is not an `ApiError`, such as a plain `Error`, a `TypeError` or an abort, read
+ * {@link FALLBACK_ERROR_MESSAGE}: such a message is outside that contract and may carry internal
+ * detail.
+ */
+function resolveErrorMessage(error: unknown): string {
+  if (isRetiredError(error)) {
+    return RETIRED_MESSAGE;
+  }
+  if (isResolvedError(error)) {
+    return RESOLVED_MESSAGE;
+  }
+  return (isApiError(error) ? textOrNull(error.message) : null) ?? FALLBACK_ERROR_MESSAGE;
+}
+
+// ---------------------------------------------------------------------------------------------
+// DiscrepancyResolution
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The "Record intended state" dialog of one discrepancy: whether it is open, and which opening
+ * it is. `session` grows with every opening, so a save that ends after its dialog was closed
+ * can tell whether the dialog shown now is still its own.
+ */
+interface DialogSession {
+  /** Whether the dialog is shown. */
+  readonly open: boolean;
+  /** The number of the latest opening; `0` before the first. */
+  readonly session: number;
+}
+
+/** The dialog before its first opening. */
+const CLOSED_DIALOG: DialogSession = { open: false, session: 0 };
+
+/** The dialog opened anew: a session no earlier save belongs to. */
+function openDialogSession(current: DialogSession): DialogSession {
+  return { open: true, session: current.session + 1 };
+}
+
+/** The dialog closed, keeping its session; unchanged when it is closed already. */
+function closeDialogSession(current: DialogSession): DialogSession {
+  return current.open ? { ...current, open: false } : current;
+}
+
+/**
+ * The resolution controls of one discrepancy: one `Button` per entry of
+ * `discrepancy.resolutions`, in the API's order, the first `primary` and the rest `secondary`,
+ * labelled from {@link RESOLUTION_LABELS}.
+ *
+ * - "Record intended state", which carries `aria-haspopup="dialog"`, opens a `Dialog` titled
+ *   "Record intended state" holding `DecisionForm` (`mode="intended_state"`, `showSubject`) for
+ *   the discrepancy's subject, which the form names above its fields as the decision log does
+ *   ("Brand Search — US · Campaign · Google"), with its own Save and Cancel buttons. Saving
+ *   closes the dialog; Cancel, Escape, the Close button and the backdrop close it without
+ *   posting, and may close it while its save runs. Until that save settles,
+ *   "Record intended state" shows its loading state and every other resolution is disabled, so
+ *   neither a second intended state nor another resolution can be posted. A save that ends
+ *   after its dialog was closed is still reported. The closed dialog returns focus to "Record
+ *   intended state", which stays focusable while it loads; focus lost by the time the save
+ *   settles goes back to it when nothing else has taken it.
+ * - Every other resolution posts `POST /discrepancies/{id}/resolve` with `{ resolution }` at
+ *   once. While it runs, the clicked button shows its loading state and the others are disabled.
+ *   From the press itself, before that state renders, no further resolution posts and "Record
+ *   intended state" opens nothing, so a double click posts once; once the request settles,
+ *   either way, a later press posts again.
+ * - After a success, a polite status line names the outcome: "Resolved", or "Waiting for the
+ *   platform to match the decision" for `awaiting_platform`. Then `onResolved` is called.
+ * - A failure shows a critical banner, which takes focus, with "Computed from replaced data"
+ *   (409 `subject_retired`), "Already resolved" (409 `discrepancy_resolved`), the API's
+ *   message, or "The resolution failed." for a failure that carries none. Either 409 disables
+ *   every control while this discrepancy is shown, because the server would refuse any
+ *   resolution of it again. A failure of the intended-state save, which
+ *   the form reports through `onRetired` and `onFailed`, is shown and locks the same way, in this
+ *   banner outside the dialog. Either 409 lock stays once the dialog is closed, and so does a
+ *   failure that settled after the dialog was closed, whose form is gone; the banner takes focus
+ *   once the dialog is closed. A failure that is no lock and that the open form already showed
+ *   is dismissed with the dialog: Cancel, Escape, the Close button and the backdrop clear it, and
+ *   the dialog returns focus to "Record intended state". Any other failure stands until the next
+ *   resolution starts or the dialog opens again.
+ *
+ * The controls' state (the dialog, the outcome and those locks) belongs to the discrepancy's id:
+ * a mount reused for another discrepancy starts fresh, so one subject's lock never disables
+ * another's controls.
+ */
+export function DiscrepancyResolution(props: DiscrepancyResolutionProps) {
+  return <DiscrepancyResolutionBody key={props.discrepancy.id} {...props} />;
+}
+
+/**
+ * The body of {@link DiscrepancyResolution} for one discrepancy id. Its state and its mutation
+ * live exactly as long as that id, because `DiscrepancyResolution` keys it by the id.
+ *
+ * @param props - The props `DiscrepancyResolution` received, unchanged.
+ */
+function DiscrepancyResolutionBody({
+  discrepancy,
+  disabled = false,
+  onResolved,
+}: DiscrepancyResolutionProps) {
+  const resolve = useResolveDiscrepancy();
+  const [dialog, setDialog] = useState<DialogSession>(CLOSED_DIALOG);
+  const [outcome, setOutcome] = useState<DiscrepancyState | null>(null);
+  // What the intended-state form reports about its save. The form posts through a mutation of
+  // its own, which unmounts with it when its dialog is closed, so a save that settles after
+  // that leaves its outcome here: whether it still runs, its failure, and either 409's lock.
+  const [formPending, setFormPending] = useState(false);
+  const [formFailure, setFormFailure] = useState<string | null>(null);
+  const [formRetired, setFormRetired] = useState(false);
+  const [formClosed, setFormClosed] = useState(false);
+
+  const error = resolve.error;
+  // A 409 subject_retired is final for this discrepancy (AAP 0.3.2), and so is a closed one,
+  // whether a resolution posted here or the intended-state form received it: the server refuses
+  // every further resolution of it, so no control stays enabled. Every control is disabled from
+  // then on, so no later attempt can reset the error that set the lock.
+  const lockedByServer =
+    isRetiredError(error) || isResolvedError(error) || formRetired || formClosed;
+  const locked = disabled || lockedByServer;
+  const pendingResolution = resolve.isPending ? resolve.variables.body.resolution : null;
+  // The resolution whose request runs: one posted here, or the intended state the form posts,
+  // even with its dialog closed. While one runs, no other resolution starts.
+  const busyResolution: Resolution | null = formPending ? 'record_intended' : pendingResolution;
+  // The form's lock or failure, shown here as well, because the form that showed it is gone
+  // once its dialog closes. Each 409 lock keeps its own text, so a failure dismissed with the
+  // dialog (closeIntendedState) never leaves a lock unexplained.
+  const formMessage = formRetired ? RETIRED_MESSAGE : formClosed ? RESOLVED_MESSAGE : formFailure;
+
+  // A clicked button is loading while its request runs, and keeps keyboard focus. When the
+  // request fails, focus moves on to the error, so keyboard and screen-reader users land on the
+  // message (WCAG 2.2 SC 2.4.3, 3.3.1) without a role="alert" live region, which AAP 0.5.5
+  // reserves for the discrepancy banner on /actions.
+  const errorRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (error !== null) {
+      errorRef.current?.focus();
+    }
+  }, [error]);
+  // A failure or lock the intended-state form reports takes the same focus, once its dialog is
+  // closed: while the dialog is open its focus trap owns focus, and the form shows the message
+  // itself. React runs the dialog's cleanup, which returns focus to its opener, before this.
+  useEffect(() => {
+    if (formMessage !== null && !dialog.open) {
+      errorRef.current?.focus();
+    }
+  }, [formMessage, dialog.open]);
+
+  // A success that leaves this discrepancy on screen (awaiting_platform) re-enables the clicked
+  // button, which keeps focus while it loads; focus lost to the page meanwhile goes back to it,
+  // so keyboard and screen-reader users stay on the control they used (WCAG 2.2 SC 2.4.3). So
+  // does an intended-state save that settles after its dialog was closed, for focus lost after
+  // the dialog returned it to "Record intended state". A failure's banner takes focus first (the
+  // effects above), so nothing is focused here for it. Nor for a closed discrepancy: it leaves
+  // the list that shows it, so this button goes with it, and that list places focus instead, the
+  // `/decisions` resolver on a neighbouring card (DiscrepancyResolver) and a C0 card on
+  // `/actions` on its own status line.
+  const buttonRefs = useRef(new Map<Resolution, HTMLButtonElement>());
+  const [refocus, setRefocus] = useState<Resolution | null>(null);
+  useEffect(() => {
+    if (refocus === null || resolve.isPending || formPending) {
+      return;
+    }
+    setRefocus(null);
+    const button = buttonRefs.current.get(refocus);
+    const active = document.activeElement;
+    const focusLost = active === null || active === document.body;
+    if (button !== undefined && button.isConnected && !button.disabled && focusLost) {
+      button.focus();
+    }
+  }, [refocus, resolve.isPending, formPending]);
+
+  // Whether a resolution posted here is running, set synchronously on the press and cleared
+  // when it settles, either way. The rendered `busyResolution` cannot stop a second press before
+  // React renders again (a double click, or `click(); click();` from a script): TanStack Query
+  // reports the mutation pending only from a timer after the press, and a second post of a
+  // closing resolution would only draw 409 `discrepancy_resolved`.
+  const postingRef = useRef(false);
+
+  const post = (resolution: Resolution) => {
+    postingRef.current = true;
+    setOutcome(null);
+    // An earlier intended-state failure no longer describes what is posted now.
+    setFormFailure(null);
+    // mutateAsync, unlike mutate's per-call callbacks, settles even when this card unmounts
+    // first: a resolution that closes the discrepancy refetches the list without it before the
+    // request settles here, and onResolved must still be told. A failure is already held in
+    // resolve.error, which renders the banner, so the rejection needs no handling beyond that.
+    // The lock is lifted before React renders the settled state, while the clicked button still
+    // renders as loading, so no press lands in between; once it renders, an awaiting_platform
+    // outcome leaves every control usable for a later, deliberate resolution.
+    void resolve.mutateAsync({ id: discrepancy.id, body: { resolution } }).then(
+      (updated) => {
+        postingRef.current = false;
+        setOutcome(updated.state);
+        if (updated.state !== 'resolved') {
+          setRefocus(resolution);
+        }
+        onResolved?.(updated);
+      },
+      () => {
+        postingRef.current = false;
+      },
+    );
+  };
+
+  const openIntendedState = () => {
+    // A fresh form while an earlier save runs would post a second intended state, and one
+    // opened in the frame of a resolution posted here would post beside it.
+    if (locked || busyResolution !== null || postingRef.current) {
+      return;
+    }
+    // A failure of an earlier resolution no longer describes what the dialog is about to post.
+    resolve.reset();
+    setFormFailure(null);
+    setOutcome(null);
+    setDialog(openDialogSession);
+  };
+
+  // Cancel, Escape, the Close button and the backdrop all close the dialog here. A failure held
+  // now arrived while the open form showed it (opening the dialog and starting a save both clear
+  // it, and no opening starts while a save runs), so it goes with the dialog rather than standing
+  // on the card once the user has dismissed it. A save still running has no failure yet: one
+  // that fails after this is reported to a card whose form is gone, and stays. Either 409 lock
+  // stays as well, since its text comes from formRetired or formClosed, not from the failure.
+  const closeIntendedState = () => {
+    if (dialog.open) {
+      setFormFailure(null);
+    }
+    setDialog(closeDialogSession);
+  };
+
+  // DecisionForm calls the onDone it had when the user saved, even after its dialog was closed,
+  // so a save that ends late closes only the opening it was made in (`session`), never a dialog
+  // opened since. No opening starts while a save runs (`busyResolution`), and the intended
+  // state is recorded either way, so the outcome is still shown and reported.
+  const handleIntendedSaved = (session: number) => {
+    setDialog((current) => (current.session === session ? closeDialogSession(current) : current));
+    // The API moves a record_intended discrepancy to awaiting_platform (decisions.py
+    // resolve_discrepancy); DecisionForm reports success without the response body, so the
+    // update passed on is this discrepancy advanced by exactly that transition.
+    setOutcome('awaiting_platform');
+    onResolved?.({ ...discrepancy, state: 'awaiting_platform', resolution: 'record_intended' });
+  };
+
+  const handleClick = (resolution: Resolution) => {
+    if (locked || busyResolution !== null || postingRef.current) {
+      return;
+    }
+    if (resolution === 'record_intended') {
+      openIntendedState();
+      return;
+    }
+    post(resolution);
+  };
+
+  const errorText = formMessage ?? (error === null ? null : resolveErrorMessage(error));
+  const outcomeText = outcome === null ? null : OUTCOME_TEXT[outcome];
+  // The opening this render's intended-state form belongs to.
+  const formSession = dialog.session;
+
+  return (
+    // BLITZY [DESIGN_SYSTEM_GAP]: the design system has no text primitive and feature code
+    // carries no CSS (AAP 0.4.4), so text lines are <div> elements spaced by the Stack gap
+    // alone, as in DecisionForm. The error's wrapper is unstyled and exists only as the focus
+    // target after a failed resolution.
+    <Stack gap={2}>
+      {errorText === null ? null : (
+        <div ref={errorRef} tabIndex={-1}>
+          <Banner tone="critical" title={errorText} />
+        </div>
+      )}
+      <Inline gap={2}>
+        {discrepancy.resolutions.map((resolution, index) => (
+          <Button
+            key={resolution}
+            ref={(element: HTMLButtonElement) => {
+              buttonRefs.current.set(resolution, element);
+              return () => {
+                buttonRefs.current.delete(resolution);
+              };
+            }}
+            variant={index === 0 ? 'primary' : 'secondary'}
+            loading={busyResolution === resolution}
+            disabled={locked || (busyResolution !== null && busyResolution !== resolution)}
+            // Only "Record intended state" opens a dialog; every other resolution posts at once.
+            aria-haspopup={resolution === 'record_intended' ? 'dialog' : undefined}
+            onClick={() => {
+              handleClick(resolution);
+            }}
+          >
+            {RESOLUTION_LABELS[resolution]}
+          </Button>
+        ))}
+      </Inline>
+      {/*
+        A polite status region, mounted empty ahead of its first message so the outcome is
+        announced when it appears (WCAG 2.2 SC 4.1.3); Stack gives an empty status child no
+        space. It never carries role="alert", which AAP 0.5.5 reserves for the discrepancy
+        banner on /actions.
+      */}
+      <div role="status">{outcomeText}</div>
+      <Dialog
+        open={dialog.open}
+        title={RESOLUTION_LABELS.record_intended}
+        onClose={closeIntendedState}
+      >
+        <DecisionForm
+          mode="intended_state"
+          subject={{ type: discrepancy.subject.type, id: discrepancy.subject.id }}
+          discrepancy={discrepancy}
+          currency={discrepancy.subject.currency}
+          onDone={() => {
+            handleIntendedSaved(formSession);
+          }}
+          onRetired={() => {
+            // The subject's dataset was replaced: lock every control of this discrepancy, not
+            // only the form, so closing and reopening the dialog cannot lift the lock.
+            setFormRetired(true);
+          }}
+          onPendingChange={(saving) => {
+            setFormPending(saving);
+            if (saving) {
+              // A new save: an earlier failure no longer describes it.
+              setFormFailure(null);
+            } else {
+              setRefocus('record_intended');
+            }
+          }}
+          onFailed={(message, failure) => {
+            setFormFailure(message);
+            // Already closed on the server, which refuses any resolution of it again.
+            if (isResolvedError(failure)) {
+              setFormClosed(true);
+            }
+          }}
+          onCancel={closeIntendedState}
+          disabled={locked}
+          showSubject
+        />
+      </Dialog>
+    </Stack>
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// DiscrepancyResolver
+// ---------------------------------------------------------------------------------------------
+
+/** Accessible label of the spinner shown until the first page of the list arrives. */
+const LOADING_LABEL = 'Loading discrepancies';
+
+/** Title of the failure shown when the first read of the list fails. */
+const LOAD_ERROR_TITLE = 'Discrepancies could not be loaded';
+
+/** Title of the warning shown when a refetch of a list already on screen fails. */
+const REFRESH_ERROR_TITLE = 'Discrepancies could not be refreshed';
+
+/** Title of the warning shown when "Show more" fails; the list loaded so far stays. */
+const MORE_ERROR_TITLE = 'More discrepancies could not be loaded';
+
+/** Reason shown for a failed read that carries no message of its own. */
+const READ_ERROR_FALLBACK = 'The discrepancy list could not be read.';
+
+/** Title of the empty state, shown only when the latest read succeeded. */
+const EMPTY_TITLE = 'No open discrepancies';
+
+/** Reason of the empty state. */
+const EMPTY_REASON = 'Platform state matches every last decision.';
+
+/**
+ * Accessible name of the card list. Links reach a card by its own element id
+ * ({@link cardId}), never through the list.
+ */
+const LIST_LABEL = 'Discrepancies to resolve';
+
+/** Label of the button that loads the next page of the list. */
+const SHOW_MORE_LABEL = 'Show more discrepancies';
+
+/**
+ * The start of each card's element id, `discrepancy-{id}`, which a link to the card names as its
+ * location hash (`/decisions#discrepancy-{id}`, built by `features/actions/BlockingDiscrepancies`).
+ */
+const CARD_ID_PREFIX = 'discrepancy-';
+
+/** A discrepancy id as the API sends it and a card's element id spells it: a positive integer. */
+const DISCREPANCY_ID_PATTERN = /^[1-9][0-9]*$/u;
+
+/** The element id of a discrepancy's card, `discrepancy-{id}`, from its id or the id's digits. */
+function cardId(id: Discrepancy['id'] | string): string {
+  return `${CARD_ID_PREFIX}${String(id)}`;
+}
+
+/**
+ * The id of the discrepancy a location hash links to, `"12"` for `discrepancy-12`, or `null`
+ * for any other hash, such as the page's own `discrepancies` section anchor. `hash` is the
+ * router's decoded hash, without its `#`.
+ */
+function linkedDiscrepancyId(hash: string): string | null {
+  if (!hash.startsWith(CARD_ID_PREFIX)) {
+    return null;
+  }
+  const id = hash.slice(CARD_ID_PREFIX.length);
+  return DISCREPANCY_ID_PATTERN.test(id) ? id : null;
+}
+
+/**
+ * The status line for a linked discrepancy that a fully read list does not hold: "Discrepancy
+ * {id} is no longer unresolved." It was resolved, by the worker or by hand, after the link was
+ * made. When the list also leaves out discrepancies whose subject cannot be loaded
+ * ({@link unavailableCount}), it may be one of those, and the line names both possibilities.
+ */
+function linkedAbsentText(id: string, unavailable: number): string {
+  return unavailable > 0
+    ? `Discrepancy ${id} is not listed: it is no longer unresolved, or its campaign or ` +
+        'shared budget could not be loaded.'
+    : `Discrepancy ${id} is no longer unresolved.`;
+}
+
+/** The text of a failed list read: the API's message, or a generic sentence without one. */
+function readErrorMessage(error: unknown): string {
+  return (isApiError(error) ? textOrNull(error.message) : null) ?? READ_ERROR_FALLBACK;
+}
+
+/**
+ * The summary line of a loaded list: "Showing {n} of {total} unresolved discrepancies", or
+ * "Showing {n} unresolved discrepancies" when the API sent no total. The total counts every
+ * unresolved discrepancy of the active datasets, as the `/actions` banner does, so it can exceed
+ * what every page together lists when a subject cannot be loaded. While pages remain to load the
+ * rest may still appear; once every page is read, {@link unavailableText} explains the
+ * difference beneath this line.
+ */
+function summaryText(shown: number, total: number | undefined): string {
+  const noun = (total ?? shown) === 1 ? 'unresolved discrepancy' : 'unresolved discrepancies';
+  return total === undefined
+    ? `Showing ${formatCount(shown)} ${noun}`
+    : `Showing ${formatCount(shown)} of ${formatCount(total)} ${noun}`;
+}
+
+/**
+ * How many unresolved discrepancies a list can never show: the API's total less the `shown`
+ * discrepancies, once every page is read (`complete`). `GET /discrepancies` counts in
+ * `X-Total-Count` the rows whose subject cannot be loaded but leaves them out of every page, so
+ * only a fully read list can tell how many those are. `0` while pages remain, when the API sent
+ * no total, or when the total does not exceed what is shown.
+ */
+function unavailableCount(shown: number, total: number | undefined, complete: boolean): number {
+  return complete && total !== undefined && total > shown ? total - shown : 0;
+}
+
+/**
+ * The line explaining the `unavailable` discrepancies ({@link unavailableCount}) a fully read
+ * list leaves out. Beneath the summary of a `listed` list it gives the difference: "1 cannot be
+ * shown because its campaign or shared budget could not be loaded." With nothing listed it
+ * stands in place of the summary and so names the total: "2 unresolved discrepancies cannot be
+ * shown because their campaigns or shared budgets could not be loaded."
+ */
+function unavailableText(unavailable: number, listed: boolean): string {
+  const single = unavailable === 1;
+  const noun = single ? 'unresolved discrepancy' : 'unresolved discrepancies';
+  const subjects = single ? 'its campaign or shared budget' : 'their campaigns or shared budgets';
+  const count = listed ? formatCount(unavailable) : `${formatCount(unavailable)} ${noun}`;
+  return `${count} cannot be shown because ${subjects} could not be loaded.`;
+}
+
+/** A "Show more" that has settled, kept until focus has been placed after it. */
+interface SettledMore {
+  /** The index, in the list, of the first discrepancy the load added. */
+  firstNew: number;
+  /** The query's `dataUpdatedAt` the load settled with; the render that shows it moves focus. */
+  dataUpdatedAt: number;
+  /** The query's `errorUpdatedAt` the load settled with. */
+  errorUpdatedAt: number;
+  /** The error the load failed with, or `null` when it succeeded. */
+  error: ApiError | null;
+}
+
+/** A closed discrepancy to announce, kept until the next successful read replaces the list. */
+interface Closure {
+  /** The text announced: "{subject} resolved". */
+  text: string;
+  /** When the resolution was reported, in milliseconds since the epoch. */
+  at: number;
+}
+
+/**
+ * A discrepancy whose card leaves the list: one a resolution here closed, or one a read dropped
+ * while its card held focus. It is kept until the next closure replaces it, so focus can be
+ * placed once its card has left the list (see {@link closedFocusTarget}).
+ */
+interface ClosedCard {
+  /** The closed discrepancy's id. */
+  readonly id: Discrepancy['id'];
+  /** Its card's index in the list shown when the resolution was reported, or before that read. */
+  readonly index: number;
+  /**
+   * The ids of the other cards listed when the resolution was reported, or before that read:
+   * those after it in list order, then those before it, nearest first. Focus goes to the first
+   * of them still listed.
+   */
+  readonly neighbours: readonly Discrepancy['id'][];
+}
+
+/** Where focus goes after a {@link ClosedCard}, as {@link closedFocusTarget} decides it. */
+type ClosedFocus =
+  | {
+      /** A card's list item. */
+      readonly kind: 'card';
+      /** The discrepancy whose card takes focus. */
+      readonly id: Discrepancy['id'];
+      /**
+       * Whether the closed card has left the list, so `id` is another card's; `false` while a
+       * failed read keeps the closed card itself listed.
+       */
+      readonly gone: boolean;
+    }
+  | {
+      /** The resolver's polite status region. */
+      readonly kind: 'status';
+    };
+
+/**
+ * The {@link ClosedCard} of discrepancy `id`, from the cards `shown` when a resolution that
+ * closed it was reported, or before the read that dropped its focused card. When `shown` does
+ * not hold it, its index is 0 and it has no neighbours.
+ */
+function closedCard(id: Discrepancy['id'], shown: readonly Discrepancy[]): ClosedCard {
+  const ids = shown.map((discrepancy) => discrepancy.id);
+  const at = ids.indexOf(id);
+  return {
+    id,
+    index: Math.max(at, 0),
+    neighbours: at < 0 ? [] : [...ids.slice(at + 1), ...ids.slice(0, at).reverse()],
+  };
+}
+
+/**
+ * Whether `focus` names the card of discrepancy `id`, or the status region when `id` is
+ * omitted.
+ */
+function isClosedFocusOn(focus: ClosedFocus | null, id?: Discrepancy['id']): boolean {
+  if (focus === null) {
+    return false;
+  }
+  return id === undefined ? focus.kind === 'status' : focus.kind === 'card' && focus.id === id;
+}
+
+/**
+ * Where focus goes after a resolution closed a discrepancy, or a read dropped the card holding
+ * focus (WCAG 2.2 SC 2.4.3), or `null` when nothing is closed or no list is loaded:
+ *
+ * - while the closed card is still listed: the card itself, which a failed read keeps on screen
+ *   (the resolver places focus there only once no read runs, because the read that drops the
+ *   card may not be shown yet);
+ * - once it has left the list: the card now next to where it was, which is the first of its
+ *   {@link ClosedCard.neighbours} still listed, the following card before the preceding one. A
+ *   neighbour is followed by id, so a later read that adds or drops other cards never moves the
+ *   target away from a card that holds focus. Should only cards listed since remain, the card
+ *   now at the closed card's index, or the last card when the list has shrunk past it;
+ * - with no card left: the resolver's status region, which then says what is left open, and
+ *   names the closure when a resolution here made it. "Show more discrepancies" is never shown
+ *   then: a page load keeps following the API's next link while it has read no discrepancy
+ *   (`useDiscrepancyPages`), so a list that shows no card has been read to its end.
+ *
+ * @param closed - The latest closure, or `null` before the first.
+ * @param shown - The cards listed now, or `undefined` before the first read.
+ */
+function closedFocusTarget(
+  closed: ClosedCard | null,
+  shown: readonly Discrepancy[] | undefined,
+): ClosedFocus | null {
+  if (closed === null || shown === undefined) {
+    return null;
+  }
+  const listed = new Set(shown.map((discrepancy) => discrepancy.id));
+  if (listed.has(closed.id)) {
+    return { kind: 'card', id: closed.id, gone: false };
+  }
+  const neighbour =
+    closed.neighbours.find((id) => listed.has(id)) ??
+    shown[Math.min(closed.index, shown.length - 1)]?.id;
+  return neighbour === undefined
+    ? { kind: 'status' }
+    : { kind: 'card', id: neighbour, gone: true };
+}
+
+/** Props of {@link DiscrepancyCard}. */
+interface DiscrepancyCardProps {
+  /** The discrepancy shown. */
+  discrepancy: Discrepancy;
+  /** The IANA zone the detection instant is formatted in. */
+  displayTimezone: string;
+  /** Passed to the card's {@link DiscrepancyResolution} as its `onResolved`. */
+  onResolved: (updated: Discrepancy) => void;
+}
+
+/**
+ * One resolver card: the subject as the headline, its source, type and kind as the entity line,
+ * the state, the platform and decided values and the detection time in the body, and the
+ * resolution controls in the footer. Every line is built from API values only.
+ */
+function DiscrepancyCard({ discrepancy, displayTimezone, onResolved }: DiscrepancyCardProps) {
+  return (
+    <Card id={cardId(discrepancy.id)}>
+      <Card.Header
+        headingLevel={3}
+        title={subjectTitle(discrepancy)}
+        meta={subjectMeta(discrepancy)}
+      />
+      <Card.Body>
+        <div>{STATE_LABELS[discrepancy.state]}</div>
+        <div>{comparisonText(discrepancy)}</div>
+        <div>{`Detected ${formatInstant(discrepancy.detected_at, displayTimezone)}`}</div>
+      </Card.Body>
+      <Card.Footer>
+        <DiscrepancyResolution discrepancy={discrepancy} onResolved={onResolved} />
+      </Card.Footer>
+    </Card>
+  );
+}
+
+/** The resolver's paged list query, as `useDiscrepancyPages()` returns it. */
+type DiscrepancyPagesQuery = ReturnType<typeof useDiscrepancyPages>;
+
+/** A page load {@link useLinkedDiscrepancy} made to reach the card a link names. */
+interface LinkedLoad {
+  /** Whether the load is still in flight. */
+  readonly pending: boolean;
+  /** The query's `dataUpdatedAt` the load settled with; `0` while it is in flight. */
+  readonly dataUpdatedAt: number;
+  /** The query's `errorUpdatedAt` the load settled with; `0` while it is in flight. */
+  readonly errorUpdatedAt: number;
+  /** The error the load failed with; `null` while it is in flight and after a success. */
+  readonly error: ApiError | null;
+}
+
+/** A {@link LinkedLoad} that has not settled yet. */
+const PENDING_LINKED_LOAD: LinkedLoad = Object.freeze({
+  pending: true,
+  dataUpdatedAt: 0,
+  errorUpdatedAt: 0,
+  error: null,
+});
+
+/** What {@link useLinkedDiscrepancy} tells the resolver. */
+interface LinkedDiscrepancy {
+  /** The id of the discrepancy the location hash links to, or `null` when it names none. */
+  readonly id: string | null;
+  /** Whether that discrepancy is among the loaded ones, so its card is rendered. */
+  readonly listed: boolean;
+  /** Whether a page load toward it is in flight. */
+  readonly loading: boolean;
+  /** The failure of the latest such load while it is still the query's error; else `null`. */
+  readonly error: ApiError | null;
+}
+
+/**
+ * Brings the card a link names into view: `/decisions#discrepancy-{id}`, the link a held card on
+ * `/actions` gives a blocker that has no C0 card in its run (`BlockingDiscrepancies`). The list
+ * is paged, so on arrival the card may not be loaded yet, and the router's own scroll to the
+ * hash, made once the route has rendered, finds no element.
+ *
+ * The hash is read through the router (`useLocation`), so a client-side `Link` navigation is
+ * seen as well as a full page load, and a hash that changes while the resolver is shown is
+ * followed.
+ *
+ * - **Loading.** While the loaded pages do not hold the discrepancy and the API names a next
+ *   page, the next page is loaded with `fetchNextPage`: the same `DISCREPANCY_PAGE_SIZE`-row load
+ *   "Show more" makes, under the same paging guards, one load at a time, until the card is
+ *   loaded or the list ends. The whole list is never read in one request. No load starts while
+ *   the list is being read already (a poll, a retry, or "Show more", which `busy` reports),
+ *   before the render that shows the previous load, or while the list's latest read failed; a
+ *   failed load is therefore tried again only after a later read of the list succeeds.
+ * - **Scrolling.** Once the card has rendered, it is scrolled into view, once per hash: polls
+ *   and later pages never scroll again, while a new hash does, and so does the same hash
+ *   followed again after it was cleared. Focus is not moved.
+ *
+ * @param query - The resolver's `useDiscrepancyPages()` result.
+ * @param busy - Whether "Show more" is loading a page.
+ * @returns The linked discrepancy's id, whether it is listed, and its loads' state.
+ */
+function useLinkedDiscrepancy(query: DiscrepancyPagesQuery, busy: boolean): LinkedDiscrepancy {
+  const hash = useLocation({ select: (location) => location.hash });
+  const id = linkedDiscrepancyId(hash);
+  const { data: list, error, hasNextPage, isFetching, fetchNextPage } = query;
+  const { dataUpdatedAt, errorUpdatedAt } = query;
+  const listed =
+    id !== null &&
+    list !== undefined &&
+    list.discrepancies.some((discrepancy) => String(discrepancy.id) === id);
+
+  const [load, setLoad] = useState<LinkedLoad | null>(null);
+  // TanStack notifies observers on a later tick, so a settled load waits for the render that
+  // shows it; deciding from the list before it would load a page past the one just read.
+  const awaitingLoad =
+    load !== null &&
+    (load.pending || dataUpdatedAt < load.dataUpdatedAt || errorUpdatedAt < load.errorUpdatedAt);
+  const loadNext =
+    id !== null &&
+    list !== undefined &&
+    !listed &&
+    hasNextPage &&
+    !isFetching &&
+    !busy &&
+    error === null &&
+    !awaitingLoad;
+
+  useEffect(() => {
+    if (!loadNext) {
+      return;
+    }
+    setLoad(PENDING_LINKED_LOAD);
+    // `cancelRefetch: false` joins a poll that started since this render instead of cancelling
+    // it, so the list is never read twice at once.
+    void fetchNextPage({ cancelRefetch: false }).then((result) => {
+      setLoad({
+        pending: false,
+        dataUpdatedAt: result.dataUpdatedAt,
+        errorUpdatedAt: result.errorUpdatedAt,
+        error: result.isFetchNextPageError ? result.error : null,
+      });
+    });
+  }, [loadNext, fetchNextPage]);
+
+  // The hash whose card was scrolled to; cleared with the hash, so a link followed again scrolls.
+  const scrolledFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (id === null) {
+      scrolledFor.current = null;
+      return;
+    }
+    if (!listed || scrolledFor.current === id) {
+      return;
+    }
+    const card = document.getElementById(cardId(id));
+    if (card === null) {
+      return;
+    }
+    scrolledFor.current = id;
+    // Environments without layout, such as jsdom, do not implement scrollIntoView.
+    if (typeof card.scrollIntoView === 'function') {
+      card.scrollIntoView({ block: 'start' });
+    }
+  }, [id, listed]);
+
+  return {
+    id,
+    listed,
+    loading: load?.pending === true,
+    error: load?.error != null && error === load.error ? load.error : null,
+  };
+}
+
+/**
+ * The `/decisions` resolver: the open and awaiting-platform discrepancies of the active datasets,
+ * oldest `detected_at` first as the API returns them, a page at a time (`useDiscrepancyPages`,
+ * `DISCREPANCY_PAGE_SIZE` rows per page), one {@link Card} each with
+ * `id="discrepancy-{id}"`, the target of links to a blocking discrepancy, in a list labelled
+ * "Discrepancies to resolve".
+ *
+ * Each card's heading is an `<h3>` below the page's "Discrepancies" section heading. Its entity
+ * line reads "{source} · {Campaign or Shared budget} · {kind}", and its body the state ("Open" or
+ * "Awaiting platform"), "Platform shows {platform}, last decided {decided}" and "Detected
+ * {instant}", formatted in the default run's `display_timezone`, or in UTC, so labelled, until
+ * that run is known. The footer holds {@link DiscrepancyResolution}.
+ *
+ * **Paging** (AAP 0.1.1 performance). Only the pages loaded so far are fetched and mounted.
+ * Below the list a "Show more discrepancies" `Button` loads the next page while the API names
+ * one; it shows its loading state meanwhile, and once the page is shown focus returns to it, or,
+ * after the last page removed it, moves to the first discrepancy the page added, unless the user
+ * moved focus elsewhere (WCAG 2.2 SC 2.4.3). Every discrepancy stays reachable.
+ *
+ * **Focus after a closing resolution or a refresh** (WCAG 2.2 SC 2.4.3). A resolution that
+ * closes a discrepancy ("Platform is correct", "Adopt platform state", "Acknowledge removal")
+ * removes its card, and with it the clicked button, which kept focus while it loaded, so focus
+ * falls to the page. Once the refetched list is shown without the card, focus moves to the card
+ * now next to where it was: the following card, else the preceding one, else, with no card
+ * left, the status region below, which then names the closure and what is left open ("No open
+ * discrepancies" when nothing is).
+ * "Show more" is never shown with no card left, because a page load reads on while it has found
+ * none. A card or the region is focusable (`tabindex="-1"`) only as that target, and stays so
+ * once focused until the next closure, so a later read never drops the focus it holds; it takes
+ * the design system's focus ring. When the refetch fails and the closed card stays listed,
+ * the card itself takes focus, and focus moves on as above once a later read drops it.
+ * A read, a poll included, that drops the card holding focus without a resolution here hands
+ * focus on the same way, from the cards shown before that read: the worker auto-resolved the
+ * discrepancy, or another tab resolved it, as when this card's 409 "Already resolved" banner
+ * holds focus. The resolver records the card focus enters, its intended-state dialog included,
+ * and forgets it when focus moves to another element or onto the page. No closure is announced
+ * for such a card, because this tab did not close it; the status region's lines say what is
+ * left open. Focus the user has moved elsewhere is never taken back; a resolution that keeps its
+ * card listed (`awaiting_platform`) leaves focus on its button ({@link DiscrepancyResolution}).
+ *
+ * **Linked discrepancy** (AAP 0.5.5 "with the blocking discrepancy linked"). When the location
+ * hash names a card, `#discrepancy-{id}` as a held card's link on `/actions` does, on arrival or
+ * by a later change, the resolver loads the next page while the pages loaded so far do not hold
+ * that discrepancy and the API names one, a page at a time as "Show more" would, with "Show more"
+ * in its loading state meanwhile. Once the card has rendered it is scrolled into view, once per
+ * hash, without moving focus. When every page is read and none holds it, the status region says
+ * so (see below). A failed load reads as a failed "Show more".
+ *
+ * **One polite status region** (WCAG 2.2 SC 4.1.3). The resolver renders a single
+ * `role="status"` element in every state, from the first render, outside the card list, so
+ * each outcome lands in a region assistive technology already watches and is announced
+ * politely. It never carries `role="alert"`, which AAP 0.5.5 reserves for the discrepancy banner
+ * on `/actions`. The `Spinner` sits outside it, because it is a status element of its own. The
+ * region holds, as they apply:
+ *
+ * - the first read failed: an `EmptyState` "Discrepancies could not be loaded" with the API's
+ *   message and a "Retry" `Button`. It stays in place while the read runs again, by poll or by
+ *   Retry, so it never flickers back to the spinner, and focus returns to Retry once a retry
+ *   the user started settles;
+ * - a refetch of a loaded list failed: a warning `Banner` "Discrepancies could not be
+ *   refreshed" with the API's message, saying the list shown is the state as last loaded at
+ *   {instant}, or that none were open then when that read listed and counted none, with
+ *   "Retry". A discrepancy left on screen still blocks the items that depend on it (AAP 0.5.4.2
+ *   P1), so the list and its summary lines below are kept, and an empty list from an earlier
+ *   read is never presented as the current state;
+ * - the latest read succeeded, every page is read, nothing is listed and the API's
+ *   `X-Total-Count` is 0 or absent: an `EmptyState` "No open discrepancies", "Platform state
+ *   matches every last decision.";
+ * - a loaded list: "Showing {n} of {total} unresolved discrepancies", the total from the API's
+ *   `X-Total-Count`, or "Showing {n} unresolved discrepancies" without one. While "Show more"
+ *   remains, the rest may still load, so nothing more is said;
+ * - every page is read and the total exceeds what is listed: the API counts, but cannot list, a
+ *   discrepancy whose campaign or shared budget cannot be loaded, so a line beneath the summary
+ *   reads "{total − n} cannot be shown because their campaigns or shared budgets could not be
+ *   loaded.", or, with nothing listed, stands in place of the summary as "{total} unresolved
+ *   discrepancies cannot be shown because …". A positive total is never shown as "No open
+ *   discrepancies", which would contradict the `/actions` banner's count (AAP 0.5.4.2 P1);
+ * - every page is read and none holds the discrepancy the hash links to: "Discrepancy {id} is
+ *   no longer unresolved.", or, while some discrepancies cannot be shown, "Discrepancy {id} is
+ *   not listed: it is no longer unresolved, or its campaign or shared budget could not be
+ *   loaded.";
+ * - "Show more", or a page load toward the linked discrepancy, failed: a warning `Banner` "More
+ *   discrepancies could not be loaded" with the API's message; "Show more" stays to try again;
+ * - a resolution closed a discrepancy: "{subject} resolved", until the next successful read.
+ *   The closed card leaves the refetched list before its own status line could be announced.
+ *
+ * The list refreshes itself every 30 s while shown (`useDiscrepancyPages`), so discrepancies the
+ * worker opens or auto-resolves appear without a reload.
+ */
+export function DiscrepancyResolver() {
+  const query = useDiscrepancyPages();
+  const defaultRun = useDefaultRun();
+  const displayTimezone = textOrNull(defaultRun.data?.display_timezone) ?? FALLBACK_TIMEZONE;
+  const list = query.data;
+  const { dataUpdatedAt, errorUpdatedAt } = query;
+  const failure = useSettledFailure(query.error, query.fetchStatus !== 'idle', list !== undefined);
+  const { retrying, buttonRef: retryButtonRef, retry } = useRetry(query.refetch);
+
+  const [closure, setClosure] = useState<Closure | null>(null);
+  const [closed, setClosed] = useState<ClosedCard | null>(null);
+  // The discrepancy whose card holds focus, recorded as focus enters the card's list item from
+  // its controls, its banner or its intended-state dialog, whose events React passes up through
+  // the dialog's portal. Focus moving to another element, or onto the page, forgets it
+  // (`forgetFocusedCard`). Removing a focused element fires no focus event, so the record
+  // outlives a card a read drops, and that read can tell the card held focus.
+  const focusedCardRef = useRef<Discrepancy['id'] | null>(null);
+  // The cards the latest committed render shows, where a resolution that settles finds its card.
+  const shownRef = useRef<readonly Discrepancy[]>([]);
+  useEffect(() => {
+    const previous = shownRef.current;
+    const shown = list?.discrepancies ?? [];
+    shownRef.current = shown;
+    // A read that drops the card holding focus without a resolution here (the worker
+    // auto-resolved it, or another tab resolved it, whose 409 "Already resolved" banner held
+    // focus) hands focus on as a closing resolution does, from the cards shown before that read.
+    // Only focus lost with the card moves: onto the page, or an element no longer in it.
+    const focusedId = focusedCardRef.current;
+    if (focusedId === null || shown.some((discrepancy) => discrepancy.id === focusedId)) {
+      return;
+    }
+    focusedCardRef.current = null;
+    const active = document.activeElement;
+    if (list === undefined || (active !== null && active !== document.body && active.isConnected)) {
+      return;
+    }
+    // A closure a resolution here recorded for this card stands, with the focus placed for it.
+    setClosed((current) => (current?.id === focusedId ? current : closedCard(focusedId, previous)));
+  }, [list]);
+  const handleResolved = (updated: Discrepancy) => {
+    if (updated.state === 'resolved') {
+      setClosure({ text: `${subjectTitle(updated)} resolved`, at: Date.now() });
+      // A read shown since the click may have dropped the card already; the list it was clicked
+      // in, which this callback's render showed, still holds it.
+      const shown = shownRef.current.some((discrepancy) => discrepancy.id === updated.id)
+        ? shownRef.current
+        : (list?.discrepancies ?? []);
+      // That read may have recorded this card's closure already, as the card that held focus;
+      // replacing it would strip the element focus was placed on of its tabindex.
+      setClosed((current) =>
+        current?.id === updated.id ? current : closedCard(updated.id, shown),
+      );
+    }
+  };
+  // Focus leaving a card forgets it when it moved to another element, which records its own
+  // card if it is in one, or onto the page itself. Focus leaving with the window keeps the
+  // record: the element still holds the document's focus.
+  const forgetFocusedCard = (id: Discrepancy['id'], next: EventTarget | null) => {
+    const active = document.activeElement;
+    const onPage = active === null || active === document.body;
+    if (focusedCardRef.current === id && (next !== null || onPage)) {
+      focusedCardRef.current = null;
+    }
+  };
+
+  // "Show more": the button is loading, hence inert, until the page settles; then focus is
+  // placed once the render that shows the page has committed.
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [settledMore, setSettledMore] = useState<SettledMore | null>(null);
+  const focusedMoreRef = useRef<SettledMore | null>(null);
+  const showMoreRef = useRef<HTMLButtonElement>(null);
+  const firstNewRef = useRef<HTMLLIElement>(null);
+  const linked = useLinkedDiscrepancy(query, loadingMore);
+
+  useEffect(() => {
+    if (settledMore === null || focusedMoreRef.current === settledMore) {
+      return;
+    }
+    if (dataUpdatedAt < settledMore.dataUpdatedAt || errorUpdatedAt < settledMore.errorUpdatedAt) {
+      // TanStack notifies observers on a later tick; wait for the render that shows the page.
+      return;
+    }
+    focusedMoreRef.current = settledMore;
+    const active = document.activeElement;
+    if (active !== null && active !== document.body) {
+      return;
+    }
+    const button = showMoreRef.current;
+    if (button !== null && button.isConnected && !button.disabled) {
+      button.focus();
+      return;
+    }
+    const firstNew = firstNewRef.current;
+    if (firstNew !== null && firstNew.isConnected) {
+      firstNew.focus();
+    }
+  }, [settledMore, dataUpdatedAt, errorUpdatedAt]);
+
+  // A closing resolution, or a read that dropped the focused card: focus is placed once while a
+  // failed read keeps a resolution's closed card listed, and once after the card has left the
+  // list, each time only when focus was lost (onto the page, or an element no longer in it), so
+  // focus the user moved is left where it is. The element focus was placed on stays focusable
+  // until the next closure, so a later read that changes the target (a discrepancy raised while
+  // the status region holds focus) or a poll in flight never strips the focused element of its
+  // tabindex, which would drop focus again.
+  const closedFocus = closedFocusTarget(closed, list?.discrepancies);
+  const reading = query.isFetching;
+  const [placed, setPlaced] = useState<{ closed: ClosedCard; focus: ClosedFocus } | null>(null);
+  const placedFocus = placed !== null && placed.closed === closed ? placed.focus : null;
+  const closedCardRef = useRef<HTMLLIElement>(null);
+  const statusRef = useRef<HTMLDivElement>(null);
+  const handledClosedRef = useRef<{ closed: ClosedCard; gone: boolean } | null>(null);
+  useEffect(() => {
+    if (closed === null || closedFocus === null) {
+      return;
+    }
+    const gone = closedFocus.kind !== 'card' || closedFocus.gone;
+    if (!gone && reading) {
+      // The read that drops the closed card may not be shown yet.
+      return;
+    }
+    const handled = handledClosedRef.current;
+    if (handled !== null && handled.closed === closed && (handled.gone || !gone)) {
+      return;
+    }
+    handledClosedRef.current = { closed, gone };
+    const active = document.activeElement;
+    if (active !== null && active !== document.body && active.isConnected) {
+      return;
+    }
+    const target = closedFocus.kind === 'card' ? closedCardRef.current : statusRef.current;
+    if (target !== null && target.isConnected) {
+      target.focus();
+      setPlaced({ closed, focus: closedFocus });
+    }
+  }, [closed, closedFocus, reading]);
+
+  const showMore = async (): Promise<void> => {
+    if (list === undefined || loadingMore || linked.loading) {
+      return;
+    }
+    const firstNew = list.discrepancies.length;
+    setLoadingMore(true);
+    try {
+      const result = await query.fetchNextPage();
+      setSettledMore({
+        firstNew,
+        dataUpdatedAt: result.dataUpdatedAt,
+        errorUpdatedAt: result.errorUpdatedAt,
+        error: result.isFetchNextPageError ? result.error : null,
+      });
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
+  const retryButton = (
+    <Button
+      ref={retryButtonRef}
+      loading={retrying}
+      onClick={() => {
+        void retry();
+      }}
+    >
+      {RETRY_LABEL}
+    </Button>
+  );
+
+  // A failed "Show more", or a failed page load toward a linked card, stays its own notice while
+  // that error is the query's current one; any other error on a loaded list is a failed refresh.
+  const moreError =
+    settledMore?.error != null && query.error === settledMore.error
+      ? settledMore.error
+      : linked.error;
+  const refreshError = list !== undefined && query.error !== moreError ? query.error : null;
+  const notices: ReactNode[] = [];
+  if (list === undefined) {
+    if (failure !== null) {
+      notices.push(
+        <EmptyState key="load-error" title={LOAD_ERROR_TITLE} action={retryButton}>
+          {readErrorMessage(failure)}
+        </EmptyState>,
+      );
+    }
+  } else {
+    const shown = list.discrepancies.length;
+    const complete = !query.hasNextPage;
+    const unavailable = unavailableCount(shown, list.total, complete);
+    // Nothing is open only when every page is read, none is listed and the API counts none: a
+    // positive total over an empty list means its subjects could not be loaded, never that the
+    // platform matches every decision.
+    const noneOpen = complete && shown === 0 && (list.total ?? 0) === 0;
+    if (refreshError !== null) {
+      const loadedAt = lastLoadedText(dataUpdatedAt, displayTimezone);
+      const asLoaded = noneOpen
+        ? `No discrepancies were open when the list was last loaded ${loadedAt}.`
+        : `Showing the list as last loaded ${loadedAt}.`;
+      notices.push(
+        <Banner
+          key="refresh-error"
+          tone="warning"
+          title={REFRESH_ERROR_TITLE}
+          actions={retryButton}
+        >
+          <Stack gap={1}>
+            <div>{readErrorMessage(refreshError)}</div>
+            <div>{asLoaded}</div>
+          </Stack>
+        </Banner>,
+      );
+    } else if (noneOpen) {
+      notices.push(
+        <EmptyState key="empty" title={EMPTY_TITLE}>
+          {EMPTY_REASON}
+        </EmptyState>,
+      );
+    }
+    // With nothing listed, the unavailable line names the total in place of the summary.
+    if (shown > 0 || (!noneOpen && unavailable === 0)) {
+      notices.push(<div key="summary">{summaryText(shown, list.total)}</div>);
+    }
+    if (unavailable > 0) {
+      notices.push(<div key="unavailable">{unavailableText(unavailable, shown > 0)}</div>);
+    }
+    if (linked.id !== null && complete && !linked.listed) {
+      notices.push(<div key="linked-absent">{linkedAbsentText(linked.id, unavailable)}</div>);
+    }
+    if (moreError !== null) {
+      notices.push(
+        <Banner key="more-error" tone="warning" title={MORE_ERROR_TITLE}>
+          {readErrorMessage(moreError)}
+        </Banner>,
+      );
+    }
+  }
+  if (closure !== null && dataUpdatedAt <= closure.at) {
+    notices.push(<div key="closure">{closure.text}</div>);
+  }
+
+  return (
+    // BLITZY [DESIGN_SYSTEM_GAP]: the design system has no text or live-region primitive and
+    // feature code carries no CSS (AAP 0.4.4), so the status region and its text lines are
+    // unstyled <div> elements spaced by the Stack gap alone; Stack takes the region out of the
+    // column while it is empty. The region and a card's list item are focusable only as the
+    // place a closing resolution or "Show more" puts focus, and take the base focus ring.
+    <Stack gap={4}>
+      {list === undefined && failure === null ? <Spinner label={LOADING_LABEL} showLabel /> : null}
+      <div
+        ref={statusRef}
+        role="status"
+        tabIndex={
+          isClosedFocusOn(closedFocus) || isClosedFocusOn(placedFocus) ? -1 : undefined
+        }
+      >
+        {notices.length === 0 ? null : <Stack gap={3}>{notices}</Stack>}
+      </div>
+      {list !== undefined && list.discrepancies.length > 0 ? (
+        <Stack as="ul" gap={4} aria-label={LIST_LABEL}>
+          {list.discrepancies.map((discrepancy, index) => {
+            const isFirstNew = settledMore !== null && index === settledMore.firstNew;
+            const isClosedFocus = isClosedFocusOn(closedFocus, discrepancy.id);
+            const focusable =
+              isFirstNew || isClosedFocus || isClosedFocusOn(placedFocus, discrepancy.id);
+            return (
+              <li
+                key={discrepancy.id}
+                ref={
+                  isFirstNew || isClosedFocus
+                    ? (element: HTMLLIElement | null) => {
+                        if (isFirstNew) {
+                          firstNewRef.current = element;
+                        }
+                        if (isClosedFocus) {
+                          closedCardRef.current = element;
+                        }
+                      }
+                    : undefined
+                }
+                tabIndex={focusable ? -1 : undefined}
+                onFocus={() => {
+                  focusedCardRef.current = discrepancy.id;
+                }}
+                onBlur={(event) => {
+                  forgetFocusedCard(discrepancy.id, event.relatedTarget);
+                }}
+              >
+                <DiscrepancyCard
+                  discrepancy={discrepancy}
+                  displayTimezone={displayTimezone}
+                  onResolved={handleResolved}
+                />
+              </li>
+            );
+          })}
+        </Stack>
+      ) : null}
+      {list !== undefined && query.hasNextPage ? (
+        <Inline gap={2}>
+          <Button
+            ref={showMoreRef}
+            variant="secondary"
+            loading={loadingMore || linked.loading}
+            onClick={() => {
+              void showMore();
+            }}
+          >
+            {SHOW_MORE_LABEL}
+          </Button>
+        </Inline>
+      ) : null}
+    </Stack>
+  );
+}

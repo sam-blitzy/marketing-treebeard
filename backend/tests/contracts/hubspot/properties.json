@@ -1,0 +1,301 @@
+{
+  "surface": "hubspot.properties",
+  "source": "hubspot",
+  "reference_url": "https://developers.hubspot.com/docs/api-reference/latest/crm/properties/get-property",
+  "api_version": "2026-09",
+  "last_modified": "2026-09-09",
+  "request": {
+    "method": "GET",
+    "url": "https://api.hubapi.com/crm/properties/2026-09/{objectType}/{propertyName}",
+    "required_headers": [
+      "Authorization"
+    ],
+    "required_query": [],
+    "optional_query": [
+      "archived",
+      "dataSensitivity",
+      "locale",
+      "properties"
+    ],
+    "fields": null,
+    "body": null,
+    "gaql": null,
+    "limits": {}
+  },
+  "response": {
+    "status": [
+      200
+    ],
+    "body": {
+      "type": "object",
+      "description": "HubSpot Property definition from GET /crm/properties/2026-09/{objectType}/{propertyName}. The product only reads property definitions and never creates or edits them. Query parameters, all optional: archived (boolean, default false; true returns only archived properties), dataSensitivity (highly_sensitive, non_sensitive or sensitive; default non_sensitive), locale (string) and properties (string). Startup verification uses this surface to: resolve the contacts.lifecyclestage option labels configured in config/hubspot_mapping.yaml (for example First meeting booked, Qualified Lead, Sales Qualified Lead) to their internal option values, which are numeric strings for custom stages; confirm that the stage-entry property hs_v2_date_entered_{option value} exists; confirm that a property-mode MQL or QL binding names an existing date or datetime property; and confirm the optional HUBSPOT_GOOGLE_CAMPAIGN_PROPERTY and HUBSPOT_GOOGLE_TOUCH_DATE_PROPERTY contact properties. MQL and QL are bound independently: QL is never derived from MQL, a later current stage never stands in for an empty stage-entry date, and the default Marketing Qualified Lead stage counts as MQL only when the configuration names it. A label with no matching option, or a property that does not exist (a 404, handled by the connector outside this success contract), makes its metric unavailable, never zero. Fields follow the reference exactly: none is nullable, optional fields may be absent, and timestamps and user ids stay wire strings.",
+      "properties": {
+        "description": {
+          "type": "string",
+          "description": "Help text shown for the property in HubSpot; may be an empty string."
+        },
+        "fieldType": {
+          "type": "string",
+          "description": "How the property appears in HubSpot, for example radio, select, date or text."
+        },
+        "groupName": {
+          "type": "string",
+          "description": "Name of the property group the property belongs to."
+        },
+        "label": {
+          "type": "string",
+          "description": "Human-readable property label."
+        },
+        "name": {
+          "type": "string",
+          "description": "Internal property name used through the API, for example lifecyclestage or hs_v2_date_entered_{stage id}."
+        },
+        "options": {
+          "type": "array",
+          "description": "Valid options for enumerated properties; empty for other property types.",
+          "items": {
+            "type": "object",
+            "description": "One option of an enumerated property, such as a contacts.lifecyclestage stage.",
+            "properties": {
+              "hidden": {
+                "type": "boolean",
+                "description": "True when HubSpot hides the option from its UI."
+              },
+              "label": {
+                "type": "string",
+                "description": "Human-readable option label; configured MQL and QL stage labels are matched against it."
+              },
+              "value": {
+                "type": "string",
+                "description": "Internal option value used through the API. Custom lifecycle stages use numeric strings such as \"1406943076\", which are valid suffixes in hs_v2_date_entered_{value}."
+              },
+              "description": {
+                "type": "string",
+                "description": "Option description."
+              },
+              "displayOrder": {
+                "type": "integer",
+                "description": "Display position; -1 places the option after positive values, so no positivity is assumed."
+              }
+            },
+            "required": [
+              "hidden",
+              "label",
+              "value"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "type": {
+          "type": "string",
+          "description": "Property data type, for example enumeration, datetime, date, string, number or bool. Not constrained to an enum, matching the reference."
+        },
+        "archived": {
+          "type": "boolean",
+          "description": "Whether the property is archived."
+        },
+        "archivedAt": {
+          "type": "string",
+          "description": "When the property was archived, as an ISO 8601 wire string."
+        },
+        "calculated": {
+          "type": "boolean",
+          "description": "For default properties, true when a HubSpot process calculates the value."
+        },
+        "calculationFormula": {
+          "type": "string",
+          "description": "Formula that computes a calculated property."
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "When the property was created, as an ISO 8601 wire string."
+        },
+        "createdUserId": {
+          "type": "string",
+          "description": "HubSpot user id of the creator; absent when the property was created outside HubSpot."
+        },
+        "currencyPropertyName": {
+          "type": "string",
+          "description": "Name of the related currency property."
+        },
+        "dataSensitivity": {
+          "type": "string",
+          "description": "Sensitivity level of the property.",
+          "enum": [
+            "highly_sensitive",
+            "non_sensitive",
+            "sensitive"
+          ]
+        },
+        "dateDisplayHint": {
+          "type": "string",
+          "description": "How date values are displayed.",
+          "enum": [
+            "absolute",
+            "absolute_with_relative",
+            "time_since",
+            "time_until"
+          ]
+        },
+        "displayOrder": {
+          "type": "integer",
+          "description": "Display position of the property."
+        },
+        "externalOptions": {
+          "type": "boolean",
+          "description": "For default properties, true when the options are stored outside the property settings."
+        },
+        "formField": {
+          "type": "boolean",
+          "description": "Whether the property can be used in a HubSpot form."
+        },
+        "hasUniqueValue": {
+          "type": "boolean",
+          "description": "Whether the property value must be unique."
+        },
+        "hidden": {
+          "type": "boolean",
+          "description": "Whether the property is hidden from the HubSpot UI."
+        },
+        "hubspotDefined": {
+          "type": "boolean",
+          "description": "True for default properties built into HubSpot."
+        },
+        "modificationMetadata": {
+          "type": "object",
+          "description": "Edit permissions on the property; may be absent.",
+          "properties": {
+            "archivable": {
+              "type": "boolean",
+              "description": "Whether the property can be archived."
+            },
+            "readOnlyDefinition": {
+              "type": "boolean",
+              "description": "Whether the property definition is read-only."
+            },
+            "readOnlyValue": {
+              "type": "boolean",
+              "description": "Whether the property value is read-only."
+            },
+            "readOnlyOptions": {
+              "type": "boolean",
+              "description": "Whether the property options are read-only."
+            }
+          },
+          "required": [
+            "archivable",
+            "readOnlyDefinition",
+            "readOnlyValue"
+          ],
+          "additionalProperties": false
+        },
+        "numberDisplayHint": {
+          "type": "string",
+          "description": "How number values are displayed and validated.",
+          "enum": [
+            "currency",
+            "duration",
+            "formatted",
+            "percentage",
+            "probability",
+            "unformatted"
+          ]
+        },
+        "referencedObjectType": {
+          "type": "string",
+          "description": "Object type the property refers to, when it relates to other objects."
+        },
+        "sensitiveDataCategories": {
+          "type": "array",
+          "description": "Categories of sensitive data the property holds.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "showCurrencySymbol": {
+          "type": "boolean",
+          "description": "Whether the account currency symbol is displayed with the value."
+        },
+        "textDisplayHint": {
+          "type": "string",
+          "description": "How text values are displayed and validated.",
+          "enum": [
+            "domain_name",
+            "email",
+            "ip_address",
+            "multi_line",
+            "phone_number",
+            "physical_address",
+            "postal_code",
+            "unformatted_single_line"
+          ]
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "When the property was last updated, as an ISO 8601 wire string."
+        },
+        "updatedUserId": {
+          "type": "string",
+          "description": "HubSpot user id of the last editor; absent when the property was updated outside HubSpot."
+        }
+      },
+      "required": [
+        "description",
+        "fieldType",
+        "groupName",
+        "label",
+        "name",
+        "options",
+        "type"
+      ],
+      "additionalProperties": false
+    },
+    "documented_sample": {
+      "description": "<string>",
+      "fieldType": "<string>",
+      "groupName": "<string>",
+      "label": "<string>",
+      "name": "<string>",
+      "options": [
+        {
+          "hidden": true,
+          "label": "<string>",
+          "value": "<string>",
+          "description": "<string>",
+          "displayOrder": 123
+        }
+      ],
+      "type": "<string>",
+      "archived": true,
+      "archivedAt": "2023-11-07T05:31:56Z",
+      "calculated": true,
+      "calculationFormula": "<string>",
+      "createdAt": "2023-11-07T05:31:56Z",
+      "createdUserId": "<string>",
+      "currencyPropertyName": "<string>",
+      "dataSensitivity": "highly_sensitive",
+      "dateDisplayHint": "absolute",
+      "displayOrder": 123,
+      "externalOptions": true,
+      "formField": true,
+      "hasUniqueValue": true,
+      "hidden": false,
+      "hubspotDefined": true,
+      "modificationMetadata": {
+        "archivable": true,
+        "readOnlyDefinition": true,
+        "readOnlyValue": true,
+        "readOnlyOptions": true
+      },
+      "numberDisplayHint": "currency",
+      "referencedObjectType": "<string>",
+      "sensitiveDataCategories": [
+        "<string>"
+      ],
+      "showCurrencySymbol": true,
+      "textDisplayHint": "domain_name",
+      "updatedAt": "2023-11-07T05:31:56Z",
+      "updatedUserId": "<string>"
+    }
+  }
+}

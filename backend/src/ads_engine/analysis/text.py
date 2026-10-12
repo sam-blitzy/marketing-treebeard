@@ -1,0 +1,838 @@
+"""Search-term text analysis: tokeniser, token Jaccard similarity and single-linkage clusters.
+
+Google's Keyword Planner (``KeywordPlanIdeaService``) is not reachable through the n8n
+webhook, so every related term the product suggests is derived from the account's own
+search-term report and labelled "from your search-term report". This module holds the pure
+text primitives those rules share:
+
+* K2 expansion candidates list adjacent terms: other window search terms whose token
+  Jaccard similarity with the converting term is at least ``k2.adjacent_jaccard``
+  (:meth:`TermIndex.similar` over an index built once per search-term report, or
+  :func:`adjacent_terms` for a single query).
+* C3b launch ideas group converting search terms by single linkage at ``c3b.jaccard``
+  (:func:`cluster_terms`) and name each cluster by its head tokens, the tokens present in at
+  least ``c3b.head_token_share`` of its members (:func:`head_tokens`), listed in the order
+  the members phrase them (:attr:`TermCluster.label`). The idea is raised only when no head
+  token appears in any keyword text, ad group name or campaign name (:func:`contains_tokens`).
+
+Design constraints:
+
+* Pure and stdlib-only: no I/O, no logging, no third-party packages.
+* Thresholds are parameters. Callers pass the configured ``Decimal`` values from
+  ``Thresholds``; nothing here hard-codes a similarity cut-off or a head-token share.
+* Exact: every "Jaccard >= threshold" and "share >= minimum" test is an exact rational
+  comparison of cross-multiplied integers, so decimal rounding can neither create nor hide
+  an edge or a head token.
+* Deterministic: no result depends on set or dict iteration order, so the same input gives
+  the same output under every ``PYTHONHASHSEED`` and analysis runs stay reproducible.
+
+Example:
+    >>> from decimal import Decimal
+    >>> sorted(tokenize("Best B2B Attribution Software"))
+    ['attribution', 'b2b', 'software']
+    >>> jaccard(frozenset({"crm", "software"}), frozenset({"crm", "tool"}))
+    Decimal('0.3333333333333333333333333333')
+    >>> clusters = cluster_terms(
+    ...     ["crm tool", "crm tool pricing", "tool pricing guide", "project management"],
+    ...     threshold=Decimal("0.5"),
+    ...     min_head_share=Decimal("0.5"),
+    ... )
+    >>> [cluster.members for cluster in clusters]
+    [('crm tool', 'crm tool pricing', 'tool pricing guide'), ('project management',)]
+    >>> clusters[0].label
+    'crm tool pricing'
+    >>> contains_tokens(["Brand", "CRM Tool Ad Group"], clusters[0].head_tokens)
+    True
+"""
+
+import heapq
+import re
+import unicodedata
+from collections import Counter, defaultdict
+from collections.abc import Iterable, Sequence
+from collections.abc import Set as AbstractSet
+from dataclasses import dataclass
+from decimal import ROUND_HALF_EVEN, Context, Decimal
+from typing import Final
+
+__all__ = [
+    "STOPWORDS",
+    "TermCluster",
+    "TermIndex",
+    "adjacent_terms",
+    "cluster_terms",
+    "contains_tokens",
+    "head_tokens",
+    "jaccard",
+    "tokenize",
+]
+
+# A fixed list, never loaded from a corpus or a third-party package, so token sets (and with
+# them every adjacent term, cluster and head token) are reproducible across runs, hosts and
+# library upgrades. Sorted for review. It holds English function words (articles,
+# prepositions, conjunctions, pronouns, auxiliaries), the clitic fragments "s" and "t" that
+# splitting on apostrophes leaves behind ("women's", "don't"), and search-intent modifiers
+# that carry no topic ("best", "near", "me", "vs", "versus").
+#
+# Deliberately absent although common in generic stopword lists, because in B2B search
+# terms they are usually topic words once lowercased: "it" and "its" (IT), "us" (US),
+# "will" (legal wills) and "not" (it inverts meaning).
+STOPWORDS: Final[frozenset[str]] = frozenset(
+    {
+        "a",
+        "about",
+        "an",
+        "and",
+        "any",
+        "are",
+        "as",
+        "at",
+        "be",
+        "best",
+        "but",
+        "by",
+        "can",
+        "do",
+        "does",
+        "for",
+        "from",
+        "has",
+        "have",
+        "how",
+        "i",
+        "if",
+        "in",
+        "into",
+        "is",
+        "me",
+        "my",
+        "near",
+        "of",
+        "on",
+        "or",
+        "our",
+        "s",
+        "should",
+        "so",
+        "t",
+        "than",
+        "that",
+        "the",
+        "their",
+        "them",
+        "then",
+        "there",
+        "these",
+        "they",
+        "this",
+        "those",
+        "to",
+        "versus",
+        "vs",
+        "was",
+        "we",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "why",
+        "with",
+        "you",
+        "your",
+    }
+)
+
+# Runs of characters that are neither letters nor digits. Python's ``\W`` is Unicode-aware,
+# and the underscore (which ``\w`` admits) is added explicitly, so this splits on exactly the
+# non-alphanumeric runs. For ASCII text it is the same split as ``[^0-9a-z]+`` on lowercased
+# input; unlike that pattern it keeps accented letters inside their word ("naïve" stays one
+# token instead of becoming the fragments "na" and "ve", which would create false overlaps).
+_NON_ALPHANUMERIC_RUN: Final = re.compile(r"[\W_]+")
+
+# Jaccard values are reported with the default decimal precision (28 significant digits,
+# banker's rounding) whatever context the caller has active, so evidence is reproducible.
+# Threshold tests never use these rounded values; see ``_meets``.
+_JACCARD_CONTEXT: Final = Context(prec=28, rounding=ROUND_HALF_EVEN)
+
+# An exact rational threshold in (0, 1] as (numerator, denominator), from
+# ``Decimal.as_integer_ratio``.
+type _Ratio = tuple[int, int]
+
+
+def _normalise(text: str) -> str:
+    """Return ``text`` in Unicode compatibility-caseless form (NFKC, casefold, NFKC).
+
+    ``casefold`` can emit characters that are no longer NFKC-normalised, so normalisation is
+    applied on both sides of it: full-width letters, ligatures and composed accents compare
+    equal to their ordinary forms (full-width "crm" and ASCII "crm" are the same token).
+    """
+    return unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", text).casefold())
+
+
+def tokenize(text: str) -> frozenset[str]:
+    """Split a search term, keyword or entity name into its set of comparable tokens.
+
+    The text is Unicode-normalised (NFKC) and casefolded, split on every run of
+    non-alphanumeric characters (spaces, punctuation, underscores, symbols), and stripped of
+    empty fragments and :data:`STOPWORDS`. Digits are kept, so "B2B" is the token "b2b" and
+    "2026" is a token. The result is a set: repeated words count once, which is what token
+    Jaccard similarity compares (AAP K2 and C3b: "lowercased, stopwords removed").
+
+    Args:
+        text: Any text: a search term, keyword text, ad group name or campaign name.
+
+    Returns:
+        The distinct tokens. Empty when the text holds only stopwords or punctuation.
+
+    Example:
+        >>> sorted(tokenize("Best B2B Attribution Software"))
+        ['attribution', 'b2b', 'software']
+        >>> sorted(tokenize("CRM-tool_pricing (2026)!"))
+        ['2026', 'crm', 'pricing', 'tool']
+        >>> tokenize("the and for")
+        frozenset()
+    """
+    return frozenset(
+        token
+        for token in _NON_ALPHANUMERIC_RUN.split(_normalise(text))
+        if token and token not in STOPWORDS
+    )
+
+
+def _ordered_tokens(text: str) -> tuple[str, ...]:
+    """Return the distinct tokens of ``text`` in the order the text first uses them.
+
+    The normalisation, split and :data:`STOPWORDS` are exactly those of :func:`tokenize`, so
+    ``frozenset(_ordered_tokens(text)) == tokenize(text)``; this form also keeps the word
+    order, which :attr:`TermCluster.label` reads. A repeated word keeps its first position.
+    """
+    return tuple(
+        dict.fromkeys(
+            token
+            for token in _NON_ALPHANUMERIC_RUN.split(_normalise(text))
+            if token and token not in STOPWORDS
+        )
+    )
+
+
+def _overlap(a: AbstractSet[str], b: AbstractSet[str]) -> tuple[int, int]:
+    """Return ``(len(a & b), len(a | b))`` without building the union."""
+    intersection = len(a & b)
+    return intersection, len(a) + len(b) - intersection
+
+
+def jaccard(a: AbstractSet[str], b: AbstractSet[str]) -> Decimal:
+    """Return the Jaccard similarity ``len(a & b) / len(a | b)`` of two token sets.
+
+    The value is ``Decimal(len(a & b)) / Decimal(len(a | b))`` at 28 significant digits with
+    banker's rounding, independent of the caller's decimal context. Terminating fractions
+    are exact (``2/4`` is ``Decimal("0.5")``); others are rounded at the 28th digit
+    (``1/3``). Threshold decisions in this module never rely on the rounded value: they
+    compare the exact fraction.
+
+    Args:
+        a: A token set, typically from :func:`tokenize`.
+        b: Another token set.
+
+    Returns:
+        A value in [0, 1]. ``Decimal(0)`` when both sets are empty, because two terms with
+        no tokens share nothing to compare; disjoint sets also give 0, identical non-empty
+        sets give 1.
+
+    Example:
+        >>> jaccard(frozenset({"crm", "tool", "pricing"}), frozenset({"tool", "pricing", "guide"}))
+        Decimal('0.5')
+    """
+    intersection, union = _overlap(a, b)
+    if union == 0:
+        return Decimal(0)
+    return _JACCARD_CONTEXT.divide(Decimal(intersection), Decimal(union))
+
+
+def _ratio(name: str, value: object) -> _Ratio:
+    """Validate a share or similarity threshold and return it as an exact integer ratio.
+
+    Args:
+        name: Parameter name used in the error message.
+        value: The threshold the caller passed, expected to be a finite ``Decimal`` in (0, 1].
+
+    Returns:
+        ``(numerator, denominator)`` with ``numerator / denominator == value`` exactly.
+
+    Raises:
+        TypeError: ``value`` is not a ``Decimal``. Thresholds come from
+            ``Thresholds.ratio()``, which yields ``Decimal``; a float would make the
+            comparison inexact.
+        ValueError: ``value`` is not finite or lies outside (0, 1]. Zero is rejected because
+            every pair of terms, even two with no token in common, has Jaccard >= 0, so the
+            rule would join unrelated terms; a zero head share would make every token a head
+            token.
+    """
+    if not isinstance(value, Decimal):
+        raise TypeError(f"{name} must be a Decimal, got {type(value).__name__}")
+    if not value.is_finite() or value <= 0 or value > 1:
+        raise ValueError(f"{name} must be a finite Decimal in (0, 1], got {value}")
+    return value.as_integer_ratio()
+
+
+def _reject_single_string(name: str, value: object) -> None:
+    """Refuse a bare string where a collection of strings is expected.
+
+    A ``str`` is itself a ``Sequence[str]`` and an ``Iterable[str]`` of its characters, so
+    passing one term where a list of terms belongs would silently compare single letters.
+
+    Raises:
+        TypeError: ``value`` is a ``str``.
+    """
+    if isinstance(value, str):
+        raise TypeError(f"{name} must be a collection of strings, not a single string")
+
+
+def _meets(a: AbstractSet[str], b: AbstractSet[str], threshold: _Ratio) -> bool:
+    """Return whether ``jaccard(a, b) >= threshold``, compared as exact fractions.
+
+    ``len(a & b) / len(a | b) >= p / q`` is evaluated as
+    ``len(a & b) * q >= len(a | b) * p`` on integers. Two empty sets have Jaccard 0, which
+    never meets a threshold above 0.
+    """
+    intersection, union = _overlap(a, b)
+    if union == 0:
+        return False
+    numerator, denominator = threshold
+    return intersection * denominator >= union * numerator
+
+
+def _head_of(token_sets: Sequence[AbstractSet[str]], min_share: _Ratio) -> frozenset[str]:
+    """Return the tokens present in at least ``min_share`` of the given member token sets.
+
+    A token's share is the number of members containing it divided by the number of
+    members, compared exactly: ``count * q >= members * p``. No members, no head tokens.
+    """
+    members = len(token_sets)
+    if members == 0:
+        return frozenset()
+    numerator, denominator = min_share
+    counts = Counter(token for tokens in token_sets for token in tokens)
+    return frozenset(
+        token for token, count in counts.items() if count * denominator >= members * numerator
+    )
+
+
+def head_tokens(members: Sequence[str], *, min_share: Decimal) -> frozenset[str]:
+    """Return the tokens present in at least ``min_share`` of the member terms (C3b).
+
+    Each distinct member string counts once, as in :func:`cluster_terms`, and a token counts
+    once per member however often the member repeats it. The comparison is inclusive: with
+    ``min_share=Decimal("0.5")`` a token in exactly 2 of 4 members is a head token.
+
+    Args:
+        members: The member search terms of one cluster.
+        min_share: The configured head-token share (``c3b.head_token_share``), a ``Decimal``
+            in (0, 1].
+
+    Returns:
+        The head tokens; empty when there are no members or no token reaches the share.
+
+    Raises:
+        TypeError: ``members`` is a single string, or ``min_share`` is not a ``Decimal``.
+        ValueError: ``min_share`` is outside (0, 1].
+
+    Example:
+        >>> from decimal import Decimal
+        >>> sorted(
+        ...     head_tokens(
+        ...         ["crm tool", "crm tool pricing", "tool pricing guide"],
+        ...         min_share=Decimal("0.5"),
+        ...     )
+        ... )
+        ['crm', 'pricing', 'tool']
+    """
+    _reject_single_string("members", members)
+    share = _ratio("min_share", min_share)
+    return _head_of([tokenize(member) for member in set(members)], share)
+
+
+@dataclass(frozen=True, slots=True)
+class TermCluster:
+    """One single-linkage cluster of search terms and the head tokens that name it (C3b).
+
+    Instances are normalised on construction: ``members`` becomes the sorted tuple of
+    distinct member strings and ``head_tokens`` a ``frozenset``, so equal clusters compare
+    and hash equal however they were built.
+
+    Attributes:
+        members: The distinct member terms, sorted alphabetically (code-point order).
+        head_tokens: Tokens present in at least the configured share of the members.
+
+    Example:
+        >>> cluster = TermCluster(("crm tool pricing", "crm tool"), frozenset({"tool", "crm"}))
+        >>> cluster.members
+        ('crm tool', 'crm tool pricing')
+        >>> cluster.label
+        'crm tool'
+        >>> forecasting = TermCluster(
+        ...     (
+        ...         "revenue forecasting tool",
+        ...         "b2b revenue forecasting",
+        ...         "revenue forecasting software",
+        ...     ),
+        ...     frozenset({"forecasting", "revenue"}),
+        ... )
+        >>> forecasting.sorted_head
+        ('forecasting', 'revenue')
+        >>> forecasting.label
+        'revenue forecasting'
+    """
+
+    members: tuple[str, ...]
+    head_tokens: frozenset[str]
+
+    def __post_init__(self) -> None:
+        """Normalise the fields and reject an empty cluster.
+
+        Raises:
+            TypeError: ``members`` is a single string.
+            ValueError: ``members`` is empty; every cluster has at least one term.
+        """
+        _reject_single_string("members", self.members)
+        members = tuple(sorted(set(self.members)))
+        if not members:
+            raise ValueError("a term cluster needs at least one member")
+        object.__setattr__(self, "members", members)
+        object.__setattr__(self, "head_tokens", frozenset(self.head_tokens))
+
+    @property
+    def size(self) -> int:
+        """Number of distinct member terms (C3b compares it with ``c3b.min_terms``)."""
+        return len(self.members)
+
+    @property
+    def sorted_head(self) -> tuple[str, ...]:
+        """Head tokens in alphabetical order, the stable form used in evidence and entity keys.
+
+        Unlike :attr:`label` it ignores word order, so the same head tokens always give the
+        same key however the member terms phrase them.
+        """
+        return tuple(sorted(self.head_tokens))
+
+    @property
+    def label(self) -> str:
+        """Head tokens in the members' word order: "Create ad group or campaign for '{label}'".
+
+        Each member term is read in its own word order, tokenised as :func:`tokenize` does.
+        For every pair of head tokens a member contains, the one it uses first earns a point;
+        a member lacking one of the pair gives neither a point. Head tokens are listed by
+        points, most first, then alphabetically (code-point order) on a tie, so the label
+        follows how the terms are searched ("revenue forecasting", not the alphabetical
+        "forecasting revenue") and depends only on the cluster's fields, never on hash order.
+
+        Empty when the cluster has no head token; C3b never names such a cluster.
+        """
+        if not self.head_tokens:
+            return ""
+        points: Counter[str] = Counter()
+        for member in self.members:
+            used = [token for token in _ordered_tokens(member) if token in self.head_tokens]
+            for position, token in enumerate(used):
+                points[token] += len(used) - 1 - position
+        return " ".join(sorted(self.head_tokens, key=lambda token: (-points[token], token)))
+
+
+class _DisjointSet:
+    """Union-find over ``0 .. count - 1`` with path halving and union by size.
+
+    Only the resulting partition is observable, and it does not depend on the order in which
+    unions are applied, so clustering is deterministic even though candidate pairs are
+    visited in set order.
+    """
+
+    __slots__ = ("_parent", "_size")
+
+    def __init__(self, count: int) -> None:
+        self._parent = list(range(count))
+        self._size = [1] * count
+
+    def find(self, item: int) -> int:
+        """Return the representative of ``item``'s component."""
+        parent = self._parent
+        while parent[item] != item:
+            parent[item] = parent[parent[item]]
+            item = parent[item]
+        return item
+
+    def union(self, a: int, b: int) -> None:
+        """Merge the components of ``a`` and ``b``."""
+        root_a, root_b = self.find(a), self.find(b)
+        if root_a == root_b:
+            return
+        if self._size[root_a] < self._size[root_b]:
+            root_a, root_b = root_b, root_a
+        self._parent[root_b] = root_a
+        self._size[root_a] += self._size[root_b]
+
+
+def _ceil_div(dividend: int, divisor: int) -> int:
+    """Return ``ceil(dividend / divisor)`` for a positive divisor, in exact integer arithmetic."""
+    return -(-dividend // divisor)
+
+
+def _min_overlap(size_a: int, size_b: int, threshold: _Ratio) -> int:
+    """Return the fewest shared tokens two sets of these sizes need to reach ``threshold``.
+
+    ``i / (size_a + size_b - i) >= p / q`` holds exactly when
+    ``i >= p * (size_a + size_b) / (p + q)``, so the minimum overlap is that bound rounded
+    up.
+    """
+    numerator, denominator = threshold
+    return _ceil_div(numerator * (size_a + size_b), numerator + denominator)
+
+
+def _probe_prefix_length(size: int, threshold: _Ratio) -> int:
+    """Return how many of a set's rarest tokens are looked up in the index (prefix filter).
+
+    If ``jaccard(x, y) >= t`` then ``len(x & y) >= t * len(x | y) >= ceil(t * len(x))``.
+    With every set's tokens ordered by one global order, the first token ``x`` and ``y``
+    share therefore lies within the first ``len(x) - ceil(t * len(x)) + 1`` tokens of ``x``
+    (the prefix-filtering principle of set-similarity joins). For ``t`` in (0, 1] and a
+    non-empty set the length lies in [1, len(x)]; an empty set has no prefix and therefore
+    no similar term.
+    """
+    if size == 0:
+        return 0
+    numerator, denominator = threshold
+    return size - _ceil_div(numerator * size, denominator) + 1
+
+
+def _index_prefix_length(size: int, threshold: _Ratio) -> int:
+    """Return how many of a set's rarest tokens are added to the index (indexing prefix).
+
+    Sets are indexed in ascending size order, so a set ``y`` already in the index is never
+    larger than the probing set ``x``. Then ``len(x & y) >= t / (1 + t) * (len(x) + len(y))
+    >= 2t / (1 + t) * len(y)``, so the first shared token lies within the first
+    ``len(y) - ceil(2t / (1 + t) * len(y)) + 1`` tokens of ``y``. This prefix is never
+    longer than the probing prefix, and it keeps tokens common to most terms ("crm" in a CRM
+    account) out of the index for short terms, where they would otherwise pair every term
+    with every other.
+    """
+    if size == 0:
+        return 0
+    return size - _min_overlap(size, size, threshold) + 1
+
+
+def cluster_terms(
+    terms: Sequence[str], *, threshold: Decimal, min_head_share: Decimal
+) -> list[TermCluster]:
+    """Group search terms into single-linkage clusters of token Jaccard similarity (C3b).
+
+    Two terms are linked when ``jaccard(tokenize(a), tokenize(b)) >= threshold`` (inclusive,
+    compared exactly), and the clusters are the connected components of that graph: a term
+    joins a cluster when it is similar enough to any one member, so "crm tool" and
+    "tool pricing guide" share a cluster through "crm tool pricing" although they are not
+    similar to each other. Every term belongs to exactly one cluster; a term similar to no
+    other term forms a singleton cluster, and the caller applies its own minimum size
+    (``c3b.min_terms``). Terms with no tokens (only stopwords or punctuation) are always
+    singletons.
+
+    Identical strings are de-duplicated first. Members are sorted alphabetically, and
+    clusters are ordered by size (largest first), then by first member, so the output is
+    identical for any input order and any hash seed.
+
+    Candidate pairs come from an inverted index over each term's rarest tokens, using the
+    prefix, size-ordered indexing and positional filters of set-similarity joins
+    (``_probe_prefix_length``, ``_index_prefix_length``, ``_min_overlap``), so a token shared
+    by most terms ("crm" in a CRM account) does not force a comparison of every pair. The
+    pruning is exact: it skips only pairs that cannot reach the threshold, and every
+    remaining pair is decided by the exact Jaccard comparison.
+
+    Args:
+        terms: Search terms, typically the window's converting terms.
+        threshold: The configured link threshold (``c3b.jaccard``), a ``Decimal`` in (0, 1].
+        min_head_share: The configured head-token share (``c3b.head_token_share``), a
+            ``Decimal`` in (0, 1], used to compute each cluster's :attr:`TermCluster.head_tokens`
+            as :func:`head_tokens` would.
+
+    Returns:
+        Every cluster, singletons included, largest first.
+
+    Raises:
+        TypeError: ``terms`` is a single string, or a threshold is not a ``Decimal``.
+        ValueError: A threshold is outside (0, 1].
+    """
+    _reject_single_string("terms", terms)
+    link = _ratio("threshold", threshold)
+    share = _ratio("min_head_share", min_head_share)
+
+    unique_terms = sorted(set(terms))
+    token_sets = [tokenize(term) for term in unique_terms]
+    frequency = Counter(token for tokens in token_sets for token in tokens)
+
+    def rarest_first(token: str) -> tuple[int, str]:
+        return frequency[token], token
+
+    forest = _DisjointSet(len(unique_terms))
+    # token -> [(term index, position of the token in that term's rarest-first order)]
+    postings: defaultdict[str, list[tuple[int, int]]] = defaultdict(list)
+    by_size = sorted(range(len(unique_terms)), key=lambda i: (len(token_sets[i]), unique_terms[i]))
+    for index in by_size:
+        tokens = token_sets[index]
+        size = len(tokens)
+        ordered = sorted(tokens, key=rarest_first)
+        compared: set[int] = set()
+        for position, token in enumerate(ordered[: _probe_prefix_length(size, link)]):
+            for other, other_position in postings[token]:
+                if other in compared:
+                    continue
+                # The first sighting of ``other`` is at the first token the two terms share,
+                # so every shared token sits at or after these positions in both orders
+                # (positional filter): the overlap is at most what remains of the shorter tail.
+                compared.add(other)
+                other_size = len(token_sets[other])
+                overlap_bound = min(size - position, other_size - other_position)
+                if overlap_bound < _min_overlap(size, other_size, link):
+                    continue
+                if forest.find(other) != forest.find(index) and _meets(
+                    tokens, token_sets[other], link
+                ):
+                    forest.union(other, index)
+        for position, token in enumerate(ordered[: _index_prefix_length(size, link)]):
+            postings[token].append((index, position))
+
+    components: defaultdict[int, list[int]] = defaultdict(list)
+    for index in range(len(unique_terms)):
+        components[forest.find(index)].append(index)
+
+    clusters = [
+        TermCluster(
+            members=tuple(unique_terms[index] for index in indices),
+            head_tokens=_head_of([token_sets[index] for index in indices], share),
+        )
+        for indices in components.values()
+    ]
+    clusters.sort(key=lambda cluster: (-cluster.size, cluster.members[0]))
+    return clusters
+
+
+def contains_tokens(texts: Iterable[str], tokens: AbstractSet[str]) -> bool:
+    """Return whether any of ``tokens`` appears among the tokens of any of ``texts`` (C3b).
+
+    C3b raises a launch idea only when a cluster's head tokens "appear in no keyword text,
+    ad group name or campaign name". The test is therefore *any token in any text*: a single
+    head token found in a single name means the account already covers the theme, and the
+    cluster is not a launch idea. C3b fires only when this function returns ``False``.
+
+    Texts are tokenised with :func:`tokenize`, so matching is by whole token, caseless and
+    stopword-free: "CRM Tool Ad Group" contains "crm" and "tool" but not "too". The given
+    tokens are normalised the same way, so a head token compares equal however it is cased.
+
+    Args:
+        texts: Keyword texts, ad group names and campaign names to search.
+        tokens: The tokens to look for, typically :attr:`TermCluster.head_tokens`.
+
+    Returns:
+        ``True`` when at least one token occurs in at least one text. ``False`` for an empty
+        token set: there is nothing to find. A caller that needs a named theme must also
+        require non-empty head tokens.
+
+    Raises:
+        TypeError: ``texts`` is a single string.
+
+    Example:
+        >>> contains_tokens(["Brand", "CRM Tool Ad Group"], frozenset({"crm", "tool"}))
+        True
+        >>> contains_tokens(["Brand", "Competitors"], frozenset({"pricing", "guide"}))
+        False
+    """
+    _reject_single_string("texts", texts)
+    _reject_single_string("tokens", tokens)
+    needles = frozenset(
+        normalised
+        for token in tokens
+        for normalised in _NON_ALPHANUMERIC_RUN.split(_normalise(token))
+        if normalised
+    )
+    if not needles:
+        return False
+    return any(not needles.isdisjoint(tokenize(text)) for text in texts)
+
+
+def _term_key(term: str) -> str:
+    return " ".join(_normalise(term).split())
+
+
+class TermIndex:
+    """An inverted token index over search terms, built once and queried per term (K2).
+
+    K2 asks one question of an account's search-term report for every expansion candidate:
+    which other terms reach token Jaccard ``k2.adjacent_jaccard`` with it. The index answers
+    each query without reading the whole report again. On construction every distinct term is
+    tokenised once (:func:`tokenize`), its caseless, whitespace-normalised spelling is
+    recorded once, and every token maps to the ascending positions of the terms containing
+    it; a query then compares only terms that share a token with the queried term
+    (:meth:`similar`).
+
+    Terms keep the order they are given in, and a repeated string is indexed once, at its
+    first occurrence. An index never changes after construction, and no answer depends on set
+    or dict iteration order, so the same terms always give the same answers.
+
+    Args:
+        terms: The terms to index, in the order queries return them. K2 passes its eligible
+            terms ranked by conversions, then clicks, then term.
+
+    Raises:
+        TypeError: ``terms`` is a single string, or one of its items is not a string.
+
+    Example:
+        >>> from decimal import Decimal
+        >>> index = TermIndex(["crm tool", "CRM Tool Pricing", "tool pricing guide", "crm tool"])
+        >>> index.terms
+        ('crm tool', 'CRM Tool Pricing', 'tool pricing guide')
+        >>> index.similar("crm tool pricing", threshold=Decimal("0.5"))
+        ['crm tool', 'tool pricing guide']
+        >>> index.similar("crm tool pricing", threshold=Decimal("0.5"), limit=1)
+        ['crm tool']
+    """
+
+    __slots__ = ("_keys", "_positions", "_postings", "_terms", "_tokens")
+
+    def __init__(self, terms: Sequence[str]) -> None:
+        """Index ``terms`` (see the class docstring for the arguments and errors)."""
+        _reject_single_string("terms", terms)
+        distinct: dict[str, None] = {}
+        for term in terms:
+            if not isinstance(term, str):
+                raise TypeError(f"terms must hold only strings, found {type(term).__name__}")
+            distinct.setdefault(term, None)
+        self._terms: tuple[str, ...] = tuple(distinct)
+        self._tokens: tuple[frozenset[str], ...] = tuple(tokenize(term) for term in self._terms)
+        self._keys: tuple[str, ...] = tuple(_term_key(term) for term in self._terms)
+        self._positions: dict[str, int] = {term: index for index, term in enumerate(self._terms)}
+        postings: dict[str, list[int]] = {}
+        for position, tokens in enumerate(self._tokens):
+            for token in tokens:
+                postings.setdefault(token, []).append(position)
+        self._postings: dict[str, tuple[int, ...]] = {
+            token: tuple(positions) for token, positions in postings.items()
+        }
+
+    @property
+    def terms(self) -> tuple[str, ...]:
+        """The distinct indexed terms, in first-occurrence order (the order of every answer)."""
+        return self._terms
+
+    def similar(self, term: str, *, threshold: Decimal, limit: int | None = None) -> list[str]:
+        """Return the indexed terms whose token Jaccard with ``term`` meets ``threshold``.
+
+        An indexed term matches when ``jaccard(tokenize(term), tokenize(other)) >= threshold``,
+        inclusive and compared exactly as cross-multiplied integers. ``term`` itself never
+        matches, also when an indexed term spells it with different case or spacing
+        ("CRM  Tool" is "crm tool"), and a term without tokens matches nothing. ``term`` need
+        not be indexed; when it is, its stored tokens are reused.
+
+        Matches come in index order, and the search stops at the ``limit``-th match, so with a
+        ranked index the first ``limit`` matches are the best ranked. Only terms sharing one of
+        the queried term's ``len(x) - ceil(threshold * len(x)) + 1`` rarest tokens (fewest
+        indexed terms first, then code-point order) are compared. This pruning is exact: a term
+        ``y`` with Jaccard at least ``threshold`` shares at least ``ceil(threshold * len(x))``
+        tokens with the queried token set ``x``, because ``len(x | y) >= len(x)``, so it
+        cannot miss every one of those rarest tokens; every remaining term is decided by the
+        exact comparison.
+
+        Args:
+            term: The queried search term, typically a converting term.
+            threshold: The configured similarity (``k2.adjacent_jaccard``), a ``Decimal`` in
+                (0, 1].
+            limit: The most matches to return; ``None`` returns every match and ``0`` none.
+
+        Returns:
+            The matching indexed terms in index order; empty when ``term`` has no tokens.
+
+        Raises:
+            TypeError: ``threshold`` is not a ``Decimal``, ``limit`` is neither ``None`` nor an
+                ``int`` (a ``bool`` is refused), or ``term`` is not a string.
+            ValueError: ``threshold`` is outside (0, 1], or ``limit`` is negative.
+        """
+        link = _ratio("threshold", threshold)
+        if limit is not None:
+            if isinstance(limit, bool) or not isinstance(limit, int):
+                raise TypeError(f"limit must be an int or None, got {type(limit).__name__}")
+            if limit < 0:
+                raise ValueError(f"limit must be at least 0, got {limit}")
+        if not isinstance(term, str):
+            raise TypeError(f"term must be a string, got {type(term).__name__}")
+        position = self._positions.get(term)
+        if position is None:
+            own_tokens, own_key = tokenize(term), _term_key(term)
+        else:
+            own_tokens, own_key = self._tokens[position], self._keys[position]
+        if not own_tokens or limit == 0:
+            return []
+        postings = self._postings
+
+        def rarest_first(token: str) -> tuple[int, str]:
+            return len(postings.get(token, ())), token
+
+        prefix = _probe_prefix_length(len(own_tokens), link)
+        probes = sorted(own_tokens, key=rarest_first)[:prefix]
+        matches: list[str] = []
+        previous = -1
+        # Each posting list ascends, so the merge visits candidates in index order; a term
+        # sharing several probed tokens comes out once per token, consecutively.
+        for candidate in heapq.merge(*(postings[token] for token in probes if token in postings)):
+            if candidate == previous:
+                continue
+            previous = candidate
+            if self._keys[candidate] != own_key and _meets(
+                own_tokens, self._tokens[candidate], link
+            ):
+                matches.append(self._terms[candidate])
+                if limit is not None and len(matches) >= limit:
+                    break
+        return matches
+
+
+def adjacent_terms(term: str, candidates: Sequence[str], *, threshold: Decimal) -> list[str]:
+    """Return the candidates whose token Jaccard similarity with ``term`` meets ``threshold``.
+
+    K2 suggests adjacent terms for an expansion candidate from the account's own search-term
+    report: other window search terms with token Jaccard at least ``k2.adjacent_jaccard``
+    (inclusive, compared exactly). The term itself is excluded, also when a candidate spells
+    it with different case or spacing ("CRM  Tool" is "crm tool"). Repeated candidate
+    strings are returned once.
+
+    The result keeps the candidates' input order and is otherwise unranked and uncapped. The
+    caller (K2) drops terms that are already keywords, excluded terms and terms below the
+    click minimum, orders by conversions then clicks, and keeps at most
+    ``k2.adjacent_max_terms``.
+
+    This is one query of a :class:`TermIndex` built over ``candidates``; a caller with many
+    terms to query against the same candidates builds the index once and queries it instead.
+
+    Args:
+        term: The converting search term.
+        candidates: The window's search terms.
+        threshold: The configured similarity (``k2.adjacent_jaccard``), a ``Decimal`` in
+            (0, 1].
+
+    Returns:
+        Matching candidates in first-occurrence order; empty when ``term`` has no tokens.
+
+    Raises:
+        TypeError: ``candidates`` is a single string or holds an item that is not a string
+            (checked only when ``term`` has tokens), or ``threshold`` is not a ``Decimal``.
+        ValueError: ``threshold`` is outside (0, 1].
+
+    Example:
+        >>> from decimal import Decimal
+        >>> adjacent_terms(
+        ...     "crm tool pricing",
+        ...     ["crm tool", "CRM Tool Pricing", "tool pricing guide", "project management"],
+        ...     threshold=Decimal("0.5"),
+        ... )
+        ['crm tool', 'tool pricing guide']
+    """
+    _reject_single_string("candidates", candidates)
+    _ratio("threshold", threshold)
+    if not tokenize(term):
+        return []
+    return TermIndex(candidates).similar(term, threshold=threshold)

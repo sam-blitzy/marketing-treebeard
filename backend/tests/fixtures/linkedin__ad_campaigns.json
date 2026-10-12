@@ -1,0 +1,208 @@
+{
+  "request": {
+    "body": null,
+    "headers": {
+      "Authorization": "Bearer <redacted>",
+      "Linkedin-Version": "202609",
+      "X-Restli-Protocol-Version": "2.0.0"
+    },
+    "method": "GET",
+    "query": [
+      [
+        "q",
+        "search"
+      ],
+      [
+        "search",
+        "(status:(values:List(ACTIVE,PAUSED,ARCHIVED,COMPLETED,CANCELED,DRAFT,PENDING_DELETION,REMOVED)))"
+      ],
+      [
+        "pageSize",
+        "100"
+      ]
+    ],
+    "url": "https://api.linkedin.com/rest/adAccounts/990000001/adCampaigns"
+  },
+  "response": {
+    "body": {
+      "elements": [
+        {
+          "account": "urn:li:sponsoredAccount:990000001",
+          "campaignGroup": "urn:li:sponsoredCampaignGroup:990020000",
+          "changeAuditStamps": {
+            "created": {
+              "time": 1772793600000
+            },
+            "lastModified": {
+              "time": 1772793600000
+            }
+          },
+          "dailyBudget": {
+            "amount": "250.00",
+            "currencyCode": "USD"
+          },
+          "id": 990010000,
+          "name": "Pipeline Report - Lead gen (NA)",
+          "objectiveType": "LEAD_GENERATION",
+          "runSchedule": {
+            "start": 1772793600000
+          },
+          "status": "ACTIVE",
+          "test": false,
+          "type": "SPONSORED_UPDATES",
+          "version": {
+            "versionTag": "1"
+          }
+        },
+        {
+          "account": "urn:li:sponsoredAccount:990000001",
+          "campaignGroup": "urn:li:sponsoredCampaignGroup:990020000",
+          "changeAuditStamps": {
+            "created": {
+              "time": 1772793660000
+            },
+            "lastModified": {
+              "time": 1772793660000
+            }
+          },
+          "dailyBudget": {
+            "amount": "220.00",
+            "currencyCode": "USD"
+          },
+          "id": 990010001,
+          "name": "Benchmarks - Lead gen (NA)",
+          "objectiveType": "LEAD_GENERATION",
+          "runSchedule": {
+            "start": 1772793660000
+          },
+          "status": "ACTIVE",
+          "test": false,
+          "type": "SPONSORED_UPDATES",
+          "version": {
+            "versionTag": "1"
+          }
+        },
+        {
+          "account": "urn:li:sponsoredAccount:990000001",
+          "campaignGroup": "urn:li:sponsoredCampaignGroup:990020000",
+          "changeAuditStamps": {
+            "created": {
+              "time": 1772793720000
+            },
+            "lastModified": {
+              "time": 1772793720000
+            }
+          },
+          "dailyBudget": {
+            "amount": "150.00",
+            "currencyCode": "USD"
+          },
+          "id": 990010002,
+          "name": "Attribution Playbook - Lead gen",
+          "objectiveType": "LEAD_GENERATION",
+          "runSchedule": {
+            "start": 1772793720000
+          },
+          "status": "ACTIVE",
+          "test": false,
+          "type": "SPONSORED_UPDATES",
+          "version": {
+            "versionTag": "1"
+          }
+        },
+        {
+          "account": "urn:li:sponsoredAccount:990000001",
+          "campaignGroup": "urn:li:sponsoredCampaignGroup:990020000",
+          "changeAuditStamps": {
+            "created": {
+              "time": 1772793780000
+            },
+            "lastModified": {
+              "time": 1772793780000
+            }
+          },
+          "dailyBudget": {
+            "amount": "90.00",
+            "currencyCode": "USD"
+          },
+          "id": 990010003,
+          "name": "Attribution Playbook - Website visits",
+          "objectiveType": "WEBSITE_CONVERSION",
+          "runSchedule": {
+            "start": 1772793780000
+          },
+          "status": "ACTIVE",
+          "test": false,
+          "type": "SPONSORED_UPDATES",
+          "version": {
+            "versionTag": "1"
+          }
+        },
+        {
+          "account": "urn:li:sponsoredAccount:990000001",
+          "campaignGroup": "urn:li:sponsoredCampaignGroup:990020001",
+          "changeAuditStamps": {
+            "created": {
+              "time": 1772793840000
+            },
+            "lastModified": {
+              "time": 1772793840000
+            }
+          },
+          "id": 990010004,
+          "name": "Webinar series - Q2",
+          "objectiveType": "LEAD_GENERATION",
+          "runSchedule": {
+            "start": 1772793840000
+          },
+          "status": "COMPLETED",
+          "test": false,
+          "totalBudget": {
+            "amount": "6000.00",
+            "currencyCode": "USD"
+          },
+          "type": "SPONSORED_UPDATES",
+          "version": {
+            "versionTag": "1"
+          }
+        },
+        {
+          "account": "urn:li:sponsoredAccount:990000001",
+          "campaignGroup": "urn:li:sponsoredCampaignGroup:990020002",
+          "changeAuditStamps": {
+            "created": {
+              "time": 1772793900000
+            },
+            "lastModified": {
+              "time": 1772793900000
+            }
+          },
+          "dailyBudget": {
+            "amount": "50.00",
+            "currencyCode": "USD"
+          },
+          "id": 990010005,
+          "name": "Brand awareness - 2025",
+          "objectiveType": "BRAND_AWARENESS",
+          "runSchedule": {
+            "start": 1772793900000
+          },
+          "status": "ARCHIVED",
+          "test": false,
+          "type": "SPONSORED_UPDATES",
+          "version": {
+            "versionTag": "1"
+          }
+        }
+      ],
+      "metadata": {
+        "nextPageToken": null
+      }
+    },
+    "status": 200
+  },
+  "scenario": "default",
+  "seed": 42,
+  "source": "linkedin",
+  "surface": "linkedin.ad_campaigns"
+}

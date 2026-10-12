@@ -1,0 +1,78 @@
+/* Shared a11y utilities for the product wrappers. GAP: bind to Blitzy OS on source arrival (see ../GAPS.md). */
+
+/*
+ * Wrappers import this file next to their own stylesheet. It holds only these utilities:
+ * - .ds-visually-hidden: content that assistive technology reads, or that keyboard focus can
+ *   land on, but the screen does not show. Used by Spinner (the label inside role="status"), Card
+ *   (the "Rank " prefix before the rank number), DataTable (the "Details" header of the expand
+ *   column, and the row name that completes each toggle's accessible name), DateRangePicker
+ *   (two role="status" regions: the one that announces a failed Apply's summary and the
+ *   picker-level one that announces the caller's status message), Dialog (the empty leading and
+ *   trailing focus sentinels around the panel) and PageShell (the skip link, together with the
+ *   modifier below).
+ * - .ds-visually-hidden--focusable: combined with .ds-visually-hidden, the element stays hidden
+ *   until it receives focus, then appears in flow. Used by the PageShell skip link "Skip to main
+ *   content" (WCAG 2.2 SC 2.4.1 Bypass Blocks).
+ *
+ * The content is clipped, never taken out of the accessibility tree: display: none or
+ * visibility: hidden would also hide it from assistive technology, so neither is used here.
+ */
+
+.ds-visually-hidden {
+  position: absolute;
+  /* a11y utility: 1px is the standard visually-hidden size, not a design value */
+  inline-size: 1px;
+  block-size: 1px;
+  padding: 0;
+  /* margin stays 0, not the common negative one-pixel offset: spacing carries only tokens or 0 */
+  margin: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/*
+ * Revealed on focus. Both pseudo-classes are listed so the link also appears when focus arrives
+ * programmatically or in a browser that treats it as non-visible focus. No outline is set, so
+ * the base :focus-visible ring from ../tokens.css still marks the focused link.
+ *
+ * It is revealed in flow, never laid over its neighbours: a box laid over the PageShell top bar
+ * is sized by its own text, not by the product name beneath it, so at some font, zoom, wrap or
+ * writing direction part of the name would show beside it. In flow it takes a line of its own
+ * above the top bar and moves the page down while it holds focus; that follows the keypress
+ * that moved focus, so it is not an unexpected layout shift.
+ * - position: relative keeps z-index in effect, so the ring and shadow paint over the top bar's
+ *   <header>, which is positioned too and comes later in the document.
+ * - fit-content keeps the link as wide as its text, so the PageShell frame's flex column does not
+ *   stretch it across the page, and still lets the text wrap on a narrow viewport.
+ * - The inline margin of --space-4 matches the top bar's inline padding, so the link starts on
+ *   the product name's inline-start edge; the block margin of --space-2 keeps the ring clear of
+ *   the viewport edge and of the top bar.
+ *
+ * Once shown, the link can also be tapped, so it gets the same target as Button: at least 44 by
+ * 44 CSS px (WCAG 2.2 SC 2.5.5), through minimum block and inline sizes of --space-8 + --space-3
+ * (2.75rem at the 16px root), with its text centred on the cross axis.
+ */
+.ds-visually-hidden--focusable:focus,
+.ds-visually-hidden--focusable:focus-visible {
+  position: relative;
+  display: flex;
+  align-items: center;
+  inline-size: fit-content;
+  block-size: auto;
+  min-block-size: calc(var(--space-8) + var(--space-3));
+  min-inline-size: calc(var(--space-8) + var(--space-3));
+  margin: var(--space-2) var(--space-4);
+  padding: var(--space-2) var(--space-3);
+  overflow: visible;
+  clip-path: none;
+  white-space: normal;
+  /* The hairline border width is a quarter of --space-1; its colour comes from the border token */
+  border: calc(var(--space-1) / 4) solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  color: var(--color-text);
+  box-shadow: var(--shadow-2);
+  z-index: var(--z-banner);
+}

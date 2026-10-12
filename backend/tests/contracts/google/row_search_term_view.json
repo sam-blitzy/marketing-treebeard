@@ -1,0 +1,203 @@
+{
+  "surface": "google.row_search_term_view",
+  "source": "google",
+  "reference_url": "https://developers.google.com/google-ads/api/fields/v25/search_term_view",
+  "api_version": "v25",
+  "last_modified": "2026-09-30",
+  "request": {
+    "method": "POST",
+    "url": "{N8N_GOOGLE_ADS_WEBHOOK_URL}",
+    "required_headers": [],
+    "required_query": [],
+    "optional_query": [],
+    "fields": null,
+    "body": null,
+    "gaql": {
+      "query_id": "Q-G6",
+      "resource": "search_term_view",
+      "select": [
+        "search_term_view.search_term",
+        "search_term_view.status",
+        "segments.keyword.ad_group_criterion",
+        "segments.keyword.info.text",
+        "segments.keyword.info.match_type",
+        "ad_group.id",
+        "campaign.id",
+        "segments.date",
+        "metrics.cost_micros",
+        "metrics.clicks",
+        "metrics.impressions",
+        "metrics.conversions",
+        "metrics.conversions_value"
+      ]
+    },
+    "limits": {}
+  },
+  "response": {
+    "status": [
+      200
+    ],
+    "body": {
+      "type": "object",
+      "description": "One REST GoogleAdsRow of Q-G6 (search_term_view, daily; AAP 0.3.3), arriving as an element of results[] in the google.search response (search.json), which governs the n8n request and response envelope. No status filter: the query is bounded only by segments.date BETWEEN the fetch range, so EXCLUDED and ADDED_EXCLUDED terms arrive too and K1 and K2 skip them. camelCase keys; INT64 values (ids, costMicros, clicks, impressions) arrive as JSON strings and DOUBLE values (conversions, conversionsValue) as JSON numbers. resourceName is returned for the FROM resource and for each attributed resource with a selected field (adGroup, campaign). The attributed resources ad_group and campaign do not segment metrics; segments.date and segments.keyword do. The view excludes Performance Max data (campaign_search_term_view is out of scope). Coverage: Google withholds low-volume search terms for privacy, so search-term totals fall below keyword totals; the Keywords section reports search-term coverage = search-term spend / keyword spend and flags items when coverage is below keywords.min_search_term_coverage in config/thresholds.yaml (default 0.80, that is 80%; AAP 0.5.4.3). Partitioning: date, then campaign.id ranges, then ad_group.id ranges; search-term rows have no unique sortable id, so a single (day, ad group) partition that still returns 10,000 rows is stored as returned and marked incomplete in dataset_freshness (google.search_terms) with the reason \"result limit reached at finest partition\" (AAP 0.3.3). Feeds K1 (negative candidates), K2 (expansion) and C3b (keyword clusters). Parsed by PARSERS[\"row_search_term_view\"] into SearchTermRow (fact_search_term_daily).",
+      "properties": {
+        "searchTermView": {
+          "type": "object",
+          "description": "search_term_view fields: the FROM resource of Q-G6.",
+          "properties": {
+            "resourceName": {
+              "type": "string",
+              "description": "Output only. Form customers/{customer_id}/searchTermViews/{campaign_id}~{ad_group_id}~{URL-base64_search_term} (v25 field reference). Always returned for the FROM resource."
+            },
+            "searchTerm": {
+              "type": "string",
+              "description": "search_term_view.search_term: the search term. Stored as fact_search_term_daily.search_term; the K1 and K2 term and the C3b clustering input."
+            },
+            "status": {
+              "type": "string",
+              "description": "search_term_view.status (SearchTermTargetingStatus): whether the term is currently one of the targeted or excluded keywords. Stored as fact_search_term_daily.term_status. K1 considers NONE and ADDED and skips EXCLUDED and ADDED_EXCLUDED; for an ADDED term K1 names the matched criterion from segments.keyword.adGroupCriterion. K2 requires NONE. UNKNOWN and UNSPECIFIED are wire values no rule acts on.",
+              "enum": [
+                "ADDED",
+                "ADDED_EXCLUDED",
+                "EXCLUDED",
+                "NONE",
+                "UNKNOWN",
+                "UNSPECIFIED"
+              ]
+            }
+          },
+          "required": [
+            "resourceName",
+            "searchTerm",
+            "status"
+          ],
+          "additionalProperties": false
+        },
+        "segments": {
+          "type": "object",
+          "description": "Segments selected by Q-G6. segments.date and segments.keyword segment the metrics.",
+          "properties": {
+            "date": {
+              "type": "string",
+              "description": "segments.date, YYYY-MM-DD: the native day in the customer account's time zone (customer.time_zone), stored as returned and never rebucketed (AAP 0.5.4.1)."
+            },
+            "keyword": {
+              "type": "object",
+              "description": "segments.keyword: the keyword criterion the search term matched. Optional: when absent, the row matched no keyword criterion and carries no matched criterion, keyword text or match type. The v25 field reference does not document when it is absent, so neither it nor its keys are required.",
+              "properties": {
+                "adGroupCriterion": {
+                  "type": "string",
+                  "description": "segments.keyword.ad_group_criterion: the AdGroupCriterion resource name customers/{customer_id}/adGroupCriteria/{ad_group_id}~{criterion_id}. The parser derives matched_criterion_id from the part after '~'; K1 names it for an ADDED term, because an exact negative also blocks that keyword's exact-match traffic."
+                },
+                "info": {
+                  "type": "object",
+                  "description": "segments.keyword.info: the matched keyword's text and match type, both required when info is present.",
+                  "properties": {
+                    "text": {
+                      "type": "string",
+                      "description": "segments.keyword.info.text: the keyword text (at most 80 characters and 10 words). Stored as matched_keyword_text."
+                    },
+                    "matchType": {
+                      "type": "string",
+                      "description": "segments.keyword.info.match_type (KeywordMatchType). Stored as matched_match_type.",
+                      "enum": [
+                        "BROAD",
+                        "EXACT",
+                        "PHRASE",
+                        "UNKNOWN",
+                        "UNSPECIFIED"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "text",
+                    "matchType"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "date"
+          ],
+          "additionalProperties": false
+        },
+        "adGroup": {
+          "type": "object",
+          "description": "Attributed resource ad_group; it does not segment metrics.",
+          "properties": {
+            "resourceName": {
+              "type": "string",
+              "description": "customers/{customer_id}/adGroups/{ad_group_id}; returned because ad_group.id is selected."
+            },
+            "id": {
+              "type": "string",
+              "description": "ad_group.id, INT64 as a decimal JSON string (REST encodes int64 as strings). The last partitioning level: a single (day, ad group) is the finest Q-G6 partition."
+            }
+          },
+          "required": [
+            "resourceName",
+            "id"
+          ],
+          "additionalProperties": false
+        },
+        "campaign": {
+          "type": "object",
+          "description": "Attributed resource campaign; it does not segment metrics.",
+          "properties": {
+            "resourceName": {
+              "type": "string",
+              "description": "customers/{customer_id}/campaigns/{campaign_id}; returned because campaign.id is selected."
+            },
+            "id": {
+              "type": "string",
+              "description": "campaign.id, INT64 as a decimal JSON string (REST encodes int64 as strings). Split by numeric campaign.id ranges, not lists of known ids, so spend by a campaign removed during the window is still covered."
+            }
+          },
+          "required": [
+            "resourceName",
+            "id"
+          ],
+          "additionalProperties": false
+        },
+        "metrics": {
+          "type": "object",
+          "description": "Metrics selected by Q-G6, per search term, ad group and day. REST omits zero or unset values, so metrics and every metric key are optional; the parser reads an absent additive metric as 0.",
+          "properties": {
+            "costMicros": {
+              "type": "string",
+              "description": "metrics.cost_micros, INT64 as a decimal JSON string (REST encodes int64 as strings). Micros of the account currency, divided by 1,000,000 at parse time; K1's wasted spend."
+            },
+            "clicks": {
+              "type": "string",
+              "description": "metrics.clicks, INT64 as a decimal JSON string (REST encodes int64 as strings). Compared with K1's minimum clicks n*."
+            },
+            "impressions": {
+              "type": "string",
+              "description": "metrics.impressions, INT64 as a decimal JSON string (REST encodes int64 as strings)."
+            },
+            "conversions": {
+              "type": "number",
+              "description": "metrics.conversions, DOUBLE, never assumed integral: data-driven attribution yields fractions and MANY_PER_CLICK actions allow several per click. Includes only conversion actions with include_in_conversions_metric = true. Any value > 0, including a fraction such as 0.3, counts as converting for K1, which requires exactly 0 in the window. Google returns at most six decimal places (observed live 2026-10-07); a value finer than six places cannot be stored exactly in numeric(18,6) and is a parse defect."
+            },
+            "conversionsValue": {
+              "type": "number",
+              "description": "metrics.conversions_value, DOUBLE: the value of the included conversions. Google returns at most six decimal places (observed live 2026-10-07); a value finer than six places cannot be stored exactly in numeric(18,6) and is a parse defect."
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "searchTermView",
+        "segments",
+        "adGroup",
+        "campaign"
+      ],
+      "additionalProperties": false
+    },
+    "documented_sample": null
+  }
+}

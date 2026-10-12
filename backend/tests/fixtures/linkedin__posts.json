@@ -1,0 +1,186 @@
+{
+  "request": {
+    "body": null,
+    "headers": {
+      "Authorization": "Bearer <redacted>",
+      "Linkedin-Version": "202609",
+      "X-RestLi-Method": "BATCH_GET",
+      "X-Restli-Protocol-Version": "2.0.0"
+    },
+    "method": "GET",
+    "query": [
+      [
+        "ids",
+        "List(urn%3Ali%3Ashare%3A990030000,urn%3Ali%3Ashare%3A990030001,urn%3Ali%3Ashare%3A990030002,urn%3Ali%3Ashare%3A990030003,urn%3Ali%3Ashare%3A990030004,urn%3Ali%3Ashare%3A990030005,urn%3Ali%3Ashare%3A990030007,urn%3Ali%3Ashare%3A990030008,urn%3Ali%3Ashare%3A990030006)"
+      ]
+    ],
+    "url": "https://api.linkedin.com/rest/posts"
+  },
+  "response": {
+    "body": {
+      "errors": {},
+      "results": {
+        "urn:li:share:990030000": {
+          "author": "urn:li:organization:990000001",
+          "commentary": "Get the 2026 B2B Pipeline Report: benchmarks from 1,200 revenue teams.",
+          "content": {
+            "media": {
+              "id": "urn:li:document:990030000",
+              "title": "73% of B2B pipeline starts before the first sales call"
+            }
+          },
+          "createdAt": 1772799600000,
+          "id": "urn:li:share:990030000",
+          "lastModifiedAt": 1772799600000,
+          "lifecycleState": "PUBLISHED",
+          "publishedAt": 1772799600000,
+          "visibility": "PUBLIC"
+        },
+        "urn:li:share:990030001": {
+          "author": "urn:li:organization:990000001",
+          "commentary": "Get the 2026 B2B Pipeline Report: benchmarks from 1,200 revenue teams.",
+          "content": {
+            "media": {
+              "id": "urn:li:document:990030001",
+              "title": "Where does your pipeline really come from?"
+            }
+          },
+          "createdAt": 1772799660000,
+          "id": "urn:li:share:990030001",
+          "lastModifiedAt": 1772799660000,
+          "lifecycleState": "PUBLISHED",
+          "publishedAt": 1772799660000,
+          "visibility": "PUBLIC"
+        },
+        "urn:li:share:990030002": {
+          "author": "urn:li:organization:990000001",
+          "commentary": "Paid Media Benchmarks 2026: CPL, CTR and CPC by channel and industry.",
+          "content": {
+            "media": {
+              "id": "urn:li:document:990030002",
+              "title": "What does a good cost per lead look like in 2026?"
+            }
+          },
+          "createdAt": 1772799720000,
+          "id": "urn:li:share:990030002",
+          "lastModifiedAt": 1772799720000,
+          "lifecycleState": "PUBLISHED",
+          "publishedAt": 1772799720000,
+          "visibility": "PUBLIC"
+        },
+        "urn:li:share:990030003": {
+          "author": "urn:li:organization:990000001",
+          "commentary": "Paid Media Benchmarks 2026: CPL, CTR and CPC by channel and industry.",
+          "content": {
+            "media": {
+              "id": "urn:li:document:990030003",
+              "title": "Your CTR versus 4,000 B2B advertisers"
+            }
+          },
+          "createdAt": 1772799780000,
+          "id": "urn:li:share:990030003",
+          "lastModifiedAt": 1772799780000,
+          "lifecycleState": "PUBLISHED",
+          "publishedAt": 1772799780000,
+          "visibility": "PUBLIC"
+        },
+        "urn:li:share:990030004": {
+          "author": "urn:li:organization:990000001",
+          "commentary": "A practical guide to multi-touch attribution for B2B marketers.",
+          "content": {
+            "media": {
+              "id": "urn:li:document:990030004",
+              "title": "The Attribution Playbook"
+            }
+          },
+          "createdAt": 1772799840000,
+          "id": "urn:li:share:990030004",
+          "lastModifiedAt": 1772799840000,
+          "lifecycleState": "PUBLISHED",
+          "publishedAt": 1772799840000,
+          "visibility": "PUBLIC"
+        },
+        "urn:li:share:990030005": {
+          "author": "urn:li:organization:990000001",
+          "commentary": "A practical guide to multi-touch attribution for B2B marketers.",
+          "content": {
+            "media": {
+              "id": "urn:li:document:990030005",
+              "title": "Stop guessing which channel works"
+            }
+          },
+          "createdAt": 1772799900000,
+          "id": "urn:li:share:990030005",
+          "lastModifiedAt": 1772799900000,
+          "lifecycleState": "PUBLISHED",
+          "publishedAt": 1772799900000,
+          "visibility": "PUBLIC"
+        },
+        "urn:li:share:990030006": {
+          "author": "urn:li:organization:990000001",
+          "commentary": "The full playbook, free on our site.",
+          "content": {
+            "article": {
+              "source": "https://www.sim.invalid/attribution-playbook",
+              "title": "Read the Attribution Playbook online"
+            }
+          },
+          "createdAt": 1772799960000,
+          "id": "urn:li:share:990030006",
+          "lastModifiedAt": 1772799960000,
+          "lifecycleState": "PUBLISHED",
+          "publishedAt": 1772799960000,
+          "visibility": "PUBLIC"
+        },
+        "urn:li:share:990030007": {
+          "author": "urn:li:organization:990000001",
+          "commentary": "Join our Q2 webinar series.",
+          "content": {
+            "media": {
+              "id": "urn:li:document:990030007",
+              "title": "Live: attribution that sales trusts"
+            }
+          },
+          "createdAt": 1772800020000,
+          "id": "urn:li:share:990030007",
+          "lastModifiedAt": 1772800020000,
+          "lifecycleState": "PUBLISHED",
+          "publishedAt": 1772800020000,
+          "visibility": "PUBLIC"
+        },
+        "urn:li:share:990030008": {
+          "author": "urn:li:organization:990000001",
+          "commentary": "See how revenue teams prove pipeline.",
+          "content": {
+            "article": {
+              "source": "https://www.sim.invalid/",
+              "title": "Meet the attribution platform for revenue teams"
+            }
+          },
+          "createdAt": 1772800080000,
+          "id": "urn:li:share:990030008",
+          "lastModifiedAt": 1772800080000,
+          "lifecycleState": "PUBLISHED",
+          "publishedAt": 1772800080000,
+          "visibility": "PUBLIC"
+        }
+      },
+      "statuses": {
+        "urn:li:share:990030000": 200,
+        "urn:li:share:990030001": 200,
+        "urn:li:share:990030002": 200,
+        "urn:li:share:990030003": 200,
+        "urn:li:share:990030004": 200,
+        "urn:li:share:990030005": 200,
+        "urn:li:share:990030006": 200,
+        "urn:li:share:990030007": 200,
+        "urn:li:share:990030008": 200
+      }
+    },
+    "status": 200
+  },
+  "scenario": "default",
+  "seed": 42,
+  "source": "linkedin",
+  "surface": "linkedin.posts"
+}

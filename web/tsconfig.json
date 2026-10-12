@@ -1,0 +1,52 @@
+{
+  // TypeScript 6.0 configuration for the whole web package: the SPA in src/, the unit and
+  // end-to-end tests in tests/ and src/**/*.test.tsx, and the two tool config files.
+  // `npm run typecheck` (tsc --noEmit) reads this file, and CI runs that script.
+  //
+  // One file by design: no tsconfig.app.json, tsconfig.node.json or project references.
+  // Every option the build depends on is stated, including options equal to a TypeScript 6.0
+  // default, so a moved default cannot change the build silently. No deprecated option is used,
+  // so ignoreDeprecations is not set.
+  "compilerOptions": {
+    // Language and runtime. TypeScript 6.0 merges DOM.Iterable into DOM, so it is not listed.
+    "target": "ES2023",
+    "lib": ["ES2023", "DOM"],
+    "useDefineForClassFields": true,
+
+    // Bundler mode: Vite and Vitest resolve modules; tsc only type-checks. Imports are relative
+    // (for example ../design-system), so baseUrl and paths are not set and tsc, Vite and Vitest
+    // resolve identically without an alias plugin.
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "moduleDetection": "force",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    // TypeScript 6.0 defaults `types` to [], so every ambient package is listed explicitly.
+    // vite/client: import.meta.env and *.css / *.module.css modules (needed for side-effect
+    //   imports such as './design-system/tokens.css' under noUncheckedSideEffectImports).
+    // vitest/globals: describe, it and expect, because vite.config.ts sets test.globals.
+    // node: process.env in vite.config.ts and playwright.config.ts; eslint.config.js forbids
+    //   process inside src/.
+    "types": ["vite/client", "vitest/globals", "node"],
+
+    // Strictness.
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noUncheckedSideEffectImports": true,
+
+    // Hygiene.
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  // eslint.config.js is plain ESM JavaScript and is not type-checked, so allowJs stays off.
+  "include": ["src", "tests", "vite.config.ts", "playwright.config.ts"],
+  "exclude": ["node_modules", "dist", "coverage", "playwright-report", "test-results"]
+}

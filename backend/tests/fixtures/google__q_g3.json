@@ -1,0 +1,171 @@
+{
+  "request": {
+    "body": {
+      "customer_id": "9900000001",
+      "page_token": null,
+      "query": "SELECT campaign.id, segments.date, metrics.cost_micros, metrics.impressions, metrics.clicks, metrics.conversions, metrics.conversions_value, metrics.search_budget_lost_impression_share, metrics.search_impression_share FROM campaign WHERE segments.date BETWEEN '2026-10-01' AND '2026-10-01'"
+    },
+    "headers": {
+      "Content-Type": "application/json",
+      "X-Webhook-Secret": "<redacted>"
+    },
+    "method": "POST",
+    "query": [],
+    "url": "https://n8n.sim.invalid/webhook/google-ads"
+  },
+  "response": {
+    "body": {
+      "fieldMask": "campaign.id,segments.date,metrics.costMicros,metrics.impressions,metrics.clicks,metrics.conversions,metrics.conversionsValue,metrics.searchBudgetLostImpressionShare,metrics.searchImpressionShare",
+      "queryResourceConsumption": "1",
+      "results": [
+        {
+          "campaign": {
+            "id": "990000000000",
+            "resourceName": "customers/9900000001/campaigns/990000000000"
+          },
+          "metrics": {
+            "clicks": "163",
+            "conversions": 17.0,
+            "conversionsValue": 1571.01,
+            "costMicros": "195620000",
+            "impressions": "1943",
+            "searchBudgetLostImpressionShare": 0.2426,
+            "searchImpressionShare": 0.5425
+          },
+          "segments": {
+            "date": "2026-10-01"
+          }
+        },
+        {
+          "campaign": {
+            "id": "990000000001",
+            "resourceName": "customers/9900000001/campaigns/990000000001"
+          },
+          "metrics": {
+            "clicks": "60",
+            "conversions": 5.0,
+            "conversionsValue": 477.31,
+            "costMicros": "250240000",
+            "impressions": "1359",
+            "searchBudgetLostImpressionShare": 0.0382,
+            "searchImpressionShare": 0.7507
+          },
+          "segments": {
+            "date": "2026-10-01"
+          }
+        },
+        {
+          "campaign": {
+            "id": "990000000002",
+            "resourceName": "customers/9900000001/campaigns/990000000002"
+          },
+          "metrics": {
+            "clicks": "42",
+            "conversions": 0.0,
+            "conversionsValue": 0.0,
+            "costMicros": "108170000",
+            "impressions": "1375",
+            "searchBudgetLostImpressionShare": 0.0105,
+            "searchImpressionShare": 0.9164
+          },
+          "segments": {
+            "date": "2026-10-01"
+          }
+        },
+        {
+          "campaign": {
+            "id": "990000000003",
+            "resourceName": "customers/9900000001/campaigns/990000000003"
+          },
+          "metrics": {
+            "clicks": "75",
+            "conversions": 0.0,
+            "conversionsValue": 0.0,
+            "costMicros": "117850000",
+            "impressions": "2489",
+            "searchBudgetLostImpressionShare": 0.2378,
+            "searchImpressionShare": 0.5467
+          },
+          "segments": {
+            "date": "2026-10-01"
+          }
+        },
+        {
+          "campaign": {
+            "id": "990000000004",
+            "resourceName": "customers/9900000001/campaigns/990000000004"
+          },
+          "metrics": {
+            "clicks": "129",
+            "conversions": 2.0,
+            "conversionsValue": 206.47,
+            "costMicros": "121050000",
+            "impressions": "32370"
+          },
+          "segments": {
+            "date": "2026-10-01"
+          }
+        },
+        {
+          "campaign": {
+            "id": "990000000005",
+            "resourceName": "customers/9900000001/campaigns/990000000005"
+          },
+          "metrics": {
+            "clicks": "60",
+            "conversions": 4.0,
+            "conversionsValue": 407.42,
+            "costMicros": "123210000",
+            "impressions": "1992",
+            "searchBudgetLostImpressionShare": 0.0184,
+            "searchImpressionShare": 0.913
+          },
+          "segments": {
+            "date": "2026-10-01"
+          }
+        },
+        {
+          "campaign": {
+            "id": "990000000006",
+            "resourceName": "customers/9900000001/campaigns/990000000006"
+          },
+          "metrics": {
+            "clicks": "40",
+            "conversions": 2.0,
+            "conversionsValue": 216.03,
+            "costMicros": "90920000",
+            "impressions": "1596",
+            "searchBudgetLostImpressionShare": 0.0073,
+            "searchImpressionShare": 0.9022
+          },
+          "segments": {
+            "date": "2026-10-01"
+          }
+        },
+        {
+          "campaign": {
+            "id": "990000000007",
+            "resourceName": "customers/9900000001/campaigns/990000000007"
+          },
+          "metrics": {
+            "clicks": "28",
+            "conversions": 1.0,
+            "conversionsValue": 100.84,
+            "costMicros": "40300000",
+            "impressions": "931",
+            "searchBudgetLostImpressionShare": 0.0221,
+            "searchImpressionShare": 0.7749
+          },
+          "segments": {
+            "date": "2026-10-01"
+          }
+        }
+      ]
+    },
+    "status": 200
+  },
+  "scenario": "default",
+  "seed": 42,
+  "source": "google",
+  "surface": "google.search"
+}

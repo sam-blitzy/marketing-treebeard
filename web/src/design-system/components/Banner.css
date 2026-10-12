@@ -1,0 +1,157 @@
+/* Banner: product wrapper. GAP: bind to Blitzy OS on source arrival (see ../GAPS.md). */
+
+/*
+ * Global message banner: open discrepancies, tracking findings, simulated sources, stale or
+ * incomplete datasets, the short window and the custom-window notice. Class contract with
+ * Banner.tsx, which renders:
+ *
+ *   <div class="ds-banner ds-banner--{tone}" [role="alert"]>
+ *     <p class="ds-banner__title">…</p>
+ *     <div class="ds-banner__content">…</div>   only when children are given
+ *     <div class="ds-banner__actions">…</div>   only when actions are given
+ *   </div>
+ *
+ * {tone} is one of TONES in ../tokens.ts: neutral, info, warning, critical or success.
+ *
+ * Tone colours appear only as the thick inline-start border and the title text, both on
+ * --color-surface. A tone colour never fills the banner behind text, so every pairing is a
+ * ratio that ../tokens.css already checks: each tone colour and --color-text are at least
+ * 4.5:1 on the surface. The title text names the condition, so colour is never the only cue.
+ *
+ * Banners sit in normal document flow and are never sticky, so no z-index is set here;
+ * --z-banner applies only to an element that overlays content.
+ *
+ * Every colour, spacing, typography, radius and border-width value is a token from
+ * ../tokens.css or 0 (web/.stylelintrc.json), so binding Blitzy OS values touches tokens.css
+ * alone. The class names are a contract with Banner.tsx; keep them exactly as written.
+ */
+
+/*
+ * Base: a surface panel that stacks title, content and actions with a token gap. The border
+ * shorthand comes first so that border-inline-start-width, and each tone's
+ * border-inline-start-color below, override only the start edge.
+ *
+ * Border widths are derived from the spacing scale instead of the usual literal px borders, so
+ * that every value resolves to a design token, the same as the hairline in shared.css and the
+ * focus ring in ../tokens.css:
+ * - the hairline is a quarter of --space-1 (1px at the 16px placeholder root);
+ * - the tone edge is --space-1 itself (4px at that root).
+ * Rebinding --space-1 therefore rebinds both widths; do not replace them with px literals.
+ *
+ * min-inline-size: 0 lets the banner shrink inside a flex or grid parent instead of widening
+ * it, and overflow-wrap breaks long unbroken text such as dataset names or ids inside the
+ * panel rather than letting it overflow (defensive text handling).
+ */
+.ds-banner {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-inline-size: 0;
+  padding: var(--space-3) var(--space-4);
+  background: var(--color-surface);
+  color: var(--color-text);
+  border: calc(var(--space-1) / 4) solid var(--color-border);
+  border-inline-start-width: var(--space-1);
+  border-radius: var(--radius-md);
+  overflow-wrap: break-word;
+}
+
+/*
+ * Tones. Each modifier shares the base class's specificity and follows it in source order, so
+ * its border-inline-start-color wins over the colour the border shorthand set. The title
+ * selector is more specific than .ds-banner__title, so the tone colour always reaches it.
+ * Neutral restates the base colours, so an explicit tone="neutral" maps to a real class.
+ */
+.ds-banner--neutral {
+  border-inline-start-color: var(--color-border);
+}
+
+.ds-banner--neutral .ds-banner__title {
+  color: var(--color-text);
+}
+
+.ds-banner--info {
+  border-inline-start-color: var(--color-info);
+}
+
+.ds-banner--info .ds-banner__title {
+  color: var(--color-info);
+}
+
+.ds-banner--warning {
+  border-inline-start-color: var(--color-warning);
+}
+
+.ds-banner--warning .ds-banner__title {
+  color: var(--color-warning);
+}
+
+.ds-banner--critical {
+  border-inline-start-color: var(--color-critical);
+}
+
+.ds-banner--critical .ds-banner__title {
+  color: var(--color-critical);
+}
+
+.ds-banner--success {
+  border-inline-start-color: var(--color-success);
+}
+
+.ds-banner--success .ds-banner__title {
+  color: var(--color-success);
+}
+
+/*
+ * Title: a paragraph, not a heading, so banners never disturb the page heading outline. The
+ * user-agent paragraph margin is cleared because the base gap alone spaces the parts.
+ */
+.ds-banner__title {
+  margin: 0;
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-semibold);
+}
+
+/*
+ * Content: the supporting message, one step smaller than the title. Feature code may pass
+ * paragraphs or lists; their outer user-agent margins are cleared at the edges so the base gap
+ * stays the only space between the title, the content and the actions.
+ */
+.ds-banner__content {
+  font-size: var(--font-size-sm);
+}
+
+.ds-banner__content > :first-child {
+  margin-block-start: 0;
+}
+
+.ds-banner__content > :last-child {
+  margin-block-end: 0;
+}
+
+/*
+ * Actions: buttons and links in a wrapping row with a token gap. Centring on the cross axis
+ * lines up a text link, such as "Back to default", with the buttons beside it.
+ */
+.ds-banner__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/*
+ * A link placed directly in the actions slot, such as "Review discrepancies" or "Back to
+ * default", stands alone rather than inside a sentence, so it gets the same target as Button:
+ * at least 44 by 44 CSS px (WCAG 2.2 SC 2.5.5), through minimum block and inline sizes of
+ * --space-8 + --space-3 (2.75rem at the 16px root), with its text centred on the cross axis.
+ * 44px is the touch target minimum that applies when no design source specifies a smaller
+ * target; the Blitzy OS source is unavailable, so none does. Only the box grows: the link stays
+ * a native link with the global link colour, underline and focus ring from ../tokens.css.
+ */
+.ds-banner__actions > a {
+  display: inline-flex;
+  align-items: center;
+  min-block-size: calc(var(--space-8) + var(--space-3));
+  min-inline-size: calc(var(--space-8) + var(--space-3));
+}

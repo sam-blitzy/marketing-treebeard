@@ -1,0 +1,214 @@
+{
+  "surface": "linkedin.ad_analytics_statistics",
+  "source": "linkedin",
+  "reference_url": "https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads-reporting/ads-reporting?view=li-lms-2026-09",
+  "api_version": "202609",
+  "last_modified": "2026-06-24",
+  "request": {
+    "method": "GET",
+    "url": "adAnalytics?q=statistics&pivots=List(CAMPAIGN,{member_pivot})&timeGranularity=ALL&dateRange=(start:(year:{y},month:{m},day:{d}),end:(year:{y},month:{m},day:{d}))&accounts=List({acct})&fields={fields}",
+    "required_headers": [
+      "Authorization",
+      "Linkedin-Version",
+      "X-Restli-Protocol-Version"
+    ],
+    "required_query": [
+      "q",
+      "pivots",
+      "timeGranularity",
+      "dateRange",
+      "accounts",
+      "fields"
+    ],
+    "optional_query": [],
+    "fields": "pivotValues,costInLocalCurrency,impressions,clicks,oneClickLeads,externalWebsiteConversions",
+    "body": null,
+    "gaql": null,
+    "limits": {
+      "max_fields": 20,
+      "max_elements": 15000,
+      "max_pivots": 3,
+      "demographic_top_values": 100,
+      "demographic_min_events": 3,
+      "demographic_retention_years": 2
+    }
+  },
+  "response": {
+    "status": [
+      200
+    ],
+    "body": {
+      "type": "object",
+      "description": "Statistics Finder (`q=statistics`) response for one LinkedIn demographic-segment request: one ad account, the CAMPAIGN pivot plus one professional-demographic pivot, one preset window, `timeGranularity=ALL` (AAP 0.3.3). One request is made per pivot and per preset in `window.presets` (default 14, 28, 56 and 90 days), and every preset ends on the default window end, the earlier of yesterday in the Google account's time zone and yesterday UTC (AAP 0.3.2). Sources: the Ads Reporting page (https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads-reporting/ads-reporting?view=li-lms-2026-09; served moniker li-lms-2026-09, ms.date 2026-06-19, updated_at 2026-06-24) for the finder, the sample response and the restrictions; the Reporting schema page (https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads-reporting/ads-reporting-schema?view=li-lms-2026-09; served moniker li-lms-2026-09, ms.date 2026-09-14, updated_at 2026-09-16) for the query parameters, the pivot enums and the metric types. URL template: `{member_pivot}` is one of MEMBER_JOB_FUNCTION, MEMBER_SENIORITY or MEMBER_INDUSTRY and must match `parser.SEGMENT_PIVOTS`; `{fields}` must equal `request.fields` exactly, which is the AAP 0.3.3 projection and equals `client.SEGMENT_FIELDS`, sent raw because LinkedIn rejects an encoded projection with 400 \"Projected field ... not present in schema\"; `{acct}` is the URL-encoded `urn%3Ali%3AsponsoredAccount%3A{id}`; Rest.li parentheses, colons and commas stay literal. `dateRange.start`, `timeGranularity` and at least one facet are required; `pivotValues` is a response field requested through `fields`, never a filter. Daily boundaries are UTC. PLAN RISK, flagged rather than silently changed, and confirmed live on 2026-10-07: the request is declared as AAP 0.3.3 specifies, but the schema page lists the Statistics Finder `pivots` enum as COMPANY, ACCOUNT, SHARE, CAMPAIGN, CREATIVE, CAMPAIGN_GROUP, CONVERSION, CONVERSATION_NODE, CONVERSATION_NODE_OPTION_INDEX, SERVING_LOCATION, OBJECTIVE_TYPE, CARD_INDEX, PLACEMENT_NAME, IMPRESSION_DEVICE_TYPE and EVENT_STAGE, with no MEMBER_* value. Professional-demographic pivots (MEMBER_COMPANY_SIZE, MEMBER_INDUSTRY, MEMBER_SENIORITY, MEMBER_JOB_TITLE, MEMBER_JOB_FUNCTION, MEMBER_COUNTRY_V2, MEMBER_REGION_V2, MEMBER_COMPANY, MEMBER_DESIGNATED_MARKET_AREA) are documented only for the Analytics Finder `pivot`. A one-off live request in this exact form against version 202609 returned HTTP 400, inputErrors code FIELD_INVALID at `pivots_1/value`: '\"MEMBER_SENIORITY\" is not an enum symbol'. A 400 is a defect (AAP 0.3.3: the job fails, with no retry and no mock), so this form alone would fail every live segment fetch and with it every live LinkedIn dataset build. The connector therefore sends this contracted request first and, on its HTTP 400, logs `linkedin.segments.statistics_finder_rejected` and switches, for the rest of the client's life, to the documented fallback below. After that 400, a `QueryDefect` the fallback raises propagates (chained to the original 400 on the call that switched, unchained on later calls) and fails the live segment fetch; a live LinkedIn dataset build that includes that fetch then fails, LinkedIn stays on its simulated dataset, and C3a is withheld with `segment_window_unavailable`. Other fallback errors keep their normal classification: an HTTP 403 is `AccessDenied`, and a transient error leaves the segment listing incomplete. The simulator answers the contracted form. Documented fallback: `adAnalytics?q=analytics&pivot={MEMBER_*}&timeGranularity=ALL&dateRange=(...)&campaigns=List({one campaign URN})&fields={fields}`, one request per delivering campaign, pivot and preset. The Analytics Finder form was verified live (HTTP 200, each `pivotValues` a single `urn:li:seniority:{id}` entry) with the accounts facet; the campaigns facet is documented for that finder. In the fallback `pivotValues` holds only the demographic value URN and the campaign comes from the request. The fallback's two request forms have contracts of their own: the per-account discovery call `adAnalytics?q=analytics&pivot=CAMPAIGN&timeGranularity=ALL&dateRange=(...)&accounts=List({acct})&fields=pivotValues,impressions` (`ad_analytics_campaign_delivery.json`), cached per account and window and leaving out campaigns with zero impressions, and the per-campaign request above (`ad_analytics_member_segments.json`). `payloads.identify_surface` routes each form to its own contract by finder, pivot and granularity, so neither is validated against this one, and the parser takes the fallback's campaign from the request. This schema accepts both the one-value and two-value `pivotValues` forms. Demographic restrictions (reporting page): only the top 100 values per creative per day are returned for a professional-demographic pivot; no values are returned for ads receiving engagement from too few members; values with fewer than 3 events are dropped; demographic pivots do not support carousel metrics; the metrics are approximate to protect member privacy (LinkedIn help answer 61000), so daily values and narrower windows do not sum to a window's value, which is why segments are fetched per exact window into `fact_segment_window` and never summed from daily rows (AAP 0.3.2); `conversionValueInLocalCurrency`, `cardImpressions`, `cardClicks`, `viralCardImpressions`, `viralCardClicks` and `approximateMemberReach` are available only with non-MEMBER_ pivots, and any metric the pivot does not return is stored as unavailable (AAP 0.3.3); demographic metrics are delayed 12 to 24 hours; demographic data is retained 2 years (performance data 10 years). With `timeGranularity=ALL`, a range whose start or end falls outside the 6-month daily retention is rounded to month boundaries; the preset windows end yesterday and are at most 90 days by default, so they stay inside it. Limits (reporting page): up to 3 pivots per Statistics Finder request; up to 20 fields; at most 15,000 elements per response; the endpoint does not paginate, and the client follows a rel=next link only when one is returned, until the first non-empty page that adds no `pivotValues` not already read for the request, which ends the chain complete (live 202609 ignores `start` with `timeGranularity=ALL` and repeats the same page behind every rel=next link, observed on 2026-10-10; see `paging`); an empty `elements` means no activity to report or no read access; throttled at 45 million metric values per 5 minutes. Use by C3a (AAP 0.5.4.4): segment rows serve a run only when its window exactly equals a fetched segment window, with the same start and end dates; otherwise C3a is withheld with `segment_window_unavailable` and never reuses another window's segments (AAP 0.3.2).",
+      "properties": {
+        "elements": {
+          "type": "array",
+          "description": "Report data points; at most 15,000 per response. A response at the cap that ends its chain, with no rel=next link or as a page repeating only `pivotValues` already read, may be truncated and is recorded incomplete.",
+          "items": {
+            "type": "object",
+            "description": "One segment data point: one campaign and one demographic value over the whole requested window (`timeGranularity=ALL`), written to `fact_segment_window` keyed by the exact window. Only `pivotValues` is required. Every metric is optional: a metric the pivot does not return, or that LinkedIn withholds, is absent, never zero, and is stored as unavailable (AAP 0.3.3).",
+            "properties": {
+              "pivotValues": {
+                "type": "array",
+                "description": "Values of the requested pivots for this data point (string[]). For this request: [campaign URN `urn:li:sponsoredCampaign:{id}`, demographic value URN such as `urn:li:function:{id}` (MEMBER_JOB_FUNCTION), `urn:li:seniority:{id}` (MEMBER_SENIORITY) or `urn:li:industry:{id}` (MEMBER_INDUSTRY)]. The parser finds the campaign by its `urn:li:sponsoredCampaign:` prefix and does not rely on order. The documented single-pivot sample carries one value, and the documented Analytics Finder fallback carries only the demographic URN. Prefixes from the Targeting Criteria Facet URNs reference (https://learn.microsoft.com/en-us/linkedin/shared/references/v2/ads/targeting-criteria-facet-urns: urn:li:function:22, urn:li:seniority:7, urn:li:industry:9); the seniority prefix was also observed live on 2026-10-07.",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "costInLocalCurrency": {
+                "type": "string",
+                "description": "BigDecimal as a decimal string, in the account currency; parsed to numeric(18,6) into `fact_segment_window.cost`. Live 202609 responses carry up to 17 decimal places of float residue (for example \"19.918330000000001\"), so the parser rounds a value with more than 6 decimal places half-even to 6 places; a value that rounds to 10^12 or more is a defect. The schema page notes that cost is not adjusted for over-delivery with a member demographic pivot."
+              },
+              "impressions": {
+                "type": "integer",
+                "description": "long. Feeds `fact_segment_window.impressions`, the numerator of the segment's impression share of its campaign (C3a)."
+              },
+              "clicks": {
+                "type": "integer",
+                "description": "long. Feeds `fact_segment_window.clicks`."
+              },
+              "oneClickLeads": {
+                "type": "integer",
+                "description": "long. Feeds `fact_segment_window.leads`; absent means unavailable (leads null), never zero, and C3a does not fire on a segment without a lead metric (AAP 0.5.4.4)."
+              },
+              "externalWebsiteConversions": {
+                "type": "integer",
+                "description": "long, documented default \"0\"; it arrives as an integer. The outcome for campaigns whose objective is not LEAD_GENERATION (AAP 0.5.4.1); absent means unavailable."
+              },
+              "dateRange": {
+                "type": "object",
+                "description": "Not in this request's projection, so absent from live responses; declared because the documented sample carries it. UTC calendar days, start and end inclusive. The schema page marks start required and end optional.",
+                "properties": {
+                  "start": {
+                    "type": "object",
+                    "description": "Calendar date; year, month (1-12) and day (1-31) as integers.",
+                    "properties": {
+                      "year": {
+                        "type": "integer"
+                      },
+                      "month": {
+                        "type": "integer"
+                      },
+                      "day": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "year",
+                      "month",
+                      "day"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "end": {
+                    "type": "object",
+                    "description": "Calendar date; year, month (1-12) and day (1-31) as integers.",
+                    "properties": {
+                      "year": {
+                        "type": "integer"
+                      },
+                      "month": {
+                        "type": "integer"
+                      },
+                      "day": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "year",
+                      "month",
+                      "day"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "start"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "pivotValues"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "paging": {
+          "type": "object",
+          "description": "Optional. The documented sample carries {count, links, start} with an empty `links`, and the live Analytics Finder fallback response (2026-10-07) carried a rel=next link and no `total`. The reporting page states that adAnalytics does not support pagination; only a rel=next link in `links` is ever acted on. Live 202609 ignores `start` with `timeGranularity=ALL` (observed on 2026-10-10 on the Analytics Finder fallback's per-campaign MEMBER_SENIORITY request, ad_analytics_member_segments.json): every page (start 0, 10, 20, ...) repeated the same elements, carried `count` 10, `start` echoing the request and a rel=next link to start+count, and had no `total`, so following every link never ended. The client applies the same rule to this request: it ends a rel=next chain at the first non-empty page that adds no `pivotValues` not already read for the request and counts the chain complete without re-adding that page's elements; such a repeat page at the 15,000 cap still counts as possibly truncated, and an empty page never ends a chain. The simulator reproduces this paging on the three timeGranularity=ALL surfaces when a world sets `LinkedInSpec.analytics_repeat_pages` (scenario `linkedin.repeat_pages.case`).",
+          "properties": {
+            "count": {
+              "type": "integer"
+            },
+            "start": {
+              "type": "integer"
+            },
+            "links": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "rel": {
+                    "type": "string"
+                  },
+                  "href": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "rel",
+                  "href"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "total": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "count",
+            "start"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "elements"
+      ],
+      "additionalProperties": false
+    },
+    "documented_sample": {
+      "elements": [
+        {
+          "clicks": 177,
+          "impressions": 54494,
+          "dateRange": {
+            "end": {
+              "day": 23,
+              "month": 5,
+              "year": 2025
+            },
+            "start": {
+              "day": 1,
+              "month": 1,
+              "year": 2024
+            }
+          },
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:1234567"
+          ]
+        }
+      ],
+      "paging": {
+        "count": 10,
+        "links": [],
+        "start": 0
+      }
+    }
+  }
+}

@@ -1,0 +1,177 @@
+/*
+ * Semantic design tokens for the Blitzy OS indirection layer.
+ *
+ * The Blitzy OS source (package, design frames or token files) is unavailable, so every value
+ * below is a neutral placeholder, not a Blitzy OS value. When the source arrives, replace the
+ * values in this file only. The token names are the stable contract for feature code: they are
+ * mirrored one-to-one, in this order, by TOKEN_NAMES in tokens.ts, and must not be renamed.
+ * If Blitzy OS uses other names, map them here (a token's value becomes var() of the Blitzy OS
+ * name) rather than renaming anything in feature code. See GAPS.md for the full gap inventory
+ * and the binding procedure.
+ *
+ * This file holds every placeholder token value, and it is the stylesheet web/.stylelintrc.json
+ * exempts from the token-only value rules. The few structural, reset, accessibility, motion and
+ * breakpoint literals in component CSS that GAPS.md lists are the documented exceptions to
+ * keeping design values here. main.tsx imports it once, before any component renders. Feature
+ * code reads tokens through var() in component CSS and never imports this file.
+ *
+ * Placeholder colours meet WCAG 2.2 AA: every text and tone colour is at least 4.5:1 on both
+ * the surface and the page background, surface text on the accent is at least 4.5:1, and the
+ * border and the focus accent are at least 3:1 on both backgrounds. Re-check these ratios
+ * whenever a colour value changes.
+ */
+
+:root {
+  /* Colour */
+  --color-bg: #f5f6f8; /* GAP: placeholder, not Blitzy OS */
+  --color-surface: #ffffff; /* GAP: placeholder, not Blitzy OS */
+  --color-border: #767d89; /* GAP: placeholder, not Blitzy OS */
+  --color-text: #1a1d23; /* GAP: placeholder, not Blitzy OS */
+  --color-text-muted: #4a5361; /* GAP: placeholder, not Blitzy OS */
+  --color-accent: #1d5bbf; /* GAP: placeholder, not Blitzy OS */
+  --color-info: #1b5e9e; /* GAP: placeholder, not Blitzy OS */
+  --color-warning: #8a4b00; /* GAP: placeholder, not Blitzy OS */
+  --color-critical: #b42318; /* GAP: placeholder, not Blitzy OS */
+  --color-success: #1f6f3a; /* GAP: placeholder, not Blitzy OS */
+
+  /* Spacing: 4 px steps at a 16 px root, in rem so spacing scales with text resizing */
+  --space-1: 0.25rem; /* GAP: placeholder, not Blitzy OS */
+  --space-2: 0.5rem; /* GAP: placeholder, not Blitzy OS */
+  --space-3: 0.75rem; /* GAP: placeholder, not Blitzy OS */
+  --space-4: 1rem; /* GAP: placeholder, not Blitzy OS */
+  --space-5: 1.25rem; /* GAP: placeholder, not Blitzy OS */
+  --space-6: 1.5rem; /* GAP: placeholder, not Blitzy OS */
+  --space-7: 1.75rem; /* GAP: placeholder, not Blitzy OS */
+  --space-8: 2rem; /* GAP: placeholder, not Blitzy OS */
+
+  /* Typography: system font stacks only, because the CSP allows no external font source; the monospace family sets code identifiers */
+  --font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; /* GAP: placeholder, not Blitzy OS */
+  --font-family-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; /* GAP: placeholder, not Blitzy OS */
+  --font-size-xs: 0.75rem; /* GAP: placeholder, not Blitzy OS */
+  --font-size-sm: 0.875rem; /* GAP: placeholder, not Blitzy OS */
+  --font-size-md: 1rem; /* GAP: placeholder, not Blitzy OS */
+  --font-size-lg: 1.25rem; /* GAP: placeholder, not Blitzy OS */
+  --font-size-xl: 1.5rem; /* GAP: placeholder, not Blitzy OS */
+  --font-weight-regular: 400; /* GAP: placeholder, not Blitzy OS */
+  --font-weight-semibold: 600; /* GAP: placeholder, not Blitzy OS */
+  --line-height-tight: 1.25; /* GAP: placeholder, not Blitzy OS */
+  --line-height-normal: 1.5; /* GAP: placeholder, not Blitzy OS */
+
+  /* Radius */
+  --radius-sm: 0.25rem; /* GAP: placeholder, not Blitzy OS */
+  --radius-md: 0.5rem; /* GAP: placeholder, not Blitzy OS */
+
+  /* Shadow */
+  --shadow-1: 0 1px 2px rgb(16 24 40 / 0.08); /* GAP: placeholder, not Blitzy OS */
+  --shadow-2: 0 4px 12px rgb(16 24 40 / 0.16); /* GAP: placeholder, not Blitzy OS */
+
+  /* Z-index: tooltips sit above dialogs, because a tooltip can open inside a dialog */
+  --z-banner: 10; /* GAP: placeholder, not Blitzy OS */
+  --z-dialog: 100; /* GAP: placeholder, not Blitzy OS */
+  --z-tooltip: 200; /* GAP: placeholder, not Blitzy OS */
+
+  /* Opacity: unitless 0 to 1 element opacity, not a colour, for inactive controls and the modal backdrop */
+  --opacity-disabled: 0.6; /* GAP: placeholder, not Blitzy OS */
+  --opacity-backdrop: 0.5; /* GAP: placeholder, not Blitzy OS */
+
+  /* Size: the full extent of the containing block, and the full inline size of the nearest inline-size query container, so component geometry holds no percentage or container-unit literal */
+  --size-full: 100%; /* GAP: placeholder, not Blitzy OS */
+  --size-container-full: 100cqi; /* GAP: placeholder, not Blitzy OS */
+}
+
+/* Base layer: the only global rules in the SPA; values from the tokens above. GAP: rebind with Blitzy OS base styles on source arrival. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+}
+
+body {
+  font-family: var(--font-family);
+  font-size: var(--font-size-md);
+  line-height: var(--line-height-normal);
+  color: var(--color-text);
+  background: var(--color-bg);
+}
+
+/*
+ * Bold text takes the semibold weight token. The user-agent rule for <b> and <strong> is
+ * font-weight: bolder, which computes 700 on regular text, a weight no token holds. The design
+ * system has no text primitive, so feature code marks bold inline text with these elements and
+ * this rule alone sets their weight. :where() adds no specificity, so any component rule that
+ * sets its own weight wins.
+ */
+:where(b, strong) {
+  font-weight: var(--font-weight-semibold);
+}
+
+/*
+ * Code, keyboard input, preformatted text and sample output take the monospace family token in
+ * place of the user-agent monospace, which no token holds. Feature code sets identifiers such as
+ * threshold keys, property names and URNs in <code>. :where() adds no specificity, so any
+ * component rule that sets its own family wins.
+ */
+:where(code, kbd, pre, samp) {
+  font-family: var(--font-family-mono);
+}
+
+/* Router links render as plain anchors; the accent keeps them at AA contrast on both backgrounds */
+a {
+  color: var(--color-accent);
+}
+
+/*
+ * Link states for every anchor with an href, router links included. :where() adds no
+ * specificity, so these rules weigh the same as the type selector above: source order lets them
+ * refine it, and any component rule that styles its own anchors, such as the SideNav link or the
+ * skip link, wins wherever it sets the same property.
+ * - Hover thickens the underline to the focus-ring width, half of --space-1 (2px at the 16px
+ *   root), a cue that does not rely on colour. Only on devices whose primary pointer can hover,
+ *   so a tap leaves no sticky state.
+ * - Pressed takes --color-text, at least 4.5:1 on both backgrounds, with the same underline, so
+ *   touch input gets a cue that does not rely on colour either.
+ * No transition is declared: the token set has no motion token.
+ */
+@media (hover: hover) {
+  a:where(:any-link:hover) {
+    text-decoration-thickness: calc(var(--space-1) / 2);
+  }
+}
+
+a:where(:any-link:active) {
+  color: var(--color-text);
+  text-decoration-thickness: calc(var(--space-1) / 2);
+}
+
+/*
+ * Visible focus for every focusable element. Components may refine this ring, never remove it.
+ * The ring's width and offset are half of --space-1, so rebinding the spacing scale rebinds the
+ * ring; its colour is --color-accent, which keeps it at least 3:1 on both backgrounds.
+ */
+:focus-visible {
+  outline: calc(var(--space-1) / 2) solid var(--color-accent);
+  outline-offset: calc(var(--space-1) / 2);
+}
+
+/*
+ * Reduced-motion safety net. It uses !important, which the rest of the SPA may not (stylelint
+ * allows it in this file only), because it must win over component animation declarations of
+ * any specificity. The iteration count is pinned to 1 as well: an infinite animation, such as
+ * the Spinner's, shortened to 0.01ms would otherwise redraw at a random phase every frame and
+ * flicker instead of stopping.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

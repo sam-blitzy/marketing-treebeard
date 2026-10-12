@@ -1,0 +1,262 @@
+/* PageShell: product wrapper. GAP: bind to Blitzy OS on source arrival (see ../GAPS.md). */
+
+/*
+ * Page frame for every screen. PageShell.tsx renders the class contract below; keep the names
+ * exactly as written, because PageShell.tsx and PageShell.test.tsx depend on them.
+ *
+ *   .ds-pageshell                 frame: skip link, top bar, then the body row
+ *   .ds-pageshell__skip           "Skip to main content" link; shared.css hides it until focused,
+ *                                 then shows it on a line of its own above the top bar
+ *   .ds-pageshell__header         <header> landmark holding TopBar
+ *   .ds-pageshell__body           row of side navigation and main content
+ *   .ds-pageshell__sidenav        plain container for SideNav, which supplies the <nav> landmark
+ *   .ds-pageshell__main           <main id="ds-main" tabindex="-1">, the skip link's target
+ *   .ds-pageshell__titlebar       PageShell.Title: the page <h1> plus optional actions
+ *   .ds-pageshell__title          the <h1>
+ *   .ds-pageshell__section        PageShell.Section: <section> whose id is an anchor target,
+ *                                 such as #section-{key} or #group-{sectionKey}-{groupKey}
+ *   .ds-pageshell__section--level-2 | --level-3   heading level of that section
+ *   .ds-pageshell__section-header the section heading row: heading plus optional actions
+ *   .ds-pageshell__section-title  the <h2> or <h3>
+ *   .ds-pageshell__actions        action slot of the title bar and of each section header
+ *   .ds-pageshell--boot           the static loading screen in web/index.html (rule below)
+ *
+ * web/index.html writes the frame, header, body, side-navigation and main classes out by hand,
+ * together with TopBar's, SideNav's and Spinner's, in that loading screen; keep them in step
+ * with it, which PageShell.test.tsx checks.
+ *
+ * Every colour, spacing and typography value is a token from ../tokens.css, so binding Blitzy OS
+ * touches tokens.css alone (web/.stylelintrc.json enforces this). The literals, each listed in
+ * ../GAPS.md, are the flex factors (1 on the body row and the side navigation, 999 on main),
+ * the 999 width-switch multiplier in the side-navigation and main caps, the viewport-height
+ * unit on the frame and the documented Grid breakpoint at the end of this file, which Grid.css
+ * holds in identical form, so the page frame and Grid are both a single column from that width
+ * down. The column, row and cap sizes are whole multiples of --space-8, and the caps' switch
+ * width adds the body gap token, so they all rebind with the spacing scale.
+ */
+
+/*
+ * Frame: fills at least the viewport so the page background reaches the bottom on short pages.
+ * The viewport unit is a sizing keyword for "the visible page", not a design token value; a
+ * percentage would resolve to auto here, because no ancestor of the frame has a set height.
+ */
+.ds-pageshell {
+  display: flex;
+  flex-direction: column;
+  min-block-size: 100vh;
+  background: var(--color-bg);
+  color: var(--color-text);
+}
+
+/*
+ * Static loading screen: web/index.html renders this frame, with the product's top bar, the
+ * one-link "Sign in" side navigation and a labelled Spinner, right after the app's empty #root,
+ * so the first paint already says what is loading. It stays while the bundle downloads and also
+ * while the router presents nothing yet (React empties #root on its first render, and the router
+ * shows its own pending screen only after its pending delay), and it goes the moment the app
+ * renders anything into #root, taking its navigation landmark out of the accessibility tree
+ * with it. The selector depends on #root staying empty in web/index.html, without even
+ * whitespace, and on this frame following it.
+ */
+#root:not(:empty) ~ .ds-pageshell--boot {
+  display: none;
+}
+
+/* Header: a positioning context for anything TopBar anchors inside the banner landmark. */
+.ds-pageshell__header {
+  position: relative;
+}
+
+/*
+ * Body row: side navigation beside main content when both fit on one line, stacked above it
+ * when they do not. The row wraps, so the side navigation moves onto a line of its own as soon
+ * as main would fall below its single-column width at the Grid breakpoint. While they are
+ * stacked from the breakpoint up, both keep that width (see main's cap below), so main holds it
+ * until the line fits both columns and widens from there: it never narrows as the viewport
+ * widens.
+ * align-content: flex-start packs the lines at the top, and the items keep the default stretch,
+ * so beside main the side-navigation column is as tall as main and its navigation can stick
+ * inside it.
+ *
+ * The inline padding matches the top bar's at every width, so the product name, the page
+ * heading and the content share one inline-start edge. The row stops widening at 40 --space-8
+ * steps (1280px at the 16px root), which keeps lines, banners and empty states at a readable
+ * width; it stays at the inline start, under the product name.
+ */
+.ds-pageshell__body {
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  gap: var(--space-6);
+  max-inline-size: calc(var(--space-8) * 40);
+  padding-block: var(--space-6);
+  padding-inline: var(--space-4);
+}
+
+/*
+ * Side navigation column: seven --space-8 steps wide beside main (224px at the 16px root),
+ * derived from the spacing scale so it rebinds with it. It grows only when it is alone on its
+ * line above main; beside main, main's far larger grow factor takes almost all the free space.
+ * It carries main's cap (see main below), so stacked above main it is exactly as wide as main
+ * beneath it.
+ */
+.ds-pageshell__sidenav {
+  flex: 1 1 calc(var(--space-8) * 7);
+  max-inline-size: max(
+    calc(var(--space-8) * 23),
+    (var(--size-full) - var(--space-8) * 30 - var(--space-6)) * 999
+  );
+}
+
+/*
+ * The navigation stays in view while main scrolls. It sticks inside the side-navigation column,
+ * which beside main is as tall as main. Stacked above main, the column is exactly the
+ * navigation's height, so the navigation has no room to stick and scrolls away with the page.
+ */
+.ds-pageshell__sidenav > * {
+  position: sticky;
+  inset-block-start: var(--space-4);
+}
+
+/*
+ * Main content: takes the rest of its line. Its basis, 23 --space-8 steps (736px at the 16px
+ * root), is its single-column width at the Grid breakpoint, so the side navigation sits beside
+ * main only where main still gets at least that width, and stacks above it otherwise.
+ *
+ * The cap is a width switch on the body line. 30 --space-8 steps plus --space-6 (984px at the
+ * 16px root) is the side column's basis, the body gap and main's basis together: the narrowest
+ * line that holds both columns. On a narrower line the second argument of max() is negative, so
+ * main is capped at its single-column width and stays at the inline start, as wide as at the
+ * breakpoint; on a line at least one pixel wider, the 999 multiplier makes the second argument
+ * wider than the whole line, so the cap never binds and main takes the rest of its line. From
+ * the breakpoint up, main therefore keeps its single-column width until the side navigation
+ * fits beside it, then widens with the viewport.
+ *
+ * min-inline-size: 0 lets it shrink below the intrinsic width of long content, so text and
+ * tables wrap inside it instead of widening the page. The gap spaces the title bar and the
+ * sections.
+ *
+ * The block-start scroll margin keeps main's focus ring in view after the skip link. Focusing
+ * main scrolls it into view, and on a page taller than the viewport that puts main's top edge at
+ * the viewport's top, which would clip the base :focus-visible ring drawn outside it. The ring
+ * reaches --space-1 beyond the edge (its offset plus its width, half of --space-1 each), so a
+ * margin of --space-2 leaves the whole ring painted with a --space-1 gap above it, the same
+ * clearance the skip link's own block margin gives its ring (WCAG 2.2 SC 2.4.7 and 2.4.11).
+ */
+.ds-pageshell__main {
+  display: flex;
+  flex: 999 1 calc(var(--space-8) * 23);
+  flex-direction: column;
+  gap: var(--space-6);
+  min-inline-size: 0;
+  max-inline-size: max(
+    calc(var(--space-8) * 23),
+    (var(--size-full) - var(--space-8) * 30 - var(--space-6)) * 999
+  );
+  scroll-margin-block-start: var(--space-2);
+}
+
+/*
+ * Main receives focus from the skip link (tabindex="-1"). The ring is dropped only when the
+ * browser judges the focus non-visible, as after a mouse click on the skip link, for which
+ * PageShell.tsx focuses main with focusVisible: false; keyboard activation keeps the base
+ * :focus-visible ring from ../tokens.css (WCAG 2.2 SC 2.4.7).
+ */
+.ds-pageshell__main:focus:not(:focus-visible) {
+  outline: 0;
+}
+
+/*
+ * Title bar: the page heading with its actions, wrapping the actions below on narrow widths and
+ * keeping them at the inline end there (see the action slot below).
+ */
+.ds-pageshell__titlebar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+/*
+ * Page heading. overflow-wrap: anywhere lets a long unbroken name break, so the heading never
+ * forces horizontal scrolling at the narrowest supported viewport (WCAG 2.2 SC 1.4.10 Reflow).
+ */
+.ds-pageshell__title {
+  margin: 0;
+  font-size: var(--font-size-xl);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
+  overflow-wrap: anywhere;
+}
+
+/*
+ * Section: heading row, then content. The scroll margin keeps an anchored section's heading
+ * clear of the viewport edge when the side navigation or a banner link jumps to it.
+ */
+.ds-pageshell__section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  scroll-margin-block-start: var(--space-6);
+}
+
+/* Section heading row: the heading with its actions, wrapping like the title bar. */
+.ds-pageshell__section-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+/* Section heading. Its size follows the heading level modifier on the section. */
+.ds-pageshell__section-title {
+  margin: 0;
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
+  overflow-wrap: anywhere;
+}
+
+.ds-pageshell__section--level-2 .ds-pageshell__section-title {
+  font-size: var(--font-size-lg);
+}
+
+.ds-pageshell__section--level-3 .ds-pageshell__section-title {
+  font-size: var(--font-size-md);
+}
+
+/*
+ * Action slot: the title bar's or a section header's controls, wrapping onto new lines. The auto
+ * start margin keeps it at the row's inline end: beside the heading it takes the free space as
+ * space-between would, and when a long heading wraps it onto a line of its own, where
+ * space-between would leave a lone item at the line's start, it still ends at the inline end
+ * (the right in left-to-right text, the left in right-to-left text).
+ */
+.ds-pageshell__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-inline-start: auto;
+}
+
+/*
+ * Single-column collapse, last so it wins at equal specificity. Below the Grid breakpoint the
+ * side navigation takes a full line of its own, so it stacks above main whatever the token
+ * values, and the body's block padding and gap step down from --space-6 to --space-4, so the
+ * page heading sits closer to the top of a small screen. The gap is the space between the
+ * stacked navigation and main. The inline padding does not step down, so the content stays in
+ * line with the top bar.
+ */
+/* GAP: breakpoint literal (custom properties cannot be used in @media), see GAPS.md */
+@media (max-width: 48rem) {
+  .ds-pageshell__body {
+    gap: var(--space-4);
+    padding-block: var(--space-4);
+  }
+
+  .ds-pageshell__sidenav {
+    flex-basis: var(--size-full);
+  }
+}

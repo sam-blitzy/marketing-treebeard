@@ -1,0 +1,246 @@
+{
+  "request": {
+    "body": {
+      "customer_id": "9900000001",
+      "page_token": null,
+      "query": "SELECT ad_group_criterion.criterion_id, ad_group.id, campaign.id, ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type, ad_group_criterion.status, ad_group_criterion.quality_info.quality_score FROM ad_group_criterion WHERE ad_group_criterion.type = 'KEYWORD' AND ad_group_criterion.status != 'REMOVED' AND ad_group.id >= 0 AND ad_group.id <= 9223372036854775807"
+    },
+    "headers": {
+      "Content-Type": "application/json",
+      "X-Webhook-Secret": "<redacted>"
+    },
+    "method": "POST",
+    "query": [],
+    "url": "https://n8n.sim.invalid/webhook/google-ads"
+  },
+  "response": {
+    "body": {
+      "fieldMask": "adGroupCriterion.criterionId,adGroup.id,campaign.id,adGroupCriterion.keyword.text,adGroupCriterion.keyword.matchType,adGroupCriterion.status,adGroupCriterion.qualityInfo.qualityScore",
+      "queryResourceConsumption": "1",
+      "results": [
+        {
+          "adGroup": {
+            "id": "990200000000",
+            "resourceName": "customers/9900000001/adGroups/990200000000"
+          },
+          "adGroupCriterion": {
+            "criterionId": "990300000000",
+            "keyword": {
+              "matchType": "EXACT",
+              "text": "acme analytics"
+            },
+            "qualityInfo": {
+              "qualityScore": 9
+            },
+            "resourceName": "customers/9900000001/adGroupCriteria/990200000000~990300000000",
+            "status": "ENABLED"
+          },
+          "campaign": {
+            "id": "990000000000",
+            "resourceName": "customers/9900000001/campaigns/990000000000"
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000001",
+            "resourceName": "customers/9900000001/adGroups/990200000001"
+          },
+          "adGroupCriterion": {
+            "criterionId": "990300000001",
+            "keyword": {
+              "matchType": "PHRASE",
+              "text": "attribution software"
+            },
+            "qualityInfo": {
+              "qualityScore": 7
+            },
+            "resourceName": "customers/9900000001/adGroupCriteria/990200000001~990300000001",
+            "status": "ENABLED"
+          },
+          "campaign": {
+            "id": "990000000001",
+            "resourceName": "customers/9900000001/campaigns/990000000001"
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000001",
+            "resourceName": "customers/9900000001/adGroups/990200000001"
+          },
+          "adGroupCriterion": {
+            "criterionId": "990300000002",
+            "keyword": {
+              "matchType": "EXACT",
+              "text": "attribution modeling"
+            },
+            "qualityInfo": {
+              "qualityScore": 6
+            },
+            "resourceName": "customers/9900000001/adGroupCriteria/990200000001~990300000002",
+            "status": "ENABLED"
+          },
+          "campaign": {
+            "id": "990000000001",
+            "resourceName": "customers/9900000001/campaigns/990000000001"
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000001",
+            "resourceName": "customers/9900000001/adGroups/990200000001"
+          },
+          "adGroupCriterion": {
+            "criterionId": "990300000003",
+            "keyword": {
+              "matchType": "PHRASE",
+              "text": "multi touch attribution"
+            },
+            "qualityInfo": {
+              "qualityScore": 5
+            },
+            "resourceName": "customers/9900000001/adGroupCriteria/990200000001~990300000003",
+            "status": "ENABLED"
+          },
+          "campaign": {
+            "id": "990000000001",
+            "resourceName": "customers/9900000001/campaigns/990000000001"
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000001",
+            "resourceName": "customers/9900000001/adGroups/990200000001"
+          },
+          "adGroupCriterion": {
+            "criterionId": "990300000004",
+            "keyword": {
+              "matchType": "EXACT",
+              "text": "attribution platform cost"
+            },
+            "qualityInfo": {
+              "qualityScore": 6
+            },
+            "resourceName": "customers/9900000001/adGroupCriteria/990200000001~990300000004",
+            "status": "ENABLED"
+          },
+          "campaign": {
+            "id": "990000000001",
+            "resourceName": "customers/9900000001/campaigns/990000000001"
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000001",
+            "resourceName": "customers/9900000001/adGroups/990200000001"
+          },
+          "adGroupCriterion": {
+            "criterionId": "990300000005",
+            "keyword": {
+              "matchType": "PHRASE",
+              "text": "attribution reporting"
+            },
+            "resourceName": "customers/9900000001/adGroupCriteria/990200000001~990300000005",
+            "status": "ENABLED"
+          },
+          "campaign": {
+            "id": "990000000001",
+            "resourceName": "customers/9900000001/campaigns/990000000001"
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000002",
+            "resourceName": "customers/9900000001/adGroups/990200000002"
+          },
+          "adGroupCriterion": {
+            "criterionId": "990300000006",
+            "keyword": {
+              "matchType": "BROAD",
+              "text": "sales analytics software"
+            },
+            "qualityInfo": {
+              "qualityScore": 6
+            },
+            "resourceName": "customers/9900000001/adGroupCriteria/990200000002~990300000006",
+            "status": "ENABLED"
+          },
+          "campaign": {
+            "id": "990000000001",
+            "resourceName": "customers/9900000001/campaigns/990000000001"
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000003",
+            "resourceName": "customers/9900000001/adGroups/990200000003"
+          },
+          "adGroupCriterion": {
+            "criterionId": "990300000007",
+            "keyword": {
+              "matchType": "BROAD",
+              "text": "rival attribution suite"
+            },
+            "qualityInfo": {
+              "qualityScore": 5
+            },
+            "resourceName": "customers/9900000001/adGroupCriteria/990200000003~990300000007",
+            "status": "ENABLED"
+          },
+          "campaign": {
+            "id": "990000000002",
+            "resourceName": "customers/9900000001/campaigns/990000000002"
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000006",
+            "resourceName": "customers/9900000001/adGroups/990200000006"
+          },
+          "adGroupCriterion": {
+            "criterionId": "990300000008",
+            "keyword": {
+              "matchType": "PHRASE",
+              "text": "analytics platform"
+            },
+            "qualityInfo": {
+              "qualityScore": 7
+            },
+            "resourceName": "customers/9900000001/adGroupCriteria/990200000006~990300000008",
+            "status": "ENABLED"
+          },
+          "campaign": {
+            "id": "990000000005",
+            "resourceName": "customers/9900000001/campaigns/990000000005"
+          }
+        },
+        {
+          "adGroup": {
+            "id": "990200000007",
+            "resourceName": "customers/9900000001/adGroups/990200000007"
+          },
+          "adGroupCriterion": {
+            "criterionId": "990300000009",
+            "keyword": {
+              "matchType": "PHRASE",
+              "text": "reporting tool"
+            },
+            "qualityInfo": {
+              "qualityScore": 6
+            },
+            "resourceName": "customers/9900000001/adGroupCriteria/990200000007~990300000009",
+            "status": "ENABLED"
+          },
+          "campaign": {
+            "id": "990000000006",
+            "resourceName": "customers/9900000001/campaigns/990000000006"
+          }
+        }
+      ]
+    },
+    "status": 200
+  },
+  "scenario": "default",
+  "seed": 42,
+  "source": "google",
+  "surface": "google.search"
+}

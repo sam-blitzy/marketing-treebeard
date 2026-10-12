@@ -1,0 +1,199 @@
+/* Tooltip: product wrapper. GAP: bind to Blitzy OS on source arrival (see ../GAPS.md). */
+
+/*
+ * Help text on metrics. Class contract with Tooltip.tsx, which renders:
+ *
+ *   <span class="ds-tooltip">                    hover and focus handlers live here
+ *     <span>                                     an element child whose own focusable element
+ *       child                                    (a Button or field control) carries
+ *     </span>                                    aria-describedby; this span takes no styling
+ *     or
+ *     <span class="ds-tooltip__trigger" tabindex="0" aria-describedby="…">
+ *       child                                    a string, or an element child with no
+ *     </span>                                    focusable described element (a plain span, a
+ *                                                disabled or loading Button)
+ *     <span class="ds-tooltip__content" role="tooltip" id="…" hidden>…</span>
+ *   </span>
+ *
+ * The content is always in the DOM, so the trigger's aria-describedby always resolves; the
+ * hidden attribute alone shows or hides it. WCAG 2.2 SC 1.4.13 (content on hover or focus):
+ * - hoverable: the content is a descendant of the wrapper that owns the hover handlers, and
+ *   the ::before or ::after bridge below covers the gap between trigger and content, so the
+ *   pointer can move onto the content without leaving the wrapper;
+ * - persistent and dismissible: Tooltip.tsx hides it on Escape, or once hover and focus have
+ *   both ended (a pointer leave alone keeps a focused tooltip open, and a blur alone keeps a
+ *   hovered one open), and never on a timer. This file declares no transition or animation,
+ *   so dismissal is never delayed.
+ *
+ * Target size (SC 2.5.5 and 2.5.8): the focusable trigger is at least 44 by 44 CSS px at a 16px
+ * root, through a min-block-size and min-inline-size of --space-8 + --space-3 (2.75rem), the
+ * same token-derived target as Button, Tabs and the SideNav links. 44px is the touch target
+ * minimum that applies when no design source specifies a smaller target; the Blitzy OS source
+ * is unavailable, so none does. It holds for every pointer type, not only coarse ones, so a
+ * short label such as "QS" is still 44px wide, and it is in rem, so it grows with the user's
+ * text size. Only the box grows: the label keeps its type size, the bubble opens against the
+ * larger box (see Placement), and the unstyled span around an element child with its own focus
+ * stop takes no size, because that child is already its own target.
+ *
+ * Placement: while the content is open, Tooltip.tsx places it from the wrapper's viewport
+ * rectangle. It opens below the trigger, aligned to its inline start; it flips above when
+ * there is not enough room below and more room above, and shifts along the inline axis,
+ * narrowing on a small viewport, so it stays inside the viewport. It is recomputed after every
+ * render while open, on resize and on scroll of any ancestor. The content is position: fixed
+ * and anchored at the viewport origin by this file, and Tooltip.tsx moves it from there with an
+ * inline transform: translate() alone. Its layout position therefore never changes while it
+ * follows a scrolling trigger, and a transform change is not a layout shift, so open tooltips
+ * add nothing to Cumulative Layout Shift. Fixed positioning keeps the content clear of an
+ * ancestor that clips or scrolls its overflow (a DataTable region, a Dialog panel), while it
+ * stays a DOM descendant of the wrapper, so hover and aria-describedby work unchanged. An
+ * ancestor with transform, filter, perspective, contain or will-change of those would become
+ * the containing block of the fixed content and offset it; no wrapper in this design system
+ * sets them.
+ *
+ * Every colour, spacing, typography, radius, shadow, stacking and size value is a token from
+ * ../tokens.css, so binding Blitzy OS touches tokens.css alone.
+ */
+
+/*
+ * inline-block keeps the wrapper in the text flow; its box is the trigger rectangle the content
+ * is placed against.
+ */
+.ds-tooltip {
+  display: inline-block;
+}
+
+/*
+ * Focusable trigger (a string child, or an element child with no focus stop of its own): a
+ * dotted underline and the help cursor mark the term as having help text. The underline offset
+ * is a spacing token, so it scales with text resizing. inline-block makes the trigger's box,
+ * and so its focus ring, enclose a wrapped element child such as a disabled Button or field;
+ * it is the wrapper's only in-flow content, so the wrapper's box, which Tooltip.tsx places the
+ * bubble against, is the trigger's box. The minimum block and inline sizes give it the 44px
+ * target described in the header (--space-8 + --space-3), and align-content centres a shorter
+ * label on the block axis (except in a table cell, below); the label keeps its inline-start
+ * alignment, so it lines up with the text above and below it. The trigger stays a block
+ * container rather than a flex one: the underline then reaches its text and inline children
+ * only, as before, and never the label of a wrapped Button, which a flex container would pass
+ * it to as a flex item. An engine without align-content on block containers keeps the full
+ * target, with the label at its top.
+ */
+.ds-tooltip__trigger {
+  display: inline-block;
+  align-content: center;
+  min-block-size: calc(var(--space-8) + var(--space-3));
+  min-inline-size: calc(var(--space-8) + var(--space-3));
+  text-decoration: underline dotted;
+  text-underline-offset: var(--space-1);
+  cursor: help;
+}
+
+/*
+ * In a table cell the label starts at the top of its target instead: DataTable cells align
+ * their content to the top, so a row header's label stays on the row's first line, level with
+ * the text in the row's other cells, and the target extends below the label. :where() keeps
+ * the specificity of the rule above, so this one wins by order alone.
+ */
+:where(th, td) .ds-tooltip__trigger {
+  align-content: start;
+}
+
+/*
+ * WCAG 2.2 SC 2.4.7 Focus Visible. Restates the base :focus-visible ring from ../tokens.css, so
+ * the trigger keeps that ring even if a later rule resets outlines on spans. Width and offset
+ * are half of --space-1, as in the base ring (2px at a 16px root) rather than a literal 2px, so
+ * every focus ring in the SPA rebinds with the spacing scale.
+ */
+.ds-tooltip__trigger:focus-visible {
+  outline: calc(var(--space-1) / 2) solid var(--color-accent);
+  outline-offset: calc(var(--space-1) / 2);
+}
+
+/*
+ * The bubble, placed by Tooltip.tsx as described under Placement above: top and left pin its
+ * margin box to the viewport origin, and Tooltip.tsx sets a transform: translate() from there,
+ * a narrower max-width when the viewport is smaller than the bubble's own maximum, and
+ * data-placement="bottom" or "top". top and left are physical, not inset-block-start and
+ * inset-inline-start, because the translation is in physical viewport coordinates (from
+ * getBoundingClientRect) in either text direction; a logical start would anchor a
+ * right-to-left bubble at the right edge. The transform makes the bubble the containing block
+ * of its own absolutely positioned hover bridges, which it already is as a positioned box, so
+ * the bridges move with it. Tooltip.tsx reads both margins from this rule: the block margin
+ * (--space-1) is the gap to the trigger, which a hover bridge below fills, and the inline
+ * margin (--space-2) is the distance kept from the viewport's inline edges. It sizes to its
+ * text up to eight --space-8 steps, then wraps; overflow-wrap breaks a long unbroken value
+ * (an id or URL) instead of letting it overflow. The inverted pair (text colour as background,
+ * surface colour as text) has the same contrast ratio as body text on the surface. text-align
+ * and the typography are set explicitly so a tooltip inside a table header or a heading does
+ * not inherit centring or a heavier weight.
+ */
+.ds-tooltip__content {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: var(--z-tooltip);
+  inline-size: max-content;
+  max-inline-size: calc(var(--space-8) * 8);
+  margin: var(--space-1) var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-text);
+  color: var(--color-surface);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-regular);
+  line-height: var(--line-height-normal);
+  text-align: start;
+  white-space: normal;
+  overflow-wrap: break-word;
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-2);
+
+  /*
+   * Invisible here, but forced-colors mode paints outlines in a system colour, so the bubble
+   * keeps an edge where its background and shadow are removed. The hairline is a quarter of
+   * --space-1, like the skip-link border in shared.css.
+   */
+  outline: calc(var(--space-1) / 4) solid transparent;
+}
+
+/*
+ * Hover bridges (SC 1.4.13 hoverable): a transparent strip filling the --space-1 gap between
+ * the bubble and the trigger. ::before lies along the bubble's upper edge, facing a trigger the
+ * bubble opens below; ::after lies along its lower edge, facing a trigger the bubble opens
+ * above. Only the one facing the trigger is rendered. Each keeps one position relative to the
+ * bubble, so a flip while the page scrolls swaps which one is rendered instead of moving one:
+ * a box that appears or disappears is not a layout shift, while a moved one would be. Pointer
+ * events on a pseudo-element target the bubble itself, so crossing the gap from the trigger
+ * never leaves the wrapper and never closes the tooltip.
+ */
+.ds-tooltip__content::before,
+.ds-tooltip__content::after {
+  content: "";
+  position: absolute;
+  inset-inline: 0;
+  block-size: var(--space-1);
+}
+
+.ds-tooltip__content::before {
+  inset-block-end: var(--size-full);
+}
+
+.ds-tooltip__content::after {
+  display: none;
+  inset-block-start: var(--size-full);
+}
+
+/* Flipped above the trigger: the bridge along the lower edge, facing the trigger, takes over. */
+.ds-tooltip__content[data-placement="top"]::before {
+  display: none;
+}
+
+.ds-tooltip__content[data-placement="top"]::after {
+  display: block;
+}
+
+/*
+ * Closed state. Explicit, so that any display value given to the content (for example by a
+ * Blitzy OS binding) can never override the hidden attribute and leave a closed tooltip shown.
+ */
+.ds-tooltip__content[hidden] {
+  display: none;
+}

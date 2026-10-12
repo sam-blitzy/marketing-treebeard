@@ -1,0 +1,263 @@
+/* Tabs: product wrapper. GAP: bind to Blitzy OS on source arrival (see ../GAPS.md). */
+
+/*
+ * Sub-list switch (the Keywords section's Block / Expand / Review lists). Tabs.tsx renders the
+ * WAI-ARIA tabs pattern with these classes, which are its contract:
+ *
+ *   <div class="ds-tabs">
+ *     <div class="ds-tabs__scroller">
+ *       <div class="ds-tabs__list" role="tablist" aria-label="…">
+ *         <button class="ds-tabs__tab" role="tab" aria-selected="true|false" aria-controls="…"
+ *                 tabindex="0|-1">
+ *           <span class="ds-tabs__label"><span class="ds-tabs__label-text">Label</span>
+ *             <span class="ds-tabs__label-sizer" aria-hidden="true">Label</span></span>
+ *           <span class="ds-tabs__count">3</span></button>
+ *       </div>
+ *     </div>
+ *     <div class="ds-tabs__panel" role="tabpanel" aria-labelledby="…" tabindex="0" hidden>…</div>
+ *   </div>
+ *
+ * Plain global CSS with the ds- prefix and BEM element names, like every stylesheet in this
+ * folder. Every colour, spacing, typography and radius value is a token from ../tokens.css, so
+ * binding Blitzy OS touches tokens.css alone. Line widths derive from --space-1 the same way as
+ * the base :focus-visible ring and the shared.css hairline, rather than literal pixels: a
+ * quarter of it is the 1 px hairline and half of it the 2 px ring at the 16 px root.
+ *
+ * The selected tab is marked by three cues, never by colour alone (WCAG 2.2 SC 1.4.1): the
+ * aria-selected state, a semibold label and an accent bar under the tab. The label is rendered
+ * twice, visibly and as a hidden semibold sizer, so the semibold cue changes no tab's width and
+ * selecting a tab moves none of its neighbours.
+ */
+
+/*
+ * Root: the tab list above the visible panel. min-inline-size: 0 lets the component shrink
+ * inside a flex or grid parent, as Stack and Inline do, so neither a wide panel nor a wide tab
+ * row can widen its track.
+ */
+.ds-tabs {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-inline-size: 0;
+}
+
+/*
+ * Scroller (WCAG 2.2 SC 1.4.10 Reflow). The tabs never wrap, because a wrapped row would leave
+ * the selected tab's accent bar between rows instead of on the baseline. A row wider than the
+ * component scrolls sideways here, so the page itself never scrolls at a 320 CSS px viewport;
+ * moving focus with the arrow keys, Home or End scrolls the focused tab into view. An overflow
+ * container clips what extends past its padding box, and the focus ring reaches --space-1 past
+ * a tab (its 2 px offset plus its 2 px width). The scroller's block padding of --space-1 keeps
+ * the ring whole above and below the row, and the tab list's inline padding keeps it whole at
+ * the row's ends. When focus scrolls a tab into view, scroll-padding-inline of --space-2 leaves
+ * the ring that room plus a margin, because browsers round the scroll position to whole pixels
+ * while tab widths are fractional. overscroll-behavior-inline keeps a sideways swipe at the
+ * row's end from navigating the page, and the thin scrollbar sits below the baseline.
+ *
+ * The scroll cue, the same one DataTable's region shows. Tabs scrolled out of view, like the
+ * Keywords section's later tabs beside its long first title on a narrow screen, leave no sign
+ * of themselves, and an overlay or hidden scrollbar gives none, so each edge beyond which tabs
+ * are hidden shows a shadow. The scroller paints the page background the tabs sit on
+ * (--color-bg, PageShell.css) and four background layers over it, topmost first:
+ * 1. and 2. covers in that background colour, attached local, so they sit at the left and right
+ *    ends of the scrolled row and move with it; each is solid for the shadow's width, then fades;
+ * 3. and 4. shadows from the border colour to transparent, attached scroll, so they stay on the
+ *    scroller's left and right edges.
+ * While an end of the row is in view, its cover lies over that edge's shadow and hides it;
+ * scrolling that end out of view, by pointer, touch or the arrow keys, Home and End, uncovers
+ * the shadow. A row that fits shows both ends, so no shadow at all. Physical left and right
+ * serve both directions: in right-to-left text the row starts at the right edge and overflows
+ * to the left, and the same covers and shadows follow it. The layers are the scroller's own
+ * background, so everything inside paints over them: the tabs, transparent at rest, show the
+ * shadow behind their labels, while the tab list's hairline, the accent bar and the focus ring
+ * stay whole on top. In forced colours the browser drops background images that are not url()
+ * based and repaints the background colour from the system palette, so the cue is absent there
+ * and the row otherwise behaves the same. Colours are tokens ending in transparent, and sizes
+ * are spacing tokens and the full-extent token.
+ */
+.ds-tabs__scroller {
+  display: flex;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+  scrollbar-width: thin;
+  padding-block: var(--space-1);
+  scroll-padding-inline: var(--space-2);
+  background-color: var(--color-bg);
+  background-image:
+    linear-gradient(to right, var(--color-bg) var(--space-3), transparent),
+    linear-gradient(to left, var(--color-bg) var(--space-3), transparent),
+    linear-gradient(to right, var(--color-border), transparent),
+    linear-gradient(to left, var(--color-border), transparent);
+  background-position:
+    left center,
+    right center,
+    left center,
+    right center;
+  background-size:
+    var(--space-6) var(--size-full),
+    var(--space-6) var(--size-full),
+    var(--space-3) var(--size-full),
+    var(--space-3) var(--size-full);
+  background-repeat: no-repeat;
+  background-attachment: local, local, scroll, scroll;
+}
+
+/*
+ * Tab row: one line of tabs on the hairline rule that marks the baseline the selected tab's
+ * accent bar sits on. It is the scroller's one flex item, growing to the scroller's width and
+ * never shrinking below its tabs (flex: 1 0 auto), so the hairline spans the whole row, scrolled
+ * or not, and stays directly under the tabs, above any scrollbar. The inline padding holds the
+ * focus ring at the first tab (--space-1) and, at the last tab, the scroller's --space-2 of
+ * scroll padding, so a row scrolled to its end shows the last tab's ring whole.
+ */
+.ds-tabs__list {
+  display: flex;
+  flex: 1 0 auto;
+  flex-wrap: nowrap;
+  gap: var(--space-1);
+  padding-inline: var(--space-1) var(--space-2);
+  border-block-end: calc(var(--space-1) / 4) solid var(--color-border);
+}
+
+/*
+ * A tab is a raw <button>, so the user-agent font, border and background are reset here. Every
+ * tab reserves the accent bar's width with a transparent bottom border, so selecting a tab
+ * never shifts the row vertically. The minimum block and inline sizes of --space-8 + --space-3
+ * (2.75rem, 44 CSS px at the 16 px root, the same token-derived target as Button and the SideNav
+ * links) keep each tab at least 44 by 44 CSS px (WCAG 2.2 SC 2.5.5), the touch target minimum
+ * that applies when no design source specifies a smaller target; the Blitzy OS source is
+ * unavailable, so none does. It holds for every pointer type and grows with the user's text size.
+ */
+.ds-tabs__tab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  min-block-size: calc(var(--space-8) + var(--space-3));
+  min-inline-size: calc(var(--space-8) + var(--space-3));
+  font-family: var(--font-family);
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-regular);
+  line-height: var(--line-height-tight);
+  color: var(--color-text-muted);
+  background: transparent;
+  border: 0;
+  border-block-end: var(--space-1) solid transparent;
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  cursor: pointer;
+  /* A tab keeps its full width in a row too wide for its container; the row scrolls instead. */
+  flex-shrink: 0;
+}
+
+/* Selected: full-strength text, semibold weight and the accent bar (cues beyond colour). */
+.ds-tabs__tab[aria-selected="true"] {
+  color: var(--color-text);
+  font-weight: var(--font-weight-semibold);
+  border-block-end-color: var(--color-accent);
+}
+
+/*
+ * Keyboard focus. The ring restates the base ring from ../tokens.css, so it stays visible even
+ * if a later layer restyles the base; the arrow keys move focus and selection together. The
+ * scroller's and tab list's padding keep the ring clear of the scroller's clipping edge.
+ */
+.ds-tabs__tab:focus-visible {
+  outline: calc(var(--space-1) / 2) solid var(--color-accent);
+  outline-offset: calc(var(--space-1) / 2);
+}
+
+/*
+ * Label slot. The visible label and its sizer share the slot's one grid cell, so the cell is as
+ * wide as the wider of the two: the sizer, which is always semibold. The tab is therefore as
+ * wide unselected as selected, and the selection moves no tab (the grid placement is a
+ * structural layout value, see ../GAPS.md). The visible label starts at the cell's start in
+ * both weights, so the label itself never shifts sideways either. nowrap keeps the label on one
+ * line, so both copies lay out identically; it is never truncated, and a row of tabs wider than
+ * its container scrolls inside the scroller instead.
+ */
+.ds-tabs__label {
+  display: inline-grid;
+  white-space: nowrap;
+}
+
+.ds-tabs__label-text,
+.ds-tabs__label-sizer {
+  grid-area: 1 / 1;
+}
+
+/*
+ * The sizer reserves the semibold width and paints nothing. visibility: hidden keeps its box in
+ * the layout, and with aria-hidden it stays out of the accessibility tree and the tab's name.
+ */
+.ds-tabs__label-sizer {
+  font-weight: var(--font-weight-semibold);
+  visibility: hidden;
+}
+
+/*
+ * Item count beside the label ("Block 3"); tabular figures keep counts the same width, and
+ * flex-shrink: 0 keeps the count whole beside the label.
+ */
+.ds-tabs__count {
+  flex-shrink: 0;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * The panel is focusable (tabindex="0"), so the keyboard reaches panels that start with no
+ * focusable content; its ring matches the tab ring.
+ */
+.ds-tabs__panel:focus-visible {
+  outline: calc(var(--space-1) / 2) solid var(--color-accent);
+  outline-offset: calc(var(--space-1) / 2);
+}
+
+/* Unselected panels stay hidden even if a later rule gives panels a display value. */
+.ds-tabs__panel[hidden] {
+  display: none;
+}
+
+/*
+ * Pointer hover on an unselected tab raises its text to full strength. It sits inside
+ * (hover: hover) so touch devices never keep a sticky hover after a tap, and it changes no
+ * layout. There is no transition, so reduced-motion preferences need no separate rule.
+ */
+@media (hover: hover) {
+  .ds-tabs__tab:not([aria-selected="true"]):hover {
+    color: var(--color-text);
+  }
+}
+
+/*
+ * Pressed (:active), for pointer and touch alike, distinct from both rest and hover: the tab
+ * fills with --color-surface, which stands apart from the page background the tabs sit on, its
+ * text goes to full strength, and an unselected tab shows a --color-border bar (at least 3:1 on
+ * both backgrounds) in the bottom border it reserves, which becomes the accent bar once the
+ * press selects it. Fill and bar paint only space the tab already has, so nothing shifts. In
+ * forced colours unselected tabs reserve that space as margin instead (below), and the
+ * system palette repaints the fill.
+ */
+.ds-tabs__tab:active {
+  color: var(--color-text);
+  background: var(--color-surface);
+}
+
+.ds-tabs__tab:not([aria-selected="true"]):active {
+  border-block-end-color: var(--color-border);
+}
+
+/*
+ * Forced colours (Windows High Contrast). The browser paints every border in a system colour,
+ * transparent ones included, so each unselected tab would show the same bar as the selected
+ * one. Unselected tabs therefore drop the bottom border and reserve the same --space-1 as a
+ * bottom margin instead, so the bar stays on the selected tab alone and every label keeps its
+ * position in the row.
+ */
+@media (forced-colors: active) {
+  .ds-tabs__tab:not([aria-selected="true"]) {
+    border-block-end-style: none;
+    margin-block-end: var(--space-1);
+  }
+}

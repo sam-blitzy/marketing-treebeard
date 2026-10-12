@@ -1,0 +1,270 @@
+{
+  "surface": "linkedin.creatives",
+  "source": "linkedin",
+  "reference_url": "https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads/account-structure/create-and-manage-creatives?view=li-lms-2026-09",
+  "api_version": "202609",
+  "last_modified": "2026-06-24",
+  "request": {
+    "method": "GET",
+    "url": "adAccounts/{id}/creatives?q=criteria&campaigns=List({campaign_urns})&intendedStatuses=List(ACTIVE,PAUSED,DRAFT,ARCHIVED,CANCELED,PENDING_DELETION,REMOVED)&pageSize=100",
+    "required_headers": [
+      "Authorization",
+      "Linkedin-Version",
+      "X-Restli-Protocol-Version"
+    ],
+    "required_query": [
+      "q",
+      "campaigns",
+      "intendedStatuses",
+      "pageSize"
+    ],
+    "optional_query": [
+      "pageToken",
+      "sortOrder"
+    ],
+    "fields": null,
+    "body": null,
+    "gaql": null,
+    "limits": {
+      "page_size": 100,
+      "max_page_size": 100,
+      "max_creatives_per_account": 15000,
+      "max_creatives_per_campaign": 100
+    }
+  },
+  "response": {
+    "status": [
+      200
+    ],
+    "body": {
+      "description": "Creatives criteria-search response, LinkedIn Marketing API 202609. Verified against the Microsoft Learn page served as moniker li-lms-2026-09 (last updated 2026-06-24, ms.date 2026-06-19) and against live 202609 responses on 2026-10-07. The URL is relative to https://api.linkedin.com/rest/. {id} is the numeric ad account id. {campaign_urns} stands for the comma-separated campaign URNs of one request: each URN is URL-encoded as urn%3Ali%3AsponsoredCampaign%3A{cid}, while the List( ) parentheses and the commas between URNs stay literal; the Rest.li value is never percent-encoded as a whole. The page documents no maximum list length; the client sends at most 100 campaign URNs per request. intendedStatuses is an addition to the plan's request (q, campaigns, pageSize): the page documents that CANCELED creatives are hidden when querying all creatives under a campaign, and a hidden creative would drop its spend and leads from white-paper attribution and leave the creative table incomplete. A live check on 2026-10-07 returned a CANCELED creative with and without the parameter; the client sends the full list so the result never depends on that server default. The status list in request.url must equal connectors/linkedin/parser.py CREATIVE_INTENDED_STATUSES exactly, in the same order. The page's creative-id search sample mentions an X-RestLi-Method: FINDER header; live 202609 criteria searches return 200 without it, and the client does not send it. Paging: the client sends pageSize=100 (the documented maximum) and sends metadata.nextPageToken back as pageToken until a response carries no non-null nextPageToken (an absent or null token ends enumeration). On the last page live responses return an empty metadata object plus a legacy paging block that the client ignores. The page also limits an ad account to 15,000 creatives and a campaign to 100. Canonical form identity: leadgenCallToAction.destination is urn:li:adForm:{id}, and connectors/linkedin/parser.py canonical_form_urn maps it to urn:li:leadGenForm:{id} with the same id; the Lead Sync migration guide states that the form id \"is still the unique identifier of the form\", and on 2026-10-07 every live adForm destination id matched a lead form returned by leadForms under that id. That canonical URN is stored as creative.lead_form_urn and joins the content-asset registry, so every version of a form maps to the same white paper. Headline and intro text come from the referenced post through posts.json, not from this surface. Undeclared keys fail validation, so a field a newer version adds must be declared here before a capture containing it can pass. documented_sample is the page's criteria search sample response, verbatim. Its nextPageToken is the page's public sample cursor, not a credential: a secret-scan match on it is settled by the pagination-cursor allowlist in .gitleaks.toml, never by editing the sample. That allowlist is scoped by rule, path and field, not by value: it admits only a generic-api-key match whose matched text begins with a page-token key such as nextPageToken, pageToken or page_token, and only in a JSON file under backend/tests/contracts or a file under backend/tests/fixtures, so a provider-shaped token in the same field is still reported by its own rule.",
+      "type": "object",
+      "required": [
+        "elements"
+      ],
+      "properties": {
+        "elements": {
+          "description": "One page of creatives matching the campaigns and intendedStatuses criteria, sorted by creative id (ASCENDING unless sortOrder is sent, which the client does not do).",
+          "type": "array",
+          "items": {
+            "description": "One creative. parse_creative stores it in the creative table: id, campaign, account, name, intendedStatus (normalised through CREATIVE_STATUS_MAP), content.reference as post_urn, leadgenCallToAction.destination as the canonical lead_form_urn and leadgenCallToAction.label as cta_label. Required keys are those present in every documented and live element that parse_creative needs; everything else is optional, and live responses omit an optional field rather than sending null.",
+            "type": "object",
+            "required": [
+              "id",
+              "campaign",
+              "intendedStatus"
+            ],
+            "properties": {
+              "id": {
+                "description": "Sponsored creative URN, urn:li:sponsoredCreative:{id}. A string URN in every sample and live response, never a bare number. Read-only.",
+                "type": "string"
+              },
+              "campaign": {
+                "description": "Campaign URN, urn:li:sponsoredCampaign:{id}.",
+                "type": "string"
+              },
+              "account": {
+                "description": "Ad account URN, urn:li:sponsoredAccount:{id}. Read-only.",
+                "type": "string"
+              },
+              "name": {
+                "description": "Advertiser-set creative name. Absent when none was set (observed live).",
+                "type": "string"
+              },
+              "intendedStatus": {
+                "description": "Creative intended status, set independently of the parent campaign's status; the parent status overrides it in effect. Values as listed on the served page. The page documents that CANCELED creatives are hidden from campaign searches unless intendedStatuses is sent; REMOVED creatives stay fetchable because performance data exists.",
+                "type": "string",
+                "enum": [
+                  "ACTIVE",
+                  "PAUSED",
+                  "DRAFT",
+                  "ARCHIVED",
+                  "CANCELED",
+                  "PENDING_DELETION",
+                  "REMOVED"
+                ]
+              },
+              "content": {
+                "description": "Sponsored content. A union: the product reads only reference, a post URN (urn:li:share:{id} or urn:li:ugcPost:{id}; urn:li:adInMailContent:{id} for message ads). Other variants (event ad, document ad, text ad, spotlight, follower, job and third-party VAST video ads) carry their own keys that the product does not read, so undeclared keys are allowed here.",
+                "type": "object",
+                "properties": {
+                  "reference": {
+                    "description": "URN of the sponsored post or InMail content.",
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": true
+              },
+              "inlineContent": {
+                "description": "Inline post payload, documented for action=createInline. Not seen in live criteria searches; declared so a response carrying it validates. Not read by the product.",
+                "type": "object",
+                "additionalProperties": true
+              },
+              "dynamicContent": {
+                "description": "Undocumented dynamic-content override observed live on 2026-10-07 (for example value.video.dynamicCommentaryOverride). Declared so real responses validate; not read by the product.",
+                "type": "object",
+                "additionalProperties": true
+              },
+              "leadgenCallToAction": {
+                "description": "Lead-gen call to action, required on the platform for LEAD_GENERATION campaigns. No page sample carries this node, so it is declared from the page's LeadgenCreativeCallToAction schema table; live responses match it. destination is an ad form URN, urn:li:adForm:{id}, immutable once the creative leaves DRAFT; its canonical form urn:li:leadGenForm:{id} (same id) joins the content-asset registry. label is the call-to-action label that open-rate tests change.",
+                "type": "object",
+                "required": [
+                  "destination",
+                  "label"
+                ],
+                "properties": {
+                  "destination": {
+                    "description": "Ad form URN, urn:li:adForm:{id}.",
+                    "type": "string"
+                  },
+                  "label": {
+                    "description": "Call-to-action button label, as listed on the served page.",
+                    "type": "string",
+                    "enum": [
+                      "APPLY",
+                      "DOWNLOAD",
+                      "VIEW_QUOTE",
+                      "LEARN_MORE",
+                      "SIGN_UP",
+                      "SUBSCRIBE",
+                      "REGISTER",
+                      "REQUEST_DEMO",
+                      "JOIN",
+                      "ATTEND",
+                      "UNLOCK_FULL_DOCUMENT"
+                    ]
+                  }
+                }
+              },
+              "isTest": {
+                "description": "True for a creative under a test account. The flag is isTest, not test.",
+                "type": "boolean"
+              },
+              "isServing": {
+                "description": "Whether the creative is currently serving. Read-only.",
+                "type": "boolean"
+              },
+              "servingHoldReasons": {
+                "description": "Reasons the creative is not serving; absent while it serves. Open strings, so a new reason never rejects a real response. Documented values: STOPPED, UNDER_REVIEW, REJECTED, FORM_HOLD, PROCESSING, PROCESSING_FAILED, REFERRED_CONTENT_QUALITY_HOLD, JOB_POSTING_ON_HOLD, JOB_POSTING_INVALID, CAMPAIGN_STOPPED, ACCOUNT_TOTAL_BUDGET_HOLD, ACCOUNT_END_DATE_HOLD, CAMPAIGN_START_DATE_HOLD, CAMPAIGN_END_DATE_HOLD, CAMPAIGN_TOTAL_BUDGET_HOLD, CAMPAIGN_AUDIENCE_COUNT_HOLD, CAMPAIGN_GROUP_START_DATE_HOLD, CAMPAIGN_GROUP_END_DATE_HOLD, CAMPAIGN_GROUP_TOTAL_BUDGET_HOLD, CAMPAIGN_GROUP_STATUS_HOLD, ACCOUNT_SERVING_HOLD.",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "review": {
+                "description": "Creative review, read-only. Absent while the creative is in DRAFT (live responses also omit it on some REMOVED and CANCELED creatives). Documented status values: PENDING, APPROVED, REJECTED, NEEDS_REVIEW. Not read by the product.",
+                "type": "object",
+                "required": [
+                  "status"
+                ],
+                "properties": {
+                  "status": {
+                    "description": "Review status.",
+                    "type": "string"
+                  },
+                  "rejectionReasons": {
+                    "description": "Rejection reason codes, from the page's rejection-reason list.",
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "createdAt": {
+                "description": "Creation time, epoch milliseconds.",
+                "type": "integer"
+              },
+              "lastModifiedAt": {
+                "description": "Last modification time, epoch milliseconds.",
+                "type": "integer"
+              },
+              "createdBy": {
+                "description": "Member URN that created the creative, urn:li:person:{id} (urn:li:unknown observed live). The product never reads or stores it, and capture redaction does not mask member URNs, so a capture keeps it as returned.",
+                "type": "string"
+              },
+              "lastModifiedBy": {
+                "description": "Member URN that last modified the creative, urn:li:person:{id} (urn:li:unknown observed live). The product never reads or stores it, and capture redaction does not mask member URNs, so a capture keeps it as returned.",
+                "type": "string"
+              }
+            }
+          }
+        },
+        "metadata": {
+          "description": "Cursor paging metadata. On the last page it is empty or carries a null nextPageToken.",
+          "type": "object",
+          "properties": {
+            "nextPageToken": {
+              "description": "Opaque cursor for the next page, sent back as the pageToken query parameter. Absent or null on the last page.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "paging": {
+          "description": "Legacy Rest.li collection paging block. The documented sample omits it, but live 202609 responses carry it on the last page (2026-10-07). Its count does not track the number of elements, and links can hold a stale rel=next href in the old start/count style even when no nextPageToken is present. Cursor search pages by metadata.nextPageToken only, so the client never reads this block; it is declared so real responses validate.",
+          "type": "object",
+          "properties": {
+            "start": {
+              "type": "integer"
+            },
+            "count": {
+              "type": "integer"
+            },
+            "total": {
+              "type": "integer"
+            },
+            "links": {
+              "type": "array",
+              "items": {
+                "description": "Rest.li paging link.",
+                "type": "object",
+                "properties": {
+                  "rel": {
+                    "type": "string"
+                  },
+                  "href": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "documented_sample": {
+      "metadata": {
+        "nextPageToken": "DgGerr1iVQreCJVjZDOW_grcp63nueBDipsS4DJpvJo"
+      },
+      "elements": [
+        {
+          "createdAt": 1624249280000,
+          "servingHoldReasons": [
+            "STOPPED",
+            "CAMPAIGN_STOPPED",
+            "ACCOUNT_SERVING_HOLD",
+            "CAMPAIGN_GROUP_STATUS_HOLD"
+          ],
+          "lastModifiedAt": 1624249280000,
+          "isTest": false,
+          "createdBy": "urn:li:person:rboDhL7Xsf",
+          "isServing": false,
+          "lastModifiedBy": "urn:li:person:rboDhL7Xsf",
+          "campaign": "urn:li:sponsoredCampaign:360035215",
+          "id": "urn:li:sponsoredCreative:119962155",
+          "intendedStatus": "DRAFT",
+          "account": "urn:li:sponsoredAccount:520866471",
+          "content": {
+            "reference": "urn:li:share:6778045555198214144"
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,57 @@
+/* Select: product wrapper. GAP: bind to Blitzy OS on source arrival (see ../GAPS.md). */
+
+/*
+ * Select-specific styles only. Select.tsx renders the shared form-field markup from
+ * TextField.css and imports that stylesheet before this one:
+ *
+ *   div.ds-field
+ *     label.ds-field__label[for]
+ *     select.ds-field__control.ds-select   the native <select>
+ *     p.ds-field__hint / p.ds-field__error  optional, referenced by aria-describedby
+ *
+ * The field box, label, hint, error, focus ring, invalid border and disabled dimming all come
+ * from the .ds-field* rules in TextField.css and are not repeated here, so a Select and a
+ * TextField side by side share one height, border and focus ring. Every value is a token from
+ * ../tokens.css or a CSS keyword.
+ *
+ * The native arrow is kept: appearance stays at its default and no background image or data
+ * URI is drawn. The product ships no icon set until the Blitzy OS icon source arrives, and the
+ * Content-Security-Policy allows images from the app's own origin only.
+ */
+
+/*
+ * Clears the user-agent form-control font (a small system font in several engines) so the
+ * select's weight, style and variant follow the page instead.
+ *
+ * The rule sits in :where() on purpose, with zero specificity, rather than on .ds-select: the
+ * font shorthand also resets font-family, font-size and line-height, and .ds-select would win
+ * over .ds-field__control (equal specificity, later stylesheet) and make the select take its
+ * parent's size inside any smaller-text container, such as a table or card meta line, while the
+ * TextField beside it keeps the md token. At zero specificity the rule still outranks the
+ * user-agent stylesheet, which is a lower origin, and the shared .ds-field__control typography
+ * tokens stay authoritative.
+ */
+:where(.ds-select) {
+  font: inherit;
+}
+
+/*
+ * The pointer cursor marks the whole box as one control that opens a list. The wider end
+ * padding leaves room for the native arrow so a long option label never runs under it. It is a
+ * logical property, so the room follows the arrow to the left edge in right-to-left text. This
+ * overrides only the end side of the shared control's inline padding; it relies on Select.tsx
+ * importing TextField.css before this file.
+ */
+.ds-select {
+  cursor: pointer;
+  padding-inline-end: var(--space-6);
+}
+
+/*
+ * Disabled: the not-allowed cursor replaces the pointer above. The native disabled attribute
+ * blocks interaction and removes the select from the tab order, and the shared
+ * .ds-field__control:disabled rule dims it.
+ */
+.ds-select:disabled {
+  cursor: not-allowed;
+}

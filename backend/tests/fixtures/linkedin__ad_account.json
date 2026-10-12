@@ -1,0 +1,36 @@
+{
+  "request": {
+    "body": null,
+    "headers": {
+      "Authorization": "Bearer <redacted>",
+      "Linkedin-Version": "202609",
+      "X-Restli-Protocol-Version": "2.0.0"
+    },
+    "method": "GET",
+    "query": [],
+    "url": "https://api.linkedin.com/rest/adAccounts/990000001"
+  },
+  "response": {
+    "body": {
+      "changeAuditStamps": {
+        "created": {
+          "time": 1772787600000
+        },
+        "lastModified": {
+          "time": 1772787600000
+        }
+      },
+      "currency": "USD",
+      "id": 990000001,
+      "name": "Simulated Ads - North America",
+      "status": "ACTIVE",
+      "test": false,
+      "type": "BUSINESS"
+    },
+    "status": 200
+  },
+  "scenario": "default",
+  "seed": 42,
+  "source": "linkedin",
+  "surface": "linkedin.ad_account"
+}

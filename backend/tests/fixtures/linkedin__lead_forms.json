@@ -1,0 +1,286 @@
+{
+  "request": {
+    "body": null,
+    "headers": {
+      "Authorization": "Bearer <redacted>",
+      "Linkedin-Version": "202609",
+      "X-Restli-Protocol-Version": "2.0.0"
+    },
+    "method": "GET",
+    "query": [
+      [
+        "q",
+        "owner"
+      ],
+      [
+        "owner",
+        "(sponsoredAccount:urn%3Ali%3AsponsoredAccount%3A990000001)"
+      ],
+      [
+        "count",
+        "100"
+      ],
+      [
+        "start",
+        "0"
+      ]
+    ],
+    "url": "https://api.linkedin.com/rest/leadForms"
+  },
+  "response": {
+    "body": {
+      "elements": [
+        {
+          "content": {
+            "questions": [
+              {
+                "name": "firstName",
+                "predefinedField": "FIRST_NAME",
+                "question": {
+                  "localized": {
+                    "en_US": "First name"
+                  },
+                  "preferredLocale": {
+                    "country": "US",
+                    "language": "en"
+                  }
+                },
+                "questionId": 1001
+              },
+              {
+                "name": "lastName",
+                "predefinedField": "LAST_NAME",
+                "question": {
+                  "localized": {
+                    "en_US": "Last name"
+                  },
+                  "preferredLocale": {
+                    "country": "US",
+                    "language": "en"
+                  }
+                },
+                "questionId": 1002
+              },
+              {
+                "name": "jobTitle",
+                "predefinedField": "JOB_TITLE",
+                "question": {
+                  "localized": {
+                    "en_US": "Job title"
+                  },
+                  "preferredLocale": {
+                    "country": "US",
+                    "language": "en"
+                  }
+                },
+                "questionId": 1003
+              },
+              {
+                "name": "workEmail",
+                "predefinedField": "WORK_EMAIL",
+                "question": {
+                  "localized": {
+                    "en_US": "Work email"
+                  },
+                  "preferredLocale": {
+                    "country": "US",
+                    "language": "en"
+                  }
+                },
+                "questionId": 1005
+              },
+              {
+                "name": "company",
+                "predefinedField": "COMPANY_NAME",
+                "question": {
+                  "localized": {
+                    "en_US": "Company name"
+                  },
+                  "preferredLocale": {
+                    "country": "US",
+                    "language": "en"
+                  }
+                },
+                "questionId": 1004
+              }
+            ]
+          },
+          "created": 1772805600000,
+          "id": 990000101,
+          "lastModified": 1785715200000,
+          "name": "2026 B2B Pipeline Report - Download",
+          "owner": {
+            "sponsoredAccount": "urn:li:sponsoredAccount:990000001"
+          },
+          "state": "PUBLISHED",
+          "versionId": 2
+        },
+        {
+          "content": {
+            "questions": [
+              {
+                "name": "firstName",
+                "predefinedField": "FIRST_NAME",
+                "question": {
+                  "localized": {
+                    "en_US": "First name"
+                  },
+                  "preferredLocale": {
+                    "country": "US",
+                    "language": "en"
+                  }
+                },
+                "questionId": 3001
+              },
+              {
+                "name": "lastName",
+                "predefinedField": "LAST_NAME",
+                "question": {
+                  "localized": {
+                    "en_US": "Last name"
+                  },
+                  "preferredLocale": {
+                    "country": "US",
+                    "language": "en"
+                  }
+                },
+                "questionId": 3002
+              },
+              {
+                "name": "workEmail",
+                "predefinedField": "WORK_EMAIL",
+                "question": {
+                  "localized": {
+                    "en_US": "Work email"
+                  },
+                  "preferredLocale": {
+                    "country": "US",
+                    "language": "en"
+                  }
+                },
+                "questionId": 3003
+              },
+              {
+                "name": "jobTitle",
+                "predefinedField": "JOB_TITLE",
+                "question": {
+                  "localized": {
+                    "en_US": "Job title"
+                  },
+                  "preferredLocale": {
+                    "country": "US",
+                    "language": "en"
+                  }
+                },
+                "questionId": 3004
+              }
+            ]
+          },
+          "created": 1772805720000,
+          "id": 990000201,
+          "lastModified": 1772805720000,
+          "name": "Paid Media Benchmarks 2026",
+          "owner": {
+            "sponsoredAccount": "urn:li:sponsoredAccount:990000001"
+          },
+          "state": "PUBLISHED",
+          "versionId": 1
+        },
+        {
+          "content": {
+            "questions": [
+              {
+                "name": "firstName",
+                "predefinedField": "FIRST_NAME",
+                "question": {
+                  "localized": {
+                    "en_US": "First name"
+                  },
+                  "preferredLocale": {
+                    "country": "US",
+                    "language": "en"
+                  }
+                },
+                "questionId": 4001
+              },
+              {
+                "name": "lastName",
+                "predefinedField": "LAST_NAME",
+                "question": {
+                  "localized": {
+                    "en_US": "Last name"
+                  },
+                  "preferredLocale": {
+                    "country": "US",
+                    "language": "en"
+                  }
+                },
+                "questionId": 4002
+              },
+              {
+                "name": "email",
+                "predefinedField": "EMAIL",
+                "question": {
+                  "localized": {
+                    "en_US": "Email address"
+                  },
+                  "preferredLocale": {
+                    "country": "US",
+                    "language": "en"
+                  }
+                },
+                "questionId": 4003
+              },
+              {
+                "name": "company",
+                "predefinedField": "COMPANY_NAME",
+                "question": {
+                  "localized": {
+                    "en_US": "Company name"
+                  },
+                  "preferredLocale": {
+                    "country": "US",
+                    "language": "en"
+                  }
+                },
+                "questionId": 4004
+              },
+              {
+                "name": "challenge",
+                "question": {
+                  "localized": {
+                    "en_US": "What is your biggest attribution challenge?"
+                  },
+                  "preferredLocale": {
+                    "country": "US",
+                    "language": "en"
+                  }
+                },
+                "questionId": 4005
+              }
+            ]
+          },
+          "created": 1772805780000,
+          "id": 990000301,
+          "lastModified": 1772805780000,
+          "name": "The Attribution Playbook",
+          "owner": {
+            "sponsoredAccount": "urn:li:sponsoredAccount:990000001"
+          },
+          "state": "PUBLISHED",
+          "versionId": 1
+        }
+      ],
+      "paging": {
+        "count": 100,
+        "start": 0,
+        "total": 3
+      }
+    },
+    "status": 200
+  },
+  "scenario": "default",
+  "seed": 42,
+  "source": "linkedin",
+  "surface": "linkedin.lead_forms"
+}

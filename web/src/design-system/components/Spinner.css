@@ -1,0 +1,114 @@
+/* Spinner: product wrapper. GAP: bind to Blitzy OS on source arrival (see ../GAPS.md). */
+
+/*
+ * Loading indicator. Spinner.tsx renders, with shared.css imported beside this file:
+ *
+ *   <span role="status" class="ds-spinner">
+ *     <span class="ds-spinner__circle" aria-hidden="true"></span>
+ *     <span class="ds-visually-hidden">{label}</span>
+ *   </span>
+ *
+ * and, with showLabel, the label shown beside the ring:
+ *
+ *   <span role="status" class="ds-spinner ds-spinner--labelled">
+ *     <span class="ds-spinner__circle" aria-hidden="true"></span>
+ *     <span class="ds-spinner__label">{label}</span>
+ *   </span>
+ *
+ * role="status" is a polite live region, so the label, hidden or shown, carries the loading state
+ * to assistive technology; the ring is decorative and hidden from the accessibility tree. The
+ * class names are a contract with Spinner.tsx, and with the static loading screen in
+ * web/index.html, which writes the showLabel markup out by hand so the browser can paint it
+ * before the bundle runs; keep them exactly as written.
+ *
+ * Plain global CSS with the ds- prefix and BEM elements, like every stylesheet in this folder.
+ * Every size, colour and radius is a token from ../tokens.css, so binding Blitzy OS touches
+ * tokens.css alone until Blitzy OS supplies a spinner of its own.
+ */
+
+/*
+ * Wrapper: sits inline with surrounding text or button content, centred on the line, so a
+ * Spinner can follow a label without shifting the baseline of its neighbours.
+ */
+.ds-spinner {
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
+}
+
+/*
+ * Ring: a square box with a border on every side, one side in the accent colour; rotating the
+ * box sweeps that arc around the ring.
+ *
+ * - Size: --space-4 in both dimensions, so the ring scales with the user's text size.
+ * - Border width: half of --space-1 (2px at a 16px root), the same derivation as the base
+ *   :focus-visible ring in ../tokens.css. It is derived rather than a literal 2px because
+ *   every size in this file comes from a token, so rebinding the spacing scale rebinds the
+ *   ring as well.
+ * - Colours: the track uses --color-border and the arc --color-accent, both at least 3:1 on the
+ *   surface and page backgrounds (WCAG 2.2 SC 1.4.11 Non-text Contrast, per ../tokens.css).
+ * - Radius: a percentage (50%) is not a token, and web/.stylelintrc.json allows only tokens for
+ *   radius in component CSS, so the ring uses --radius-md. With the placeholder tokens that is
+ *   exactly half of --space-4, a true circle; a different Blitzy OS radius yields a rounded
+ *   square, an acceptable placeholder until Blitzy OS supplies its spinner.
+ * - Motion: one turn per second, linear, repeating. ../tokens.css has no motion category, so
+ *   the timing is a placeholder too (GAP, see ../GAPS.md).
+ */
+.ds-spinner__circle {
+  display: inline-block;
+  inline-size: var(--space-4);
+  block-size: var(--space-4);
+  border: calc(var(--space-1) / 2) solid var(--color-border);
+  border-block-start-color: var(--color-accent);
+  border-radius: var(--radius-md);
+  animation: ds-spin 1s linear infinite;
+}
+
+@keyframes ds-spin {
+  to {
+    transform: rotate(1turn);
+  }
+}
+
+/*
+ * Shown label (showLabel): the loading message beside the ring, for a page or page section that
+ * is still loading. The visually hidden label is absolutely positioned, so the gap applies only
+ * here, where the label is a flex item. The text is secondary, like EmptyState's reason:
+ * --color-text-muted is at least 4.5:1 on the surface and page backgrounds (WCAG 2.2 SC 1.4.3).
+ */
+.ds-spinner--labelled {
+  gap: var(--space-2);
+}
+
+.ds-spinner__label {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+
+/*
+ * Reduced motion (WCAG 2.2 SC 2.3.3 Animation from Interactions, a AAA criterion applied here as
+ * good practice): the ring stops and stays as a static track with its accent arc, while the
+ * label, hidden or shown, still conveys the loading state. This rule is the component's own
+ * guarantee; it does not rely on the global safety net at the end of ../tokens.css, which only
+ * shortens animations to a single near-instant run.
+ */
+@media (prefers-reduced-motion: reduce) {
+  .ds-spinner__circle {
+    animation: none;
+  }
+}
+
+/*
+ * Forced colours (Windows High Contrast and similar): the browser repaints every border side in
+ * the same system colour, transparent included, so the accent arc would vanish and the turning
+ * ring would look static. Dropping two adjacent sides instead leaves an open arc of the ring,
+ * drawn in the user's own palette, whose gap the rotation visibly sweeps around. One dropped
+ * side is not enough: the neighbouring sides taper into it, closing the gap to a sliver at
+ * 16 CSS px. Normal rendering is unchanged.
+ */
+@media (forced-colors: active) {
+  .ds-spinner__circle {
+    border-block-start-style: none;
+    border-inline-end-style: none;
+  }
+}

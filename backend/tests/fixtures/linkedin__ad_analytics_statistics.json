@@ -1,0 +1,362 @@
+{
+  "request": {
+    "body": null,
+    "headers": {
+      "Authorization": "Bearer <redacted>",
+      "Linkedin-Version": "202609",
+      "X-Restli-Protocol-Version": "2.0.0"
+    },
+    "method": "GET",
+    "query": [
+      [
+        "q",
+        "statistics"
+      ],
+      [
+        "pivots",
+        "List(CAMPAIGN,MEMBER_JOB_FUNCTION)"
+      ],
+      [
+        "timeGranularity",
+        "ALL"
+      ],
+      [
+        "dateRange",
+        "(start:(year:2026,month:9,day:4),end:(year:2026,month:10,day:1))"
+      ],
+      [
+        "accounts",
+        "List(urn%3Ali%3AsponsoredAccount%3A990000001)"
+      ],
+      [
+        "fields",
+        "pivotValues,costInLocalCurrency,impressions,clicks,oneClickLeads,externalWebsiteConversions"
+      ]
+    ],
+    "url": "https://api.linkedin.com/rest/adAnalytics"
+  },
+  "response": {
+    "body": {
+      "elements": [
+        {
+          "clicks": 430,
+          "costInLocalCurrency": "1374.75",
+          "externalWebsiteConversions": 0,
+          "impressions": 57310,
+          "oneClickLeads": 26,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010000",
+            "urn:li:function:15"
+          ]
+        },
+        {
+          "clicks": 253,
+          "costInLocalCurrency": "808.68",
+          "externalWebsiteConversions": 0,
+          "impressions": 33710,
+          "oneClickLeads": 15,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010000",
+            "urn:li:function:25"
+          ]
+        },
+        {
+          "clicks": 152,
+          "costInLocalCurrency": "485.21",
+          "externalWebsiteConversions": 0,
+          "impressions": 20230,
+          "oneClickLeads": 9,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010000",
+            "urn:li:function:4"
+          ]
+        },
+        {
+          "clicks": 139,
+          "costInLocalCurrency": "444.77",
+          "externalWebsiteConversions": 0,
+          "impressions": 18540,
+          "oneClickLeads": 8,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010000",
+            "urn:li:function:13"
+          ]
+        },
+        {
+          "clicks": 101,
+          "costInLocalCurrency": "323.47",
+          "externalWebsiteConversions": 0,
+          "impressions": 13490,
+          "oneClickLeads": 6,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010000",
+            "urn:li:function:10"
+          ]
+        },
+        {
+          "clicks": 101,
+          "costInLocalCurrency": "323.47",
+          "externalWebsiteConversions": 0,
+          "impressions": 13490,
+          "oneClickLeads": 6,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010000",
+            "urn:li:function:8"
+          ]
+        },
+        {
+          "clicks": 88,
+          "costInLocalCurrency": "283.04",
+          "externalWebsiteConversions": 0,
+          "impressions": 11800,
+          "oneClickLeads": 5,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010000",
+            "urn:li:function:18"
+          ]
+        },
+        {
+          "clicks": 547,
+          "costInLocalCurrency": "876.02",
+          "externalWebsiteConversions": 0,
+          "impressions": 57040,
+          "oneClickLeads": 61,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010001",
+            "urn:li:function:15"
+          ]
+        },
+        {
+          "clicks": 322,
+          "costInLocalCurrency": "515.30",
+          "externalWebsiteConversions": 0,
+          "impressions": 33560,
+          "oneClickLeads": 36,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010001",
+            "urn:li:function:25"
+          ]
+        },
+        {
+          "clicks": 193,
+          "costInLocalCurrency": "309.18",
+          "externalWebsiteConversions": 0,
+          "impressions": 20130,
+          "oneClickLeads": 21,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010001",
+            "urn:li:function:4"
+          ]
+        },
+        {
+          "clicks": 177,
+          "costInLocalCurrency": "283.42",
+          "externalWebsiteConversions": 0,
+          "impressions": 18460,
+          "oneClickLeads": 20,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010001",
+            "urn:li:function:13"
+          ]
+        },
+        {
+          "clicks": 129,
+          "costInLocalCurrency": "206.12",
+          "externalWebsiteConversions": 0,
+          "impressions": 13420,
+          "oneClickLeads": 14,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010001",
+            "urn:li:function:10"
+          ]
+        },
+        {
+          "clicks": 129,
+          "costInLocalCurrency": "206.12",
+          "externalWebsiteConversions": 0,
+          "impressions": 13420,
+          "oneClickLeads": 14,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010001",
+            "urn:li:function:8"
+          ]
+        },
+        {
+          "clicks": 113,
+          "costInLocalCurrency": "180.36",
+          "externalWebsiteConversions": 0,
+          "impressions": 11740,
+          "oneClickLeads": 12,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010001",
+            "urn:li:function:18"
+          ]
+        },
+        {
+          "clicks": 300,
+          "costInLocalCurrency": "1074.28",
+          "externalWebsiteConversions": 0,
+          "impressions": 42700,
+          "oneClickLeads": 17,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010002",
+            "urn:li:function:15"
+          ]
+        },
+        {
+          "clicks": 176,
+          "costInLocalCurrency": "631.93",
+          "externalWebsiteConversions": 0,
+          "impressions": 25120,
+          "oneClickLeads": 10,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010002",
+            "urn:li:function:25"
+          ]
+        },
+        {
+          "clicks": 106,
+          "costInLocalCurrency": "379.16",
+          "externalWebsiteConversions": 0,
+          "impressions": 15070,
+          "oneClickLeads": 6,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010002",
+            "urn:li:function:4"
+          ]
+        },
+        {
+          "clicks": 97,
+          "costInLocalCurrency": "347.56",
+          "externalWebsiteConversions": 0,
+          "impressions": 13810,
+          "oneClickLeads": 5,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010002",
+            "urn:li:function:13"
+          ]
+        },
+        {
+          "clicks": 70,
+          "costInLocalCurrency": "252.77",
+          "externalWebsiteConversions": 0,
+          "impressions": 10050,
+          "oneClickLeads": 4,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010002",
+            "urn:li:function:10"
+          ]
+        },
+        {
+          "clicks": 70,
+          "costInLocalCurrency": "252.77",
+          "externalWebsiteConversions": 0,
+          "impressions": 10050,
+          "oneClickLeads": 4,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010002",
+            "urn:li:function:8"
+          ]
+        },
+        {
+          "clicks": 62,
+          "costInLocalCurrency": "221.17",
+          "externalWebsiteConversions": 0,
+          "impressions": 8790,
+          "oneClickLeads": 3,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010002",
+            "urn:li:function:18"
+          ]
+        },
+        {
+          "clicks": 230,
+          "costInLocalCurrency": "576.40",
+          "externalWebsiteConversions": 8,
+          "impressions": 38360,
+          "oneClickLeads": 0,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010003",
+            "urn:li:function:15"
+          ]
+        },
+        {
+          "clicks": 135,
+          "costInLocalCurrency": "339.06",
+          "externalWebsiteConversions": 5,
+          "impressions": 22560,
+          "oneClickLeads": 0,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010003",
+            "urn:li:function:25"
+          ]
+        },
+        {
+          "clicks": 81,
+          "costInLocalCurrency": "203.44",
+          "externalWebsiteConversions": 3,
+          "impressions": 13540,
+          "oneClickLeads": 0,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010003",
+            "urn:li:function:4"
+          ]
+        },
+        {
+          "clicks": 74,
+          "costInLocalCurrency": "186.48",
+          "externalWebsiteConversions": 3,
+          "impressions": 12410,
+          "oneClickLeads": 0,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010003",
+            "urn:li:function:13"
+          ]
+        },
+        {
+          "clicks": 54,
+          "costInLocalCurrency": "135.62",
+          "externalWebsiteConversions": 2,
+          "impressions": 9030,
+          "oneClickLeads": 0,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010003",
+            "urn:li:function:10"
+          ]
+        },
+        {
+          "clicks": 54,
+          "costInLocalCurrency": "135.62",
+          "externalWebsiteConversions": 2,
+          "impressions": 9030,
+          "oneClickLeads": 0,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010003",
+            "urn:li:function:8"
+          ]
+        },
+        {
+          "clicks": 47,
+          "costInLocalCurrency": "118.67",
+          "externalWebsiteConversions": 2,
+          "impressions": 7900,
+          "oneClickLeads": 0,
+          "pivotValues": [
+            "urn:li:sponsoredCampaign:990010003",
+            "urn:li:function:18"
+          ]
+        }
+      ],
+      "paging": {
+        "count": 15000,
+        "links": [],
+        "start": 0
+      }
+    },
+    "status": 200
+  },
+  "scenario": "default",
+  "seed": 42,
+  "source": "linkedin",
+  "surface": "linkedin.ad_analytics_statistics"
+}

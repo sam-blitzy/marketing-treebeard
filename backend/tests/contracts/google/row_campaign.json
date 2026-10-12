@@ -1,0 +1,147 @@
+{
+  "surface": "google.row_campaign",
+  "source": "google",
+  "reference_url": "https://developers.google.com/google-ads/api/fields/v25/campaign",
+  "api_version": "v25",
+  "last_modified": "2026-09-30",
+  "request": {
+    "method": "POST",
+    "url": "{N8N_GOOGLE_ADS_WEBHOOK_URL}",
+    "required_headers": [],
+    "required_query": [],
+    "optional_query": [],
+    "fields": null,
+    "body": null,
+    "gaql": {
+      "query_id": "Q-G2",
+      "resource": "campaign",
+      "select": [
+        "campaign.id",
+        "campaign.name",
+        "campaign.status",
+        "campaign.advertising_channel_type",
+        "campaign_budget.id",
+        "campaign_budget.amount_micros",
+        "campaign_budget.total_amount_micros",
+        "campaign_budget.period",
+        "campaign_budget.explicitly_shared"
+      ]
+    },
+    "limits": {}
+  },
+  "response": {
+    "status": [
+      200
+    ],
+    "body": {
+      "type": "object",
+      "description": "One REST GoogleAdsRow of Q-G2, the campaign keyset scan: WHERE campaign.status != 'REMOVED' AND campaign.id > {last_id} ORDER BY campaign.id LIMIT 9999, continued from the last id while a page returns exactly 9,999 rows (AAP 0.3.3). Also one row of Q-G2b: the same fields with campaign.id IN ({at most 1,000 tracked ids missing from a complete Q-G2 scan}) and no status filter, so REMOVED campaigns are returned; a tracked campaign returned as REMOVED is snapshotted as ended, and one not returned at all raises a missing discrepancy, but only after a complete scan (safe absence). Each row arrives as an element of results[] in the google.search envelope (search.json). Plan correction: campaign_budget.total_amount_micros is added to the AAP's Q-G2 select, because in v25 a CUSTOM_PERIOD (lifetime) budget's amount lives in total_amount_micros while amount_micros is unset; the own_budget total_budget decision field and the C0 budget comparison need it (AAP 0.5.2); connectors/google_n8n/queries.py makes the same addition for Q-G2 and Q-G2b. Keys are camelCase REST; int64 values (ids, *Micros) arrive as JSON strings. campaign.resourceName is always returned for the FROM resource, and campaignBudget.resourceName is returned because campaign_budget fields are selected (GAQL query structure: an attributed resource's resource_name is returned when at least one of its fields is selected). Feeds campaign entity snapshots (status, budget_amount_micros, budget_id), dated shared-budget membership (budget_id), explicitly shared budget subjects, C0 status and budget discrepancies, and daily-budget utilization (AAP 0.5.2, 0.5.4).",
+      "properties": {
+        "campaign": {
+          "type": "object",
+          "description": "The campaign resource (FROM campaign). Snapshotted every entity sync as entity_type=campaign; campaign.external_id is id, raw_status keeps status, objective_or_channel keeps advertisingChannelType.",
+          "properties": {
+            "resourceName": {
+              "type": "string",
+              "description": "customers/{customer_id}/campaigns/{campaign_id}. Returned for the FROM resource although not selected (omit_unselected_resource_names defaults to false)."
+            },
+            "id": {
+              "type": "string",
+              "description": "INT64 campaign id as a decimal string; output only. The keyset field of Q-G2 (ORDER BY campaign.id, campaign.id > last id) and the id list of Q-G2b; read by partition.enumerate_campaigns through get_field."
+            },
+            "name": {
+              "type": "string",
+              "description": "STRING campaign name, shown in evidence and used by the C3b name check."
+            },
+            "status": {
+              "type": "string",
+              "description": "CampaignStatusEnum (v25). Q-G2 excludes REMOVED; Q-G2b has no status filter and can return REMOVED. Normalised by CAMPAIGN_STATUS_MAP: ENABLED to active, PAUSED to paused, REMOVED to ended; the raw value is kept as raw_status.",
+              "enum": [
+                "ENABLED",
+                "PAUSED",
+                "REMOVED",
+                "UNKNOWN",
+                "UNSPECIFIED"
+              ]
+            },
+            "advertisingChannelType": {
+              "type": "string",
+              "description": "AdvertisingChannelTypeEnum (v25); immutable after creation. Stored as the campaign's objective_or_channel.",
+              "enum": [
+                "DEMAND_GEN",
+                "DISPLAY",
+                "HOTEL",
+                "LOCAL",
+                "LOCAL_SERVICES",
+                "MULTI_CHANNEL",
+                "PERFORMANCE_MAX",
+                "SEARCH",
+                "SHOPPING",
+                "SMART",
+                "TRAVEL",
+                "UNKNOWN",
+                "UNSPECIFIED",
+                "VIDEO"
+              ]
+            }
+          },
+          "required": [
+            "resourceName",
+            "id",
+            "name",
+            "status",
+            "advertisingChannelType"
+          ],
+          "additionalProperties": false
+        },
+        "campaignBudget": {
+          "type": "object",
+          "description": "The attributed campaign_budget resource. Present whenever the campaign references a campaign budget; when absent, the campaign has no budget row (budget_id null) and is excluded from cap and utilization rules.",
+          "properties": {
+            "resourceName": {
+              "type": "string",
+              "description": "customers/{customer_id}/campaignBudgets/{campaign_budget_id}. Returned because at least one campaign_budget field is selected."
+            },
+            "id": {
+              "type": "string",
+              "description": "INT64 campaign budget id as a decimal string; output only. The budget's external_id and the campaign snapshot's budget_id, which gives dated shared-budget membership (AAP 0.5.4.5)."
+            },
+            "amountMicros": {
+              "type": "string",
+              "description": "INT64 as a string: the DAILY budget amount in micros of the account currency (1,000,000 micros = one currency unit). Unset for CUSTOM_PERIOD; mutually exclusive with totalAmountMicros. Kept as budget.amount_micros and compared at native precision by C0."
+            },
+            "totalAmountMicros": {
+              "type": "string",
+              "description": "INT64 as a string: the CUSTOM_PERIOD (lifetime) budget amount in micros of the account currency. Unset for DAILY; mutually exclusive with amountMicros. Plan correction: added to the Q-G2 and Q-G2b select so the own_budget total_budget field and C0 can read lifetime budgets."
+            },
+            "period": {
+              "type": "string",
+              "description": "BudgetPeriodEnum (v25); immutable, DAILY by default. DAILY budgets get utilization; CUSTOM_PERIOD budgets show utilization as n/a and are excluded from cap rules (AAP 0.5.4.1). Decides which amount field the own_budget and budget decision shapes accept (daily_budget for DAILY, total_budget for CUSTOM_PERIOD).",
+              "enum": [
+                "CUSTOM_PERIOD",
+                "DAILY",
+                "UNKNOWN",
+                "UNSPECIFIED"
+              ]
+            },
+            "explicitlyShared": {
+              "type": "boolean",
+              "description": "BOOLEAN. true marks an explicitly shared budget, a decision subject of its own whose member campaigns take the shared_member shape (AAP 0.5.2); a shared budget can never become non-shared. A CUSTOM_PERIOD budget cannot be explicitly shared. The key may be omitted when false under proto3 JSON default-value omission, and consumers treat absence as false."
+            }
+          },
+          "required": [
+            "resourceName",
+            "id",
+            "period"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "campaign"
+      ],
+      "additionalProperties": false
+    },
+    "documented_sample": null
+  }
+}

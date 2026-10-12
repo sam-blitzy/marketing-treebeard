@@ -1,0 +1,87 @@
+# White paper registry: content assets and the LinkedIn lead forms that gate them.
+#
+# Purpose
+#   The ad platforms do not identify content assets, so this file maps each
+#   white paper to the LinkedIn lead forms that deliver it, plus optional
+#   creative overrides. The White papers section attributes spend, LinkedIn
+#   leads, HubSpot MQL and Qualified Lead counts, meetings and deals to an asset
+#   and, below it, to the creative that produced them.
+#
+# Loading
+#   - Read by backend/src/ads_engine/analysis/thresholds.py with a strict PyYAML
+#     SafeLoader subclass that rejects duplicate keys, together with
+#     thresholds.yaml and hubspot_mapping.yaml in this directory. A key repeated
+#     within one mapping fails config load.
+#   - Part of config_hash: the hash covers the parsed contents of all three
+#     files, so editing a value changes the hash stored on every analysis run,
+#     while editing only comments does not.
+#   - Mounted read-only at /app/config in the containers; from backend/ on the
+#     host it is read as ../config.
+#   - Persisted into content_asset (slug, title), content_asset_form
+#     (asset, lead_form_urn) and content_asset_creative (asset, creative_urn),
+#     and shown read-only by GET /api/v1/config and the /settings screen.
+#
+# Schema
+#   assets:                     list of asset mappings, in display order
+#     - slug:                   unique id, lowercase kebab-case matching
+#                               ^[a-z0-9]+(-[a-z0-9]+)*$
+#       title:                  non-empty display title
+#       lead_forms:             canonical LinkedIn form URNs,
+#                               "urn:li:leadGenForm:{digits}". Never a versioned
+#                               URN ("urn:li:versionedLeadGenForm:(...)"): joins
+#                               use the canonical URN, so every version of a
+#                               form maps to the same asset.
+#       creative_overrides:     optional; creative URNs,
+#                               "urn:li:sponsoredCreative:{digits}". Absent or
+#                               [] means none.
+#
+# Asset resolution (one precedence for spend and for leads)
+#   1. The creative's override, when the creative is listed here.
+#   2. Otherwise the asset whose lead_forms holds the canonical form URN: the
+#      creative's call-to-action form for spend, the lead's own form for leads.
+#   A form or creative that resolves to no asset attributes to no white paper.
+#
+# Configuration load fails when
+#   - a lead form is listed under two assets;
+#   - a creative is listed under two assets' creative_overrides;
+#   - an override contradicts its creative's own form mapping, that is, the
+#     creative's call-to-action form maps to a different asset. This check runs
+#     against the synced creatives of the active LinkedIn dataset, before each
+#     analysis run. Overrides therefore serve creatives without a lead-gen form,
+#     such as landing-page creatives.
+#
+# Shipped entries and live use
+#   The entries below use simulated LinkedIn ids from the reserved block that
+#   starts at 990000000 (forms 990000100-990000999, creatives
+#   990001000-990009999). The simulated world creates exactly these forms and
+#   the override creative, so the White papers section populates on first start
+#   in simulated mode. For a live LinkedIn account, replace them with the
+#   account's real canonical form URNs and creative URNs. A form that is not
+#   listed here attributes to no white paper.
+
+assets:
+  # Several forms gating one asset: both forms, and every version of each,
+  # resolve to this white paper.
+  - slug: b2b-pipeline-report-2026
+    title: "The 2026 B2B Pipeline Report"
+    lead_forms:
+      - "urn:li:leadGenForm:990000101"
+      - "urn:li:leadGenForm:990000102"
+    creative_overrides: []
+
+  # A single form gating one asset.
+  - slug: paid-media-benchmarks-2026
+    title: "Paid Media Benchmarks 2026"
+    lead_forms:
+      - "urn:li:leadGenForm:990000201"
+    creative_overrides: []
+
+  # A form plus one override. Creative 990001301 is a landing-page creative
+  # with no lead-gen form, so its spend resolves to this asset only through the
+  # override.
+  - slug: attribution-playbook
+    title: "The Attribution Playbook"
+    lead_forms:
+      - "urn:li:leadGenForm:990000301"
+    creative_overrides:
+      - "urn:li:sponsoredCreative:990001301"

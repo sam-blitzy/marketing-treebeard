@@ -1,0 +1,3824 @@
+"""Source modes: live or simulated per source, connector clients, probes, fallback and builds.
+
+AAP 0.3.3 ("Error classification and mock-data fallback", "Modes", "Granularity",
+"Datasets and provenance", "Cross-source joins with simulation", "Recovery readiness"), AAP
+0.5.1 ("Source mode and datasets") and AAP 0.11.2 ("First start"). Connectors raise only
+``AccessDenied``, ``TransientError`` or ``QueryDefect`` (AAP 0.11.1); this module alone decides
+what each one means:
+
+==================  ================================================================
+Classification      Consequence (:meth:`SourceModeController.on_error`)
+==================  ================================================================
+Access unavailable  Required credentials missing: the source is simulated with the
+                    reason ``credentials not configured``.
+Access denied       401/403 (LinkedIn: 401 after one token refresh), or a Google
+                    denial inside an n8n HTTP 200: the whole source switches to
+                    simulated data; the platform code and failing endpoint are the
+                    reason.
+Transient           429, 5xx, timeout, ``RESOURCE_EXHAUSTED``, call budget: the
+                    affected datasets turn stale and keep their last good data. Never
+                    mock. A probe that meets only these
+                    (:meth:`SourceModeController.ensure_dataset`), and a live build
+                    discarded on them or any shortfall but a denial or a defect, turn
+                    the source ``stale``: no fallback, the active dataset kept, probed
+                    and built again after :data:`PROBE_INTERVAL`.
+Defect              400, GAQL ``QueryError``, validation: the job fails. No mock, no
+                    retry. A probe that meets one and no denial
+                    (:meth:`SourceModeController.ensure_dataset`), and a live build
+                    discarded because one of its jobs met one, fail the same way:
+                    status ``error``, logged with the query id, no fallback. The
+                    controller then neither probes nor builds the source again; a new
+                    controller (a restarted worker) tries it once more.
+==================  ================================================================
+
+Modes (``DATA_MODE``):
+
+* ``simulated`` forces every source to simulated data; it never probes and never promotes
+  a source to live, even when the probes would pass.
+* ``auto`` (default) applies the table per source. A source whose access is unavailable or
+  denied is always simulated, never left without data.
+
+Granularity: a source's active dataset is entirely live or entirely simulated, so a 403 on
+any LinkedIn endpoint, Lead Sync included, switches all of LinkedIn. A simulated LinkedIn
+dataset is built with a companion CRM dataset (simulated HubSpot, ``role=companion``) that
+activates and retires with it, so simulated leads never join live contacts and
+``@sim.invalid`` emails never reach a live portal.
+
+State of record. ``source_connection`` holds each source's resolved mode, health status
+(``ok``, ``stale``, ``denied`` or ``error``) and reason. **Automatic fallback** is the row
+``mode='simulated', status='denied'`` under ``DATA_MODE=auto`` with credentials present:
+only such a source gets recovery probes (every 30 minutes, driven by the scheduler), and the
+``denied`` status is sticky while it lasts (activation of the fallback dataset and transient
+errors on simulated data do not clear it); it ends with a live activation, or when the live
+build after a passing recovery probe fails on a defect (``error``) or transiently
+(``stale``). Every probe, the scheduler's recovery probes and
+the probes of :meth:`SourceModeController.ensure_dataset` alike, is recorded as a ``probe``
+``sync_run`` whose start spaces the source's next probe by :data:`PROBE_INTERVAL`; a
+fallback entered by a denied job writes no such row, so recovery probes are also spaced from
+its start (:meth:`SourceModeController.fallback_failure_at`).
+``source_dataset`` holds the data itself: switching mode always means building, backfilling
+and atomically activating a new dataset (``sync/datasets.py``); until then the previous
+dataset stays active and labelled.
+
+Import direction: ``sync/jobs.py`` imports this module, so the backfill is reached through
+one deferred import inside the build that :meth:`SourceModeController.build_dataset` runs.
+
+Example:
+    The worker's startup and ``ads-engine seed-simulated`` share one entry point::
+
+        report = await bootstrap_sources(get_settings())
+        for source, active in report.active.items():
+            print(source, report.modes[source].mode, active)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
+from enum import Enum
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Final, Literal, Protocol, get_args, runtime_checkable
+
+import httpx
+from pydantic import SecretStr
+from sqlalchemy import Row, func, select, text, update
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from ads_engine.analysis.thresholds import ConfigError, CrmBindings, Thresholds
+from ads_engine.connectors.errors import (
+    AccessDenied,
+    ConnectorError,
+    ErrorKind,
+    QueryDefect,
+    TransientError,
+)
+from ads_engine.connectors.google_n8n.client import (
+    SIMULATED_SECRET,
+    SIMULATED_WEBHOOK_URL,
+    UNMETERED,
+    CallBudget,
+    GoogleAdsWebhookClient,
+)
+from ads_engine.connectors.http import DEFAULT_RETRY, RetryPolicy, build_client
+from ads_engine.connectors.hubspot.client import HubSpotClient, RateLimiter
+from ads_engine.connectors.linkedin.auth import (
+    SIMULATED_TOKEN,
+    LinkedInTokenProvider,
+    StaticTokenProvider,
+)
+from ads_engine.connectors.linkedin.client import LinkedInClient
+from ads_engine.db import repositories
+from ads_engine.db.models.ops import (
+    CONNECTION_STATUSES,
+    DATASET_ROLES,
+    DATASET_STATES,
+    MODES,
+    SYNC_RUN_FAILED,
+    SYNC_RUN_RUNNING,
+    SYNC_RUN_SUCCEEDED,
+    SourceConnection,
+    SourceDataset,
+    SyncRun,
+)
+from ads_engine.db.session import get_sessionmaker
+from ads_engine.logging import get_logger
+from ads_engine.settings import SOURCES, Settings, Source, get_settings
+from ads_engine.simulation.generator import RUNTIME_SPECS, SimulatedWorld
+from ads_engine.simulation.transport import mock_transport
+from ads_engine.sync import freshness, lead_match
+from ads_engine.sync.budget_guard import GoogleCallBudget
+from ads_engine.sync.datasets import (
+    Activation,
+    DatasetManager,
+    DatasetStateError,
+    Mode,
+    Readiness,
+    WorldIdentity,
+)
+
+if TYPE_CHECKING:
+    # Types only: sync/jobs.py imports this module at its top, so its runtime import stays
+    # deferred into the build (:meth:`SourceModeController._build`).
+    from ads_engine.sync.jobs import JobResult
+
+__all__ = [
+    "ABANDONED_BUILD_AFTER",
+    "BOOTSTRAP_ORDER",
+    "CONNECTION_STATUSES",
+    "JOB_PROBE",
+    "LINKEDIN_RETENTION_DAYS",
+    "PROBE_INTERVAL",
+    "REASON_FORCED",
+    "REASON_LIVE",
+    "REASON_NO_CREDENTIALS",
+    "REASON_RECOVERED",
+    "REASON_SEEDED",
+    "ActiveDataset",
+    "BootstrapReport",
+    "BuildOutcome",
+    "ErrorDisposition",
+    "ProbeCheck",
+    "ProbeReport",
+    "ProbeRunLog",
+    "ProbeRunStatus",
+    "ResolvedMode",
+    "SourceClients",
+    "SourceModeController",
+    "bootstrap_sources",
+]
+
+_log = get_logger(__name__)
+
+# ---------------------------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------------------------
+
+REASON_NO_CREDENTIALS: Final = "credentials not configured"
+"""Mode reason of a source simulated because its required environment variables are unset."""
+
+REASON_FORCED: Final = "DATA_MODE=simulated"
+"""Mode reason of every source while ``DATA_MODE=simulated`` forces simulated data."""
+
+REASON_SEEDED: Final = "simulated data seeded on request"
+"""Dataset reason of a simulated build forced by ``ads-engine seed-simulated`` for a source
+that would otherwise resolve to live; the worker later replaces it through recovery readiness."""
+
+REASON_LIVE: Final = "live access verified"
+"""Dataset reason of a live build that followed a passing probe (first start with credentials,
+or credentials added before a restart)."""
+
+REASON_RECOVERED: Final = "recovered"
+"""Dataset reason of a live build made by :meth:`SourceModeController.recover`."""
+
+BOOTSTRAP_ORDER: Final[tuple[Source, ...]] = ("google", "hubspot", "linkedin")
+"""Bootstrap order: HubSpot's primary must be active before a live LinkedIn build stages its
+leads against it (AAP 0.3.3, "Staged matching")."""
+
+ABANDONED_BUILD_AFTER: Final = timedelta(hours=6)
+"""Age after which a ``building`` primary is treated as abandoned by a crashed build and
+discarded. Builds run to completion inside one :meth:`SourceModeController.build_dataset`
+call, so a younger one may still be in progress in another process (the CLI's
+``seed-simulated`` while the worker runs)."""
+
+LINKEDIN_RETENTION_DAYS: Final = 180
+"""LinkedIn's 6-month daily retention, the cap on every source's backfill (AAP 0.2.4, 0.3.2)."""
+
+PROBE_INTERVAL: Final = timedelta(minutes=30)
+"""The least time between two probes of a source (AAP 0.3.2: the recovery probe runs every 30
+minutes while a source is in automatic fallback).
+
+Every probe is recorded as a :data:`JOB_PROBE` ``sync_run`` whose ``started_at`` spaces the
+next one: the scheduler's recovery probes and the probes
+:meth:`SourceModeController.ensure_dataset` runs alike, so a fallback entered by a probe gets
+its first recovery probe 30 minutes later, and each probe spends live calls (on Google, the
+developer-token quota other n8n workflows share) at most once per interval. A fallback entered
+by a denied job or build is spaced from its ``last_failure_at`` too
+(:meth:`SourceModeController.fallback_failure_at`)."""
+
+JOB_PROBE: Final = "probe"
+"""The ``sync_run.job`` of every probe; its ``started_at`` spaces the probes."""
+
+ErrorDisposition = Literal["switched_to_simulated", "stale", "defect", "ignored"]
+"""What :meth:`SourceModeController.on_error` decided for one classified connector error."""
+
+_STATUS_OK: Final = "ok"
+_STATUS_STALE: Final = "stale"
+_STATUS_DENIED: Final = "denied"
+_STATUS_ERROR: Final = "error"
+if tuple(CONNECTION_STATUSES) != (_STATUS_OK, _STATUS_STALE, _STATUS_DENIED, _STATUS_ERROR):
+    # A renamed status would otherwise surface only as a CHECK violation at run time.
+    raise RuntimeError(f"connection statuses {CONNECTION_STATUSES!r} no longer match sync/mode.py")
+_DEGRADED_STATUSES: Final = frozenset({_STATUS_STALE, _STATUS_DENIED, _STATUS_ERROR})
+"""Connection statuses whose ``sync.connection`` transition is logged as a ``WARNING``."""
+
+_ROLE_PRIMARY: Final = "primary"
+_STATE_BUILDING: Final = "building"
+if _ROLE_PRIMARY not in DATASET_ROLES or _STATE_BUILDING not in DATASET_STATES:
+    raise RuntimeError("dataset roles or states no longer match sync/mode.py")
+
+if get_args(Mode) != tuple(MODES):
+    # _as_mode narrows through Mode, so a mode renamed in the schema alone would otherwise
+    # surface only as a ValueError or a CHECK violation at run time.
+    raise RuntimeError(f"modes {MODES!r} no longer match sync/mode.py")
+
+_REASON_MAX: Final = 500
+_SIMULATED_HUBSPOT_TOKEN: Final = SecretStr("simulated")
+_LOCK_TIMEOUT: Final = text("SET LOCAL lock_timeout = '30s'")
+_ELLIPSIS: Final = "…"
+
+_PAIRED_SOURCES: Final[tuple[Source, ...]] = ("hubspot", "linkedin")
+"""The sources whose activations take one common lock set, in the fixed order rows are locked.
+LinkedIn's leads are matched in HubSpot's datasets, so the lead/CRM pair a build staged must
+still be the effective pair when it activates, whichever of the two changes meanwhile."""
+
+_SETTLE_ROUNDS: Final = 3
+"""Most rounds of settle-then-activate one build runs. Each round that finds the effective
+lead/CRM pair changed under the activation lock stages the new rows and settles again; the
+bound keeps a build from chasing a dependency that keeps changing (every round may rerun a
+CRM backfill), and a build that exhausts it is discarded like any build that is not ready."""
+
+_EVERY_LEAD_SINCE: Final = datetime(1970, 1, 1, tzinfo=UTC)
+"""Staging bound of a LinkedIn build, live or simulated: before any lead, so every lead the
+backfill stored, however near its window's edge, is staged and attempted before the dataset
+activates, as the readiness test, which counts every lead, requires."""
+
+_RESTAGED_CRM_FRESHNESS: Final = ("hubspot.contacts", "hubspot.associations")
+"""Freshness rows of a building CRM dataset that rows staged after its backfill invalidate:
+matching adds contacts that neither its contact refresh nor its associations have read."""
+if not set(_RESTAGED_CRM_FRESHNESS) <= set(freshness.SOURCE_DATASETS["hubspot"]):
+    raise RuntimeError("HubSpot freshness datasets no longer match sync/mode.py")
+
+
+class _Keep(Enum):
+    """Sentinel for a ``source_connection`` field left as stored."""
+
+    KEEP = "keep"
+
+
+_KEEP: Final = _Keep.KEEP
+
+
+# ---------------------------------------------------------------------------------------------
+# Value types
+# ---------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedMode:
+    """The mode a source should read now, and why.
+
+    Attributes:
+        source: The source resolved.
+        mode: ``live`` or ``simulated``.
+        reason: Why the source is simulated (``credentials not configured``,
+            ``DATA_MODE=simulated``, or the recorded denial); ``None`` for live.
+        fallback: Whether the source is simulated because live access was denied (automatic
+            fallback); only such a source gets recovery probes.
+        needs_probe: Live is desired but the active primary dataset is simulated or absent,
+            so the full capability probe must pass before a live dataset is built.
+    """
+
+    source: Source
+    mode: Mode
+    reason: str | None
+    fallback: bool = False
+    needs_probe: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeCheck:
+    """One capability check of a probe.
+
+    Attributes:
+        name: What was checked, for example ``Q-G1`` or ``leadFormResponses 123``.
+        ok: Whether the call succeeded.
+        reason: The classified error's reason when it failed; ``None`` when it passed.
+        endpoint: The failing call's endpoint, from the classified error (its contract
+            surface name); ``None`` for a passing check or a configuration check.
+        kind: The classification of the error that failed the check: ``access_denied``,
+            ``transient`` (a listing cut short by a transient error included) or
+            ``defect``. ``None`` for a passing check or a configuration check (forced
+            simulation, missing credentials, no ad account), which sends no request.
+        query_id: The failing request's query id (``Q-G1``) when the error is a defect that
+            carries one; ``None`` otherwise.
+    """
+
+    name: str
+    ok: bool
+    reason: str | None = None
+    endpoint: str | None = None
+    kind: ErrorKind | None = None
+    query_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeReport:
+    """The result of one probe of a source's full capability set (AAP 0.3.3 "Probe set").
+
+    A failed probe is acted on by the classification of its failed checks: a :attr:`denial`
+    switches the source to simulated data, else a :attr:`defect` fails without mock data,
+    else (transient failures only) the source turns stale with no fallback and no mock data
+    (:meth:`SourceModeController.ensure_dataset`).
+
+    Attributes:
+        source: The source probed.
+        passed: True exactly when there is at least one check and every check passed.
+        checks: Each check, in the order run.
+        calls: The live calls the probe sent, read from its client's own counter as a sync
+            job's calls are (Google webhook POST attempts, retries included; LinkedIn and
+            HubSpot calls, a retry sequence once); 0 when no request was sent.
+        duration_ms: Wall-clock duration of the probe.
+
+    Raises:
+        ValueError: On construction, when ``passed`` disagrees with ``checks``.
+    """
+
+    source: Source
+    passed: bool
+    checks: tuple[ProbeCheck, ...]
+    calls: int = 0
+    duration_ms: int = 0
+
+    def __post_init__(self) -> None:
+        """Reject a report whose verdict does not follow from its checks."""
+        expected = bool(self.checks) and all(check.ok for check in self.checks)
+        if self.passed != expected:
+            raise ValueError("ProbeReport.passed must be true exactly when every check passed")
+
+    @classmethod
+    def of(
+        cls,
+        source: Source,
+        checks: tuple[ProbeCheck, ...],
+        *,
+        calls: int = 0,
+        duration_ms: int = 0,
+    ) -> ProbeReport:
+        """Build the report of ``checks``, deriving the verdict.
+
+        Args:
+            source: The source probed.
+            checks: The checks run.
+            calls: The live calls the probe sent.
+            duration_ms: How long the probe took.
+
+        Returns:
+            The report; ``passed`` only when every check passed.
+        """
+        return cls(
+            source=source,
+            passed=bool(checks) and all(check.ok for check in checks),
+            checks=checks,
+            calls=calls,
+            duration_ms=duration_ms,
+        )
+
+    @property
+    def failed(self) -> tuple[ProbeCheck, ...]:
+        """The checks that failed, in the order run."""
+        return tuple(check for check in self.checks if not check.ok)
+
+    @property
+    def reason(self) -> str | None:
+        """The first failing check's reason, naming the check once, or ``None`` when it passed.
+
+        ``"<name>: <reason>"``, or the reason alone when it already names the check, as a
+        Google reason names its query id (``"google search Q-G1: HTTP 401: …"``); the same
+        text the probe's consequence stores (:func:`_check_reason`).
+        """
+        for check in self.checks:
+            if not check.ok:
+                return _check_reason(check)
+        return None
+
+    @property
+    def endpoint(self) -> str | None:
+        """The first failing check's endpoint, or ``None``.
+
+        ``None`` when every check passed, or when the first failing check is a configuration
+        check (forced simulation, missing credentials), which sends no request.
+        """
+        for check in self.checks:
+            if not check.ok:
+                return check.endpoint
+        return None
+
+    @property
+    def denial(self) -> ProbeCheck | None:
+        """The first check that failed with an access denial, or ``None``.
+
+        One denied check is enough to switch the whole source to simulated data, whatever
+        the other checks returned (AAP 0.3.3 "Granularity").
+        """
+        return self._first_failed("access_denied")
+
+    @property
+    def defect(self) -> ProbeCheck | None:
+        """The first check that failed with a defect (400, ``QueryError``, validation), or None."""
+        return self._first_failed("defect")
+
+    def _first_failed(self, kind: ErrorKind) -> ProbeCheck | None:
+        """Return the first failed check classified ``kind``, or ``None``."""
+        for check in self.checks:
+            if not check.ok and check.kind == kind:
+                return check
+        return None
+
+
+_NOTHING_CHECKED: Final = ProbeCheck(JOB_PROBE, False, "no capability was checked")
+"""The deciding check of a failed probe whose report holds no check at all: nothing verified
+access and nothing refused it, so it gets the Transient consequence, never a fallback."""
+
+ProbeRunStatus = Literal["succeeded", "failed", "cancelled"]
+"""How a ``probe`` ``sync_run`` ended, as its ``sync.job.finish`` reports it."""
+
+
+@dataclass(slots=True)
+class ProbeRunLog:
+    """The ``sync.job.start`` and the one ``sync.job.finish`` of a ``probe`` ``sync_run`` row.
+
+    AAP 0.11.1 logs every sync job's start and finish with its source, job, rows, calls and
+    duration, and a probe is the :data:`JOB_PROBE` job: the scheduler's recovery probes and
+    the probes :meth:`SourceModeController.ensure_dataset` runs alike. :meth:`start` logs the
+    start once the row exists; :meth:`finish` logs the finish the first time a path closes
+    the row, and any later call logs nothing, so an error or a cancellation after a close
+    never adds a second one. The level follows the status as for every job: ``info`` for
+    ``succeeded``, ``error`` for ``failed``, ``warning`` for ``cancelled``. ``rows`` is always
+    0, since a probe writes no data; ``checks`` and ``calls`` are :attr:`report`'s, 0 while
+    the probe has not reported. No field carries an email, a secret or a token: an error is
+    a sanitized connector reason, a fixed text or an exception's class name.
+
+    Attributes:
+        source: The probed source.
+        run_id: The probe's ``sync_run`` row.
+        started: ``time.perf_counter()`` when the row opened; the duration runs from it.
+        report: The probe's report once it ran, else ``None``.
+        finished: Whether the finish was logged.
+    """
+
+    source: Source
+    run_id: int
+    started: float = field(default_factory=time.perf_counter)
+    report: ProbeReport | None = None
+    finished: bool = False
+
+    @classmethod
+    def start(cls, source: Source, run_id: int) -> ProbeRunLog:
+        """Log the start of the probe whose ``sync_run`` row ``run_id`` was just opened.
+
+        Args:
+            source: The probed source.
+            run_id: The probe's row.
+
+        Returns:
+            The log that :meth:`finish` completes.
+        """
+        run = cls(source, run_id)
+        _log.info(
+            "sync.job.start",
+            source=source,
+            job=JOB_PROBE,
+            run_id=run_id,
+            dataset_id=None,
+            mode="live",
+            rows=0,
+            calls=0,
+            duration_ms=0,
+        )
+        return run
+
+    def finish(
+        self,
+        status: ProbeRunStatus,
+        *,
+        dataset_id: int | None = None,
+        error: str | None = None,
+        error_type: str | None = None,
+    ) -> None:
+        """Log the probe's one ``sync.job.finish``; a call after the first logs nothing.
+
+        Args:
+            status: ``succeeded``, ``failed`` or ``cancelled``, as the row was closed.
+            dataset_id: The dataset the build after the probe made (activated or discarded,
+                or the simulated one a denial called for); ``None`` when nothing was built.
+            error: The text the row was closed with; ``None`` when it succeeded.
+            error_type: The class name of the exception that ended the probe, or ``None``.
+        """
+        if self.finished:
+            return
+        self.finished = True
+        report = self.report
+        if status == "succeeded":
+            log = _log.info
+        elif status == "cancelled":
+            log = _log.warning
+        else:
+            log = _log.error
+        log(
+            "sync.job.finish",
+            source=self.source,
+            job=JOB_PROBE,
+            run_id=self.run_id,
+            dataset_id=dataset_id,
+            status=status,
+            rows=0,
+            checks=0 if report is None else len(report.checks),
+            calls=0 if report is None else report.calls,
+            duration_ms=int((time.perf_counter() - self.started) * 1000),
+            error=None if error is None else _truncate(error),
+            error_type=error_type,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SourceClients:
+    """The connector client of one source in one mode.
+
+    :meth:`SourceModeController.open_clients` yields it with only the field of ``source``
+    set; the ``require_*`` accessors return that client typed as non-optional.
+
+    Attributes:
+        source: The source the client calls.
+        mode: ``live`` (real network, or a test's injected transport) or ``simulated`` (the
+            simulation's mock transport).
+        google: The n8n webhook client, for Google.
+        linkedin: The Marketing API client, for LinkedIn.
+        linkedin_account_ids: The ad accounts to read: ``LINKEDIN_AD_ACCOUNT_IDS`` live, the
+            simulated world's accounts simulated.
+        hubspot: The CRM client, for HubSpot.
+    """
+
+    source: Source
+    mode: Mode
+    google: GoogleAdsWebhookClient | None = None
+    # The built-in gitleaks rule linkedin-client-id reads the 14-letter type name after
+    # "linkedin:" as a client id; the line holds no credential.
+    linkedin: LinkedInClient | None = None  # gitleaks:allow
+    linkedin_account_ids: tuple[str, ...] = ()
+    hubspot: HubSpotClient | None = None
+
+    def require_google(self) -> GoogleAdsWebhookClient:
+        """Return the Google client.
+
+        Raises:
+            RuntimeError: When these are not Google's clients.
+        """
+        if self.google is None:
+            raise RuntimeError(f"no Google client: these are {self.source}'s clients")
+        return self.google
+
+    def require_linkedin(self) -> LinkedInClient:
+        """Return the LinkedIn client.
+
+        Raises:
+            RuntimeError: When these are not LinkedIn's clients.
+        """
+        if self.linkedin is None:
+            raise RuntimeError(f"no LinkedIn client: these are {self.source}'s clients")
+        return self.linkedin
+
+    def require_hubspot(self) -> HubSpotClient:
+        """Return the HubSpot client.
+
+        Raises:
+            RuntimeError: When these are not HubSpot's clients.
+        """
+        if self.hubspot is None:
+            raise RuntimeError(f"no HubSpot client: these are {self.source}'s clients")
+        return self.hubspot
+
+
+@dataclass(frozen=True, slots=True)
+class BuildOutcome:
+    """What one dataset build ended with.
+
+    Attributes:
+        source: The source built.
+        mode: The mode of the dataset built.
+        dataset_id: The dataset built; ``None`` when none could be begun. A dataset that was
+            not activated has been discarded, so the id no longer exists then.
+        activated: Whether the dataset was activated (and the previous one retired).
+        reason: The dataset's reason when activated; why the build failed otherwise.
+        companion_id: The companion CRM dataset of a simulated LinkedIn build.
+        retired: The datasets the activation retired (previous primary and its companion).
+        duration_ms: Wall-clock duration of the build.
+        probe: The recovery probe :meth:`SourceModeController.recover` ran before the build,
+            or ``None``. A recovery probe that failed builds nothing: its outcome holds
+            no dataset, ``live`` as the mode it would have built, and the probe's reason.
+    """
+
+    source: Source
+    mode: Mode
+    dataset_id: int | None
+    activated: bool
+    reason: str | None
+    companion_id: int | None = None
+    retired: tuple[int, ...] = ()
+    duration_ms: int = 0
+    probe: ProbeReport | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveDataset:
+    """A source's active primary dataset, as a bootstrap report shows it.
+
+    Attributes:
+        dataset_id: The active primary dataset.
+        mode: Its mode.
+        reason: Its reason, for example ``credentials not configured``.
+        companion_id: The active companion CRM dataset of a simulated LinkedIn dataset.
+    """
+
+    dataset_id: int
+    mode: Mode
+    reason: str | None
+    companion_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BootstrapReport:
+    """What :func:`bootstrap_sources` did for each source; no credentials are ever included.
+
+    Attributes:
+        outcomes: The build each source needed, or ``None`` when its active dataset was
+            already of the resolved mode.
+        modes: Each source's resolution after the bootstrap.
+        active: Each source's active primary dataset after the bootstrap, or ``None``.
+        failures: The error that stopped a source's bootstrap, by source; one source's
+            failure never stops the others.
+    """
+
+    outcomes: Mapping[Source, BuildOutcome | None]
+    modes: Mapping[Source, ResolvedMode]
+    active: Mapping[Source, ActiveDataset | None] = field(default_factory=dict)
+    failures: Mapping[Source, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class _DatasetRef:
+    """The identifying columns of a ``source_dataset`` row, safe to use after its session."""
+
+    id: int
+    source: Source
+    mode: Mode
+    state: str
+    role: str
+    reason: str | None
+    world: WorldIdentity | None = None
+
+    @classmethod
+    def of(cls, row: SourceDataset) -> _DatasetRef:
+        """Copy the columns of a loaded row."""
+        return cls(
+            id=row.id,
+            source=_as_source(row.source),
+            mode=_as_mode(row.mode),
+            state=row.state,
+            role=row.role,
+            reason=row.reason,
+            world=WorldIdentity.of(row),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _MatchPass:
+    """One matching pass a build runs: a CRM dataset and the leads it attempts.
+
+    Attributes:
+        crm_dataset_id: The HubSpot dataset (primary or companion) whose rows are attempted.
+        crm_mode: Its mode, which selects the HubSpot client.
+        lead_mode: The mode of every lead in the pass, which selects the LinkedIn client.
+        lead_dataset_id: Restrict the pass to one LinkedIn dataset's leads; ``None`` for all.
+    """
+
+    crm_dataset_id: int
+    crm_mode: Mode
+    lead_mode: Mode
+    lead_dataset_id: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _Staging:
+    """What one staging of a build's lead/CRM pair did.
+
+    Attributes:
+        match_pass: The matching pass that attempts the pair's rows.
+        staged: The ``lead_match`` rows the staging inserted.
+    """
+
+    match_pass: _MatchPass
+    staged: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ActivationAttempt:
+    """How one attempt to activate a build under the activation lock ended.
+
+    Exactly one outcome holds: activated (``activation``), refused as not ready under the
+    lock (``readiness``), new rows staged for a changed lead/CRM pair (``restaged``, the
+    caller settles again), refused because matched contacts still lack association reads
+    (``unhydrated``, in the CRM dataset ``crm_dataset_id``: the build's own, or HubSpot's
+    active primary for a live LinkedIn build's leads; the caller settles again), or void
+    because the access generation changed (``denied``).
+    """
+
+    activation: Activation | None = None
+    readiness: Readiness | None = None
+    restaged: int = 0
+    unhydrated: int = 0
+    crm_dataset_id: int | None = None
+    denied: bool = False
+
+
+@runtime_checkable
+class _BackfillReport(Protocol):
+    """What a build reads of its backfill's report (``jobs.SourceSyncReport``): the jobs run.
+
+    A protocol rather than the class itself: the build reaches ``sync/jobs.py`` only through
+    the backfill it calls (the jobs module imports this one), so the report is recognised by
+    its shape, and a stand-in backfill returning nothing is told apart from it.
+    """
+
+    @property
+    def results(self) -> tuple[JobResult, ...]:
+        """Each job's result, in the order run."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class _StepResult:
+    """How the steps of one build ended, before the build is settled.
+
+    ``defect`` is the job that stopped the build because it failed on a defect
+    (:class:`_BuildDefectError`): a ``QueryDefect`` the job handed to
+    :meth:`SourceModeController.on_error`, or a database integrity violation, met by one of
+    the build's backfill runs (its first or a settling rerun) or by the CRM sync of its
+    hydration pass. The jobs never raise it, so without it a build failing on one would read
+    only as not ready. It is set only when no denial voided the build meanwhile; when one did,
+    ``denied`` is set instead and the denial decides.
+    """
+
+    companion_id: int | None = None
+    activation: Activation | None = None
+    readiness: Readiness | None = None
+    error: ConnectorError | None = None
+    denied: bool = False
+    message: str | None = None
+    defect: JobResult | None = None
+
+
+class _BuildDefectError(Exception):
+    """A job a build ran failed on a defect, so the build stops at once (no retry, AAP 0.3.3).
+
+    Raised right after the job's run returns: by the build's backfill wrapper
+    (:meth:`SourceModeController._build_steps`) when a backfill run, the first or a settling
+    rerun, reports such a job, and by the hydration pass when its CRM sync does.
+    :meth:`SourceModeController._run_build_steps` catches it before any further settle,
+    matching pass, rerun or activation attempt, so the request that failed is sent once.
+
+    Attributes:
+        job: The first job of that run that failed on a defect.
+    """
+
+    def __init__(self, job: JobResult) -> None:
+        """Carry ``job``; the message names it and never its error text."""
+        super().__init__(f"{job.job} job failed on a defect")
+        self.job = job
+
+
+# ---------------------------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------------------------
+
+
+def _as_source(value: str) -> Source:
+    """Return ``value`` as a :data:`~ads_engine.settings.Source`.
+
+    Raises:
+        ValueError: When ``value`` is not ``google``, ``linkedin`` or ``hubspot``.
+    """
+    for source in SOURCES:
+        if value == source:
+            return source
+    raise ValueError(f"unknown source {value!r}; expected one of {', '.join(SOURCES)}")
+
+
+def _as_mode(value: str) -> Mode:
+    """Return ``value`` as a :data:`~ads_engine.sync.datasets.Mode`.
+
+    Raises:
+        ValueError: When ``value`` is not one of :data:`~ads_engine.db.models.ops.MODES`.
+    """
+    for mode in get_args(Mode):
+        if value == mode:
+            narrowed: Mode = mode
+            return narrowed
+    raise ValueError(f"unknown mode {value!r}; expected one of {list(MODES)!r}")
+
+
+def _truncate(reason: str) -> str:
+    """Cut a reason to the length stored and shown, marking a cut."""
+    if len(reason) <= _REASON_MAX:
+        return reason
+    return reason[: _REASON_MAX - len(_ELLIPSIS)].rstrip() + _ELLIPSIS
+
+
+def _error_source(error: ConnectorError, default: Source) -> Source:
+    """Return the source whose call raised ``error``, or ``default`` when it names none."""
+    for source in SOURCES:
+        if error.source == source:
+            return source
+    return default
+
+
+def _awaits_matching(readiness: Readiness) -> bool:
+    """Whether a build that is not ready falls short only by lead matches not yet attempted.
+
+    Such a build settles again: its pending rows were staged after the settle attempted the
+    earlier ones. A freshness shortfall (an unfinished backfill included), an unstaged lead
+    or a missing CRM dataset is not cured by another round, so it ends the build.
+    """
+    assessed = (readiness,) if readiness.companion is None else (readiness, readiness.companion)
+    if any(
+        part.missing_freshness
+        or part.unknown_freshness
+        or part.incomplete_without_reason
+        or part.unfinished_freshness
+        or part.unstaged_leads
+        for part in assessed
+    ):
+        return False
+    return any(part.pending_matches for part in assessed)
+
+
+def _own_crm_dataset(source: Source, dataset_id: int, companion_id: int | None) -> int | None:
+    """Return the CRM dataset a build holds itself, or ``None`` when it holds none.
+
+    That is the HubSpot primary of a HubSpot build and the companion of a simulated LinkedIn
+    build. A live LinkedIn build's leads are matched in HubSpot's active primary, which the
+    build does not own, and Google has no CRM dataset.
+    """
+    return dataset_id if source == "hubspot" else companion_id
+
+
+def _utcnow() -> datetime:
+    """Return the current instant in UTC."""
+    return datetime.now(UTC)
+
+
+def _later(stored: datetime | None, instant: datetime) -> datetime:
+    """Return the later of a stored instant and a new one, so the stored one never moves back."""
+    return instant if stored is None or stored < instant else stored
+
+
+def _established_mode(mode: str, active_dataset_id: int | None) -> Mode | None:
+    """The mode a ``source_connection`` row has established, or ``None`` when it has none.
+
+    Only an activation (``DatasetManager.activate``) stores ``live`` together with the
+    active dataset. A row created before any live access was verified (the live path of
+    :meth:`SourceModeController.resolve`, the default mode of a new row, the Google call
+    budget's first metered call) holds ``live`` with no active dataset: a placeholder, so no
+    mode transition reports it as the mode the source came from or went to.
+
+    Args:
+        mode: The row's stored mode.
+        active_dataset_id: The row's active dataset, if any.
+
+    Returns:
+        ``mode``, or ``None`` for a ``live`` row with no active dataset.
+    """
+    if mode == "live" and active_dataset_id is None:
+        return None
+    return _as_mode(mode)
+
+
+# ---------------------------------------------------------------------------------------------
+# Controller
+# ---------------------------------------------------------------------------------------------
+
+
+class SourceModeController:
+    """Decides, per source, between live and simulated data and carries out every switch.
+
+    One controller serves a process: the worker's scheduler, the CLI or a test. It holds no
+    mode state of its own: every decision is read from ``source_connection`` and
+    ``source_dataset``, so several controllers (worker and CLI) stay consistent. Its own
+    start instant only decides which recorded defects it holds instead of retrying
+    (:meth:`_defect_held`). A live
+    build is bound to its source's ``source_connection.access_generation``, read before its
+    probe and advanced by every recorded denial and entry into automatic fallback, so a
+    denial recorded by any controller, including one reported by the build's own backfill
+    jobs, voids it before it can activate.
+
+    Example:
+        A test drives a "live" Google through the simulator, with no network and no sleeps::
+
+            controller = SourceModeController(
+                settings,
+                sessionmaker=sessionmaker,
+                clock=fixed_clock,
+                transports={"google": mock_transport("google", world, settings=settings)},
+                retry=RetryPolicy(sleep=no_sleep),
+            )
+            outcome = await controller.ensure_dataset("google")
+    """
+
+    __slots__ = (
+        "_budget",
+        "_clock",
+        "_datasets",
+        "_hubspot_limiter",
+        "_retry",
+        "_sessionmaker",
+        "_settings",
+        "_started_at",
+        "_thresholds",
+        "_transports",
+        "_world",
+        "_world_injected",
+    )
+
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        datasets: DatasetManager | None = None,
+        sessionmaker: async_sessionmaker[AsyncSession] | None = None,
+        world: SimulatedWorld | None = None,
+        clock: Callable[[], datetime] | None = None,
+        budget: CallBudget | None = None,
+        transports: Mapping[Source, httpx.AsyncBaseTransport] | None = None,
+        retry: RetryPolicy = DEFAULT_RETRY,
+        hubspot_limiter: RateLimiter | None = None,
+        thresholds: Thresholds | None = None,
+    ) -> None:
+        """Configure the controller; nothing is built or sent until the first call.
+
+        The clock is read once, as the controller's start: a source that fails on a defect
+        after it is not probed or built again by this controller (no retry, AAP 0.3.3), while
+        a new controller, a restarted worker's, tries it once more. Nothing else is read.
+
+        Args:
+            settings: The process settings; :func:`~ads_engine.settings.get_settings` when
+                omitted.
+            datasets: The dataset manager; one on ``sessionmaker`` and ``clock`` when omitted.
+            sessionmaker: The session factory; the process-wide one, looked up per call, when
+                omitted.
+            world: The simulated world every simulated transport answers from; built lazily
+                from the settings (``MOCK_SCENARIO`` and ``MOCK_SEED``) on first use and
+                shared by all sources, so runs reproduce exactly. Simulated datasets record
+                the configured world only when it is built from the settings; an injected
+                world's datasets record none and are never replaced for their world.
+            clock: Returns the current instant, timezone-aware; ``datetime.now(UTC)`` when
+                omitted. It also drives the lazily built world and call budget, and its
+                reading here is the controller's start.
+            budget: The live Google call budget; ``GoogleCallBudget`` on the same session
+                factory and clock when omitted. Simulated calls are never metered.
+            transports: Transport per source for **live** clients; the network when a source
+                is absent. Tests pass the simulator (or a failing handler) here to act as the
+                live platform.
+            retry: The retry policy of every client, live and simulated.
+            hubspot_limiter: The HubSpot throttle; the process-wide 4 req/s limiter when
+                omitted.
+            thresholds: A fixed configuration that :attr:`thresholds` returns unchanged (tests
+                inject one); it supplies the jobs' window presets and the HubSpot mapping the
+                bindings are verified against. When omitted, every access of :attr:`thresholds`
+                runs ``Thresholds.load()``, so an edited file applies without a restart;
+                callers needing one coherent snapshot read it once and pass it on.
+
+        Raises:
+            ValueError: When the clock returns a naive datetime.
+        """
+        self._settings: Settings = settings if settings is not None else get_settings()
+        self._sessionmaker = sessionmaker
+        self._clock = clock
+        self._datasets = (
+            datasets if datasets is not None else DatasetManager(sessionmaker, clock=clock)
+        )
+        self._world = world
+        self._world_injected = world is not None
+        self._budget = budget
+        self._transports: Mapping[Source, httpx.AsyncBaseTransport] = MappingProxyType(
+            dict(transports or {})
+        )
+        self._retry = retry
+        self._hubspot_limiter = hubspot_limiter
+        self._thresholds = thresholds
+        self._started_at: datetime = self.now()
+
+    def __repr__(self) -> str:
+        """Return the data mode only; settings carry secrets and are never shown."""
+        return f"{type(self).__name__}(data_mode={self._settings.data_mode!r})"
+
+    # -- accessors ---------------------------------------------------------------------------
+
+    @property
+    def settings(self) -> Settings:
+        """The process settings."""
+        return self._settings
+
+    @property
+    def datasets(self) -> DatasetManager:
+        """The dataset manager every build goes through."""
+        return self._datasets
+
+    @property
+    def sessionmaker(self) -> async_sessionmaker[AsyncSession]:
+        """The injected session factory, or the process-wide one."""
+        return self._sessionmaker if self._sessionmaker is not None else get_sessionmaker()
+
+    @property
+    def retry(self) -> RetryPolicy:
+        """The retry policy of every client this controller opens."""
+        return self._retry
+
+    @property
+    def world(self) -> SimulatedWorld:
+        """The simulated world, built from the settings on first use and then shared.
+
+        :meth:`open_clients` builds it first in normal operation, with the epoch its
+        datasets record; read here before any simulated client was opened, it is built with
+        the clock's reading as its epoch.
+        """
+        if self._world is None:
+            self._world = SimulatedWorld.from_settings(self._settings, clock=self._clock)
+        return self._world
+
+    @property
+    def configured_world(self) -> WorldIdentity | None:
+        """The world this controller's simulated datasets are generated from and record.
+
+        ``MOCK_SCENARIO`` and ``MOCK_SEED``; ``None`` when a world was injected, whose
+        datasets record no world.
+        """
+        if self._world_injected:
+            return None
+        return WorldIdentity(self._settings.mock_scenario, self._settings.mock_seed)
+
+    def world_mismatch(self, dataset: SourceDataset) -> str | None:
+        """Why this controller may not sync a simulated dataset of another world, or ``None``.
+
+        A dataset whose recorded world differs from the configured one is left to
+        :meth:`ensure_dataset`, which replaces it, so one dataset never mixes two worlds
+        (AAP 0.3.3, granularity). A live dataset, one that records no world, or a controller
+        with an injected world is never blocked.
+
+        Args:
+            dataset: The dataset row about to be synced.
+
+        Returns:
+            The skip reason, or ``None`` when the dataset may be synced.
+        """
+        recorded = WorldIdentity.of(dataset) if dataset.mode == "simulated" else None
+        configured = self.configured_world
+        if recorded is None or configured is None or recorded == configured:
+            return None
+        return (
+            f"simulated dataset not synced: generated from world {recorded.describe()}, "
+            f"configured {configured.describe()}"
+        )
+
+    @property
+    def thresholds(self) -> Thresholds:
+        """The configuration: the injected one, else ``config/`` read again on every access.
+
+        Nothing is cached, so a controller kept for the whole worker process sees an edited
+        file (a changed ``window.presets``, for example) on its next access. A caller that
+        needs one coherent configuration across several steps reads this once and passes that
+        snapshot on, as the scheduler's segment step does from due detection to the fetch.
+
+        Raises:
+            ConfigError: When a configuration file is missing or invalid.
+        """
+        if self._thresholds is not None:
+            return self._thresholds
+        return Thresholds.load()
+
+    @property
+    def budget(self) -> CallBudget:
+        """The live Google call budget, built on first use."""
+        if self._budget is None:
+            self._budget = GoogleCallBudget(
+                self._settings, sessionmaker=self._sessionmaker, clock=self._clock
+            )
+        return self._budget
+
+    def now(self) -> datetime:
+        """Read the clock once.
+
+        Returns:
+            The current instant, timezone-aware.
+
+        Raises:
+            ValueError: When the injected clock returns a naive datetime.
+        """
+        current = self._clock() if self._clock is not None else _utcnow()
+        if current.tzinfo is None or current.utcoffset() is None:
+            raise ValueError("the source-mode clock must return a timezone-aware datetime")
+        return current
+
+    @asynccontextmanager
+    async def _transaction(self) -> AsyncIterator[AsyncSession]:
+        """Yield a session inside its own transaction, committed when the block exits."""
+        async with self.sessionmaker() as session, session.begin():
+            yield session
+
+    def _fallback_possible(self, source: Source) -> bool:
+        return self._settings.data_mode == "auto" and self._settings.has_credentials(source)
+
+    # -- mode resolution ---------------------------------------------------------------------
+
+    async def resolve(self, source: Source) -> ResolvedMode:
+        """Resolve the mode ``source`` should read now (AAP 0.3.3 "Modes").
+
+        * ``DATA_MODE=simulated``: simulated, :data:`REASON_FORCED`; never probes.
+        * ``auto`` without the source's credentials: simulated, :data:`REASON_NO_CREDENTIALS`
+          (Google needs webhook URL, secret and customer id; LinkedIn account ids plus the
+          refresh-token trio or an access token; HubSpot its token).
+        * ``auto`` in automatic fallback: simulated with the recorded denial.
+        * Otherwise live; ``needs_probe`` when the active primary is simulated or absent, so
+          credentials added before a restart go live only through recovery readiness.
+
+        The ``source_connection`` row is created when missing, and the simulated
+        resolutions record their mode and reason on it (a stale ``denied`` status is
+        cleared, since a source without credentials cannot be in fallback).
+
+        Args:
+            source: The source to resolve.
+
+        Returns:
+            The resolution.
+
+        Raises:
+            ValueError: When ``source`` is unknown.
+        """
+        checked = _as_source(source)
+        settings = self._settings
+        if settings.data_mode == "simulated":
+            await self._record_connection(
+                checked, mode="simulated", reason=REASON_FORCED, clear_denied=True
+            )
+            return ResolvedMode(checked, "simulated", REASON_FORCED)
+        if not settings.has_credentials(checked):
+            missing = settings.missing_credentials(checked)
+            await self._record_connection(
+                checked,
+                mode="simulated",
+                reason=REASON_NO_CREDENTIALS,
+                clear_denied=True,
+                missing=missing,
+            )
+            return ResolvedMode(checked, "simulated", REASON_NO_CREDENTIALS)
+
+        async with self._transaction() as session:
+            connection, _ = await self._lock_connection(session, checked, insert_mode="live")
+            fallback = connection.mode == "simulated" and connection.status == _STATUS_DENIED
+            stored_reason = connection.reason
+            active = await self._active_in(session, checked)
+        if fallback:
+            return ResolvedMode(
+                checked,
+                "simulated",
+                stored_reason if stored_reason else "access denied",
+                fallback=True,
+            )
+        return ResolvedMode(
+            checked,
+            "live",
+            None,
+            needs_probe=active is None or active.mode != "live",
+        )
+
+    async def in_fallback(self, source: Source) -> bool:
+        """Whether ``source`` is in automatic fallback and so due recovery probes.
+
+        True only under ``DATA_MODE=auto`` with the source's credentials present, when the
+        source is simulated because live access was denied (a probe, a job or a live build met
+        a denial).
+
+        Args:
+            source: The source to check.
+
+        Returns:
+            Whether recovery probes apply.
+        """
+        checked = _as_source(source)
+        if not self._fallback_possible(checked):
+            return False
+        async with self._transaction() as session:
+            row = await session.scalar(
+                select(SourceConnection).where(SourceConnection.source == checked)
+            )
+            return row is not None and row.mode == "simulated" and row.status == _STATUS_DENIED
+
+    async def fallback_failure_at(self, source: Source) -> datetime | None:
+        """When ``source``'s automatic fallback began, or ``None`` when it is not in fallback.
+
+        That is ``source_connection.last_failure_at``, stamped by the denial that entered the
+        fallback: a denied probe (:meth:`_enter_fallback`) or a denied job or build
+        (:meth:`on_error`), which writes no ``probe`` row. A later failure on the fallback
+        data moves it on, which only delays the next recovery probe. The scheduler spaces
+        recovery probes by :data:`PROBE_INTERVAL` from the later of this instant and the
+        latest probe's start, so the first one follows the fallback's start 30 minutes later
+        however the fallback began. Only reads.
+
+        Args:
+            source: The source to check.
+
+        Returns:
+            The instant, or ``None`` when the source is not in automatic fallback (as
+            :meth:`in_fallback` decides) or no failure was ever stamped.
+        """
+        checked = _as_source(source)
+        if not self._fallback_possible(checked):
+            return None
+        async with self._transaction() as session:
+            row = await session.scalar(
+                select(SourceConnection).where(SourceConnection.source == checked)
+            )
+            if row is None or row.mode != "simulated" or row.status != _STATUS_DENIED:
+                return None
+            began: datetime | None = row.last_failure_at
+        return began
+
+    # -- source_connection -------------------------------------------------------------------
+
+    async def record_attempt(self, source: Source, attempted_at: datetime) -> None:
+        """Stamp ``source_connection.last_attempt_at`` for an attempt to call ``source``.
+
+        AAP 0.5.2 keeps source health current on every attempt. Every sync job attempt,
+        simulated or live and whatever its outcome, and every probe that sends live requests
+        calls this. The stamp commits in a transaction of its own, which locks only the
+        connection row: a caller must hold no ``source_dataset`` lock, since activation
+        locks the connection first. The stored instant never moves back: the later of the
+        stored and the given one is kept, so concurrent attempts settle on the latest.
+
+        Nothing else changes: no mode, status or reason, no transition is logged and no
+        ``analysis_request`` is queued. A missing row is created as
+        :meth:`_lock_connection` creates one, in the mode a new row starts with
+        (:meth:`_default_mode`).
+
+        Args:
+            source: The source the attempt calls.
+            attempted_at: When the attempt started, timezone-aware.
+
+        Raises:
+            ValueError: When ``source`` is unknown or ``attempted_at`` is naive.
+        """
+        checked = _as_source(source)
+        if attempted_at.tzinfo is None or attempted_at.utcoffset() is None:
+            raise ValueError("record_attempt needs a timezone-aware attempted_at")
+        async with self._transaction() as session:
+            row, _ = await self._lock_connection(
+                session, checked, insert_mode=self._default_mode(checked)
+            )
+            row.last_attempt_at = _later(row.last_attempt_at, attempted_at)
+
+    async def _lock_connection(
+        self, session: AsyncSession, source: Source, *, insert_mode: Mode
+    ) -> tuple[SourceConnection, bool]:
+        """Create ``source``'s ``source_connection`` row when missing and lock it.
+
+        The call counters are left to their server defaults on insert and never written
+        here: ``sync/budget_guard.py`` owns them.
+
+        Returns:
+            The locked row, refreshed from the database, and whether it was just created.
+        """
+        created = await session.scalar(
+            insert(SourceConnection)
+            .values(source=source, mode=insert_mode, status=_STATUS_OK, reason=None)
+            .on_conflict_do_nothing(index_elements=["source"])
+            .returning(SourceConnection.source)
+        )
+        row = (
+            await session.scalars(
+                select(SourceConnection)
+                .where(SourceConnection.source == source)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).one()
+        return row, created is not None
+
+    async def _record_connection(
+        self,
+        source: Source,
+        *,
+        mode: Mode | _Keep = _KEEP,
+        status: str | _Keep = _KEEP,
+        reason: str | _Keep | None = _KEEP,
+        attempted_at: datetime | None = None,
+        clear_denied: bool = False,
+        sticky_denied: bool = False,
+        missing: Sequence[str] = (),
+        endpoint: str | None = None,
+        session: AsyncSession | None = None,
+    ) -> None:
+        """Insert or update ``source``'s ``source_connection`` row; log a mode change.
+
+        A change of an existing row's mode also queues its default-window rerun
+        (``mode_changed:<source>``) in the same transaction; see :meth:`_apply_connection`,
+        which also sets the level of the transition's log event.
+
+        Args:
+            source: The source.
+            mode: The resolved mode to store; kept when omitted.
+            status: The health status to store (``ok``, ``stale``, ``denied``, ``error``);
+                kept when omitted.
+            reason: The reason to store; kept when omitted.
+            attempted_at: The instant of the failed call (or failed probe or build) this
+                write records; when given, it is stored as ``last_attempt_at`` and as
+                ``last_failure_at``, neither of which moves back.
+            clear_denied: Replace a stored ``denied`` with ``ok``; used when the source
+                cannot be in fallback (forced simulation, no credentials).
+            sticky_denied: Keep a stored ``denied`` of a simulated source instead of the new
+                ``stale`` or ``error``: a transient or defective call on fallback data must not
+                end the fallback, whose recovery probes rely on the marker.
+            missing: Names (never values) of the unset credential variables, for the log.
+            endpoint: The failing endpoint that triggered the transition (the classified
+                error's contract surface name), logged as ``endpoint``; ``None`` for a
+                credentials, configuration or activation transition.
+            session: Join the caller's transaction instead of committing one here.
+        """
+        if session is None:
+            async with self._transaction() as owned:
+                await self._apply_connection(
+                    owned,
+                    source,
+                    mode=mode,
+                    status=status,
+                    reason=reason,
+                    attempted_at=attempted_at,
+                    clear_denied=clear_denied,
+                    sticky_denied=sticky_denied,
+                    missing=missing,
+                    endpoint=endpoint,
+                )
+            return
+        await self._apply_connection(
+            session,
+            source,
+            mode=mode,
+            status=status,
+            reason=reason,
+            attempted_at=attempted_at,
+            clear_denied=clear_denied,
+            sticky_denied=sticky_denied,
+            missing=missing,
+            endpoint=endpoint,
+        )
+
+    async def _apply_connection(
+        self,
+        session: AsyncSession,
+        source: Source,
+        *,
+        mode: Mode | _Keep,
+        status: str | _Keep,
+        reason: str | _Keep | None,
+        attempted_at: datetime | None,
+        clear_denied: bool,
+        sticky_denied: bool,
+        missing: Sequence[str],
+        endpoint: str | None,
+    ) -> None:
+        """Apply :meth:`_record_connection` inside ``session``.
+
+        A source-mode change is a rerun event (AAP 0.3.2, "Events that trigger a rerun"):
+        when an existing row's mode changes, a default-window ``analysis_request`` with the
+        reason ``mode_changed:<source>`` is queued in ``session``, so it commits or rolls back
+        with the change. A newly created row and a resolution that keeps the mode (a status or
+        reason change only) queue nothing, so repeated resolutions never flood the queue.
+
+        Modes are compared as established (:func:`_established_mode`): a ``live`` row with no
+        active dataset never verified live access, so it counts as a row with no mode yet,
+        like a newly created one. Leaving the mode as it is (``mode`` omitted) never changes
+        it, so a status write on such a placeholder logs no mode change.
+
+        Every transition is logged with its reason and ``endpoint``: ``sync.mode.change``
+        when the mode changes, else ``sync.connection`` when the status or reason does. A
+        degradation is a ``WARNING``: ``sync.mode.change`` to simulated from live or on a
+        denial, and ``sync.connection`` to ``stale``, ``error`` or ``denied``. Every other
+        transition is ``INFO``: a first start into simulated data (forced simulation,
+        missing credentials), a recovery to live, and a return to ``ok``.
+        """
+        if not isinstance(status, _Keep) and status not in CONNECTION_STATUSES:
+            raise ValueError(f"unknown connection status {status!r}")
+        insert_mode: Mode = mode if not isinstance(mode, _Keep) else self._default_mode(source)
+        row, created = await self._lock_connection(session, source, insert_mode=insert_mode)
+        previous_mode = None if created else _established_mode(row.mode, row.active_dataset_id)
+        previous_status = row.status
+
+        new_mode = row.mode if isinstance(mode, _Keep) else mode
+        new_status = row.status if isinstance(status, _Keep) else status
+        if clear_denied and new_status == _STATUS_DENIED:
+            new_status = _STATUS_OK
+        if (
+            sticky_denied
+            and previous_status == _STATUS_DENIED
+            and row.mode == "simulated"
+            and new_status in (_STATUS_STALE, _STATUS_ERROR)
+        ):
+            new_status = _STATUS_DENIED
+        new_reason = row.reason if isinstance(reason, _Keep) else reason
+        if new_reason is not None:
+            new_reason = _truncate(new_reason)
+
+        changed = (row.mode, row.status, row.reason) != (new_mode, new_status, new_reason)
+        row.mode = new_mode
+        row.status = new_status
+        row.reason = new_reason
+        if attempted_at is not None:
+            # Successful attempts stamp last_attempt_at too (record_attempt), so the failure
+            # instant _reconcile_status judges a recovery by is kept on its own.
+            row.last_attempt_at = _later(row.last_attempt_at, attempted_at)
+            row.last_failure_at = _later(row.last_failure_at, attempted_at)
+        await session.flush()
+        # This write never sets the active dataset, so a placeholder stays one.
+        to_mode = _established_mode(new_mode, row.active_dataset_id)
+        mode_changed = to_mode is not None and previous_mode != to_mode
+        if mode_changed and previous_mode is not None:
+            await repositories.enqueue_analysis_request(session, reason=f"mode_changed:{source}")
+
+        if mode_changed:
+            degraded = to_mode == "simulated" and (
+                previous_mode == "live" or new_status == _STATUS_DENIED
+            )
+            log_change = _log.warning if degraded else _log.info
+            log_change(
+                "sync.mode.change",
+                source=source,
+                from_mode=previous_mode,
+                to_mode=to_mode,
+                status=new_status,
+                reason=new_reason,
+                endpoint=endpoint,
+                missing_credentials=list(missing),
+            )
+        elif changed:
+            log_connection = _log.warning if new_status in _DEGRADED_STATUSES else _log.info
+            log_connection(
+                "sync.connection",
+                source=source,
+                mode=new_mode,
+                from_status=previous_status,
+                status=new_status,
+                reason=new_reason,
+                endpoint=endpoint,
+            )
+
+    def _default_mode(self, source: Source) -> Mode:
+        """The mode a newly created connection row starts with, before anything is resolved.
+
+        A ``live`` default establishes no mode: until an activation sets the row's active
+        dataset, no transition reports it (:func:`_established_mode`).
+        """
+        return "live" if self._fallback_possible(source) else "simulated"
+
+    async def _connection_reason(self, source: Source) -> str | None:
+        """Return the stored reason of ``source``'s connection row, or ``None``."""
+        async with self._transaction() as session:
+            return await session.scalar(
+                select(SourceConnection.reason).where(SourceConnection.source == source)
+            )
+
+    async def _access_generation(self, source: Source) -> int:
+        """Return ``source``'s committed ``access_generation``; 0 when it has no row yet.
+
+        A missing row reads as the column's server default, so a denial that creates the
+        row (and advances it to 1) still differs from a generation read before it.
+        """
+        async with self._transaction() as session:
+            generation = await session.scalar(
+                select(SourceConnection.access_generation).where(SourceConnection.source == source)
+            )
+        return 0 if generation is None else generation
+
+    @staticmethod
+    async def _advance_access_generation(session: AsyncSession, source: Source) -> None:
+        """Advance ``source``'s ``access_generation`` by one inside ``session``.
+
+        Called in the transaction that records a denial or an entry into automatic
+        fallback, after :meth:`_record_connection` has created and locked the row, so every
+        live build bound to an earlier value is refused at its activation.
+        """
+        await session.execute(
+            update(SourceConnection)
+            .where(SourceConnection.source == source)
+            .values(access_generation=SourceConnection.access_generation + 1)
+        )
+
+    async def _generation_holds(self, source: Source, generation: int | None) -> bool:
+        """Whether a build bound to ``generation`` may still go on; unbound builds always may."""
+        return generation is None or await self._access_generation(source) == generation
+
+    async def _enter_fallback(
+        self, source: Source, reason: str, *, endpoint: str | None = None
+    ) -> None:
+        """Put ``source`` into automatic fallback: simulated, ``denied``, with ``reason``.
+
+        Called when a probe meets a denial (a denial during a job or a build is recorded by
+        :meth:`on_error`). Recovery probes then retry live access every 30 minutes
+        (scheduler). The same transaction advances the source's
+        ``access_generation``, so a live build begun before the fallback cannot activate.
+        ``endpoint`` names the failing call (``None`` when no classified error caused the
+        fallback) and is logged on the transition and on ``sync.fallback``.
+        """
+        async with self._transaction() as session:
+            await self._record_connection(
+                source,
+                mode="simulated",
+                status=_STATUS_DENIED,
+                reason=reason,
+                attempted_at=self.now(),
+                endpoint=endpoint,
+                session=session,
+            )
+            await self._advance_access_generation(session, source)
+        _log.warning("sync.fallback", source=source, reason=_truncate(reason), endpoint=endpoint)
+
+    async def _reconcile_status(self, source: Source, active: _DatasetRef) -> None:
+        """Return a ``stale`` or ``error`` connection to ``ok`` once its data has caught up.
+
+        AAP 0.5.2 keeps source health current on every attempt. A transient or defective
+        call marks the connection when it fails (:meth:`on_error`) and records that instant
+        as ``last_failure_at``; this clears the mark once every freshness row of the active
+        primary has succeeded at or after that failure and no later attempt of it has
+        failed. ``last_attempt_at`` is not the failure instant: successful attempts move it
+        too. ``denied`` is never cleared here.
+        """
+        async with self._transaction() as session:
+            row = await session.scalar(
+                select(SourceConnection).where(SourceConnection.source == source).with_for_update()
+            )
+            if row is None or row.status not in (_STATUS_STALE, _STATUS_ERROR):
+                return
+            rows = await freshness.load_freshness(session, active.id)
+            if not rows:
+                return
+            failed_at = row.last_failure_at
+            for entry in rows.values():
+                succeeded = entry.last_success_at
+                if succeeded is None:
+                    return
+                if entry.last_attempt_at is not None and succeeded < entry.last_attempt_at:
+                    return
+                if failed_at is not None and succeeded < failed_at:
+                    return
+            previous = row.status
+            row.status = _STATUS_OK
+            if row.mode == active.mode:
+                row.reason = active.reason
+            await session.flush()
+        _log.info(
+            "sync.connection",
+            source=source,
+            from_status=previous,
+            status=_STATUS_OK,
+            endpoint=None,
+        )
+
+    # -- datasets ----------------------------------------------------------------------------
+
+    @staticmethod
+    async def _active_in(session: AsyncSession, source: Source) -> _DatasetRef | None:
+        """Return ``source``'s active primary dataset read in ``session``."""
+        row = (await repositories.active_datasets(session)).get(source)
+        return None if row is None else _DatasetRef.of(row)
+
+    async def _active(self, source: Source) -> _DatasetRef | None:
+        """Return ``source``'s active primary dataset."""
+        async with self._transaction() as session:
+            return await self._active_in(session, source)
+
+    async def _dataset(self, dataset_id: int) -> _DatasetRef | None:
+        """Return a dataset's identifying columns, or ``None`` when it does not exist."""
+        async with self._transaction() as session:
+            row = await session.get(SourceDataset, dataset_id, populate_existing=True)
+            return None if row is None else _DatasetRef.of(row)
+
+    # -- clients -----------------------------------------------------------------------------
+
+    @asynccontextmanager
+    async def open_clients(self, source: Source, mode: str) -> AsyncIterator[SourceClients]:
+        """Open ``source``'s connector client in ``mode``; its HTTP client closes on exit.
+
+        * **Simulated**: every request goes through the simulation's mock transport
+          (``mock_transport(source, self.world, settings=self.settings)``), so the live clients
+          and parsers run unchanged. Google gets :data:`SIMULATED_WEBHOOK_URL` with
+          :data:`SIMULATED_SECRET` under the configured secret header name, which the
+          transport validates against the same settings, and is never metered against the
+          live call budget; LinkedIn a static simulated token and the world's ad accounts;
+          HubSpot a client marked not live, which never sends simulated emails to a portal.
+        * **Live**: the network, or the transport injected for the source. Google reads the
+          n8n webhook settings and draws on the product's call budget (no Google OAuth,
+          client id, secret, refresh token or developer token exists here); LinkedIn
+          exchanges the refresh token (or uses the static access token) for the configured
+          ad accounts; HubSpot uses ``HUBSPOT_ACCESS_TOKEN``.
+
+        Args:
+            source: The source to open.
+            mode: ``live`` or ``simulated``, normally the mode of the dataset being written.
+
+        Yields:
+            The clients, with only ``source``'s field set.
+
+        Raises:
+            ValueError: When ``source`` or ``mode`` is unknown, or a live client is
+                requested for a source without credentials.
+        """
+        checked_source = _as_source(source)
+        checked_mode = _as_mode(mode)
+        transport: httpx.AsyncBaseTransport | None
+        if checked_mode == "simulated":
+            world = await self._simulated_world()
+            transport = mock_transport(checked_source, world, settings=self._settings)
+        else:
+            if not self._settings.has_credentials(checked_source):
+                missing = ", ".join(self._settings.missing_credentials(checked_source))
+                raise ValueError(f"no live {checked_source} client without credentials: {missing}")
+            transport = self._transports.get(checked_source)
+        async with build_client(checked_source, transport, settings=self._settings) as http:
+            yield self._clients(checked_source, checked_mode, http)
+
+    async def _simulated_world(self) -> SimulatedWorld:
+        """The world simulated clients answer from, built once from the settings with its epoch.
+
+        For a world with changes counted from its epoch (``reappear_after_epoch``), the epoch
+        (:attr:`SimulatedWorld.epoch`) is the creation of the earliest ``building`` or
+        ``active`` simulated primary dataset generated from the configured world, so every
+        process of the product agrees on when the world's simulation started and on the
+        instants counted from it; with no such dataset it is the clock's reading. Other worlds
+        need no epoch and read nothing. An injected world, or one already built, is returned
+        as it is.
+        """
+        if self._world is not None:
+            return self._world
+        configured = self.configured_world
+        spec = RUNTIME_SPECS[self._settings.mock_scenario]
+        epoch: datetime | None = None
+        needs_epoch = any(
+            change.reappear_after_epoch is not None for change in spec.platform_changes
+        )
+        if configured is not None and needs_epoch:
+            async with self._transaction() as session:
+                epoch = await session.scalar(
+                    select(func.min(SourceDataset.created_at)).where(
+                        SourceDataset.mode == "simulated",
+                        SourceDataset.role == "primary",
+                        SourceDataset.state.in_(("building", "active")),
+                        SourceDataset.simulated_world == configured.scenario,
+                        SourceDataset.simulated_seed == configured.seed,
+                    )
+                )
+        # Re-checked after the read: a concurrent open may have built the world meanwhile.
+        if self._world is None:
+            world = SimulatedWorld.from_settings(
+                self._settings, spec, clock=self._clock, epoch=epoch
+            )
+            self._world = world
+            if needs_epoch:
+                _log.info(
+                    "simulation.world_epoch",
+                    world=world.name,
+                    epoch=world.epoch.isoformat(),
+                    from_dataset=epoch is not None,
+                )
+        return self._world
+
+    def _clients(self, source: Source, mode: Mode, http: httpx.AsyncClient) -> SourceClients:
+        """Build ``source``'s connector client in ``mode`` on ``http``."""
+        settings = self._settings
+        simulated = mode == "simulated"
+        match source:
+            case "google":
+                if simulated:
+                    google = GoogleAdsWebhookClient(
+                        http=http,
+                        budget=UNMETERED,
+                        webhook_url=SIMULATED_WEBHOOK_URL,
+                        secret_header=settings.n8n_webhook_secret_header,
+                        secret=SecretStr(SIMULATED_SECRET),
+                        customer_id=self.world.google_customer_id,
+                        retry=self._retry,
+                    )
+                else:
+                    google = GoogleAdsWebhookClient.from_settings(
+                        settings, http, self.budget, retry=self._retry
+                    )
+                return SourceClients(source, mode, google=google)
+            case "linkedin":
+                if simulated:
+                    linkedin = LinkedInClient(
+                        http, StaticTokenProvider(SIMULATED_TOKEN), retry=self._retry
+                    )
+                    accounts = self.world.linkedin_account_ids
+                else:
+                    tokens = LinkedInTokenProvider(settings, http, retry=self._retry)
+                    linkedin = LinkedInClient(http, tokens, retry=self._retry)
+                    accounts = tuple(settings.linkedin_ad_account_ids)
+                return SourceClients(source, mode, linkedin=linkedin, linkedin_account_ids=accounts)
+            case "hubspot":
+                if simulated:
+                    hubspot = HubSpotClient(
+                        http,
+                        _SIMULATED_HUBSPOT_TOKEN,
+                        live=False,
+                        retry=self._retry,
+                        limiter=self._hubspot_limiter,
+                    )
+                else:
+                    hubspot = HubSpotClient.from_settings(
+                        settings,
+                        http,
+                        live=True,
+                        retry=self._retry,
+                        limiter=self._hubspot_limiter,
+                    )
+                return SourceClients(source, mode, hubspot=hubspot)
+
+    # -- probes ------------------------------------------------------------------------------
+
+    async def probe(self, source: Source) -> ProbeReport:
+        """Run ``source``'s full capability set against the live platform.
+
+        AAP 0.3.3 ("Probe set"):
+
+        * Google: Q-G1 through the webhook.
+        * LinkedIn, per configured ad account: ``adAccounts/{id}``, a one-day ``adAnalytics``
+          (yesterday UTC), ``leadForms`` with ``count=1`` and ``leadFormResponses`` with
+          ``count=1``.
+        * HubSpot: a one-email contacts batch read, a one-result deals search and a
+          one-input associations read (``HubSpotClient.probe``).
+
+        Each check catches only classified connector errors and records their
+        classification (:attr:`ProbeCheck.kind`) and a defect's query id, and a LinkedIn
+        listing cut short by a transient error fails its check as transient. The probe acts
+        on no verdict: :meth:`ensure_dataset` and :meth:`recover` act on the report. Partial
+        success (for example LinkedIn ads readable while Lead Sync returns 403) is a failed
+        probe, so a source never flips back and forth. Under ``DATA_MODE=simulated``, or
+        without credentials, no request is sent and the report fails with that reason. A
+        probe that sends live requests is an attempt to call the source, whatever its
+        verdict: its start is stamped as ``source_connection.last_attempt_at``
+        (:meth:`record_attempt`) before the first request goes out, and that stamp is the
+        only write the probe itself makes.
+
+        The verdict is logged as ``sync.probe`` with the first failing check's endpoint, the
+        calls sent and the duration: a ``WARNING`` when live calls were sent and a check
+        failed, else ``INFO`` (a passing probe, or a configuration refusal that sent no
+        request).
+
+        Args:
+            source: The source to probe.
+
+        Returns:
+            The report; ``passed`` only when every check passed, with the calls the live
+            client sent (by its own counter) and the probe's duration.
+        """
+        checked = _as_source(source)
+        started = time.perf_counter()
+        sent = False
+        calls = 0
+        if self._settings.data_mode == "simulated":
+            checks: tuple[ProbeCheck, ...] = (ProbeCheck("data_mode", False, REASON_FORCED),)
+        elif not self._settings.has_credentials(checked):
+            checks = (ProbeCheck("credentials", False, REASON_NO_CREDENTIALS),)
+        else:
+            sent = True
+            await self.record_attempt(checked, self.now())
+            async with self.open_clients(checked, "live") as clients:
+                match checked:
+                    case "google":
+                        checks = await self._probe_google(clients)
+                    case "linkedin":
+                        checks = await self._probe_linkedin(clients)
+                    case "hubspot":
+                        checks = await self._probe_hubspot(clients)
+                calls = _client_calls(clients)
+        report = ProbeReport.of(
+            checked,
+            checks,
+            calls=calls,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+        log_probe = _log.warning if sent and not report.passed else _log.info
+        log_probe(
+            "sync.probe",
+            source=checked,
+            passed=report.passed,
+            checks=len(report.checks),
+            failed=[check.name for check in report.failed],
+            reason=report.reason,
+            endpoint=report.endpoint,
+            calls=report.calls,
+            duration_ms=report.duration_ms,
+        )
+        return report
+
+    @staticmethod
+    async def _probe_google(clients: SourceClients) -> tuple[ProbeCheck, ...]:
+        """Probe Google with Q-G1 (customer id, currency, time zone)."""
+        google = clients.require_google()
+        try:
+            await google.run_query("Q-G1")
+        except ConnectorError as exc:
+            return (_failed_check("Q-G1", exc),)
+        return (ProbeCheck("Q-G1", True),)
+
+    async def _probe_linkedin(self, clients: SourceClients) -> tuple[ProbeCheck, ...]:
+        """Probe every configured LinkedIn ad account with the four Lead Sync and ads calls."""
+        linkedin = clients.require_linkedin()
+        now = self.now().astimezone(UTC)
+        yesterday = now.date() - timedelta(days=1)
+        submitted = (now - timedelta(days=1), now)
+        checks: list[ProbeCheck] = []
+        for account in clients.linkedin_account_ids:
+            name = f"adAccounts/{account}"
+            try:
+                await linkedin.get_ad_account(account)
+            except ConnectorError as exc:
+                checks.append(_failed_check(name, exc))
+            else:
+                checks.append(ProbeCheck(name, True))
+
+            name = f"adAnalytics {account}"
+            try:
+                analytics = await linkedin.analytics_daily(
+                    account, (yesterday, yesterday), expected_creatives=1
+                )
+            except ConnectorError as exc:
+                checks.append(_failed_check(name, exc))
+            else:
+                checks.append(_listing_check(name, analytics.interrupted_by))
+
+            name = f"leadForms {account}"
+            try:
+                forms = await linkedin.list_lead_forms(account, page_size=1, max_pages=1)
+            except ConnectorError as exc:
+                checks.append(_failed_check(name, exc))
+            else:
+                checks.append(_listing_check(name, forms.interrupted_by))
+
+            name = f"leadFormResponses {account}"
+            try:
+                responses = await linkedin.list_lead_responses(
+                    account, submitted, known_versions={}, page_size=1, max_pages=1
+                )
+            except ConnectorError as exc:
+                checks.append(_failed_check(name, exc))
+            else:
+                checks.append(_listing_check(name, responses.interrupted_by))
+        if not checks:
+            checks.append(ProbeCheck("adAccounts", False, "no LinkedIn ad account configured"))
+        return tuple(checks)
+
+    @staticmethod
+    async def _probe_hubspot(clients: SourceClients) -> tuple[ProbeCheck, ...]:
+        """Probe HubSpot's contacts batch read, deals search and associations read."""
+        hubspot = clients.require_hubspot()
+        try:
+            await hubspot.probe()
+        except ConnectorError as exc:
+            return (_failed_check("crm", exc),)
+        return (ProbeCheck("crm", True),)
+
+    # -- error consequences ------------------------------------------------------------------
+
+    async def on_error(
+        self,
+        source: Source,
+        exc: ConnectorError,
+        *,
+        dataset_id: int | None = None,
+        datasets: Sequence[str] = (),
+        job: str | None = None,
+    ) -> ErrorDisposition:
+        """Apply the AAP 0.3.3 fallback table to one classified connector error.
+
+        Callers hand over every ``ConnectorError`` a job or build lets out, after the
+        connector's own retries; this method alone decides what follows.
+
+        * ``AccessDenied``: when the data in play is live (the given dataset, else the
+          source's active primary), the source switches to simulated: ``source_connection``
+          records ``mode='simulated'``, ``status='denied'`` and the error's reason (platform
+          code and failing endpoint), and the same transaction advances its
+          ``access_generation``, which voids every live build of the source begun before
+          it, whichever controller runs that build. The simulated dataset is built by
+          :meth:`ensure_dataset` (the next scheduler wake, or at once when a build was
+          denied); until it activates the previous dataset stays active and labelled.
+          Returns ``"switched_to_simulated"``. Under ``DATA_MODE=simulated``, or for a
+          denial raised on simulated data (a simulated fault), it only logs and returns
+          ``"ignored"``.
+        * ``TransientError`` (429, 5xx, timeout, ``RESOURCE_EXHAUSTED``, call budget): never
+          mock. Each named freshness dataset of the dataset records the failure, so it turns
+          stale while its last good data is kept, and the connection's status becomes
+          ``stale``. Returns ``"stale"``.
+        * ``QueryDefect`` (400, GAQL ``QueryError``, validation): the connection's status
+          becomes ``error`` and the query id is logged; no mock, no retry. Returns
+          ``"defect"``, and the job marks its ``sync_run`` failed.
+
+        A stale or erroneous call on fallback data leaves the ``denied`` marker in place,
+        and the reason of a simulated source's connection keeps its mode reason.
+
+        Args:
+            source: The source whose dataset the failed call was writing.
+            exc: The classified error.
+            dataset_id: The dataset the call was writing; the source's active primary when
+                omitted.
+            datasets: The freshness dataset names (for example ``linkedin.analytics_daily``)
+                whose refresh the error interrupted.
+            job: The sync job whose call failed (for example ``metrics``), logged with the
+                classification; ``None`` for builds and probes.
+
+        Returns:
+            The disposition.
+        """
+        checked = _as_source(source)
+        now = self.now()
+        fields: dict[str, object] = {
+            **exc.log_fields,
+            "source": checked,
+            "error_source": exc.source,
+            "dataset_id": dataset_id,
+            "datasets": list(datasets),
+            "job": job,
+        }
+
+        if isinstance(exc, AccessDenied):
+            if self._settings.data_mode == "simulated":
+                _log.warning("sync.classification", disposition="ignored", **fields)
+                return "ignored"
+            if await self._context_mode(checked, dataset_id) == "simulated":
+                _log.warning("sync.classification", disposition="ignored", **fields)
+                return "ignored"
+            async with self._transaction() as session:
+                await self._record_connection(
+                    checked,
+                    mode="simulated",
+                    status=_STATUS_DENIED,
+                    reason=exc.reason,
+                    attempted_at=now,
+                    endpoint=exc.endpoint,
+                    session=session,
+                )
+                await self._advance_access_generation(session, checked)
+            _log.warning("sync.classification", disposition="switched_to_simulated", **fields)
+            return "switched_to_simulated"
+
+        if isinstance(exc, TransientError):
+            await self._record_transient(checked, exc, dataset_id, datasets, now)
+            _log.warning("sync.classification", disposition="stale", **fields)
+            return "stale"
+
+        # QueryDefect, and defensively any other connector error: a defect is never retried
+        # or mocked, so treating an unknown kind as one is the conservative consequence.
+        await self._record_connection(
+            checked,
+            status=_STATUS_ERROR,
+            reason=await self._failure_reason(checked, exc),
+            attempted_at=now,
+            sticky_denied=True,
+            endpoint=exc.endpoint,
+        )
+        # ``fields`` carries the query id of a ``QueryDefect`` (``query_id``) when it has one.
+        _log.error(
+            "sync.classification",
+            disposition="defect",
+            unexpected_kind=not isinstance(exc, QueryDefect),
+            **fields,
+        )
+        return "defect"
+
+    async def _record_probe_failure(
+        self, source: Source, check: ProbeCheck, *, disposition: Literal["defect", "stale"]
+    ) -> None:
+        """Apply the Defect or the Transient consequence to a failed probe that met no denial.
+
+        AAP 0.3.3 fallback table: a defect (row 4) fails the probe, logged with its query id,
+        with no mock and no retry; transient failures (row 3), after their 3 attempts, turn
+        the source stale, keep its last good data and never mock. Either way the source
+        neither enters automatic fallback nor gets simulated data: its mode and
+        ``access_generation`` stay, and its active dataset, if any, is left untouched.
+        ``source_connection`` records the status (``error`` for ``defect``, ``stale`` for
+        ``stale``), the attempt, and the check's reason naming the check once
+        (:func:`_check_reason`: the failing check, its endpoint and, for Google, the query
+        id) as the reason: the probe's verdict is why
+        live data is not active, whatever reason the stored row held before a probe ran
+        (``credentials not configured`` until credentials were added). A row in automatic
+        fallback keeps its ``denied`` status and denial reason, as :meth:`on_error` keeps
+        them. The classification is logged as ``sync.classification`` with ``disposition``,
+        at the level :meth:`on_error` logs it at (error for a defect, warning for stale), with
+        the check, its ``endpoint`` and ``query_id``, and ``job`` :data:`JOB_PROBE`.
+
+        Args:
+            source: The probed source.
+            check: The deciding check: the first that failed with a defect for ``defect``,
+                the first failing check for ``stale``.
+            disposition: ``defect`` or ``stale``, the consequence applied.
+        """
+        defect = disposition == "defect"
+        reason = _check_reason(check)
+        async with self._transaction() as session:
+            row, _ = await self._lock_connection(
+                session, source, insert_mode=self._default_mode(source)
+            )
+            fallback = row.mode == "simulated" and row.status == _STATUS_DENIED
+            await self._record_connection(
+                source,
+                status=_STATUS_ERROR if defect else _STATUS_STALE,
+                reason=_KEEP if fallback else reason,
+                attempted_at=self.now(),
+                sticky_denied=True,
+                endpoint=check.endpoint,
+                session=session,
+            )
+        fields: dict[str, object] = {
+            "error_kind": check.kind,
+            "source": source,
+            "error_source": source,
+            "endpoint": check.endpoint,
+            "query_id": check.query_id,
+            "reason": _truncate(reason),
+            "check": check.name,
+            "job": JOB_PROBE,
+            "dataset_id": None,
+            "datasets": [],
+        }
+        if defect:
+            # As on_error logs a defect; a probe check's defect is never of an unexpected kind.
+            fields["unexpected_kind"] = False
+        log_classification = _log.error if defect else _log.warning
+        log_classification("sync.classification", disposition=disposition, **fields)
+
+    async def _context_mode(self, source: Source, dataset_id: int | None) -> Mode:
+        """The mode of the data a failed call was serving.
+
+        The given dataset's mode; else the source's active primary's; else the mode a call
+        would be made in now (live only with credentials under ``auto``).
+        """
+        if dataset_id is not None:
+            dataset = await self._dataset(dataset_id)
+            if dataset is not None:
+                return dataset.mode
+        active = await self._active(source)
+        if active is not None:
+            return active.mode
+        return self._default_mode(source)
+
+    async def _failure_reason(self, source: Source, exc: ConnectorError) -> str | _Keep | None:
+        """The connection reason after a transient or defective call.
+
+        A live connection shows the failure; a simulated one keeps its mode reason, which is
+        what the simulated-source banner explains (``credentials not configured``, a denial).
+        """
+        async with self._transaction() as session:
+            mode = await session.scalar(
+                select(SourceConnection.mode).where(SourceConnection.source == source)
+            )
+        return exc.reason if mode == "live" else _KEEP
+
+    async def _record_transient(
+        self,
+        source: Source,
+        exc: TransientError,
+        dataset_id: int | None,
+        names: Sequence[str],
+        now: datetime,
+    ) -> None:
+        """Record a transient failure on the named freshness rows and the connection."""
+        reason = await self._failure_reason(source, exc)
+        async with self._transaction() as session:
+            # Lock order: source_connection before the source_dataset guard the freshness
+            # write takes, the order DatasetManager.activate locks them in; the reverse
+            # order could deadlock against a concurrent activation of this source.
+            await self._record_connection(
+                source,
+                status=_STATUS_STALE,
+                reason=reason,
+                attempted_at=now,
+                sticky_denied=True,
+                endpoint=exc.endpoint,
+                session=session,
+            )
+            target = dataset_id
+            if target is None:
+                target = await repositories.active_dataset_id(session, source)
+            if target is not None and names:
+                await self._record_failed_freshness(session, target, names, exc, now)
+
+    @staticmethod
+    async def _record_failed_freshness(
+        session: AsyncSession,
+        dataset_id: int,
+        names: Sequence[str],
+        exc: TransientError,
+        now: datetime,
+    ) -> None:
+        """Fold a failed attempt into each named freshness row of a writable dataset."""
+        try:
+            dataset = await repositories.ensure_writable(session, dataset_id)
+        except repositories.DatasetNotWritable:
+            # Retired (or discarded) while the job ran: its rows are read-only history.
+            _log.info("sync.freshness.skipped", dataset_id=dataset_id, reason="not writable")
+            return
+        owned = freshness.SOURCE_DATASETS[_as_source(dataset.source)]
+        outcome = freshness.FreshnessOutcome.failure(now, reason=exc.reason)
+        for name in dict.fromkeys(names):
+            if name not in owned:
+                _log.warning(
+                    "sync.freshness.skipped",
+                    dataset_id=dataset_id,
+                    dataset=name,
+                    reason=f"not a {dataset.source} dataset",
+                )
+                continue
+            await freshness.record_freshness(session, dataset_id, name, outcome)
+
+    # -- CRM bindings ------------------------------------------------------------------------
+
+    async def verify_crm_bindings(self, dataset_id: int) -> CrmBindings:
+        """Verify the MQL, QL and Google bindings against a HubSpot dataset's portal and store them.
+
+        AAP 0.3.3 ("Startup property verification"). The client of the dataset's own mode is
+        used: the live portal for a live dataset, the simulated one for a simulated primary
+        or a companion, since the two resolve different stage ids. An unresolved binding is
+        stored as unavailable (never counted as 0).
+
+        Args:
+            dataset_id: A HubSpot dataset (primary or companion), ``building`` or ``active``.
+
+        Returns:
+            The verified bindings, as stored.
+
+        Raises:
+            ValueError: When the dataset is not HubSpot's, or a live dataset's credentials
+                are no longer configured.
+            ads_engine.sync.datasets.DatasetNotFoundError: When the dataset does not exist.
+            ads_engine.db.repositories.DatasetNotWritable: When it is retired.
+            AccessDenied: When the portal refuses the token or a scope.
+            TransientError: When a properties read keeps failing; stored bindings stand.
+            QueryDefect: When a properties response breaks its contract.
+            ConfigError: When the HubSpot mapping configuration is invalid.
+        """
+        dataset = await self.datasets.get(dataset_id)
+        if dataset.source != "hubspot":
+            raise ValueError(
+                f"source_dataset {dataset_id} is {dataset.source}; CRM bindings are HubSpot's"
+            )
+        mode = _as_mode(dataset.mode)
+        mapping = self.thresholds.mapping
+        async with self.open_clients("hubspot", mode) as clients:
+            bindings = await clients.require_hubspot().verify_bindings(mapping, self._settings)
+        await self.datasets.store_crm_bindings(dataset_id, bindings)
+        _log.info(
+            "sync.crm_bindings.verified",
+            dataset_id=dataset_id,
+            mode=mode,
+            role=dataset.role,
+            mql_available=bindings.mql.available,
+            ql_available=bindings.ql.available,
+            google_link_available=bindings.google.available,
+        )
+        return bindings
+
+    async def verify_active_bindings(
+        self, source: Source, *, skip: frozenset[int] = frozenset()
+    ) -> None:
+        """Re-verify the CRM bindings of the active HubSpot dataset ``source`` relies on.
+
+        Called by :func:`bootstrap_sources` at worker startup: for ``hubspot`` the active
+        primary, for ``linkedin`` the companion of a simulated active dataset. A classified
+        error goes through :meth:`on_error`; a denial on live data switches HubSpot to
+        simulated at once, and a transient failure keeps the stored bindings.
+
+        Args:
+            source: ``hubspot`` or ``linkedin``; Google has no CRM dataset.
+            skip: Datasets verified moments ago by a build in the same bootstrap.
+        """
+        checked = _as_source(source)
+        target: int | None = None
+        mode: Mode = "simulated"
+        if checked == "hubspot":
+            active = await self._active("hubspot")
+            if active is not None:
+                target, mode = active.id, active.mode
+        elif checked == "linkedin":
+            active = await self._active("linkedin")
+            if active is not None and active.mode == "simulated":
+                target = await self.datasets.companion_of(active.id)
+        if target is None or target in skip:
+            return
+        if not self._can_open("hubspot", mode):
+            _log.info("sync.crm_bindings.skipped", dataset_id=target, mode=mode)
+            return
+        try:
+            await self.verify_crm_bindings(target)
+        except ConnectorError as exc:
+            disposition = await self.on_error("hubspot", exc, dataset_id=target)
+            if disposition == "switched_to_simulated":
+                await self.ensure_dataset("hubspot")
+
+    def _can_open(self, source: Source, mode: Mode) -> bool:
+        """Whether a ``mode`` client of ``source`` may be opened now."""
+        if mode == "simulated":
+            return True
+        return self._settings.data_mode == "auto" and self._settings.has_credentials(source)
+
+    # -- builds ------------------------------------------------------------------------------
+
+    async def build_dataset(self, source: Source, mode: str, *, reason: str | None) -> BuildOutcome:
+        """Build, backfill and, once ready, atomically activate a new primary dataset.
+
+        AAP 0.3.3 ("Transitions", "Staged matching", "Recovery readiness"):
+
+        1. Begin a ``building`` dataset; a simulated LinkedIn one also begins its companion
+           CRM dataset (simulated HubSpot, ``role=companion``).
+        2. HubSpot primary or companion: verify the CRM bindings with the client of its mode.
+        3. HubSpot primary: when LinkedIn's active primary is live, stage a ``lead_match`` row
+           for each of its leads in the backfill range (simulated leads are never staged
+           against a primary).
+        4. Backfill (``sync/jobs.py``; ``BACKFILL_DAYS``, capped at 180 days for every
+           source). The first entity sync writes the baseline decisions.
+        5. Settle: re-stage the current lead/CRM pair (LinkedIn or HubSpot may have activated
+           a new dataset meanwhile). Rows left pending in the build's own CRM dataset, or
+           matched there with no association read of their contacts, mark its
+           ``hubspot.contacts`` and ``hubspot.associations`` freshness ``unknown`` and rerun
+           the backfill, so the new contacts get their contact refresh, associations and
+           target reads. A live LinkedIn build's rows left pending in HubSpot's active
+           primary get one more matching pass; when its leads are then matched there with
+           no association read, that primary's CRM sync runs, so they get the same reads.
+           Then assess readiness.
+        6. Ready: activate under the activation lock, which HubSpot and LinkedIn
+           activations share, so the pair cannot change during it. Under that lock the
+           current pair is staged once more; new rows, or contacts matched with no
+           association read (in the build's own CRM dataset, or for a live LinkedIn build's
+           leads in HubSpot's active primary), send the build back to step 5 (at most
+           :data:`_SETTLE_ROUNDS` rounds). Otherwise readiness is assessed again and
+           the dataset activates in one transaction with its companion, retiring the
+           previous dataset and its matching state. A build that is not ready is
+           discarded; the previous dataset stays active.
+
+        A job that fails on a defect, in the backfill, a settling rerun or the CRM sync of
+        step 5, stops the build as soon as it returns: no further settle, matching pass,
+        rerun or activation attempt sends the failed request again (AAP 0.3.3: "No mock, no
+        retry"), and the build is discarded.
+
+        A live build is bound to the source's ``access_generation``: read at the start of
+        this call (before the probe when :meth:`ensure_dataset` or :meth:`recover` build),
+        checked after the backfill and again under the activation lock. A denial or entry
+        into automatic fallback recorded by any controller meanwhile voids the build.
+
+        A live build that does not activate is settled by the AAP 0.3.3 fallback table
+        (:meth:`_settle_failure`): a denial leaves the source in automatic fallback and makes
+        sure a simulated dataset is active, so a denied source is never without data; a
+        defect (a job's ``QueryDefect`` or integrity violation included) records
+        ``status='error'`` and a transient failure or any other shortfall ``status='stale'``,
+        each with ``live build failed: <reason>``, no fallback and no simulated data.
+
+        Args:
+            source: The source to build.
+            mode: ``live`` or ``simulated``.
+            reason: The dataset's reason, recorded as the connection's mode reason on
+                activation (for example ``credentials not configured`` or ``recovered``).
+
+        Returns:
+            The build's outcome; for a denied live build, the outcome of the simulated build
+            that followed when one was needed.
+
+        Raises:
+            ValueError: When ``source``, ``mode`` or ``reason`` is invalid.
+        """
+        checked_source = _as_source(source)
+        checked_mode = _as_mode(mode)
+        # A live build called directly is bound to the generation current at its start; the
+        # probing callers (_ensure, recover) bind theirs to the value read before the probe.
+        generation = (
+            await self._access_generation(checked_source) if checked_mode == "live" else None
+        )
+        return await self._build(checked_source, checked_mode, reason=reason, generation=generation)
+
+    async def _build(
+        self, source: Source, mode: Mode, *, reason: str | None, generation: int | None
+    ) -> BuildOutcome:
+        """Run :meth:`build_dataset` for a build bound to an access generation.
+
+        Args:
+            source: The source to build.
+            mode: The mode of the dataset to build.
+            reason: The dataset's reason.
+            generation: The ``access_generation`` a live build is bound to: the build is void
+                once the stored value differs. ``None`` for a simulated build, which no
+                denial can void.
+
+        Returns:
+            The build's outcome, as :meth:`build_dataset` returns it.
+        """
+        # Deferred import: sync/jobs.py imports this module at its top (controller, clients,
+        # on_error), so a module-level import here would be a cycle. The ignore covers
+        # sync/jobs.py not existing yet and is inert once it does.
+        from ads_engine.sync.jobs import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
+            backfill_dataset,
+        )
+
+        started = time.perf_counter()
+        world = self.configured_world if mode == "simulated" else None
+        dataset_id = await self.datasets.begin(source, mode, reason=reason, world=world)
+        _log.info(
+            "sync.build.start",
+            source=source,
+            mode=mode,
+            dataset_id=dataset_id,
+            reason=reason,
+            access_generation=generation,
+        )
+        settled = False
+        try:
+            result = await self._build_steps(
+                source, mode, dataset_id, reason, generation, backfill_dataset
+            )
+            settled = True
+        finally:
+            if not settled:
+                # An unexpected exception or a cancellation ended the build: drop it rather
+                # than leave a building dataset behind.
+                await self._discard_quietly(dataset_id, best_effort=True)
+
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        if result.activation is not None:
+            outcome = BuildOutcome(
+                source=source,
+                mode=mode,
+                dataset_id=dataset_id,
+                activated=True,
+                reason=reason,
+                companion_id=result.companion_id,
+                retired=result.activation.retired,
+                duration_ms=duration_ms,
+            )
+            _log.info(
+                "sync.build",
+                source=source,
+                mode=mode,
+                dataset_id=dataset_id,
+                companion_id=result.companion_id,
+                outcome="activated",
+                retired=list(outcome.retired),
+                duration_ms=duration_ms,
+            )
+            return outcome
+        return await self._settle_failure(source, mode, dataset_id, result, duration_ms)
+
+    async def _build_steps(
+        self,
+        source: Source,
+        mode: Mode,
+        dataset_id: int,
+        reason: str | None,
+        generation: int | None,
+        backfill: Callable[[SourceModeController, int], Awaitable[object]],
+    ) -> _StepResult:
+        """Run steps 1-6 of :meth:`build_dataset` after the dataset was begun.
+
+        Every run of ``backfill``, the first and each settling rerun, goes through one wrapper
+        that stops the build as soon as the run's report holds a job that failed on a defect
+        (``on_error`` disposition ``defect``, or a database integrity violation): it raises
+        :class:`_BuildDefectError` with the first such job, so no further settle, matching
+        pass, rerun or activation attempt sends the failed request again (AAP 0.3.3 fallback
+        table: "No mock, no retry"). :meth:`_run_build_steps` turns it into the result's
+        :attr:`_StepResult.defect`, or into ``denied`` when a denial recorded meanwhile voided
+        the build. A simulated build stops the same way, and is discarded.
+        """
+
+        async def stopping(controller: SourceModeController, building: int) -> object:
+            """Run ``backfill``; stop the build on the first job it reports failed on a defect.
+
+            A stand-in backfill's return value that is no report is returned as is.
+            """
+            report = await backfill(controller, building)
+            if isinstance(report, _BackfillReport):
+                defect = next((job for job in report.results if _failed_on_defect(job)), None)
+                if defect is not None:
+                    raise _BuildDefectError(defect)
+            return report
+
+        return await self._run_build_steps(source, mode, dataset_id, reason, generation, stopping)
+
+    async def _run_build_steps(
+        self,
+        source: Source,
+        mode: Mode,
+        dataset_id: int,
+        reason: str | None,
+        generation: int | None,
+        backfill: Callable[[SourceModeController, int], Awaitable[object]],
+    ) -> _StepResult:
+        """Run steps 1-6 of :meth:`build_dataset` with the stopping ``backfill``.
+
+        A :class:`_BuildDefectError` from a backfill run or the hydration pass ends the steps
+        at once: the build is ``denied`` when the access generation moved (a denial recorded
+        during that run decides, as for every build it voids), else it carries the defective
+        job (:attr:`_StepResult.defect`).
+        """
+        companion_id: int | None = None
+        try:
+            if source == "linkedin" and mode == "simulated":
+                companion_id = await self.datasets.begin(
+                    "hubspot", "simulated", role="companion", parent=dataset_id
+                )
+            if source == "hubspot":
+                await self.verify_crm_bindings(dataset_id)
+                await self._restage(source, mode, dataset_id, None)
+            if companion_id is not None:
+                await self.verify_crm_bindings(companion_id)
+            await backfill(self, dataset_id)
+            if not await self._generation_holds(source, generation):
+                # A denial or fallback entry was recorded since the build was bound, by one
+                # of its own backfill jobs or by another controller: the build is void.
+                return _StepResult(companion_id=companion_id, denied=True)
+            refused: Readiness | None = None
+            unhydrated = 0
+            unhydrated_crm_id: int | None = None
+            for _ in range(_SETTLE_ROUNDS):
+                readiness = await self._settle_matching(
+                    source, mode, dataset_id, companion_id, generation, backfill
+                )
+                if readiness is None:
+                    return _StepResult(companion_id=companion_id, denied=True)
+                if not readiness.ready:
+                    if _awaits_matching(readiness):
+                        # Rows were staged while the settle ran (a lead sync staging new
+                        # leads in a building CRM dataset): attempt them in the next round.
+                        refused, unhydrated = readiness, 0
+                        continue
+                    return _StepResult(companion_id=companion_id, readiness=readiness)
+                attempt = await self._activate(
+                    source, mode, dataset_id, reason, companion_id, generation
+                )
+                if attempt.activation is not None:
+                    return _StepResult(
+                        companion_id=companion_id,
+                        readiness=attempt.readiness,
+                        activation=attempt.activation,
+                    )
+                if attempt.denied:
+                    return _StepResult(companion_id=companion_id, denied=True)
+                # The effective pair changed after settling: rows were staged for it, the
+                # build was not ready under the lock, or contacts were matched with no
+                # association read (in its own CRM dataset, or for a live LinkedIn build's
+                # leads in HubSpot's active primary). Settle again against the current pair.
+                refused, unhydrated = attempt.readiness, attempt.unhydrated
+                unhydrated_crm_id = attempt.crm_dataset_id
+        except _BuildDefectError as stop:
+            if not await self._generation_holds(source, generation):
+                # A denial was recorded during the run that met the defect (a later job of
+                # the same backfill, or another controller): the denial voids the build and
+                # decides its consequence, automatic fallback.
+                return _StepResult(companion_id=companion_id, denied=True)
+            return _StepResult(companion_id=companion_id, defect=stop.job)
+        except ConnectorError as exc:
+            return _StepResult(companion_id=companion_id, error=exc)
+        except (DatasetStateError, repositories.DatasetNotWritable) as exc:
+            # Another process activated, discarded or retired a dataset this build relies on,
+            # or activation found the dataset not ready under its lock.
+            return _StepResult(companion_id=companion_id, message=str(exc))
+        if unhydrated:
+            noun = "matched lead" if unhydrated == 1 else "matched leads"
+            return _StepResult(
+                companion_id=companion_id,
+                message=(
+                    f"matched contacts still lack association reads after {_SETTLE_ROUNDS} "
+                    f"rounds: {unhydrated} {noun} in CRM dataset {unhydrated_crm_id}"
+                ),
+            )
+        if refused is not None:
+            return _StepResult(companion_id=companion_id, readiness=refused)
+        return _StepResult(
+            companion_id=companion_id,
+            message=(
+                f"the effective LinkedIn/CRM dataset pair kept changing: {_SETTLE_ROUNDS} "
+                "rounds staged new lead matches under the activation lock"
+            ),
+        )
+
+    async def _settle_failure(
+        self,
+        source: Source,
+        mode: Mode,
+        dataset_id: int,
+        result: _StepResult,
+        duration_ms: int,
+    ) -> BuildOutcome:
+        """Classify a failed build, discard it, and settle a live one by the fallback table.
+
+        The reason is, in this order: the raised connector error's when it denied access or
+        was a defect; the denial's; the first defective backfill job's (``"<job> job:
+        <its error>"``, :attr:`_StepResult.defect`); any other raised error's; the readiness
+        shortfall; the failure message. A simulated build only ends discarded: the previous
+        dataset stays active and the next wake builds again. A live build that did not
+        activate is settled by the AAP 0.3.3 fallback table:
+
+        * **Denied** (a denial recorded meanwhile voided it, or the raised error switched this
+          source to simulated): the denial already put the source into automatic fallback,
+          so a simulated dataset is built when none is active; an access-denied source is
+          never left without data.
+        * **Defect** (the raised error was classified ``defect``, or a job the build ran failed
+          on one and stopped it): ``source_connection`` records ``status='error'`` with
+          ``live build failed: <reason>``. No fallback, no mock, no retry: the access
+          generation stays, no
+          simulated dataset is built (an active one stays active and labelled), a fallback
+          the build was recovering from ends (its probe passed), and this controller neither
+          probes nor builds the source again (:meth:`_ensure`).
+        * **Otherwise** (transient failures, a call-budget deferral, any other shortfall):
+          ``status='stale'`` with the same reason, and likewise no fallback and no mock. The
+          source still resolves live, so :meth:`_ensure` probes and builds it again once
+          :data:`PROBE_INTERVAL` has passed since its latest probe.
+        """
+        denied = result.denied
+        raised_decides = False
+        endpoint: str | None = None
+        defect = result.defect is not None
+        if result.error is not None:
+            failed_source = _error_source(result.error, source)
+            # Classify before discarding: on_error reads the building dataset's mode.
+            disposition = await self.on_error(
+                failed_source,
+                result.error,
+                dataset_id=dataset_id if failed_source == source else None,
+            )
+            denied = failed_source == source and disposition == "switched_to_simulated"
+            defect = defect or disposition == "defect"
+            raised_decides = denied or disposition == "defect" or result.defect is None
+            endpoint = result.error.endpoint
+        defect = defect and not denied
+        if result.error is not None and raised_decides:
+            reason = result.error.reason
+        elif result.denied:
+            reason = await self._connection_reason(source) or "access denied during backfill"
+        elif result.defect is not None:
+            reason = _defect_reason(result.defect)
+            endpoint = None
+        elif result.readiness is not None:
+            reason = "not ready: " + "; ".join(result.readiness.reasons)
+        else:
+            reason = result.message or "build failed"
+        reason = _truncate(reason)
+
+        await self._discard_quietly(dataset_id)
+        outcome = BuildOutcome(
+            source=source,
+            mode=mode,
+            dataset_id=dataset_id,
+            activated=False,
+            reason=reason,
+            companion_id=result.companion_id,
+            duration_ms=duration_ms,
+        )
+        _log.warning(
+            "sync.build",
+            source=source,
+            mode=mode,
+            dataset_id=dataset_id,
+            companion_id=result.companion_id,
+            outcome="discarded",
+            reason=reason,
+            duration_ms=duration_ms,
+        )
+        if mode != "live":
+            # The previous dataset stays active; the next wake retries the simulated build.
+            return outcome
+        if denied:
+            # The denial put the source into automatic fallback, so it resolves simulated.
+            follow = await self._ensure(source, force_simulated=False, allow_live=False)
+            return follow if follow is not None else outcome
+        # A defect is the product's own fault and a transient failure a passing outage, not
+        # unavailable access (AAP 0.3.3 fallback table, rows 3 and 4): the source keeps its
+        # mode and data. No sticky_denied: the probe that preceded this build passed, so a
+        # fallback it was recovering from ends here and recovery probes stop.
+        await self._record_connection(
+            source,
+            status=_STATUS_ERROR if defect else _STATUS_STALE,
+            reason=f"live build failed: {reason}",
+            attempted_at=self.now(),
+            endpoint=endpoint,
+        )
+        return outcome
+
+    @staticmethod
+    async def _lock_connections(
+        session: AsyncSession, sources: Sequence[Source]
+    ) -> Sequence[Row[str, str, str, int, int | None]]:
+        """Lock the existing ``source_connection`` rows of ``sources``, in source order.
+
+        Rows are locked in one fixed order (``ORDER BY source``), so two transactions taking
+        overlapping sets never deadlock. A missing row is not created.
+
+        Returns:
+            Each locked row's ``source``, ``mode``, ``status``, ``access_generation`` and
+            ``active_dataset_id``.
+        """
+        result = await session.execute(
+            select(
+                SourceConnection.source,
+                SourceConnection.mode,
+                SourceConnection.status,
+                SourceConnection.access_generation,
+                SourceConnection.active_dataset_id,
+            )
+            .where(SourceConnection.source.in_(sources))
+            .order_by(SourceConnection.source)
+            .with_for_update()
+        )
+        return result.all()
+
+    async def _activate(
+        self,
+        source: Source,
+        mode: Mode,
+        dataset_id: int,
+        reason: str | None,
+        companion_id: int | None,
+        generation: int | None,
+    ) -> _ActivationAttempt:
+        """Activate a ready build under the activation lock, against the current pair.
+
+        One transaction, bounded by a 30 s lock wait:
+
+        1. Create the build's own ``source_connection`` row when missing (the defaults
+           :meth:`_lock_connection` inserts), then lock the rows: HubSpot's and LinkedIn's
+           for a build of either (:data:`_PAIRED_SOURCES`), the source's own for Google.
+           Every activation of HubSpot or LinkedIn takes this same set, so they run one
+           after another: a row that exists serialises them, and a missing counterpart row
+           belongs to a source that never activated (activation creates the row and nothing
+           deletes it), which has no active dataset whose change could alter the pair. The
+           counterpart's row is never created here.
+        2. A live build bound to an access generation is void when the locked row's value
+           differs (``denied``). The own row is locked even on the source's first
+           activation, so the check is authoritative: a denial, which creates the row too
+           when missing, commits either before it and is seen, or after the activation.
+        3. HubSpot and LinkedIn: stage the current effective lead/CRM pair
+           (:meth:`_stage_pair`). Rows inserted mean the pair changed since the build
+           settled; they are committed and the attempt returns ``restaged`` without
+           activating, so the caller attempts them before it tries again.
+        4. Assess readiness under the lock; a build not ready is returned as such.
+        5. The build's own CRM dataset (a HubSpot primary, a simulated LinkedIn build's
+           companion): a contact matched there since the settle, by any matcher, has no
+           association read yet (``DatasetManager.unhydrated_matches``). The attempt then
+           returns ``unhydrated`` without activating, and the caller settles again, which
+           reruns the CRM backfill for it. A live LinkedIn build holds no CRM dataset, so
+           the same check covers its own leads' matches in HubSpot's active primary staged
+           in step 3; the settle that follows runs that primary's CRM sync for them.
+        6. Activate through ``DatasetManager.activate`` in the same transaction. It records
+           ``status='ok'``; a simulated dataset activated while the source is in automatic
+           fallback keeps ``denied``, or recovery probes would stop. Both writes share the
+           transaction, so no reader sees the gap.
+
+        Once committed, an activation that changes the source's established mode logs
+        ``sync.mode.change`` with the dataset's reason. A row this activation created, and a
+        ``live`` row with no active dataset (:func:`_established_mode`), had no mode before
+        it, so a source's first live activation logs a change from none to ``live``.
+        """
+        locked_sources: tuple[Source, ...] = (
+            _PAIRED_SOURCES if source in _PAIRED_SOURCES else (source,)
+        )
+        async with self._transaction() as session:
+            await session.execute(_LOCK_TIMEOUT)
+            # The own row exists before the generation check, so this transaction holds its
+            # lock from the check through the activation. Inserting a row that no other
+            # transaction can see yet cannot deadlock with the ordered FOR UPDATE scans of the
+            # paired set: those scans do not see uncommitted rows, and a concurrent insert of
+            # the same row (another activation, or a denial recorded by on_error) waits for
+            # this transaction to end, holding no row of the set while it waits.
+            created = await session.scalar(
+                insert(SourceConnection)
+                .values(
+                    source=source,
+                    mode=self._default_mode(source),
+                    status=_STATUS_OK,
+                    reason=None,
+                )
+                .on_conflict_do_nothing(index_elements=["source"])
+                .returning(SourceConnection.source)
+            )
+            locked = await self._lock_connections(session, locked_sources)
+            prior = next((row for row in locked if row.source == source), None)
+            if generation is not None:
+                current = 0 if prior is None else prior.access_generation
+                if current != generation:
+                    _log.warning(
+                        "sync.build.voided",
+                        source=source,
+                        dataset_id=dataset_id,
+                        bound_generation=generation,
+                        access_generation=current,
+                    )
+                    return _ActivationAttempt(denied=True)
+            staging: _Staging | None = None
+            if source in _PAIRED_SOURCES:
+                staging = await self._stage_pair(session, source, mode, dataset_id, companion_id)
+                if staging is not None and staging.staged:
+                    return _ActivationAttempt(restaged=staging.staged)
+            readiness = await self.datasets.readiness(dataset_id, session=session)
+            if not readiness.ready:
+                return _ActivationAttempt(readiness=readiness)
+            # The CRM dataset whose matches must be hydrated, and the LinkedIn dataset whose
+            # leads' matches count there (None: every lead's).
+            own_crm_id = _own_crm_dataset(source, dataset_id, companion_id)
+            scope: tuple[int, int | None] | None = None
+            if own_crm_id is not None:
+                scope = (own_crm_id, None)
+            elif source == "linkedin" and mode == "live" and staging is not None:
+                scope = (staging.match_pass.crm_dataset_id, dataset_id)
+            if scope is not None:
+                crm_id, lead_dataset_id = scope
+                unhydrated = await self.datasets.unhydrated_matches(
+                    crm_id, lead_dataset_id=lead_dataset_id, session=session
+                )
+                if unhydrated:
+                    _log.info(
+                        "sync.build.unhydrated",
+                        source=source,
+                        dataset_id=dataset_id,
+                        crm_dataset_id=crm_id,
+                        lead_dataset_id=lead_dataset_id,
+                        unhydrated=unhydrated,
+                    )
+                    return _ActivationAttempt(unhydrated=unhydrated, crm_dataset_id=crm_id)
+            try:
+                activation = await self.datasets.activate(
+                    dataset_id, reason=reason, session=session
+                )
+            except DatasetStateError as exc:
+                if exc.readiness is None:
+                    raise
+                # A row committed since the check above (a lead sync staging a new lead in
+                # the building CRM dataset): nothing was written, so settle again.
+                return _ActivationAttempt(readiness=exc.readiness)
+            if (
+                mode == "simulated"
+                and prior is not None
+                and prior.status == _STATUS_DENIED
+                and self._fallback_possible(source)
+            ):
+                await session.execute(
+                    update(SourceConnection)
+                    .where(SourceConnection.source == source)
+                    .values(status=_STATUS_DENIED)
+                )
+        # A row created by this activation had no mode before it, and a live row with no
+        # active dataset only holds the mode a new row starts with: the change is from none.
+        prior_mode = (
+            None
+            if created is not None or prior is None
+            else _established_mode(prior.mode, prior.active_dataset_id)
+        )
+        if prior_mode != mode:
+            # An activation is no failing call, so the transition names no endpoint; switching
+            # live data off is a degradation, every other activation a healthy change.
+            log_change = _log.warning if prior_mode == "live" and mode == "simulated" else _log.info
+            log_change(
+                "sync.mode.change",
+                source=source,
+                from_mode=prior_mode,
+                to_mode=mode,
+                reason=reason,
+                dataset_id=dataset_id,
+                endpoint=None,
+            )
+        return _ActivationAttempt(activation=activation, readiness=readiness)
+
+    async def _settle_matching(
+        self,
+        source: Source,
+        mode: Mode,
+        dataset_id: int,
+        companion_id: int | None,
+        generation: int | None,
+        backfill: Callable[[SourceModeController, int], Awaitable[object]],
+    ) -> Readiness | None:
+        """Re-stage, attempt the rows staged after the backfill, and assess readiness.
+
+        Rows are staged after the backfill's own CRM passes when the effective pair changed
+        meanwhile: LinkedIn activated a new dataset (a HubSpot build), or HubSpot replaced
+        its primary (a live LinkedIn build). A LinkedIn build, live or simulated, also stages
+        every lead its backfill stored with no row in the pair's CRM dataset, whenever
+        submitted (:data:`_EVERY_LEAD_SINCE`). How they are attempted depends on whose CRM
+        dataset holds them:
+
+        * The build's own CRM dataset (a HubSpot primary build, or a simulated LinkedIn
+          build's companion). Matching alone stores contacts and outcomes but not their
+          meetings, deals and associations. So when rows are still pending there, or rows
+          were matched there since the backfill, by any matcher, whose contacts have no
+          association read (``DatasetManager.unhydrated_matches``), the CRM dataset's
+          ``hubspot.contacts`` and ``hubspot.associations`` rows are marked ``unknown`` in
+          one transaction and the backfill runs again: matching, contact refresh, and
+          associations with target reads. Readiness then needs those rows recorded by the
+          rerun; a rerun that only fails leaves them ``unknown`` and the build not ready.
+        * HubSpot's active primary (a live LinkedIn build). The build owns none of that
+          dataset's data and the dataset is in use, so its freshness is never withdrawn and
+          the backfill is not rerun. When the build's rows are still pending there, one
+          ``lead_match.run_matching`` pass attempts them, which is what readiness requires.
+          When the build's leads are then matched there with no association read of their
+          contacts (``DatasetManager.unhydrated_matches`` of this dataset's leads), one CRM
+          sync of that primary (``sync/jobs.refresh_crm_dataset``) gives them their contact
+          refresh, associations and target reads before the LinkedIn dataset activates.
+
+        Args:
+            source: The source built.
+            mode: The build's mode.
+            dataset_id: The building primary.
+            companion_id: Its companion, for a simulated LinkedIn build.
+            generation: The access generation a live build is bound to; ``None`` unbound.
+            backfill: The backfill the build ran, rerun for its own CRM dataset.
+
+        Returns:
+            The readiness, or ``None`` when the access generation changed while the backfill
+            or the CRM sync ran: the live build is then void.
+
+        Raises:
+            _BuildDefectError: When the backfill rerun (through the build's stopping wrapper)
+                or the CRM sync of the hydration pass met a defect; the build stops there.
+        """
+        match_pass = await self._restage(source, mode, dataset_id, companion_id)
+        readiness = await self.datasets.readiness(dataset_id)
+        own_crm_id = _own_crm_dataset(source, dataset_id, companion_id)
+        if own_crm_id is not None:
+            own = readiness if own_crm_id == dataset_id else readiness.companion
+            pending = 0 if own is None else own.pending_matches
+            unhydrated = await self.datasets.unhydrated_matches(own_crm_id)
+            if pending or unhydrated:
+                await self._withdraw_crm_evidence(own_crm_id, pending, unhydrated)
+                await backfill(self, dataset_id)
+                if not await self._generation_holds(source, generation):
+                    return None
+                readiness = await self.datasets.readiness(dataset_id)
+            return readiness
+        if match_pass is None:
+            return readiness
+        settled = False
+        if readiness.pending_matches:
+            await self._matching_pass(match_pass)
+            settled = True
+        unhydrated = await self.datasets.unhydrated_matches(
+            match_pass.crm_dataset_id, lead_dataset_id=dataset_id
+        )
+        if unhydrated:
+            await self._hydration_pass(match_pass.crm_dataset_id, dataset_id, unhydrated)
+            if not await self._generation_holds(source, generation):
+                return None
+            settled = True
+        if settled:
+            readiness = await self.datasets.readiness(dataset_id)
+        return readiness
+
+    async def _withdraw_crm_evidence(
+        self, crm_dataset_id: int, staged: int, unhydrated: int
+    ) -> None:
+        """Mark a building CRM dataset's contact and association freshness ``unknown``.
+
+        Called before the backfill reruns for rows it has not hydrated: rows staged after
+        it ran and still pending (``staged``), and rows matched since then, by any matcher,
+        whose contacts have no association read (``unhydrated``). The dataset cannot read
+        as complete until the rerun records them again.
+        """
+        debts: list[str] = []
+        if staged:
+            noun = "lead match" if staged == 1 else "lead matches"
+            debts.append(f"{staged} {noun} staged")
+        if unhydrated:
+            noun = "matched lead" if unhydrated == 1 else "matched leads"
+            debts.append(f"{unhydrated} {noun} without association reads")
+        reason = (
+            f"{' and '.join(debts)} after the CRM backfill; matching, contact refresh and "
+            "associations re-run"
+        )
+        async with self._transaction() as session:
+            for name in _RESTAGED_CRM_FRESHNESS:
+                await freshness.mark_unknown(session, crm_dataset_id, name, reason=reason)
+        _log.info(
+            "sync.build.crm_rerun",
+            crm_dataset_id=crm_dataset_id,
+            staged=staged,
+            unhydrated=unhydrated,
+        )
+
+    async def _restage(
+        self, source: Source, mode: Mode, dataset_id: int, companion_id: int | None
+    ) -> _MatchPass | None:
+        """Stage a build's current lead/CRM pair in a transaction of its own.
+
+        The transaction takes the activation lock set (:data:`_PAIRED_SOURCES`) for the few
+        statements it runs, so no LinkedIn or HubSpot activation can retire the pair between
+        reading it and staging it.
+
+        Returns:
+            The pass that attempts the pair's rows, or ``None`` when there is no pair.
+        """
+        async with self._transaction() as session:
+            await session.execute(_LOCK_TIMEOUT)
+            await self._lock_connections(session, _PAIRED_SOURCES)
+            staging = await self._stage_pair(session, source, mode, dataset_id, companion_id)
+        return None if staging is None else staging.match_pass
+
+    async def _stage_pair(
+        self,
+        session: AsyncSession,
+        source: Source,
+        mode: Mode,
+        dataset_id: int,
+        companion_id: int | None,
+    ) -> _Staging | None:
+        """Stage, in ``session``, the ``lead_match`` rows of a build's current lead/CRM pair.
+
+        The pair is read in ``session``, so under the activation lock it is exactly the pair
+        the activation commits against:
+
+        * HubSpot primary: every lead of LinkedIn's active primary, when that is live, in the
+          backfill range (``BACKFILL_DAYS``, capped at LinkedIn's 180-day retention).
+          Simulated leads are matched only in their own companion.
+        * Live LinkedIn: every lead of the build, whenever submitted, against HubSpot's
+          active primary, matching the readiness test, which counts every lead. With no
+          HubSpot primary, ``sync.build.no_crm`` is logged and nothing is staged; readiness
+          then holds a build that has leads.
+        * Simulated LinkedIn: every lead of the build, whenever submitted, against its
+          companion, matching the readiness test.
+
+        Staging is idempotent: a lead with a row in the CRM dataset is skipped. Nothing is
+        committed here.
+
+        Returns:
+            The pass and the rows inserted, or ``None`` when the build has no pair.
+        """
+        now = self.now()
+        span = min(self._settings.backfill_days, LINKEDIN_RETENTION_DAYS)
+        since = now - timedelta(days=span)
+        if source == "hubspot":
+            leads = await self._active_in(session, "linkedin")
+            if leads is None or leads.mode != "live":
+                return None
+            lead_dataset_id = leads.id
+            match_pass = _MatchPass(dataset_id, mode, "live", None)
+        elif source == "linkedin" and mode == "live":
+            crm = await self._active_in(session, "hubspot")
+            if crm is None:
+                _log.warning(
+                    "sync.build.no_crm",
+                    source=source,
+                    dataset_id=dataset_id,
+                    reason="HubSpot has no active primary dataset to match the leads against",
+                )
+                return None
+            lead_dataset_id = dataset_id
+            since = _EVERY_LEAD_SINCE
+            match_pass = _MatchPass(crm.id, crm.mode, "live", dataset_id)
+        elif source == "linkedin" and companion_id is not None:
+            lead_dataset_id = dataset_id
+            since = _EVERY_LEAD_SINCE
+            match_pass = _MatchPass(companion_id, "simulated", "simulated", dataset_id)
+        else:
+            return None
+        staged = await lead_match.stage_rows(
+            session, match_pass.crm_dataset_id, lead_dataset_id, since=since, now=now
+        )
+        _log.info(
+            "sync.build.staged",
+            source=source,
+            dataset_id=dataset_id,
+            crm_dataset_id=match_pass.crm_dataset_id,
+            crm_mode=match_pass.crm_mode,
+            lead_dataset_id=lead_dataset_id,
+            staged=staged,
+        )
+        return _Staging(match_pass, staged)
+
+    async def _matching_pass(self, match_pass: _MatchPass) -> None:
+        """Attempt the pending ``lead_match`` rows of one CRM dataset once.
+
+        Every exhausted ``TransientError`` the pass met goes to :meth:`on_error` with no
+        freshness dataset (:meth:`_matching_interrupted`): on a normal return, and before
+        an error the pass raises propagates, so the build's own classification of that
+        error (:meth:`_settle_failure`) is the consequence that stands.
+        """
+        if not (
+            self._can_open("linkedin", match_pass.lead_mode)
+            and self._can_open("hubspot", match_pass.crm_mode)
+        ):
+            _log.warning(
+                "sync.build.matching_skipped",
+                crm_dataset_id=match_pass.crm_dataset_id,
+                reason="live credentials not configured",
+            )
+            return
+        bindings = await self.datasets.load_crm_bindings(match_pass.crm_dataset_id)
+        if bindings is None:
+            bindings = await self.verify_crm_bindings(match_pass.crm_dataset_id)
+        properties = HubSpotClient.contact_property_map(bindings, self._settings)
+        async with (
+            self.open_clients("linkedin", match_pass.lead_mode) as lead_clients,
+            self.open_clients("hubspot", match_pass.crm_mode) as crm_clients,
+        ):
+            linkedin = lead_clients.require_linkedin()
+            clients = lead_match.MatchClients(
+                # Every lead of one pass is of one mode (the isolation rule of stage_rows),
+                # so a single client re-fetches them all.
+                linkedin_for=lambda _lead_dataset_id: linkedin,
+                hubspot=crm_clients.require_hubspot(),
+                contact_properties=properties,
+            )
+            interruptions: list[TransientError] = []
+            try:
+                report = await lead_match.run_matching(
+                    self._sessionmaker,
+                    match_pass.crm_dataset_id,
+                    clients,
+                    now=self.now(),
+                    lead_dataset_id=match_pass.lead_dataset_id,
+                    interruptions=interruptions,
+                )
+            except Exception:
+                # The interruptions met before the raise go first; the raised error is the
+                # build's to classify.
+                await self._matching_interrupted(match_pass, interruptions)
+                raise
+        await self._matching_interrupted(match_pass, report.interrupted_by)
+        _log.info(
+            "sync.build.matching",
+            crm_dataset_id=match_pass.crm_dataset_id,
+            attempted=report.attempted,
+            matched=report.matched,
+            pending_left=report.pending_left,
+        )
+
+    async def _hydration_pass(
+        self, crm_dataset_id: int, lead_dataset_id: int, unhydrated: int
+    ) -> None:
+        """Run one CRM sync of the HubSpot primary a live LinkedIn build's leads matched in.
+
+        Matching stored the contacts of ``unhydrated`` of the build's rows there but read
+        none of their associations. The sync (``sync/jobs.refresh_crm_dataset``) refreshes
+        every matched contact of the dataset and reads its meetings and deals with their
+        targets. A read that fails is recorded as an attempted, unknown outcome; a sync that
+        cannot run (no HubSpot client of the dataset's mode may be opened now) records
+        nothing, so the activation guard still finds the debt and the build settles again.
+        A sync that fails on a defect stops the build instead: the next settle round would
+        send the same request again (no retry, AAP 0.3.3).
+
+        Args:
+            crm_dataset_id: HubSpot's active primary, where the build's leads were matched.
+            lead_dataset_id: The building LinkedIn dataset.
+            unhydrated: The build's matched rows there whose contacts lack association reads.
+
+        Raises:
+            _BuildDefectError: When the CRM sync failed on a defect, once it is logged.
+        """
+        # Deferred import: sync/jobs.py imports this module at its top (controller, clients,
+        # on_error), so a module-level import here would be a cycle.
+        from ads_engine.sync.jobs import refresh_crm_dataset
+
+        result = await refresh_crm_dataset(self, crm_dataset_id)
+        status = "skipped" if result is None else result.status
+        log = _log.info if status == "succeeded" else _log.warning
+        log(
+            "sync.build.crm_hydration",
+            crm_dataset_id=crm_dataset_id,
+            lead_dataset_id=lead_dataset_id,
+            unhydrated=unhydrated,
+            status=status,
+        )
+        if result is not None and _failed_on_defect(result):
+            raise _BuildDefectError(result)
+
+    async def _matching_interrupted(
+        self, match_pass: _MatchPass, interruptions: Sequence[TransientError]
+    ) -> None:
+        """Hand a build's matching interruptions to :meth:`on_error`, with no dataset name.
+
+        Matching state lives in ``lead_match``, where the interrupted rows already ended
+        retried ``error``, so no freshness row records the failure: only the source's
+        connection turns ``stale`` (a ``denied`` fallback marker stays). Each error names
+        the dataset its source served in the pass: the CRM dataset for HubSpot, the leads'
+        dataset for LinkedIn (the source's active primary when the pass names none).
+        """
+        served: dict[Source, int | None] = {
+            "hubspot": match_pass.crm_dataset_id,
+            "linkedin": match_pass.lead_dataset_id,
+        }
+        for error in interruptions:
+            await self.on_error(error.source, error, dataset_id=served.get(error.source))
+
+    async def _discard_quietly(self, dataset_id: int, *, best_effort: bool = False) -> None:
+        """Discard a building dataset, tolerating one already gone or activated elsewhere.
+
+        Args:
+            dataset_id: The building primary to discard.
+            best_effort: Also tolerate a database error, when the build is already ending
+                with another exception; the abandoned-build sweep removes it later.
+        """
+        try:
+            await self.datasets.discard(dataset_id)
+        except DatasetStateError as exc:
+            _log.info("sync.build.discard_skipped", dataset_id=dataset_id, reason=str(exc))
+        except SQLAlchemyError as exc:
+            if not best_effort:
+                raise
+            _log.warning(
+                "sync.build.discard_failed", dataset_id=dataset_id, error=type(exc).__name__
+            )
+
+    async def _discard_abandoned_builds(self, source: Source) -> None:
+        """Discard ``source``'s building primaries left behind by a crashed build.
+
+        Decision: nothing else removes them (``purge_retired`` purges only retired
+        datasets), and a stale build would hold staged ``lead_match`` rows forever. A build
+        younger than :data:`ABANDONED_BUILD_AFTER` may still be running in another process.
+        """
+        cutoff = self.now() - ABANDONED_BUILD_AFTER
+        async with self._transaction() as session:
+            abandoned = list(
+                await session.scalars(
+                    select(SourceDataset.id)
+                    .where(
+                        SourceDataset.source == source,
+                        SourceDataset.role == _ROLE_PRIMARY,
+                        SourceDataset.state == _STATE_BUILDING,
+                        SourceDataset.created_at < cutoff,
+                    )
+                    .order_by(SourceDataset.id)
+                )
+            )
+        for dataset_id in abandoned:
+            _log.warning("sync.build.abandoned", source=source, dataset_id=dataset_id)
+            await self._discard_quietly(dataset_id)
+
+    # -- ensuring, recovery ------------------------------------------------------------------
+
+    async def ensure_dataset(
+        self, source: Source, *, force_simulated: bool = False
+    ) -> BuildOutcome | None:
+        """Make sure ``source``'s active primary dataset is of the mode it resolves to.
+
+        Called on every scheduler wake and by :func:`bootstrap_sources`. It performs a
+        pending live-to-simulated switch after a denial, first builds, and the first live
+        build once credentials are present:
+
+        * an active primary of the resolved mode: nothing to build (``None``), unless it is a
+          simulated dataset generated from another world than the configured
+          ``MOCK_SCENARIO`` and ``MOCK_SEED``: then a new simulated dataset is built with the
+          resolution's reason and replaces it (a dataset recording no world is kept);
+        * simulated resolved: build simulated with the resolution's reason;
+        * live resolved: probe the full capability set first and build live only when it
+          passes. A failed probe is acted on by the classification of its failed checks
+          (AAP 0.3.3 fallback table):
+
+          - a denial on any check: automatic fallback, with that check as reason. The
+            fallback builds simulated data when none is active;
+          - else a defect (400, GAQL ``QueryError``, validation): the Defect consequence,
+            never a fallback. ``source_connection`` records ``status='error'`` with the
+            failing check as reason, the defect is logged with its query id, no simulated
+            data is built and ``None`` is returned;
+          - else (transient failures only: 429, 5xx, timeout, ``RESOURCE_EXHAUSTED``, call
+            budget, after their attempts, or a listing they cut short): the Transient
+            consequence, never a fallback and never mock. ``source_connection`` records
+            ``status='stale'`` with the first failing check as reason; the mode and the
+            ``access_generation`` stay, an active dataset stays active and untouched, no
+            dataset is built and ``None`` is returned.
+
+          Every such probe is recorded as a :data:`JOB_PROBE` ``sync_run`` started when the
+          probe starts and committed before it sends anything. It ends ``succeeded`` only
+          when the probe passed and the live dataset built from it activated, else
+          ``failed`` with the deciding check, or the build's reason, as error; a probe or
+          build that raises or is cancelled ends it ``failed`` too (best effort). Its
+          ``started_at`` spaces probes by :data:`PROBE_INTERVAL`: no probe runs while the
+          source's latest ``probe`` row (this method's or a scheduler recovery probe's) is
+          younger, and ``None`` is returned with nothing changed. A first start, and a
+          restart long after the last probe, probe at once; a fallback entered by a probe
+          gets its first recovery probe one interval later; a source left in the stale state
+          (by a probe or a live build) still resolves live, outside the scheduler's recovery
+          probes, and is probed again here at most once per interval. A source left in the
+          defect state (by a probe, a live build or a job) since this controller started is
+          held instead: no probe, no build, ``None``, nothing changed (no retry). A new
+          controller, a restarted worker's, probes it once more, spaced likewise.
+
+        A live build that follows a passing probe and does not activate is settled as
+        :meth:`build_dataset` describes: only a denial falls back to simulated data.
+
+        Building primaries abandoned by a crashed build are discarded first, and a
+        ``stale``/``error`` connection whose data has caught up returns to ``ok``.
+
+        Args:
+            source: The source.
+            force_simulated: Build simulated data even where live would be resolved
+                (``ads-engine seed-simulated``); an active simulated dataset is kept unless
+                it records a world other than the configured ``MOCK_SCENARIO`` and
+                ``MOCK_SEED``, which replaces it.
+
+        Returns:
+            The build's outcome, or ``None`` when no build was needed, the probe met a
+            defect or transient failures only, the probe was not yet due, or the source is
+            held in the defect state.
+
+        Raises:
+            Exception: Any error of the probe or the live build, unchanged, once its
+                ``probe`` row was closed ``failed`` with the error's class name.
+            asyncio.CancelledError: Unchanged, once the ``probe`` row was closed ``failed``
+                with ``probe cancelled`` within ``jobs.CANCEL_CLOSE_TIMEOUT``.
+        """
+        return await self._ensure(
+            _as_source(source), force_simulated=force_simulated, allow_live=True
+        )
+
+    async def _ensure(
+        self, source: Source, *, force_simulated: bool, allow_live: bool
+    ) -> BuildOutcome | None:
+        """Run :meth:`ensure_dataset`; ``allow_live=False`` after a failed live build.
+
+        With ``allow_live=False`` nothing is probed, so no ``probe`` row is written: the
+        fallback that follows a denied live build or a denied probe builds simulated data
+        only, under the row of the probe that preceded it.
+
+        A source this controller saw fail on a defect is held (:meth:`_defect_held`): it is
+        neither probed nor built again, and ``None`` is returned with nothing changed.
+        """
+        await self._discard_abandoned_builds(source)
+        resolved = await self.resolve(source)
+        if force_simulated and resolved.mode == "live":
+            resolved = ResolvedMode(source, "simulated", REASON_SEEDED)
+        active = await self._active(source)
+        configured = self.configured_world
+        if (
+            active is not None
+            and active.mode == resolved.mode == "simulated"
+            and active.world is not None
+            and configured is not None
+            and active.world != configured
+        ):
+            # MOCK_SCENARIO or MOCK_SEED changed: the active simulated dataset was generated
+            # from another world. A dataset never mixes two worlds, so a new one is built and
+            # activated through the normal transition, and the old one becomes historical.
+            _log.info(
+                "sync.dataset.world_changed",
+                source=source,
+                dataset_id=active.id,
+                recorded=active.world.describe(),
+                configured=configured.describe(),
+            )
+            return await self.build_dataset(source, "simulated", reason=resolved.reason)
+        if active is not None and active.mode == resolved.mode:
+            await self._reconcile_status(source, active)
+            return None
+        if resolved.mode == "simulated":
+            return await self.build_dataset(source, "simulated", reason=resolved.reason)
+        if not allow_live:
+            # Unreachable after a denial (the source then resolves simulated); kept so a
+            # failed live build can never recurse into another one.
+            return None
+        held = await self._defect_held(source)
+        if held is not None:
+            # AAP 0.3.3 fallback table, row 4: a defect is never retried, so a source left in
+            # the defect state is not probed or rebuilt every PROBE_INTERVAL; a new controller
+            # (a worker restart, after a fix) tries it once more.
+            _log.debug(
+                "sync.probe.held",
+                source=source,
+                status=_STATUS_ERROR,
+                last_failure_at=held.isoformat(),
+            )
+            return None
+        started = self.now()
+        last_probe = await self._probe_started_since(source, started - PROBE_INTERVAL)
+        if last_probe is not None:
+            # Probes are spaced like the scheduler's recovery probes: a source left in the
+            # stale state, or in a defect state an earlier controller recorded, resolves live
+            # again on every 30-second wake.
+            _log.debug(
+                "sync.probe.spaced",
+                source=source,
+                last_probe_at=last_probe.isoformat(),
+                next_probe_at=(last_probe + PROBE_INTERVAL).isoformat(),
+            )
+            return None
+        # Read before the probe: a denial recorded while the probe or the build runs voids
+        # the build, so a live dataset activates only on access verified after the last one.
+        generation = await self._access_generation(source)
+        run = await self._open_probe_run(source, started)
+        try:
+            return await self._probe_and_build(source, active, generation, run)
+        except asyncio.CancelledError:
+            # Also a cancellation that lands in a close, whose transaction rolled back.
+            await self._close_cancelled_probe_run(run)
+            raise
+        except Exception as exc:
+            try:
+                await self._close_probe_run_quietly(run.run_id, error=type(exc).__name__)
+            finally:
+                # Logged even when the close is itself cancelled.
+                run.finish("failed", error=type(exc).__name__, error_type=type(exc).__name__)
+            raise
+
+    async def _probe_and_build(
+        self, source: Source, active: _DatasetRef | None, generation: int, run: ProbeRunLog
+    ) -> BuildOutcome | None:
+        """Probe a source resolved live, act on the verdict, and close its ``probe`` row.
+
+        The row's ``sync.job.finish`` is logged as soon as the row is closed, with the
+        probe's checks and calls (:class:`ProbeRunLog`).
+
+        Args:
+            source: The source, resolved live with no active live dataset.
+            active: Its active primary dataset (simulated), or ``None``.
+            generation: The ``access_generation`` read before the probe; the live build is
+                bound to it.
+            run: The probe's open ``sync_run`` row and its log.
+
+        Returns:
+            The live build's outcome (for a denied live build, the simulated build that
+            followed it when no dataset was active), the simulated build of a denied probe's
+            fallback when no dataset was active, or ``None`` (a fallback with a dataset
+            active, a defect, or transient failures only).
+        """
+        report = await self.probe(source)
+        run.report = report
+        if not report.passed:
+            denial = report.denial
+            defect = report.defect
+            failed = report.failed
+            # Precedence: a denial decides over every other failure, with its own code and
+            # endpoint as the reason, whichever check failed first (AAP 0.3.3 fallback table,
+            # row 2; "Granularity"). Else a defect decides, else the first failing check: a
+            # transient one, since every check of a live probe sends its request.
+            if denial is not None:
+                deciding = denial
+            elif defect is not None:
+                deciding = defect
+            else:
+                deciding = failed[0] if failed else _NOTHING_CHECKED
+            reason = _check_reason(deciding)
+            await self._close_probe_run(run.run_id, SYNC_RUN_FAILED, error=reason)
+            run.finish("failed", error=reason)
+            if denial is None:
+                # A defect is the product's own fault and a transient failure a passing
+                # outage, not unavailable access: no fallback, no mock. The source keeps its
+                # mode and still resolves live, so after a transient failure its next probe
+                # runs here one PROBE_INTERVAL after this one, while a defect is held
+                # (_defect_held; AAP 0.3.3 fallback table, rows 3 and 4).
+                await self._record_probe_failure(
+                    source, deciding, disposition="defect" if defect is not None else "stale"
+                )
+                return None
+            await self._enter_fallback(source, reason, endpoint=denial.endpoint)
+            if active is None:
+                return await self._ensure(source, force_simulated=False, allow_live=False)
+            return None
+        outcome = await self._build(source, "live", reason=REASON_LIVE, generation=generation)
+        if outcome.activated and outcome.mode == "live":
+            await self._close_probe_run(run.run_id, SYNC_RUN_SUCCEEDED)
+            run.finish("succeeded", dataset_id=outcome.dataset_id)
+        else:
+            error = outcome.reason or "live dataset was not activated"
+            await self._close_probe_run(run.run_id, SYNC_RUN_FAILED, error=error)
+            run.finish("failed", dataset_id=outcome.dataset_id, error=error)
+        return outcome
+
+    async def _defect_held(self, source: Source) -> datetime | None:
+        """Return when ``source`` failed on a defect since this controller started, or ``None``.
+
+        A source is held when its ``source_connection`` is ``error`` and its
+        ``last_failure_at`` is at or after this controller's start: a defect recorded by a
+        probe (:meth:`_record_probe_failure`), a live build (:meth:`_settle_failure`) or a job
+        (:meth:`on_error`) while this process ran, this controller's or another's (the
+        worker's bootstrap runs its own, built after the scheduler's). A defect recorded
+        before the controller started, by a process since restarted, is not held, so a
+        deployed fix is tried once, spaced by :data:`PROBE_INTERVAL` like every probe. Only
+        reads.
+
+        Returns:
+            The failure instant that holds the source, or ``None`` when it may be probed.
+        """
+        async with self._transaction() as session:
+            row = (
+                await session.execute(
+                    select(SourceConnection.status, SourceConnection.last_failure_at).where(
+                        SourceConnection.source == source
+                    )
+                )
+            ).one_or_none()
+        if row is None:
+            return None
+        status, failed_at = row
+        if status != _STATUS_ERROR or failed_at is None or failed_at < self._started_at:
+            return None
+        held: datetime = failed_at
+        return held
+
+    async def _probe_started_since(self, source: Source, after: datetime) -> datetime | None:
+        """Return the latest ``started_at`` of ``source``'s ``probe`` rows later than ``after``.
+
+        Every probe's row counts, whatever its status and whoever wrote it: this controller's
+        (:meth:`ensure_dataset`) and the scheduler's recovery probes. Bounding the read by
+        ``after`` keeps it to the recent end of the ``(source, started_at)`` index however
+        long ``sync_run`` grows.
+
+        Returns:
+            That instant, or ``None`` when no probe started after ``after``.
+        """
+        async with self._transaction() as session:
+            latest: datetime | None = await session.scalar(
+                select(func.max(SyncRun.started_at)).where(
+                    SyncRun.source == source,
+                    SyncRun.job == JOB_PROBE,
+                    SyncRun.started_at > after,
+                )
+            )
+        return latest
+
+    async def _open_probe_run(self, source: Source, started: datetime) -> ProbeRunLog:
+        """Insert and commit a ``running`` ``probe`` ``sync_run`` row and log its start.
+
+        The row is committed before the probe sends anything, so it spaces the next probe
+        (here and in the scheduler) even when the probe or its build never ends normally. A
+        cancellation that lands once the row has its id (in the commit, which may or may not
+        have reached the server) logs the row's start and closes it as cancelled before it
+        propagates; one that lands earlier rolls the insert back and logs nothing.
+
+        Returns:
+            The row's log (:class:`ProbeRunLog`), its ``sync.job.start`` logged.
+        """
+        run_id: int | None = None
+        try:
+            async with self._transaction() as session:
+                row = SyncRun(
+                    source=source,
+                    job=JOB_PROBE,
+                    dataset=None,
+                    started_at=started,
+                    status=SYNC_RUN_RUNNING,
+                )
+                session.add(row)
+                await session.flush()
+                run_id = row.id
+            return ProbeRunLog.start(source, run_id)
+        except asyncio.CancelledError:
+            if run_id is not None:
+                await self._close_cancelled_probe_run(ProbeRunLog.start(source, run_id))
+            raise
+
+    async def _close_probe_run(self, run_id: int, status: str, *, error: str | None = None) -> None:
+        """Close a still-``running`` ``probe`` row; a row a committed close ended is kept.
+
+        ``status`` is ``succeeded`` (the probe passed and the live dataset built from it
+        activated) or ``failed``, with ``error`` cut to the stored length.
+        """
+        async with self._transaction() as session:
+            await session.execute(
+                update(SyncRun)
+                .where(SyncRun.id == run_id, SyncRun.status == SYNC_RUN_RUNNING)
+                .values(
+                    status=status,
+                    finished_at=self.now(),
+                    error=None if error is None else _truncate(error),
+                )
+                .execution_options(synchronize_session=False)
+            )
+
+    async def _close_probe_run_quietly(self, run_id: int, *, error: str) -> None:
+        """Close a ``probe`` row ``failed`` while another error propagates.
+
+        A database error doing so is logged as ``sync.probe.close_failed``, never raised in
+        place of the error that ended the probe.
+        """
+        try:
+            await self._close_probe_run(run_id, SYNC_RUN_FAILED, error=error)
+        except SQLAlchemyError as exc:
+            _log.error("sync.probe.close_failed", run_id=run_id, error=type(exc).__name__)
+
+    async def _close_cancelled_probe_run(self, run: ProbeRunLog) -> None:
+        """Log ``sync.probe.cancelled`` and close the probe's row as cancelled, bounded.
+
+        The scheduler waits a bounded time for cancelled work after losing its lock, so this
+        bookkeeping is abandoned after ``jobs.CANCEL_CLOSE_TIMEOUT``, the bound the scheduler
+        checks its own stop timeout against, or at once when it fails, and logged as
+        ``sync.probe.close_failed``; a further cancellation propagates at once. Only a row
+        still ``running`` is closed: ``failed`` with ``probe cancelled``. The row's
+        ``sync.job.finish`` is then logged ``cancelled``, even when the close was abandoned,
+        unless a close before the cancellation already logged it.
+        """
+        # Deferred import: sync/jobs.py imports this module at its top (see _build).
+        from ads_engine.sync.jobs import CANCEL_CLOSE_TIMEOUT
+
+        _log.warning("sync.probe.cancelled", source=run.source, run_id=run.run_id)
+        try:
+            async with asyncio.timeout(CANCEL_CLOSE_TIMEOUT.total_seconds()):
+                await self._close_probe_run_quietly(run.run_id, error="probe cancelled")
+        except TimeoutError as exc:
+            # Best effort: the cancellation must end the probe within the lock-loss bound.
+            _log.error("sync.probe.close_failed", run_id=run.run_id, error=type(exc).__name__)
+        finally:
+            run.finish("cancelled", error="probe cancelled", error_type="CancelledError")
+
+    async def recover(
+        self, source: Source, *, run: ProbeRunLog | None = None
+    ) -> BuildOutcome | None:
+        """Try to bring a source in automatic fallback back to live data.
+
+        AAP 0.3.3 ("Recovery readiness"). Only a source :meth:`in_fallback` is probed; the
+        scheduler calls this at most every 30 minutes. When every capability passes, a live
+        dataset is built and activated only after its backfill completes (and, for HubSpot,
+        staged-matching readiness passes); a failed build is discarded and the simulated
+        dataset stays active. A failed build is settled as :meth:`build_dataset` describes: a
+        denial keeps the fallback, while a defect (``error``) or any other failure
+        (``stale``) ends it, with no simulated data built. A partial success changes nothing.
+        The build is bound to the ``access_generation`` read before the probe, so a denial or
+        fallback entry recorded meanwhile by any controller voids it: promotion always follows
+        a full probe that passed after the latest denial. It writes no ``probe`` ``sync_run``
+        itself: the scheduler records each call as one, which also spaces it, and closes it
+        with the outcome's reason.
+
+        Args:
+            source: The source.
+            run: The log of the scheduler's ``probe`` row, or ``None``. The probe's report is
+                set on it (:attr:`ProbeRunLog.report`) as soon as the probe returns, before
+                any build, so the row's ``sync.job.finish`` carries the probe's checks and
+                calls even when the build then raises or is cancelled.
+
+        Returns:
+            ``None`` when the source is not in fallback, so nothing was probed. Otherwise an
+            outcome carrying the probe's report (:attr:`BuildOutcome.probe`): for a probe that
+            did not pass, an outcome with no dataset, not activated, with the probe's reason
+            (the deciding check, its endpoint and platform code); else the live build's
+            outcome.
+        """
+        checked = _as_source(source)
+        if not await self.in_fallback(checked):
+            return None
+        # Read before the probe, so the build activates only if no denial or fallback entry
+        # was recorded by any controller after the probe's verdict was formed.
+        generation = await self._access_generation(checked)
+        report = await self.probe(checked)
+        if run is not None:
+            run.report = report
+        if not report.passed:
+            reason = report.reason or _check_reason(_NOTHING_CHECKED)
+            _log.info("sync.recover", source=checked, recovered=False, reason=reason)
+            return BuildOutcome(
+                source=checked,
+                mode="live",
+                dataset_id=None,
+                activated=False,
+                reason=reason,
+                probe=report,
+            )
+        outcome = await self._build(checked, "live", reason=REASON_RECOVERED, generation=generation)
+        _log.info(
+            "sync.recover",
+            source=checked,
+            recovered=outcome.activated and outcome.mode == "live",
+            dataset_id=outcome.dataset_id,
+            reason=outcome.reason,
+        )
+        return replace(outcome, probe=report)
+
+    async def active_datasets(self) -> Mapping[Source, ActiveDataset | None]:
+        """Return each source's active primary dataset, with a simulated LinkedIn's companion.
+
+        Returns:
+            The active datasets by source, ``None`` for a source with none.
+        """
+        result: dict[Source, ActiveDataset | None] = {}
+        async with self._transaction() as session:
+            active = await repositories.active_datasets(session)
+            for source in SOURCES:
+                row = active.get(source)
+                if row is None:
+                    result[source] = None
+                    continue
+                companion_id: int | None = None
+                if source == "linkedin":
+                    companion_id = await self.datasets.companion_of(row.id, session=session)
+                result[source] = ActiveDataset(
+                    dataset_id=row.id,
+                    mode=_as_mode(row.mode),
+                    reason=row.reason,
+                    companion_id=companion_id,
+                )
+        return MappingProxyType(result)
+
+
+def _client_calls(clients: SourceClients) -> int:
+    """The calls the client of ``clients`` made over its lifetime, by its own counter.
+
+    Google counts every webhook POST attempt (:attr:`GoogleAdsWebhookClient.calls_made`);
+    LinkedIn and HubSpot count each call once, its retry sequence included
+    (:attr:`LinkedInClient.calls`, :attr:`HubSpotClient.calls`), as ``sync/jobs.py`` counts a
+    job's calls.
+    """
+    if clients.google is not None:
+        return clients.google.calls_made
+    if clients.linkedin is not None:
+        return clients.linkedin.calls
+    if clients.hubspot is not None:
+        return clients.hubspot.calls
+    return 0
+
+
+def _listing_check(name: str, interrupted_by: TransientError | None) -> ProbeCheck:
+    """Turn a probe listing into a check: a listing cut short by a transient error fails.
+
+    A one-page probe listing is normally incomplete ("page limit"); that is a pass. A cut-short
+    listing fails as ``transient``, the kind of the error that interrupted it.
+    """
+    if interrupted_by is not None:
+        return _failed_check(name, interrupted_by)
+    return ProbeCheck(name, True)
+
+
+def _check_reason(check: ProbeCheck) -> str:
+    """Return a failed check's reason as stored and logged, naming the check once.
+
+    ``"<name>: <reason>"``, or the reason alone when it already names the check. A
+    classified error's reason starts ``"{source} {endpoint}: "`` and a Google endpoint
+    carries its query id (``"google search Q-G1: HTTP 401: …"``), so the check ``Q-G1``
+    would repeat it. The name counts as named when its whitespace-delimited tokens occur,
+    whole, contiguous and in order, among those of the reason's head (the text before its
+    first ``": "``). A check the reason does not name keeps the prefix: the LinkedIn checks
+    (``adAccounts/123``, ``leadFormResponses 123``, whose account the reason omits) and
+    HubSpot's ``crm``. A check without a reason is its name.
+    """
+    reason = check.reason
+    if not reason:
+        return check.name
+    head = reason.split(": ", 1)[0].split()
+    name = check.name.split()
+    width = len(name)
+    named = width > 0 and any(
+        head[start : start + width] == name for start in range(len(head) - width + 1)
+    )
+    return reason if named else f"{check.name}: {reason}"
+
+
+def _failed_on_defect(job: JobResult) -> bool:
+    """Whether ``job`` failed on a defect, which is never retried (AAP 0.3.3).
+
+    That is a ``QueryDefect`` the job handed to :meth:`SourceModeController.on_error`
+    (disposition ``defect``) or a database integrity violation that ended it, as
+    ``jobs.SourceSyncReport.has_defect`` counts one.
+    """
+    return job.disposition == "defect" or job.integrity is not None
+
+
+def _defect_reason(job: JobResult) -> str:
+    """Name a build's defective backfill job and its sanitized error: ``"<job> job: <error>"``.
+
+    The error is the connector's reason, which names the source, the endpoint and the query
+    id, or the integrity violation's sanitized reason; neither carries an email or a secret.
+    """
+    if job.error:
+        return f"{job.job} job: {job.error}"
+    return f"{job.job} job failed on a defect"
+
+
+def _failed_check(name: str, error: ConnectorError) -> ProbeCheck:
+    return ProbeCheck(
+        name,
+        False,
+        error.reason,
+        error.endpoint,
+        kind=error.kind,
+        query_id=error.query_id if isinstance(error, QueryDefect) else None,
+    )
+
+
+# ---------------------------------------------------------------------------------------------
+# Bootstrap
+# ---------------------------------------------------------------------------------------------
+
+_BOOTSTRAP_FAILURES: Final = (
+    ConnectorError,
+    DatasetStateError,
+    repositories.DatasetNotWritable,
+    ConfigError,
+    httpx.HTTPError,
+)
+"""Failures that stop one source's bootstrap but never the others'. A database outage is not
+among them: it stops every source alike and propagates."""
+
+
+async def bootstrap_sources(
+    settings: Settings,
+    *,
+    force_simulated: bool = False,
+    controller: SourceModeController | None = None,
+) -> BootstrapReport:
+    """Give every source an active primary dataset of its resolved mode.
+
+    Shared by ``worker/main.py`` startup (after the scheduler lock is held, before the first
+    tick) and ``ads-engine seed-simulated``. Sources run in :data:`BOOTSTRAP_ORDER`
+    (``google``, ``hubspot``, ``linkedin``), so HubSpot's primary is active before a live
+    LinkedIn build stages its leads against it. Per source: create the ``source_connection``
+    row, resolve, build when needed (:meth:`SourceModeController.ensure_dataset`), and
+    re-verify the CRM bindings of active HubSpot datasets (primary and companion) that this
+    bootstrap did not just build. Baselines are written by the first entity sync inside
+    each backfill.
+
+    With no credentials every source ends simulated with ``credentials not configured``,
+    built, backfilled and activated (AAP 0.11.2 "First start"). Each source is independent:
+    one source's failure is recorded in the report and never stops the others.
+
+    Args:
+        settings: The process settings.
+        force_simulated: Build simulated data even where live would be resolved; an active
+            simulated dataset is kept unless it records a world other than the configured
+            ``MOCK_SCENARIO`` and ``MOCK_SEED``, which replaces it.
+        controller: The controller to use; one on ``settings`` when omitted.
+
+    Returns:
+        The report: build outcomes, final modes, active datasets and failures, by source.
+    """
+    ctl = controller if controller is not None else SourceModeController(settings)
+    outcomes: dict[Source, BuildOutcome | None] = {}
+    failures: dict[Source, str] = {}
+    for source in BOOTSTRAP_ORDER:
+        try:
+            outcome = await ctl.ensure_dataset(source, force_simulated=force_simulated)
+            outcomes[source] = outcome
+            if source in ("hubspot", "linkedin"):
+                await ctl.verify_active_bindings(source, skip=_built_ids(outcome))
+        except _BOOTSTRAP_FAILURES as exc:
+            outcomes.setdefault(source, None)
+            failures[source] = _truncate(f"{type(exc).__name__}: {exc}")
+            _log.error(
+                "sync.bootstrap.source_failed",
+                source=source,
+                error=type(exc).__name__,
+                message=failures[source],
+            )
+
+    active = await ctl.active_datasets()
+    modes: dict[Source, ResolvedMode] = {}
+    for source in BOOTSTRAP_ORDER:
+        resolved = await ctl.resolve(source)
+        current = active.get(source)
+        if (
+            force_simulated
+            and resolved.mode == "live"
+            and current is not None
+            and current.mode == "simulated"
+        ):
+            resolved = ResolvedMode(source, "simulated", current.reason or REASON_SEEDED)
+        modes[source] = resolved
+
+    for source in BOOTSTRAP_ORDER:
+        current = active.get(source)
+        _log.info(
+            "sync.bootstrap",
+            source=source,
+            mode=modes[source].mode,
+            reason=modes[source].reason,
+            fallback=modes[source].fallback,
+            dataset_id=None if current is None else current.dataset_id,
+            dataset_mode=None if current is None else current.mode,
+            companion_id=None if current is None else current.companion_id,
+            built=outcomes.get(source) is not None,
+            failed=source in failures,
+        )
+    return BootstrapReport(
+        outcomes=MappingProxyType(outcomes),
+        modes=MappingProxyType(modes),
+        active=active,
+        failures=MappingProxyType(failures),
+    )
+
+
+def _built_ids(outcome: BuildOutcome | None) -> frozenset[int]:
+    """The datasets an activated build just verified, so bootstrap does not verify them twice."""
+    if outcome is None or not outcome.activated or outcome.dataset_id is None:
+        return frozenset()
+    ids = {outcome.dataset_id}
+    if outcome.companion_id is not None:
+        ids.add(outcome.companion_id)
+    return frozenset(ids)

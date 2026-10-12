@@ -1,0 +1,44 @@
+{
+  "request": {
+    "body": {
+      "customer_id": "9900000001",
+      "page_token": null,
+      "query": "SELECT campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type, campaign_budget.id, campaign_budget.amount_micros, campaign_budget.total_amount_micros, campaign_budget.period, campaign_budget.explicitly_shared FROM campaign WHERE campaign.id IN (990000000009)"
+    },
+    "headers": {
+      "Content-Type": "application/json",
+      "X-Webhook-Secret": "<redacted>"
+    },
+    "method": "POST",
+    "query": [],
+    "url": "https://n8n.sim.invalid/webhook/google-ads"
+  },
+  "response": {
+    "body": {
+      "fieldMask": "campaign.id,campaign.name,campaign.status,campaign.advertisingChannelType,campaignBudget.id,campaignBudget.amountMicros,campaignBudget.totalAmountMicros,campaignBudget.period,campaignBudget.explicitlyShared",
+      "queryResourceConsumption": "1",
+      "results": [
+        {
+          "campaign": {
+            "advertisingChannelType": "SEARCH",
+            "id": "990000000009",
+            "name": "Legacy - Old brand",
+            "resourceName": "customers/9900000001/campaigns/990000000009",
+            "status": "REMOVED"
+          },
+          "campaignBudget": {
+            "amountMicros": "80000000",
+            "id": "990100000008",
+            "period": "DAILY",
+            "resourceName": "customers/9900000001/campaignBudgets/990100000008"
+          }
+        }
+      ]
+    },
+    "status": 200
+  },
+  "scenario": "default",
+  "seed": 42,
+  "source": "google",
+  "surface": "google.search"
+}

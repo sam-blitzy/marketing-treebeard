@@ -1,0 +1,520 @@
+# Ads Action Engine CI.
+#
+# Runs on every push and pull request as seven jobs. Every job but e2e has no `needs`, so
+# those six start together in parallel, each on its own runner. e2e is the one fan-in: it
+# starts only after lint, typecheck, backend-tests, web-tests and build have all passed.
+# secret-scan is not an e2e prerequisite; it runs alone and fails the run on its own.
+#   lint           ruff format --check and ruff check (backend); ESLint and stylelint (web)
+#   typecheck      mypy --strict (backend); tsc --noEmit (web)
+#   backend-tests  pytest on a disposable postgres:18.6 service, with the coverage gates that
+#                  backend/pyproject.toml and backend/tests/conftest.py define
+#   web-tests      Vitest, with the coverage thresholds web/vite.config.ts defines
+#   build          the SPA build and the three Compose images (backend, web and db's inline
+#                  postgres:18.6 build), after Compose 5.5.1 is installed (SHA-256 checked) and
+#                  `make check-tools` passes
+#   e2e            needs lint, typecheck, backend-tests, web-tests and build. On its own runner
+#                  it repeats the Compose 5.5.1 install and `make check-tools`, then runs the
+#                  documented first start (`make init`, then `docker compose up`) with no
+#                  source credentials, so every source runs on simulated data, then Playwright
+#   secret-scan    `make secret-scan`: gitleaks v8.30.1 over every commit, with .gitleaks.toml,
+#                  from the pinned zricethezav/gitleaks:v8.30.1 image as published;
+#                  independent of every other job
+#
+# Nothing is published or deployed: no image push, no registry login, no release, and no
+# repository secret is read. The only credential is the e2e admin password, generated in the job.
+#
+# Pins: actions by full commit SHA; tools by exact version or tag. The two downloads this file
+# makes itself, CPython (python-build-standalone) and the Compose plugin, are checked against
+# a SHA-256 pinned below; uv and Node.js come through their setup actions at the exact versions
+# below, and the scanner image through `make secret-scan` by its pinned tag. Dependencies
+# install from the committed lockfiles: `uv sync --frozen` (backend/uv.lock) and `npm ci`
+# (web/package-lock.json).
+#
+# Commands: the product checks run commands defined outside this file: the root Makefile's
+# check-tools, init and secret-scan; ruff, mypy and pytest through `uv run`, as declared and
+# configured by backend/pyproject.toml; and the npm scripts of web/package.json. This file owns
+# the runner provisioning and orchestration around them: the CPython download, SHA-256 check,
+# extraction and version check; the Compose download, checksum checks, install and version
+# check; the e2e admin password; the build job's .env copy; `docker compose build` and `up`;
+# the health wait; the Playwright browser install; the failure state dump and report upload;
+# and the teardown.
+#
+# Runner: ubuntu-26.04 ships Docker Engine 29, which `make check-tools` requires (>=29);
+# ubuntu-24.04 ships Engine 28, and the floating "latest" label moves between images.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # uv pinned exactly: backend/pyproject.toml declares required-version "==0.12.21".
+  UV_VERSION: "0.12.21"
+  # The interpreter of the runtime image python:3.14.8-slim (backend/Dockerfile).
+  PYTHON_VERSION: "3.14.8"
+  # uv 0.12.21 offers no CPython 3.14.8 download (its newest 3.14 build is 3.14.7), and
+  # ubuntu-26.04 carries only 3.14.4 (system) and 3.14.7 (tool cache). The backend jobs
+  # therefore install 3.14.8 from python-build-standalone, the build family uv installs, at
+  # this release; the digest is the release's SHA256SUMS entry for
+  # cpython-3.14.8+20261003-x86_64-unknown-linux-gnu-install_only.tar.gz.
+  PYTHON_STANDALONE_RELEASE: "20261003"
+  PYTHON_STANDALONE_SHA256: "371b6c281bbb09b29279e9e3a2996bab4ae2ea03cca52bf869f8bd89286b0ae8"
+  # The build toolchain of node:24.21.0-slim (web/Dockerfile).
+  NODE_VERSION: "24.21.0"
+  # Compose plugin for build and e2e. The accepted range lives in the root Makefile only
+  # (COMPOSE_MIN, COMPOSE_MAX, ENGINE_MIN), enforced by `make check-tools`. The digest is the
+  # release's docker-compose-linux-x86_64.sha256.
+  COMPOSE_VERSION: "5.5.1"
+  COMPOSE_SHA256: "db1889184726840f75c4f9c001048430d4f25b3be3cb084d3ddd762bc0aed576"
+
+jobs:
+  lint:
+    name: Lint and format
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    env:
+      # `uv run` uses uv.lock exactly as committed and never re-locks.
+      UV_FROZEN: "1"
+      # Only the interpreter installed below; uv never fetches another one.
+      UV_PYTHON_DOWNLOADS: "never"
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install CPython ${{ env.PYTHON_VERSION }} (python-build-standalone)
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          asset="cpython-${PYTHON_VERSION}+${PYTHON_STANDALONE_RELEASE}-x86_64-unknown-linux-gnu-install_only.tar.gz"
+          curl -fsSL -o "${asset}" \
+            "https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_STANDALONE_RELEASE}/${asset//+/%2B}"
+          printf '%s  %s\n' "${PYTHON_STANDALONE_SHA256}" "${asset}" | sha256sum --check --strict
+          mkdir -p cpython
+          tar -xzf "${asset}" -C cpython
+          actual="$(cpython/python/bin/python3 -c 'import platform; print(platform.python_version())')"
+          if [ "${actual}" != "${PYTHON_VERSION}" ]; then
+            echo "::error::python-build-standalone ${PYTHON_STANDALONE_RELEASE} reports Python ${actual}, expected ${PYTHON_VERSION}"
+            exit 1
+          fi
+          echo "${RUNNER_TEMP}/cpython/python/bin" >> "${GITHUB_PATH}"
+
+      - name: Set up uv ${{ env.UV_VERSION }}
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          # Sets UV_PYTHON, so uv selects the 3.14.8 interpreter installed above.
+          python-version: ${{ env.PYTHON_VERSION }}
+          working-directory: backend
+          enable-cache: true
+          # Resolved against working-directory: this is backend/uv.lock.
+          cache-dependency-glob: uv.lock
+
+      - name: Install backend dependencies (uv sync --frozen)
+        working-directory: backend
+        run: uv sync --frozen
+
+      - name: Check backend formatting (ruff format --check)
+        working-directory: backend
+        run: uv run ruff format --check .
+
+      - name: Lint backend (ruff check)
+        working-directory: backend
+        run: uv run ruff check .
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install web dependencies (npm ci)
+        working-directory: web
+        run: npm ci --no-audit --no-fund
+
+      - name: Lint web (ESLint, stylelint)
+        working-directory: web
+        run: npm run lint
+
+  typecheck:
+    name: Type check
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    env:
+      UV_FROZEN: "1"
+      UV_PYTHON_DOWNLOADS: "never"
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install CPython ${{ env.PYTHON_VERSION }} (python-build-standalone)
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          asset="cpython-${PYTHON_VERSION}+${PYTHON_STANDALONE_RELEASE}-x86_64-unknown-linux-gnu-install_only.tar.gz"
+          curl -fsSL -o "${asset}" \
+            "https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_STANDALONE_RELEASE}/${asset//+/%2B}"
+          printf '%s  %s\n' "${PYTHON_STANDALONE_SHA256}" "${asset}" | sha256sum --check --strict
+          mkdir -p cpython
+          tar -xzf "${asset}" -C cpython
+          actual="$(cpython/python/bin/python3 -c 'import platform; print(platform.python_version())')"
+          if [ "${actual}" != "${PYTHON_VERSION}" ]; then
+            echo "::error::python-build-standalone ${PYTHON_STANDALONE_RELEASE} reports Python ${actual}, expected ${PYTHON_VERSION}"
+            exit 1
+          fi
+          echo "${RUNNER_TEMP}/cpython/python/bin" >> "${GITHUB_PATH}"
+
+      - name: Set up uv ${{ env.UV_VERSION }}
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          working-directory: backend
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install backend dependencies (uv sync --frozen)
+        working-directory: backend
+        run: uv sync --frozen
+
+      - name: Type-check backend (mypy --strict)
+        working-directory: backend
+        run: uv run mypy --strict src
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install web dependencies (npm ci)
+        working-directory: web
+        run: npm ci --no-audit --no-fund
+
+      - name: Type-check web (tsc --noEmit)
+        working-directory: web
+        run: npm run typecheck
+
+  backend-tests:
+    name: Backend tests
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    services:
+      # A disposable database that lives only as long as this job. Its literal credentials are
+      # the throwaway service container's own, not secrets; the same values as `make test`.
+      postgres:
+        image: postgres:18.6
+        env:
+          POSTGRES_USER: ads
+          POSTGRES_PASSWORD: ads
+          POSTGRES_DB: ads_engine_test
+        ports:
+          - "5432:5432"
+        # TCP probe (-h 127.0.0.1): the image's first-run initialisation server listens on the
+        # socket only, so the job's steps start once the final server accepts connections.
+        options: >-
+          --health-cmd "pg_isready -U ads -d ads_engine_test -h 127.0.0.1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      UV_FROZEN: "1"
+      UV_PYTHON_DOWNLOADS: "never"
+      # Read by backend/tests/conftest.py, which fails (never skips) when it is unreachable.
+      # The disposable service container above; not a secret.
+      TEST_DATABASE_URL: postgresql+psycopg://ads:ads@localhost:5432/ads_engine_test
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install CPython ${{ env.PYTHON_VERSION }} (python-build-standalone)
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          asset="cpython-${PYTHON_VERSION}+${PYTHON_STANDALONE_RELEASE}-x86_64-unknown-linux-gnu-install_only.tar.gz"
+          curl -fsSL -o "${asset}" \
+            "https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_STANDALONE_RELEASE}/${asset//+/%2B}"
+          printf '%s  %s\n' "${PYTHON_STANDALONE_SHA256}" "${asset}" | sha256sum --check --strict
+          mkdir -p cpython
+          tar -xzf "${asset}" -C cpython
+          actual="$(cpython/python/bin/python3 -c 'import platform; print(platform.python_version())')"
+          if [ "${actual}" != "${PYTHON_VERSION}" ]; then
+            echo "::error::python-build-standalone ${PYTHON_STANDALONE_RELEASE} reports Python ${actual}, expected ${PYTHON_VERSION}"
+            exit 1
+          fi
+          echo "${RUNNER_TEMP}/cpython/python/bin" >> "${GITHUB_PATH}"
+
+      - name: Set up uv ${{ env.UV_VERSION }}
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          working-directory: backend
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install backend dependencies (uv sync --frozen)
+        working-directory: backend
+        run: uv sync --frozen
+
+      # Coverage is configured, not passed: pytest's addopts enable --cov, fail_under = 80
+      # applies overall, and conftest.py enforces [tool.ads_engine.coverage_gates] (90% on
+      # analysis/ and the connector parsers) at session end.
+      - name: Run backend tests with coverage gates (pytest)
+        working-directory: backend
+        run: uv run pytest
+
+  web-tests:
+    name: Web unit tests
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install web dependencies (npm ci)
+        working-directory: web
+        run: npm ci --no-audit --no-fund
+
+      # `vitest run --coverage`: web/vite.config.ts fails the run below 70% statements overall
+      # or 80% on src/features/actions/**.
+      - name: Run web unit tests with coverage thresholds (Vitest)
+        working-directory: web
+        run: npm test
+
+  build:
+    name: Build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install web dependencies (npm ci)
+        working-directory: web
+        run: npm ci --no-audit --no-fund
+
+      - name: Build the SPA (vite build)
+        working-directory: web
+        run: npm run build
+
+      # The user plugin directory ~/.docker/cli-plugins takes precedence over the runner's
+      # system Compose plugin. The published checksum must equal the pinned one before the
+      # binary is checked against it, so a replaced release asset fails here too.
+      - name: Install Docker Compose ${{ env.COMPOSE_VERSION }} (SHA-256 checked)
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/docker/compose/releases/download/v${COMPOSE_VERSION}"
+          curl -fsSLO "${base}/docker-compose-linux-x86_64"
+          curl -fsSLO "${base}/docker-compose-linux-x86_64.sha256"
+          published="$(cut -d' ' -f1 docker-compose-linux-x86_64.sha256)"
+          if [ "${published}" != "${COMPOSE_SHA256}" ]; then
+            echo "::error::Published Compose checksum ${published} does not match pinned ${COMPOSE_SHA256}"
+            exit 1
+          fi
+          sha256sum --check --strict docker-compose-linux-x86_64.sha256
+          mkdir -p "${HOME}/.docker/cli-plugins"
+          install -m 0755 docker-compose-linux-x86_64 "${HOME}/.docker/cli-plugins/docker-compose"
+          actual="$(docker compose version --short)"
+          if [ "${actual}" != "${COMPOSE_VERSION}" ]; then
+            echo "::error::docker compose reports ${actual}, expected ${COMPOSE_VERSION}"
+            exit 1
+          fi
+
+      - name: Check Docker tool versions (make check-tools)
+        run: make check-tools
+
+      # A throwaway copy of the template, with every secret empty: Compose requires the
+      # `env_file: .env` of migrate, api and worker to exist, and interpolates POSTGRES_* from it.
+      - name: Provide the Compose .env (copy of .env.example)
+        run: cp .env.example .env
+
+      # Builds backend/Dockerfile, web/Dockerfile and the db service's inline Dockerfile
+      # (postgres:18.6 with Debian security updates) as local images only; nothing is pushed.
+      - name: Build the Compose images (docker compose build)
+        run: docker compose build
+
+  e2e:
+    name: End-to-end (first start, simulated)
+    needs: [lint, typecheck, backend-tests, web-tests, build]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    env:
+      # Read by web/playwright.config.ts and the specs. The password is added to GITHUB_ENV by
+      # the step that generates it.
+      E2E_BASE_URL: http://localhost:8080
+      E2E_ADMIN_EMAIL: admin@example.com
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install Docker Compose ${{ env.COMPOSE_VERSION }} (SHA-256 checked)
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/docker/compose/releases/download/v${COMPOSE_VERSION}"
+          curl -fsSLO "${base}/docker-compose-linux-x86_64"
+          curl -fsSLO "${base}/docker-compose-linux-x86_64.sha256"
+          published="$(cut -d' ' -f1 docker-compose-linux-x86_64.sha256)"
+          if [ "${published}" != "${COMPOSE_SHA256}" ]; then
+            echo "::error::Published Compose checksum ${published} does not match pinned ${COMPOSE_SHA256}"
+            exit 1
+          fi
+          sha256sum --check --strict docker-compose-linux-x86_64.sha256
+          mkdir -p "${HOME}/.docker/cli-plugins"
+          install -m 0755 docker-compose-linux-x86_64 "${HOME}/.docker/cli-plugins/docker-compose"
+          actual="$(docker compose version --short)"
+          if [ "${actual}" != "${COMPOSE_VERSION}" ]; then
+            echo "::error::docker compose reports ${actual}, expected ${COMPOSE_VERSION}"
+            exit 1
+          fi
+
+      - name: Check Docker tool versions (make check-tools)
+        run: make check-tools
+
+      # The only credential in CI: random per run, masked in every log, and held only in this
+      # job's environment (make init stores its argon2 hash, not the password, in .env).
+      - name: Generate the e2e admin password
+        run: |
+          set -euo pipefail
+          pw="ci-$(openssl rand -hex 16)"
+          echo "::add-mask::${pw}"
+          echo "E2E_ADMIN_PASSWORD=${pw}" >> "${GITHUB_ENV}"
+
+      # The documented first start, unchanged: .env is copied from .env.example with
+      # SESSION_SECRET and APP_ADMIN_PASSWORD_HASH written, and is never edited afterwards. No
+      # source credential and no DATA_MODE is injected, so under the default DATA_MODE=auto every
+      # source resolves to simulated with the reason "credentials not configured".
+      - name: First start (make init)
+        run: make init ADMIN_PASSWORD="${E2E_ADMIN_PASSWORD}"
+
+      # db, then the one-shot migrate (migrate, ensure-admin), then api and worker, then web on
+      # 8080. `--build` as in the documented command; `--wait` is not used because migrate exits
+      # by design.
+      - name: Start the stack (docker compose up)
+        run: docker compose up -d --build
+
+      - name: Wait for the API through nginx (/api/v1/healthz)
+        run: |
+          set -euo pipefail
+          timeout 300 bash -c 'until curl -fsS --max-time 5 "${E2E_BASE_URL}/api/v1/healthz"; do echo "waiting for api"; sleep 5; done'
+          echo
+          echo "API healthy at ${E2E_BASE_URL}/api/v1/healthz"
+
+      # Installed while the worker builds the simulated datasets and runs the first default
+      # analysis, which the specs wait for.
+      - name: Install web dependencies (npm ci)
+        working-directory: web
+        run: npm ci --no-audit --no-fund
+
+      - name: Install the Playwright browser (Chromium)
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+
+      # The setup project signs in once (auth.setup.ts), then actions, decisions, first-start
+      # and simulated-mode run against the stack. CI=true (set by GitHub) enables one retry
+      # and turns tracing off (web/playwright.config.ts).
+      - name: Run the end-to-end suite (Playwright)
+        working-directory: web
+        run: npm run e2e
+
+      # Guarded on .env: when make init failed before writing it, Compose would only add a
+      # misleading second error.
+      - name: Dump the stack state
+        if: failure()
+        run: |
+          set -euo pipefail
+          if [ -f .env ]; then
+            docker compose ps --all
+            docker compose logs --no-color --timestamps
+          fi
+
+      # No trace is recorded under CI (web/playwright.config.ts), because a trace stores request
+      # headers and so would carry the session cookie. The saved session (test-results/.auth/)
+      # is excluded; hidden files stay excluded too.
+      - name: Upload the Playwright report
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: playwright-report
+          path: |
+            web/playwright-report/
+            web/test-results/
+            !web/test-results/.auth/**
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Tear down the stack
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -f .env ]; then
+            docker compose down -v --remove-orphans
+          fi
+
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      # Full history: `gitleaks git` scans every commit, which is the gate.
+      - name: Check out the full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The root Makefile's secret-scan recipe is the single source of the scanner image, its
+      # mounts and flags; CI runs it unchanged. It runs the pinned zricethezav/gitleaks:v8.30.1
+      # image directly, as published (pulled by its tag, never rebuilt or patched), checks that
+      # the binary reports v8.30.1, and scans the read-only checkout with --network none. A
+      # finding fails the step.
+      - name: Scan every commit (make secret-scan)
+        run: make secret-scan

@@ -1,0 +1,75 @@
+/* Badge: product wrapper. GAP: bind to Blitzy OS on source arrival (see ../GAPS.md). */
+
+/*
+ * Status and flag chip: source chips (Live, Simulated, Stale, Incomplete) and the flags row on
+ * recommendation cards (Short window, Floor, ...). Badge.tsx renders one <span> carrying ds-badge
+ * and exactly one tone modifier, ds-badge--{neutral|info|warning|critical|success} (default
+ * neutral). The class names are a contract with Badge.tsx; keep them exactly as written.
+ *
+ * Chips are text labels only: no icon set ships until the Blitzy OS icon source arrives. The
+ * label always states the meaning, so tone colour is decoration and never the sole indicator
+ * (WCAG 2.2 SC 1.4.1).
+ *
+ * Tone colours are used only as text and border colour on --color-surface, never as a fill
+ * behind tone text. tokens.css checks every tone colour at 4.5:1 or better against the surface,
+ * and that ratio holds only while the chip's background stays the surface token. Every other
+ * value is a token from ../tokens.css, so binding Blitzy OS touches tokens.css alone.
+ */
+
+/*
+ * Base chip. inline-flex keeps the chip on the text line and centres its label vertically.
+ * The border takes currentColor, so each tone modifier recolours text and border together.
+ *
+ * A short label such as "Short window" stays on one line inside a wrapping Inline row, because
+ * a flex row wraps between chips before it shrinks one. A label longer than its track, such as
+ * a long flag or an unbroken URN, wraps inside the chip instead of overflowing the row or card,
+ * and the chip keeps its full text, size and padding (WCAG 2.2 SC 1.4.10 Reflow, SC 1.4.4
+ * Resize Text). overflow-wrap is anywhere, not break-word, because only anywhere lowers the
+ * chip's min-content size, which is what lets a flex or grid track shrink it to fit, as in
+ * EmptyState.css.
+ */
+.ds-badge {
+  display: inline-flex;
+  align-items: center;
+  padding-block: var(--space-1);
+  padding-inline: var(--space-2);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
+
+  /*
+   * The hairline border width is a quarter of --space-1 (1px at the default 16px root), so every
+   * value here resolves to a token and rebinding the spacing scale rebinds the hairline, as in
+   * shared.css and EmptyState.css; a literal 1px would be the only untokenised value in the rule.
+   */
+  border: calc(var(--space-1) / 4) solid currentColor;
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  overflow-wrap: anywhere;
+}
+
+/*
+ * Tones. Each modifier shares the base class's specificity and follows it in source order, so
+ * its colour always wins. Neutral pairs muted text with the standard border token instead of a
+ * text-coloured outline, so a neutral chip reads quieter than the four signalling tones.
+ */
+.ds-badge--neutral {
+  color: var(--color-text-muted);
+  border-color: var(--color-border);
+}
+
+.ds-badge--info {
+  color: var(--color-info);
+}
+
+.ds-badge--warning {
+  color: var(--color-warning);
+}
+
+.ds-badge--critical {
+  color: var(--color-critical);
+}
+
+.ds-badge--success {
+  color: var(--color-success);
+}

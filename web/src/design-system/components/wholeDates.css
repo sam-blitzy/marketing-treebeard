@@ -1,0 +1,18 @@
+/* Whole dates: text helper. GAP: keep applying it in the Blitzy OS bindings (see ../GAPS.md). */
+
+/*
+ * wholeDates.tsx wraps each standalone calendar date of a banner or chip string, such as
+ * "2026-10-09", in <span class="ds-whole-date">. The class name is a contract with
+ * wholeDates.tsx; keep it exactly as written.
+ *
+ * Browsers treat each hyphen of a date as a line-break opportunity, so without this rule a narrow
+ * banner title can break a range inside its end date ("2026-10-" / "09"). nowrap removes the
+ * opportunities inside the date only: the spaces and the en dash around it still break, so a
+ * range wraps between its dates. It also stops the wrappers' overflow-wrap from breaking a date
+ * mid-way, which costs at most one date's width of min-content, narrower than any line down to
+ * the 320 px reflow width. The rule holds a keyword and no design value, so binding Blitzy OS
+ * changes nothing here.
+ */
+.ds-whole-date {
+  white-space: nowrap;
+}

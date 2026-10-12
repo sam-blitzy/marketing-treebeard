@@ -1,0 +1,76 @@
+{
+  "surface": "google.row_customer",
+  "source": "google",
+  "reference_url": "https://developers.google.com/google-ads/api/fields/v25/customer",
+  "api_version": "v25",
+  "last_modified": null,
+  "request": {
+    "method": "POST",
+    "url": "{N8N_GOOGLE_ADS_WEBHOOK_URL}",
+    "required_headers": [],
+    "required_query": [],
+    "optional_query": [],
+    "fields": null,
+    "body": null,
+    "gaql": {
+      "query_id": "Q-G1",
+      "resource": "customer",
+      "select": [
+        "customer.id",
+        "customer.descriptive_name",
+        "customer.currency_code",
+        "customer.time_zone"
+      ]
+    },
+    "limits": {}
+  },
+  "response": {
+    "status": [
+      200
+    ],
+    "body": {
+      "type": "object",
+      "description": "One REST GoogleAdsRow of Q-G1 (SELECT customer.id, customer.descriptive_name, customer.currency_code, customer.time_zone FROM customer), returned as an element of results[] in the n8n envelope defined by search.json, whose headers, body and paging rules govern the call. camelCase keys; int64 values are strings. Q-G1 is the Google probe and gives the account currency and the time zone that sets Google's native day for segments.date (AAP 0.5.4.1).",
+      "properties": {
+        "customer": {
+          "type": "object",
+          "description": "Always present: the FROM resource.",
+          "properties": {
+            "resourceName": {
+              "type": "string",
+              "description": "customers/{customer_id}; always returned for the FROM resource."
+            },
+            "id": {
+              "type": "string",
+              "description": "INT64 as a JSON string: the 10-digit customer id."
+            },
+            "descriptiveName": {
+              "type": "string",
+              "description": "Optional; absent when the account has no descriptive name."
+            },
+            "currencyCode": {
+              "type": "string",
+              "description": "ISO 4217 currency of every amount in this account; amounts are never converted across currencies."
+            },
+            "timeZone": {
+              "type": "string",
+              "description": "Account time-zone id (e.g. America/New_York). Google daily rows (segments.date) are dates in this zone and are never rebucketed."
+            }
+          },
+          "required": [
+            "resourceName",
+            "id",
+            "currencyCode",
+            "timeZone"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "customer"
+      ],
+      "additionalProperties": false
+    },
+    "documented_sample": null
+  }
+}

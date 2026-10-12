@@ -1,0 +1,128 @@
+/* Stack: product layout primitive. GAP: bind to Blitzy OS on source arrival (see ../GAPS.md). */
+
+/*
+ * Vertical layout primitive. Stack.tsx renders one element (div, ul, ol or section) carrying
+ * ds-stack, exactly one ds-stack--gap-{1..8} modifier (default 4), when its align prop is set,
+ * one ds-stack--align-{start|center|end|stretch} modifier and, when its breakLongWords prop is
+ * true, the ds-stack--break-long-words modifier. Feature code writes no flex or grid CSS of its
+ * own: it spaces and aligns content only through Stack, Inline and Grid.
+ *
+ * An empty polite live region (a role="status" or aria-live="polite" element with no child
+ * nodes) that is a direct child of a stack takes no space and no gap until it has content; see
+ * "Empty live regions" below.
+ *
+ * Plain global CSS with the ds- prefix and BEM modifiers, like every stylesheet in this folder.
+ * Every spacing value is a token from ../tokens.css, so binding Blitzy OS spacing touches
+ * tokens.css alone. The class names are a contract with Stack.tsx and Stack.test.tsx; keep them
+ * exactly as written.
+ */
+
+/*
+ * Base: a single column of children. Cross-axis alignment is left at the flex default, which
+ * stretches each child to the full inline size of the column. min-inline-size: 0 lets a stack
+ * nested in a flex or grid track shrink below its content's intrinsic width, so long text wraps
+ * inside the stack instead of overflowing the parent.
+ */
+.ds-stack {
+  display: flex;
+  flex-direction: column;
+  min-inline-size: 0;
+}
+
+/* Gap: the space between children, one modifier per step of the --space-1 to --space-8 scale. */
+.ds-stack--gap-1 {
+  gap: var(--space-1);
+}
+
+.ds-stack--gap-2 {
+  gap: var(--space-2);
+}
+
+.ds-stack--gap-3 {
+  gap: var(--space-3);
+}
+
+.ds-stack--gap-4 {
+  gap: var(--space-4);
+}
+
+.ds-stack--gap-5 {
+  gap: var(--space-5);
+}
+
+.ds-stack--gap-6 {
+  gap: var(--space-6);
+}
+
+.ds-stack--gap-7 {
+  gap: var(--space-7);
+}
+
+.ds-stack--gap-8 {
+  gap: var(--space-8);
+}
+
+/*
+ * Alignment: where children sit across the column. stretch restates the flex default so that an
+ * explicit align="stretch" prop always maps to a real class.
+ */
+.ds-stack--align-start {
+  align-items: flex-start;
+}
+
+.ds-stack--align-center {
+  align-items: center;
+}
+
+.ds-stack--align-end {
+  align-items: flex-end;
+}
+
+.ds-stack--align-stretch {
+  align-items: stretch;
+}
+
+/*
+ * Long words (breakLongWords): long unbroken text such as URNs, search terms, dataset names or
+ * threshold keys breaks at any point, so it wraps inside the column instead of widening the
+ * layout past a narrow viewport (WCAG 2.2 SC 1.4.10 Reflow). overflow-wrap is anywhere, not
+ * break-word, because only anywhere lowers the min-content size of the text's box, which is what
+ * lets a flex item, such as an item of a nested Inline row, shrink to fit its line, as in
+ * Badge.css. overflow-wrap is inherited, so every descendant gets it.
+ */
+.ds-stack--break-long-words {
+  overflow-wrap: anywhere;
+}
+
+/*
+ * Lists: a ul or ol Stack drops the user-agent bullets, outer margin and indentation, so the gap
+ * alone spaces the items (the caller supplies the li children). Safari's VoiceOver stops
+ * announcing an unmarked list as a list, so its list semantics are kept by the role="list" that
+ * Stack.tsx sets on both list elements.
+ */
+ul.ds-stack,
+ol.ds-stack {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* Sections: no outer margin, so a section Stack is spaced only by its parent's gap. */
+section.ds-stack {
+  margin: 0;
+}
+
+/*
+ * Empty live regions: a polite live region must exist before its first message so that the
+ * message is announced (WCAG 2.2 SC 4.1.3), yet an empty flex item still takes a gap. While a
+ * polite live region child of a stack (role="status", or aria-live="polite" on a region that at
+ * times holds a Spinner, which carries its own role="status") has no child nodes, it is taken out
+ * of flow: an absolutely positioned flex child takes no gap, and with no content and no inset it
+ * is 0 by 0 at its static position. It stays the same element in the accessibility tree, which
+ * display: none, visibility: hidden or display: contents would not guarantee, and it returns to
+ * the column as an ordinary child, spaced by the gap, as soon as it has content.
+ */
+.ds-stack > [role="status"]:empty,
+.ds-stack > [aria-live="polite"]:empty {
+  position: absolute;
+}

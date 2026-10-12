@@ -1,0 +1,478 @@
+/**
+ * Contract tests for `PageShell` and its heading slots `PageShell.Title` and `PageShell.Section`
+ * (AAP 0.4.2, AAP 0.5.5; `../GAPS.md`, binding procedure step 6).
+ *
+ * They hold the wrapper to the contract in its TSDoc: a "Skip to main content" link first, which
+ * moves focus to `<main>` without rewriting the URL; the top bar inside the one `banner`
+ * landmark; the side-navigation column only when `sideNav` renders something (skipped for
+ * `undefined`, `null`, booleans and `''`, kept for `0`); `<main id="ds-main" tabindex="-1">`
+ * around the content; the page title as the single `<h1>`; and each section a `region` named by
+ * its `<h2>` or `<h3>` heading with id `${id}-title`, the actions containers following the same
+ * empty-slot rule.
+ *
+ * They also hold the static loading screen in `web/index.html` to the markup it copies by hand:
+ * the frame, top bar, one-link "Sign in" side navigation and labelled `Spinner` that this
+ * wrapper, `TopBar`, `SideNav` and `Spinner` render, placed right after an empty `#root`, which
+ * the `.ds-pageshell--boot` rule in `PageShell.css` depends on.
+ */
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { fireEvent, render, screen, within } from '@testing-library/react';
+import type { ReactNode } from 'react';
+import { describe, expect, it, vi } from 'vitest';
+
+import { PageShell } from './PageShell';
+import { SideNav } from './SideNav';
+import { Spinner } from './Spinner';
+import { TopBar } from './TopBar';
+
+/** Slot values React renders as nothing, each of which must leave no container behind. */
+const EMPTY_SLOTS: readonly [string, ReactNode][] = [
+  ['undefined', undefined],
+  ['null', null],
+  ['false', false],
+  ['true', true],
+  ['the empty string', ''],
+];
+
+/**
+ * Renders the frame the router layout renders: a `TopBar`, the primary `SideNav`, named
+ * "Primary" as in `src/router.tsx`, and a page.
+ *
+ * @param children - the page content
+ * @returns the render result
+ */
+function renderShell(children: ReactNode) {
+  return render(
+    <PageShell
+      topBar={<TopBar productName="Ads Action Engine" />}
+      sideNav={
+        <SideNav
+          label="Primary"
+          items={[
+            { key: 'actions', label: 'Actions', href: '/actions', current: true },
+            { key: 'decisions', label: 'Decisions', href: '/decisions' },
+          ]}
+        />
+      }
+    >
+      {children}
+    </PageShell>,
+  );
+}
+
+describe('PageShell', () => {
+  it('lays out the skip link, banner, side navigation and main, in that order', () => {
+    const { container } = renderShell(<p>Page content</p>);
+
+    const shell = container.firstElementChild;
+    expect(shell?.className).toBe('ds-pageshell');
+    expect(Array.from(shell?.children ?? []).map((child) => child.className)).toEqual([
+      'ds-pageshell__skip ds-visually-hidden ds-visually-hidden--focusable',
+      'ds-pageshell__header',
+      'ds-pageshell__body',
+    ]);
+
+    const banner = screen.getByRole('banner');
+    expect(banner.tagName).toBe('HEADER');
+    expect(within(banner).getByText('Ads Action Engine')).toBeDefined();
+
+    const nav = screen.getByRole('navigation', { name: 'Primary' });
+    expect(nav.parentElement?.className).toBe('ds-pageshell__sidenav');
+
+    const main = screen.getByRole('main');
+    expect(main.id).toBe('ds-main');
+    expect(main.getAttribute('tabindex')).toBe('-1');
+    expect(main.className).toBe('ds-pageshell__main');
+    expect(within(main).getByText('Page content')).toBeDefined();
+    expect(nav.parentElement?.nextElementSibling).toBe(main);
+  });
+
+  it('renders exactly one banner and one main landmark', () => {
+    renderShell(<p>Page content</p>);
+
+    expect(screen.getAllByRole('banner')).toHaveLength(1);
+    expect(screen.getAllByRole('main')).toHaveLength(1);
+  });
+
+  it('composes the top bar, primary navigation, title and anchored sections into one page', () => {
+    render(
+      <PageShell
+        topBar={<TopBar productName="Ads Action Engine" />}
+        sideNav={
+          <SideNav
+            label="Primary"
+            items={[{ key: 'actions', label: 'Actions', href: '/actions', current: true }]}
+          />
+        }
+      >
+        <PageShell.Title actions={<span>Run 42</span>}>Actions</PageShell.Title>
+        <PageShell.Section id="section-keywords" title="Keywords to adjust">
+          <p>Body</p>
+        </PageShell.Section>
+        <PageShell.Section id="group-keywords-block" title="Block" headingLevel={3}>
+          <p>Group</p>
+        </PageShell.Section>
+      </PageShell>,
+    );
+
+    // Landmarks: the shell owns the one banner and the one main; SideNav owns the navigation,
+    // which sits outside both.
+    expect(screen.getAllByRole('banner')).toHaveLength(1);
+    expect(screen.getAllByRole('main')).toHaveLength(1);
+    const banner = screen.getByRole('banner');
+    const main = screen.getByRole('main');
+    const nav = screen.getByRole('navigation', { name: 'Primary' });
+    expect(banner.contains(nav)).toBe(false);
+    expect(main.contains(nav)).toBe(false);
+    expect(within(nav).getByRole('link', { name: 'Actions' }).getAttribute('aria-current')).toBe(
+      'page',
+    );
+    expect(main.id).toBe('ds-main');
+    expect(main.getAttribute('tabindex')).toBe('-1');
+
+    // The skip link is the first link in the document, ahead of the navigation's links, and
+    // activating it moves focus to main.
+    const skip = screen.getByRole('link', { name: 'Skip to main content' });
+    expect(skip.getAttribute('href')).toBe('#ds-main');
+    expect(screen.getAllByRole('link')[0]).toBe(skip);
+    fireEvent.click(skip);
+    expect(document.activeElement).toBe(main);
+
+    // The page title is the single h1, inside main, with its actions rendered beside it.
+    const h1s = screen.getAllByRole('heading', { level: 1 });
+    expect(h1s).toHaveLength(1);
+    expect(h1s[0]?.textContent).toBe('Actions');
+    expect(main.contains(h1s[0] ?? null)).toBe(true);
+    expect(within(main).getByText('Run 42').parentElement?.className).toBe(
+      'ds-pageshell__actions',
+    );
+
+    // The section anchor (section-{key}) is a region named by its level-2 heading.
+    const region = screen.getByRole('region', { name: 'Keywords to adjust' });
+    expect(region.id).toBe('section-keywords');
+    expect(region.getAttribute('aria-labelledby')).toBe('section-keywords-title');
+    const sectionHeading = within(region).getByRole('heading', { name: 'Keywords to adjust' });
+    expect(sectionHeading.tagName).toBe('H2');
+    expect(sectionHeading.id).toBe('section-keywords-title');
+    expect(within(region).getByText('Body')).toBeDefined();
+
+    // The group anchor (group-{section}-{group}) carries a level-3 heading.
+    const groupHeading = screen.getByRole('heading', { level: 3, name: 'Block' });
+    expect(groupHeading.id).toBe('group-keywords-block-title');
+    const group = screen.getByRole('region', { name: 'Block' });
+    expect(group.id).toBe('group-keywords-block');
+    expect(group.getAttribute('aria-labelledby')).toBe('group-keywords-block-title');
+    expect(within(group).getByText('Group')).toBeDefined();
+
+    // Every heading lives in main, in document order, with no level skipped.
+    expect(screen.getAllByRole('heading').map((heading) => heading.tagName)).toEqual([
+      'H1',
+      'H2',
+      'H3',
+    ]);
+    expect(within(main).getAllByRole('heading')).toHaveLength(3);
+  });
+
+  it('puts the skip link first, targeting main', () => {
+    const { container } = renderShell(<button type="button">First control</button>);
+
+    const skip = screen.getByRole('link', { name: 'Skip to main content' });
+    expect(skip.getAttribute('href')).toBe('#ds-main');
+    expect(container.querySelector('a[href], button')).toBe(skip);
+  });
+
+  it('moves focus to main on activation and prevents the URL change', () => {
+    renderShell(<p>Page content</p>);
+    const hashBefore = window.location.hash;
+
+    const skip = screen.getByRole('link', { name: 'Skip to main content' });
+    skip.focus();
+    const notCancelled = fireEvent.click(skip);
+
+    expect(notCancelled).toBe(false);
+    expect(document.activeElement).toBe(screen.getByRole('main'));
+    expect(window.location.hash).toBe(hashBefore);
+  });
+
+  // Enter on a link dispatches a click whose detail is 0; a pointer click counts its presses.
+  it.each([
+    ['keyboard activation shows', 0, true],
+    ['a pointer click hides', 1, false],
+    ['a repeated pointer click hides', 2, false],
+  ])("%s main's focus ring (click detail %i)", (_name, detail, focusVisible) => {
+    renderShell(<p>Page content</p>);
+    const skip = screen.getByRole('link', { name: 'Skip to main content' });
+    skip.focus();
+    const focus = vi.spyOn(HTMLElement.prototype, 'focus');
+
+    fireEvent.click(skip, { detail });
+
+    const main = screen.getByRole('main');
+    expect(document.activeElement).toBe(main);
+    expect(focus.mock.contexts).toEqual([main]);
+    expect(focus.mock.calls).toEqual([[{ focusVisible }]]);
+    focus.mockRestore();
+  });
+
+  it.each(EMPTY_SLOTS)('renders no side-navigation column for %s', (_name, slot) => {
+    const { container } = render(
+      <PageShell topBar={<TopBar productName="Ads Action Engine" />} sideNav={slot}>
+        <p>Page content</p>
+      </PageShell>,
+    );
+
+    const body = container.querySelector('.ds-pageshell__body');
+    expect(body?.children).toHaveLength(1);
+    expect(body?.firstElementChild).toBe(screen.getByRole('main'));
+    expect(container.querySelector('.ds-pageshell__sidenav')).toBeNull();
+  });
+
+  it('renders the side-navigation column for 0, because 0 is content', () => {
+    const { container } = render(
+      <PageShell topBar={<TopBar productName="Ads Action Engine" />} sideNav={0}>
+        <p>Page content</p>
+      </PageShell>,
+    );
+
+    expect(container.querySelector('.ds-pageshell__sidenav')?.textContent).toBe('0');
+  });
+});
+
+describe('PageShell.Title', () => {
+  it('renders the page title as the single h1, with its actions beside it', () => {
+    const sync = vi.fn();
+    const { container } = renderShell(
+      <PageShell.Title
+        actions={
+          <button type="button" onClick={sync}>
+            Sync now
+          </button>
+        }
+      >
+        Actions
+      </PageShell.Title>,
+    );
+
+    const heading = screen.getByRole('heading', { level: 1, name: 'Actions' });
+    expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
+    expect(heading.className).toBe('ds-pageshell__title');
+
+    const titlebar = container.querySelector('.ds-pageshell__titlebar');
+    expect(heading.parentElement).toBe(titlebar);
+    expect(titlebar?.querySelector('.ds-pageshell__actions')?.textContent).toBe('Sync now');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Sync now' }));
+    expect(sync).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(EMPTY_SLOTS)('renders no actions container for %s', (_name, slot) => {
+    const { container } = render(<PageShell.Title actions={slot}>Decisions</PageShell.Title>);
+
+    const titlebar = container.querySelector('.ds-pageshell__titlebar');
+    expect(titlebar?.children).toHaveLength(1);
+    expect(container.querySelector('.ds-pageshell__actions')).toBeNull();
+  });
+
+  it('renders an actions container for 0', () => {
+    const { container } = render(<PageShell.Title actions={0}>Sources</PageShell.Title>);
+
+    expect(container.querySelector('.ds-pageshell__actions')?.textContent).toBe('0');
+  });
+});
+
+describe('PageShell.Section', () => {
+  it('is a region with the verbatim id, named by its h2 heading by default', () => {
+    render(
+      <PageShell.Section id="section-keywords" title="Keywords to adjust">
+        <p>Cards</p>
+      </PageShell.Section>,
+    );
+
+    const region = screen.getByRole('region', { name: 'Keywords to adjust' });
+    expect(region.tagName).toBe('SECTION');
+    expect(region.id).toBe('section-keywords');
+    expect(region.className).toBe('ds-pageshell__section ds-pageshell__section--level-2');
+    expect(region.getAttribute('aria-labelledby')).toBe('section-keywords-title');
+
+    const heading = within(region).getByRole('heading', { level: 2, name: 'Keywords to adjust' });
+    expect(heading.id).toBe('section-keywords-title');
+    expect(heading.className).toBe('ds-pageshell__section-title');
+    expect(within(region).getByText('Cards')).toBeDefined();
+  });
+
+  it('nests a level-3 group inside a level-2 section without skipping a level', () => {
+    render(
+      <PageShell.Section id="section-campaigns" title="Campaigns to pause or launch">
+        <PageShell.Section
+          id="group-campaigns-discrepancies"
+          title="Discrepancies"
+          headingLevel={3}
+        >
+          <p>Discrepancy cards</p>
+        </PageShell.Section>
+      </PageShell.Section>,
+    );
+
+    const outer = screen.getByRole('region', { name: 'Campaigns to pause or launch' });
+    const group = within(outer).getByRole('region', { name: 'Discrepancies' });
+    expect(group.id).toBe('group-campaigns-discrepancies');
+    expect(group.className).toBe('ds-pageshell__section ds-pageshell__section--level-3');
+
+    const heading = within(group).getByRole('heading', { level: 3, name: 'Discrepancies' });
+    expect(heading.id).toBe('group-campaigns-discrepancies-title');
+    expect(screen.getAllByRole('heading').map((h) => h.tagName)).toEqual(['H2', 'H3']);
+  });
+
+  it('renders its actions beside the heading, before the content', () => {
+    const { container } = render(
+      <PageShell.Section
+        id="section-budget"
+        title="Budget changes"
+        actions={<button type="button">Expand all</button>}
+      >
+        <p>Cards</p>
+      </PageShell.Section>,
+    );
+
+    const header = container.querySelector('.ds-pageshell__section-header');
+    expect(Array.from(header?.children ?? []).map((child) => child.tagName)).toEqual([
+      'H2',
+      'DIV',
+    ]);
+    expect(header?.querySelector('.ds-pageshell__actions')?.textContent).toBe('Expand all');
+    expect(header?.nextElementSibling?.textContent).toBe('Cards');
+  });
+
+  it.each(EMPTY_SLOTS)('renders no actions container for %s', (_name, slot) => {
+    const { container } = render(
+      <PageShell.Section id="section-copy" title="Copy/creative changes" actions={slot}>
+        <p>Cards</p>
+      </PageShell.Section>,
+    );
+
+    expect(container.querySelector('.ds-pageshell__section-header')?.children).toHaveLength(1);
+    expect(container.querySelector('.ds-pageshell__actions')).toBeNull();
+  });
+
+  it('renders an actions container for 0', () => {
+    const { container } = render(
+      <PageShell.Section id="section-white-papers" title="White papers" actions={0}>
+        <p>Rows</p>
+      </PageShell.Section>,
+    );
+
+    expect(container.querySelector('.ds-pageshell__actions')?.textContent).toBe('0');
+  });
+});
+
+/**
+ * `web/index.html`, from this file's own path. Resolved with `node:path`, because the jsdom
+ * environment's global `URL` does not resolve against a `file:` base.
+ */
+const INDEX_HTML_PATH = resolve(dirname(fileURLToPath(import.meta.url)), '../../../index.html');
+
+/** An element's classes and, in order, its element children's: the shape a class contract fixes. */
+interface ClassTree {
+  readonly classes: string;
+  readonly children: readonly ClassTree[];
+}
+
+/**
+ * The class tree of `element`.
+ *
+ * @param element - the root of the tree
+ * @returns its classes and its element children's trees, in document order
+ */
+function classTree(element: Element): ClassTree {
+  return { classes: element.className, children: Array.from(element.children).map(classTree) };
+}
+
+/**
+ * Serialises `element` with the whitespace between tags removed, as React renders markup.
+ *
+ * @param element - the element to serialise
+ * @returns its outer HTML without inter-tag whitespace
+ */
+function compactHtml(element: Element): string {
+  return element.outerHTML.replace(/>\s+</g, '><');
+}
+
+describe('the static loading screen in web/index.html', () => {
+  /** The entry document, parsed as the browser parses it before any script runs. */
+  const entry = new DOMParser().parseFromString(readFileSync(INDEX_HTML_PATH, 'utf8'), 'text/html');
+  const boot = entry.querySelector('.ds-pageshell--boot');
+
+  it('follows an empty #root directly, as the rule that hides it requires', () => {
+    const root = entry.getElementById('root');
+    expect(root?.childNodes).toHaveLength(0);
+    expect(boot).not.toBeNull();
+    expect(root?.nextElementSibling).toBe(boot);
+    expect(entry.querySelectorAll('.ds-pageshell--boot')).toHaveLength(1);
+  });
+
+  it('mirrors the PageShell frame, TopBar, sign-in SideNav and labelled Spinner', () => {
+    // The sign-in navigation of the router's screens of unknown session, never current here:
+    // the static document cannot know the path it is served for.
+    const { container } = render(
+      <PageShell
+        topBar={<TopBar productName="Ads Action Engine" />}
+        sideNav={
+          <SideNav
+            label="Primary"
+            items={[{ key: 'login', label: 'Sign in', href: '/login' }]}
+          />
+        }
+      >
+        <Spinner label="Loading Ads Action Engine" showLabel />
+      </PageShell>,
+    );
+    const shell = container.querySelector('.ds-pageshell');
+    if (shell === null || boot === null) {
+      throw new Error('a frame is missing');
+    }
+    const rendered = classTree(shell);
+
+    // The skip link is left out: it targets <main id="ds-main">, which only the app renders.
+    expect(classTree(boot)).toEqual({
+      classes: `${rendered.classes} ds-pageshell--boot`,
+      children: rendered.children.filter((child) => !child.classes.includes('ds-pageshell__skip')),
+    });
+    expect(boot.querySelector('.ds-topbar__product')?.textContent).toBe('Ads Action Engine');
+
+    const bootNav = boot.querySelector('nav');
+    const nav = shell.querySelector('nav');
+    if (bootNav === null || nav === null) {
+      throw new Error('a navigation landmark is missing');
+    }
+    expect(compactHtml(bootNav)).toBe(nav.outerHTML);
+    expect(boot.querySelectorAll('[aria-current], .ds-sidenav__link--current')).toHaveLength(0);
+
+    const status = boot.querySelector('[role="status"]');
+    const spinner = shell.querySelector('[role="status"]');
+    if (status === null || spinner === null) {
+      throw new Error('a status element is missing');
+    }
+    expect(compactHtml(status)).toBe(spinner.outerHTML);
+  });
+
+  it('adds no main or banner landmark, no id, inline style or inline script beside the app', () => {
+    if (boot === null) {
+      throw new Error('the loading screen is missing');
+    }
+    // One <main> and one banner per page: the app renders its own once it starts.
+    expect(boot.querySelectorAll('main, header')).toHaveLength(0);
+    // Its one navigation landmark is named as the app's own; it leaves the accessibility tree
+    // with the rest of the screen once the app renders into #root.
+    const navs = boot.querySelectorAll('nav');
+    expect(navs).toHaveLength(1);
+    expect(navs[0]?.getAttribute('aria-label')).toBe('Primary');
+    // No id beside the app's: the skip link's target and every anchor are the app's to own.
+    expect(boot.querySelectorAll('[id]')).toHaveLength(0);
+    // nginx serves the page with Content-Security-Policy default-src 'self'.
+    expect(entry.querySelectorAll('style, [style]')).toHaveLength(0);
+    expect(Array.from(entry.scripts).every((script) => script.src !== '')).toBe(true);
+  });
+});

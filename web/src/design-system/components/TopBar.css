@@ -1,0 +1,88 @@
+/* TopBar: product wrapper. GAP: bind to Blitzy OS on source arrival (see ../GAPS.md). */
+
+/*
+ * Application top bar. TopBar.tsx renders a plain div, because PageShell already wraps it in
+ * the page's <header> landmark, and the product name is text rather than a heading, because
+ * each page's <h1> is PageShell.Title:
+ *
+ *   <div class="ds-topbar">
+ *     <span class="ds-topbar__product">Ads Action Engine</span>
+ *     <div class="ds-topbar__actions">…</div>           only when TopBar has children
+ *   </div>
+ *
+ * Plain global CSS with the ds- prefix and BEM elements, like every stylesheet in this folder.
+ * Every value is a token from ../tokens.css, so binding Blitzy OS touches tokens.css alone. The
+ * class names are a contract with TopBar.tsx, and with the static loading screen in
+ * web/index.html, which writes the bar and product name out by hand (see PageShell.css); keep
+ * them exactly as written.
+ */
+
+/*
+ * The bar: product name at the inline start, actions at the inline end. It wraps instead of
+ * overflowing, so on a narrow viewport the actions drop onto their own line (WCAG 1.4.10). The
+ * row gap is one --space-1 step, so the wrapped actions line sits close under the product name
+ * and the bar stays short; the column gap of --space-3 spaces the name and actions on one line.
+ */
+.ds-topbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-1) var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--color-surface);
+  color: var(--color-text);
+  /*
+   * The hairline border width is a quarter of --space-1, as in shared.css, so the bar carries no
+   * literal design value; its colour comes from the border token.
+   */
+  border-block-end: calc(var(--space-1) / 4) solid var(--color-border);
+}
+
+/*
+ * Product name. min-inline-size: 0 lets it shrink below its longest word inside the flex row,
+ * and overflow-wrap then breaks an unbroken name rather than letting it push the bar wider than
+ * the viewport.
+ *
+ * Its line is as tall as a Button, so the bar keeps one height and the name one position whether
+ * or not the actions row holds a "Sign out" Button: the floor is the --space-8 + --space-3 target
+ * (44px at the 16px root) that .ds-button--md and .ds-button--sm set as their min-block-size in
+ * Button.css, so change the two together (TopBar.test.tsx compares them). The floor sits on the
+ * name rather than on the bar, because a bar-level floor would let the name sit higher when the
+ * actions wrap onto a line of their own on a narrow viewport. The name is centred in that line
+ * by a column flex box, not by align-items: a row flex box would keep its text at its longest
+ * word and defeat overflow-wrap.
+ */
+.ds-topbar__product {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-block-size: calc(var(--space-8) + var(--space-3));
+  min-inline-size: 0;
+  overflow-wrap: break-word;
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
+}
+
+/*
+ * Actions: a wrapping row of controls, packed towards the inline end of their line.
+ *
+ * margin-inline-start: auto keeps the row at the inline end even when it wraps onto a line of
+ * its own; without it the bar's space-between places a lone item at the inline start. On a
+ * shared line the auto margin takes the same free space space-between would, so the wide layout
+ * is unchanged. min-inline-size: 0 and overflow-wrap: anywhere (inherited by the email and other
+ * text children) let a long unbroken value, such as a signed-in email, shrink and break inside
+ * the bar instead of overflowing a 320 CSS px viewport (WCAG 1.4.10 reflow).
+ */
+.ds-topbar__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-3);
+  min-inline-size: 0;
+  margin-inline-start: auto;
+  overflow-wrap: anywhere;
+  font-size: var(--font-size-sm);
+}

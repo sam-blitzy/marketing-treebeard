@@ -1,0 +1,209 @@
+{
+  "surface": "linkedin.ad_account",
+  "source": "linkedin",
+  "reference_url": "https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads/account-structure/create-and-manage-accounts?view=li-lms-2026-09",
+  "api_version": "202609",
+  "last_modified": "2026-09-16",
+  "request": {
+    "method": "GET",
+    "url": "adAccounts/{id}",
+    "required_headers": [
+      "Authorization",
+      "Linkedin-Version",
+      "X-Restli-Protocol-Version"
+    ],
+    "required_query": [],
+    "optional_query": [],
+    "fields": null,
+    "body": null,
+    "gaql": null,
+    "limits": {}
+  },
+  "response": {
+    "status": [
+      200
+    ],
+    "body": {
+      "description": "LinkedIn ad account, fetched by numeric id (one request per id in LINKEDIN_AD_ACCOUNT_IDS). Recovery probe plus currency source for ad_account.currency; AAP 0.3.3. Transcribed from the 'Fetch Ad Account' section and Schema table of the served Learn moniker li-lms-2026-09 (updated 2026-09-16). A 401 or 403 on this call classifies LinkedIn as access-denied and switches all of LinkedIn to simulated (AAP 0.3.3). Undeclared keys fail validation, so a field a newer version adds must be declared here from the page once a live capture shows it.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "Unique internal account id (long); the {id} of the request path.",
+          "type": "integer"
+        },
+        "name": {
+          "description": "Label for the account.",
+          "type": "string"
+        },
+        "currency": {
+          "description": "3-letter ISO code; amounts on campaigns, groups and analytics are in this currency. Default USD. An account in BRL sees budgets, bids and spend in BRL but is billed in USD.",
+          "type": "string"
+        },
+        "status": {
+          "description": "Default ACTIVE. CANCELED is permanent; DRAFT is not yet set up and not serving; PENDING_DELETION is a requested deletion; REMOVED is deleted but still fetchable because performance data exists.",
+          "type": "string",
+          "enum": [
+            "ACTIVE",
+            "CANCELED",
+            "DRAFT",
+            "PENDING_DELETION",
+            "REMOVED"
+          ]
+        },
+        "type": {
+          "description": "BUSINESS is the only value the API can create; ENTERPRISE is reserved for accounts created by LinkedIn's internal ad operations.",
+          "type": "string",
+          "enum": [
+            "BUSINESS",
+            "ENTERPRISE"
+          ]
+        },
+        "reference": {
+          "description": "Entity on whose behalf the account advertises: urn:li:person:{id} or urn:li:organization:{id}.",
+          "type": "string"
+        },
+        "referenceInfo": {
+          "description": "Union info record for the reference (OrganizationInfo for an organization, PersonInfo for a person, otherwise an empty record). Read-only, and returned only when requested as an Additional Info Field.",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "originatingCustomer": {
+          "description": "Optional URN urn:li:customer:{id} of the customer that originated the account's order. ENTERPRISE accounts only, set at creation and immutable. Supported from API version 202608.",
+          "type": "string"
+        },
+        "productType": {
+          "description": "Optional source product type inherited by every campaign under the account. ENTERPRISE accounts only, set at creation and immutable. Supported from API version 202608.",
+          "type": "string",
+          "enum": [
+            "MARKETING_SOLUTIONS",
+            "TALENT_SOLUTIONS",
+            "LINKEDIN_ON_LINKEDIN"
+          ]
+        },
+        "servingStatuses": {
+          "description": "System serving statuses. Exactly [RUNNABLE] when the account can serve; otherwise one or more reasons it cannot. Default [].",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "RUNNABLE",
+              "STOPPED",
+              "BILLING_HOLD",
+              "ACCOUNT_TOTAL_BUDGET_HOLD",
+              "ACCOUNT_END_DATE_HOLD",
+              "RESTRICTED_HOLD",
+              "INTERNAL_HOLD"
+            ]
+          }
+        },
+        "notifiedOnCampaignOptimization": {
+          "description": "Campaign contact is notified of optimization opportunities. Default false.",
+          "type": "boolean"
+        },
+        "notifiedOnCreativeApproval": {
+          "description": "Creative contact is notified when a creative is approved. Default false.",
+          "type": "boolean"
+        },
+        "notifiedOnCreativeRejection": {
+          "description": "Creative contact is notified when a creative is rejected. Default false.",
+          "type": "boolean"
+        },
+        "notifiedOnEndOfCampaign": {
+          "description": "Campaign contact is notified when a campaign completes. Default false.",
+          "type": "boolean"
+        },
+        "notifiedOnNewFeaturesEnabled": {
+          "description": "Account owner is notified of new Campaign Manager features. Default false.",
+          "type": "boolean"
+        },
+        "test": {
+          "description": "Test account flag. Settable only at creation and immutable. Default false.",
+          "type": "boolean"
+        },
+        "changeAuditStamps": {
+          "description": "Creation and last-modification stamps. time is epoch milliseconds; actor is optional, because the page's search sample omits it.",
+          "type": "object",
+          "properties": {
+            "created": {
+              "type": "object",
+              "properties": {
+                "actor": {
+                  "description": "URN of the actor, for example urn:li:person:{id} or urn:li:unknown:0.",
+                  "type": "string"
+                },
+                "time": {
+                  "description": "Epoch milliseconds.",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "time"
+              ]
+            },
+            "lastModified": {
+              "type": "object",
+              "properties": {
+                "actor": {
+                  "description": "URN of the actor, for example urn:li:person:{id} or urn:li:unknown:0.",
+                  "type": "string"
+                },
+                "time": {
+                  "description": "Epoch milliseconds.",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "time"
+              ]
+            }
+          }
+        },
+        "version": {
+          "description": "Entity version record.",
+          "type": "object",
+          "properties": {
+            "versionTag": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "currency",
+        "status",
+        "type"
+      ]
+    },
+    "documented_sample": {
+      "test": false,
+      "changeAuditStamps": {
+        "created": {
+          "actor": "urn:li:person:fGcyYDdglZ",
+          "time": 1449768717000
+        },
+        "lastModified": {
+          "actor": "urn:li:unknown:0",
+          "time": 1477941718075
+        }
+      },
+      "currency": "USD",
+      "id": 123456,
+      "name": "Company A",
+      "notifiedOnCampaignOptimization": true,
+      "notifiedOnCreativeApproval": true,
+      "notifiedOnCreativeRejection": true,
+      "notifiedOnEndOfCampaign": true,
+      "reference": "urn:li:organization:2414183",
+      "servingStatuses": [
+        "RUNNABLE"
+      ],
+      "status": "ACTIVE",
+      "type": "BUSINESS",
+      "version": {
+        "versionTag": "10"
+      }
+    }
+  }
+}

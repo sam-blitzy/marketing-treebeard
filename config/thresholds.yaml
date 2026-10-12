@@ -1,0 +1,293 @@
+# Ads Action Engine: recommendation thresholds, window settings and feedback durations.
+#
+# Every minimum sample, ratio and window used by the recommendation rules is a named key in
+# this file. It is the single source of these values: no rule falls back to a code default,
+# and a missing key fails config load.
+#
+# Loading:
+#   backend/src/ads_engine/analysis/thresholds.py (Thresholds.load) reads this file with a
+#   strict PyYAML SafeLoader subclass that rejects duplicate keys, together with
+#   config/hubspot_mapping.yaml and config/content_assets.yaml. A key repeated within one
+#   mapping fails config load instead of silently replacing the earlier value.
+#   In containers the directory is bind-mounted read-only at /app/config; on the host the
+#   backend resolves ../config from backend/.
+#
+# Hashing and evidence:
+#   The parsed values of the three files form config_hash, stored on every analysis run and
+#   shown by GET /api/v1/config and /settings. The worker compares the hash at startup and
+#   enqueues a default-window analysis when it changed. The runner copies every value a rule
+#   used into that item's evidence.thresholds, and the UI renders these configured values,
+#   never literals.
+#
+# Editing:
+#   Values are the plan defaults. Change one only deliberately: the change alters config_hash,
+#   re-triggers analysis and changes what every affected recommendation reports.
+#
+# Conventions:
+#   Ratios and shares are decimals (0.70 means 70%). Day and count keys are integers.
+#   Comparison operators in the comments state how the rule applies the value.
+#   Rule IDs (K1-K3, C0-C3b, B1-B4, G1, CR1-CR3, W1-W2, P1-P8) match the code, evidence,
+#   tests and docs/recommendation-rules.md.
+
+# --- Analysis window (shared definitions) -----------------------------------------------------
+window:
+  # Default analysis window, in complete native days. The window ends on the earlier of
+  # yesterday in the Google account's time zone and yesterday UTC; today is excluded as a
+  # partial day.
+  default_days: 28
+  # P5 short window: a window shorter than this raises the short-window banner and puts the
+  # short_window flag on every item.
+  trusted_min_days: 14
+  # Windows offered in the UI picker and fetched as LinkedIn demographic segment windows (C3a),
+  # each ending on the default window end. Must contain default_days, or config load fails.
+  presets: [14, 28, 56, 90]
+  # Sustained-pattern rules (K3, C1, C1b, C2/B1, B2, B3, B4) are withheld below this many
+  # days, with observed and required days shown.
+  sustained_min_days: 7
+  # Longest custom window, in days: LinkedIn's 6-month daily analytics retention.
+  max_days: 180
+
+# --- Source freshness (P4 stale flag) ---------------------------------------------------------
+sources:
+  # P4: an item is stale when a required dataset last succeeded longer ago than this many
+  # hours, or its coverage stops short of the window end.
+  stale_after_hours: 24
+
+# --- Budget history, utilization and history gates (C2, B1, B2, B3, G1) -------------------
+budget:
+  # A day's budget and status are whole-day known only when no gap between consecutive
+  # snapshots bracketing the day exceeds this many hours. Evidence states the assumption
+  # "unchanged across N observations, at most 6 h apart".
+  max_observation_gap_hours: 6
+  # C2/B1 capped day: daily utilization u_d >= this.
+  capped_day_ratio: 0.95
+  # C2/B1 capped day, Google alternative: search_budget_lost_impression_share >= this on
+  # that day.
+  capped_lost_is_share: 0.10
+  # B2/G1 high-utilization day: u_d >= this.
+  high_utilization: 0.90
+  # B3 under-utilized day: u_d <= this; known idle days (u_d = 0) included.
+  under_utilization: 0.50
+  # Every history gate needs >= this many known-budget active days (budget-active days for
+  # shared budgets).
+  min_known_days: 7
+  # Every history gate needs >= this many spending days, so a budget that rarely serves is
+  # never treated as capped, high-utilization or a B3 donor.
+  min_spending_days: 5
+  # C2/B1 cap-constrained gate: capped days >= this.
+  min_capped_days: 5
+  # Required share of known-budget active days, applied as >= this: capped days
+  # (cap-constrained, C2/B1); spending days and high-utilization days (high utilization,
+  # B2/G1); under-utilized days (under-utilized, B3).
+  sustained_share: 0.70
+
+# --- CRM pipeline link (C1b, C2 veto/Hold) ----------------------------------------------------
+# crm.booking_sources and crm.meeting_outcome_exclusions live in config/hubspot_mapping.yaml.
+# The loader merges both crm maps and fails when a key appears in both files.
+crm:
+  # Matured population: leads whose touch is at least this many days before the window end.
+  # Outcomes of younger leads never enter the pipeline veto.
+  lead_maturity_days: 14
+  # C2 pipeline veto (Hold) and C1b need eligible contacts >= this, counted in contacts
+  # after de-duplication.
+  veto_min_leads: 20
+
+# --- Attribution floors (P8, W1/W2, C1b, C2 veto) ---------------------------------------------
+attribution:
+  # The "meaningful share" of unresolved CRM links. A white paper's contact share >= this
+  # renders counts as ">= N" and costs as "<= X" with attribution_floor; the C2 veto needs
+  # an unresolved matured-lead share < this.
+  floor_share: 0.10
+
+# --- Keywords to adjust: section finding (K1-K3) ----------------------------------------------
+keywords:
+  # Keyword items carry search_term_coverage when search-term spend / keyword spend is below
+  # this, because Google withholds low-volume search terms.
+  min_search_term_coverage: 0.80
+
+# --- K1 Block / negative-keyword candidate ----------------------------------------------------
+k1:
+  # Trailing days, ending at the window end, for the account rate r = conversions / clicks.
+  baseline_days: 90
+  # Minimum clicks n* = max(min_clicks_floor, ceil(rule_of_three / r)), with no upper cap:
+  # 300 clicks at r = 1%, 3,000 at r = 0.1%, this floor for any r >= 0.3. Terms with
+  # clicks < n* are withheld with clicks observed and required.
+  min_clicks_floor: 10
+  # Rule-of-three scale for n*. A heuristic labelled "minimum clicks for the account's
+  # conversion rate": r is a rate, not a per-click probability (fractional under data-driven
+  # attribution, can reach or exceed 1 under MANY_PER_CLICK), so no probability is claimed.
+  rule_of_three: 3
+  # K1 is withheld account-wide with the k1_no_baseline finding when baseline conversions
+  # < this, or r is 0 or unavailable.
+  min_baseline_conversions: 10
+  # A term qualifies only with spend >= this x the account cost per conversion: at least one
+  # typical conversion's cost was spent.
+  min_spend_cpa_multiple: 1.0
+
+# --- K2 Expansion candidate -------------------------------------------------------------------
+k2:
+  # Term conversions >= this, to avoid one-off conversions.
+  min_conversions: 3
+  # Term cost/conversion <= this x the campaign's cost/conversion: at or better than campaign
+  # efficiency.
+  max_cpa_ratio: 1.0
+  # Adjacent terms: token Jaccard similarity >= this (lowercased, stopwords removed), taken
+  # from the account's own search-term report.
+  adjacent_jaccard: 0.5
+  # At most this many adjacent terms per item, ordered by conversions, then clicks.
+  adjacent_max_terms: 5
+  # An adjacent term needs clicks >= this; existing keywords and excluded terms never qualify.
+  adjacent_min_clicks: 1
+
+# --- K3 Review (declining quality score, or CPC rising without conversion) --------------------
+k3:
+  # K3 needs a window of >= this many days, split into two halves.
+  min_window_days: 14
+  # Clicks >= this in each half of the window, for a stable CPC.
+  min_clicks_per_half: 30
+  # Quality score is compared between the last and the first span of this many days.
+  qs_span_days: 7
+  # Quality-score branch: daily historical_quality_score must be present on >= this many days
+  # in each span. When daily scores are present on fewer days in either span, the quality-score
+  # branch does not fire and no snapshot fallback applies; the CPC branch is still evaluated.
+  # Only when daily scores are absent are the Q-G7 quality-score snapshots at window start and
+  # end compared instead.
+  min_qs_days_per_span: 5
+  # A drop >= this in mean quality score (integer 1-10 scale) is material.
+  qs_drop: 1
+  # CPC second half / first half >= this, and cost/conversion second half / first half >=
+  # this: a rise above normal auction noise with no matching rise in conversion.
+  rise_ratio: 1.15
+  # Alternative to the cost/conversion rise: second-half conversions are 0 while first-half
+  # conversions are >= this.
+  min_first_half_conversions: 1
+
+# --- C1 Pause ---------------------------------------------------------------------------------
+c1:
+  # C1 needs a window of >= this many days.
+  min_window_days: 14
+  # "Spending steadily": spend on >= this share of window days.
+  min_spend_day_share: 0.70
+  # Zero outcomes with expected outcomes >= this: at a Poisson mean of 3, P(0) is about 5%.
+  min_expected_outcomes: 3
+
+# --- C1b Pipeline pause (LinkedIn) ------------------------------------------------------------
+c1b:
+  # C1b needs a window of >= this many days. Its eligible-contact minimum reuses
+  # crm.veto_min_leads, and it is withheld under any attribution floor or unknown CRM evidence.
+  min_window_days: 28
+
+# --- C2 Scale or Hold, and B1 eligibility -----------------------------------------------------
+scale:
+  # Window outcomes >= this.
+  min_outcomes: 5
+  # Cost/outcome <= this x the baseline for the same source and objective group.
+  max_cpa_ratio: 1.0
+
+# --- C3a Launch: underused proven segment (LinkedIn) ------------------------------------------
+# Evaluated only when the run window equals a fetched preset segment window ending on the
+# default window end; otherwise withheld with the segment_window_unavailable finding.
+c3a:
+  # Segment leads >= this.
+  min_leads: 5
+  # Segment cost per lead <= this x the campaign's cost per lead.
+  max_cpl_ratio: 0.8
+  # Segment impression share of the campaign < this (strict): underused.
+  max_impression_share: 0.15
+
+# --- C3b Launch: keyword cluster without a campaign (Google) ----------------------------------
+c3b:
+  # Single-linkage clustering of converting search terms at token Jaccard >= this.
+  jaccard: 0.5
+  # A cluster needs >= this many converting search terms.
+  min_terms: 3
+  # A cluster needs total conversions >= this.
+  min_conversions: 5
+  # Head tokens are those present in >= this share of member terms; the cluster fires only
+  # when none appears in any keyword text, ad group name or campaign name.
+  head_token_share: 0.5
+
+# --- B1 Increase ------------------------------------------------------------------------------
+b1:
+  # Raise the latest effective daily budget by this fraction. A bounded step lets the next
+  # window measure the response.
+  step: 0.20
+
+# --- B2 Do not increase: high utilization, poor efficiency (and the G1 guard) -----------------
+b2:
+  # Poor efficiency: cost/outcome >= this x baseline. Also the G1 member-level predicate
+  # inside a high-utilization shared budget.
+  poor_efficiency_ratio: 1.5
+  # Zero-outcome branch of poor efficiency: 0 outcomes with expected outcomes >= this
+  # (B2 and the G1 member predicate).
+  min_expected_outcomes: 3
+
+# --- B3 Under-utilized ------------------------------------------------------------------------
+b3:
+  # Proposed daily budget = this percentile of daily spend over known-budget active days,
+  # times headroom.
+  spend_percentile: 90
+  # Multiplier on the spend percentile, leaving room above observed delivery.
+  headroom: 1.1
+
+# --- B4 Weekday / weekend pattern -------------------------------------------------------------
+# The rate test runs only on unweighted event counts: LinkedIn leads and website conversions,
+# or Google conversions under a verified last-click counting contract on every window day.
+# Otherwise the pattern is withheld, never rounded.
+b4:
+  # Weekend days with spend >= this.
+  min_weekend_days: 4
+  # Weekdays with spend >= this.
+  min_weekdays: 10
+  # Total outcomes >= this.
+  min_outcomes: 10
+  # Two-sample Poisson rate test on outcomes per unit of spend: the pattern is reported when
+  # p < this.
+  alpha: 0.05
+
+# --- CR1-CR3 Copy/creative changes (LinkedIn) -------------------------------------------------
+cr:
+  # A variant is a creative with window impressions >= this; see cr.min_variants.
+  min_impressions: 1000
+  # CR1-CR3 analyse a campaign only when it has >= this many variants (creatives meeting
+  # cr.min_impressions).
+  min_variants: 2
+  # CR1: a pair is distinguishable when its Holm-adjusted p < this. Also the significance
+  # level of the CR1 and CR3 sample-size estimates.
+  alpha: 0.05
+  # Power of the required-sample estimates (Cohen's h), CR1 and CR3.
+  power: 0.8
+  # CR3: relative lift the next test is sized to detect.
+  target_lift: 0.20
+  # CR1: Fisher's exact test when any expected cell is < this; otherwise the two-proportion
+  # z-test.
+  fisher_min_expected: 5
+  # CR2: confidence level of the Wilson interval per funnel stage.
+  ci_level: 0.95
+
+# --- W1 / W2 White papers ---------------------------------------------------------------------
+w:
+  # W1 Double down needs QL >= this.
+  min_ql: 3
+  # The cohort median cost/QL used by W1 and W2 is taken over the cohort's assets with
+  # QL >= this.
+  median_min_ql: 1
+  # W1: cost/QL <= this x the cohort median cost/QL (assets with QL >= w.median_min_ql).
+  double_down_ratio: 0.8
+  # W2 Retire or rework: QL = 0 and spend / cohort median cost/QL >= this.
+  retire_spend_multiple: 3
+  # W2 needs a window of >= this many days.
+  retire_min_window_days: 28
+  # A currency cohort whose assets total fewer QL than this has an unstable median: every
+  # row shows "Insufficient data".
+  cohort_min_total_ql: 3
+
+# --- Recommendation feedback suppression (C0 is exempt) ---------------------------------------
+# A dismissed, snoozed or done rule-entity pair is suppressed in later runs for this many days.
+feedback:
+  # Dismiss: suppress for this many days.
+  dismiss_days: 30
+  # Snooze: suppress for this many days.
+  snooze_days: 7
+  # Mark done: suppress for this many days.
+  done_days: 30

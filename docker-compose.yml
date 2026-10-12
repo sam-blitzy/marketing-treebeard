@@ -1,0 +1,298 @@
+# Ads Action Engine: the local stack.
+#
+# Compose Specification, with no top-level `version:` key. Requires Docker Compose >=5.5.1,<6
+# and Docker Engine >=29, which `make check-tools` verifies before `make init` and `make up`.
+#
+# First start (docs/runbook.md):
+#   make init ADMIN_PASSWORD=<value>   copies .env.example to .env (never overwrites one) and
+#                                      writes SESSION_SECRET and APP_ADMIN_PASSWORD_HASH
+#   docker compose up -d --build
+#   open http://localhost:8080         sign in as APP_ADMIN_EMAIL; /actions lists the five
+#                                      sections (simulated data until credentials are set)
+#
+# Startup order:
+#   db       Built from postgres:18.6 with Debian security updates; runs as postgres (999).
+#            Healthy once pg_isready answers over TCP, which the image's socket-only
+#            initialisation server never does, so first-run init is complete.
+#   migrate  One-shot, once db is healthy: `ads-engine migrate && ads-engine ensure-admin`.
+#            Both are idempotent, so it runs again on every `up`.
+#   api      Once migrate exited 0. Healthy once GET /api/v1/healthz answers 200, which needs
+#            a database round trip.
+#   worker   Once migrate exited 0. Resolves each source live or simulated (simulated with
+#            the reason "credentials not configured" when its credentials are blank), builds
+#            and backfills datasets and runs the default analysis before its first cycle.
+#   web      Once api is healthy. nginx serves the SPA on 8080 and proxies /api/ to api:8000
+#            (web/nginx.conf).
+#
+# Secrets and environment:
+#   - .env (gitignored, written by `make init`) reaches migrate, api and worker only. It is
+#     required: a missing .env stops Compose before any container starts.
+#   - db receives only POSTGRES_DB, POSTGRES_USER and POSTGRES_PASSWORD, interpolated from
+#     the shell, else from .env, else the local defaults below.
+#   - web receives no environment: the SPA bundle holds no configuration and no secret.
+#   - DATA_MODE set in the shell overrides .env; a blank shell value counts as unset, so .env
+#     applies, and with neither set, the default auto applies (x-backend, below). `make e2e`
+#     forces simulated data this way:
+#       DATA_MODE=simulated docker compose up -d
+#     CI's first start sets neither DATA_MODE nor a source credential, so under the default
+#     DATA_MODE=auto every source is simulated with the reason "credentials not configured".
+#   - This file holds no secret value. Source credentials go in .env only.
+#
+# Ports: only web is published, on 127.0.0.1:8080, matching APP_BASE_URL=http://localhost:8080.
+# The loopback address keeps the plain-HTTP login off the network: any other host reaches the
+# stack only through a TLS terminator (docs/runbook.md, Hosting beyond localhost). db and
+# api are reachable only on the project's default network: backend tests use their own
+# disposable database, and a published 5432 could collide with a local PostgreSQL.
+#
+# Data: the named volume pgdata keeps the database across `docker compose down` and
+# `docker compose up`; `docker compose down -v` deletes it.
+#
+# Configuration: ./config is bind-mounted read-only at /app/config, the backend's working
+# directory, so `docker compose restart api worker` picks up edited YAML. The worker compares
+# config_hash at startup and re-runs the default analysis when it changed.
+#
+# Logging: Docker's default json-file driver. The api and worker write structured JSON lines
+# (structlog, with secrets redacted) to stdout: `docker compose logs -f worker`.
+#
+# Containers: every process runs as a fixed non-root user from the container's first process:
+# migrate, api and worker as 10001 (backend/Dockerfile), web as nginx's 101 (web/Dockerfile)
+# and db as postgres's 999 (its inline Dockerfile below). Every service also sets
+# no-new-privileges, so no setuid or setgid binary in an image can raise a process's
+# privileges, and drops every Linux capability (cap_drop: ALL), none of which they need. Each
+# image applies Debian security updates on top of its exact base tag at build time, and the
+# build fails if Python, Node, nginx or PostgreSQL is no longer the pinned version. A cached
+# build keeps the packages it already has; `docker compose build --pull --no-cache` takes
+# newer updates (docs/runbook.md, Base images and OS security updates).
+#
+# Resources: each service runs under a CPU and memory ceiling (deploy.resources.limits), set
+# from the shell, else from .env (Compose interpolation, as for POSTGRES_*), else the default
+# shown; a blank value keeps the default. .env.example lists them with these defaults; no
+# process reads them. CPU is in cores, memory takes a k, m or g suffix:
+#   db       DB_CPU_LIMIT (1)       DB_MEMORY_LIMIT (1g)
+#   migrate  MIGRATE_CPU_LIMIT (1)  MIGRATE_MEMORY_LIMIT (512m)
+#   api      API_CPU_LIMIT (1)      API_MEMORY_LIMIT (1g)
+#   worker   WORKER_CPU_LIMIT (1)   WORKER_MEMORY_LIMIT (2g)
+#   web      WEB_CPU_LIMIT (1)      WEB_MEMORY_LIMIT (256m)
+# They are ceilings, not reservations: an idle service holds nothing back. The 1-core CPU
+# defaults run on any host Docker supports. Docker refuses to create a container whose CPU
+# value exceeds the CPUs it reports (`docker info`), and kills a service that exceeds its
+# memory ceiling with exit code 137 (docs/runbook.md, Resource limits).
+# A higher limit never adds a worker; the advisory lock keeps the worker a single process.
+#
+# Out of scope here: TLS, image publishing and monitoring. Any host other than this machine
+# terminates TLS in front of nginx and sets an https:// APP_BASE_URL (docs/runbook.md).
+
+name: ads-engine
+
+# The one backend image behind migrate, api and worker. Each service's `command:` selects
+# the process. `image:` is a local tag only, never pushed. Only migrate builds it: a `build:`
+# here would give each of the three services its own build, which Compose labels with that
+# service's name, so three different images would race for this one tag and every
+# `up --build` would recreate api and worker with nothing changed. api and worker run the tag
+# migrate builds and never build or pull it (`pull_policy: never`), so a re-run with no change
+# keeps their containers and a new image recreates both. They depend on migrate, so `up`
+# builds the image before starting them; `run --no-deps api|worker` on a host without it
+# needs `docker compose build migrate` (or `make init`) first.
+x-backend: &backend
+  image: ads-engine-backend:local
+  # DATA_MODE precedence: a non-blank shell value, then .env, then settings' default auto.
+  # Later env files override earlier ones. Compose reads docker-compose.data-mode.env, whose
+  # one line is DATA_MODE=${DATA_MODE}, only when DATA_MODE interpolates non-empty (shell,
+  # else .env), so a blank shell value leaves .env in force, and with neither set, the
+  # container gets no DATA_MODE. `environment:` cannot do this: Compose counts an exported
+  # empty variable as set, and `environment:` outranks every env file. A value of only spaces
+  # is non-empty to Compose, so it passes through, and settings reads it as blank (auto).
+  env_file:
+    - path: .env
+    - path: "${DATA_MODE:+docker-compose.data-mode.env}"
+      # Skipped when the path interpolates empty; the file itself is committed.
+      required: false
+  volumes:
+    - ./config:/app/config:ro
+  # No privilege gain through a setuid or setgid binary, and no Linux capability: the backend
+  # runs as 10001 and needs none (Containers, above).
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  db:
+    # postgres:18.6 itself plus a Debian security-update layer, run as the image's postgres
+    # user from its first process. The Dockerfile is inline, so it needs no file of its own;
+    # with no `image:` key the build is tagged for this Compose project only (<project>-db) and
+    # never pushed. `$$` passes a literal `$` through Compose interpolation to the build shell.
+    build:
+      dockerfile_inline: |
+        FROM postgres:18.6
+        # Debian security updates only. For this step a temporary source list naming just the
+        # image's <codename>-security suite replaces its APT sources, the PostgreSQL (PGDG)
+        # repository included, so `apt-get upgrade` cannot move the server, installs no new
+        # package and removes none; its output names every package it upgrades. The step fails
+        # unless the server is still 18.6 and the postgres user still 999:999. It then gives
+        # /var/lib/postgresql to that user, private (0700): a new pgdata volume copies this
+        # owner and mode on first mount, so initdb, running as postgres, can create PGDATA.
+        RUN codename="$$(. /etc/os-release && echo "$$VERSION_CODENAME")" \
+          && [ -n "$$codename" ] \
+          && apt_dir="$$(mktemp -d)" \
+          && mkdir "$$apt_dir/parts" \
+          && printf 'deb [signed-by=%s] %s %s-security main\n' \
+            /usr/share/keyrings/debian-archive-keyring.gpg http://deb.debian.org/debian-security \
+            "$$codename" > "$$apt_dir/security.list" \
+          && apt-get -o Dir::Etc::SourceList="$$apt_dir/security.list" \
+            -o Dir::Etc::SourceParts="$$apt_dir/parts" update \
+          && DEBIAN_FRONTEND=noninteractive apt-get \
+            -o Dir::Etc::SourceList="$$apt_dir/security.list" \
+            -o Dir::Etc::SourceParts="$$apt_dir/parts" -y upgrade \
+          && rm -rf /var/lib/apt/lists/* "$$apt_dir" \
+          && [ "$$(postgres --version | cut -d ' ' -f 3)" = "18.6" ] \
+          && [ "$$(id -u postgres):$$(id -g postgres)" = "999:999" ] \
+          && chown 999:999 /var/lib/postgresql \
+          && chmod 0700 /var/lib/postgresql
+        # The postgres user, given numerically so a runAsNonRoot policy can verify it. The
+        # entrypoint and every server process run as it: started as non-root, the entrypoint
+        # skips its chown and gosu steps and initialises or starts the cluster directly.
+        USER 999:999
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-ads_engine}"
+      POSTGRES_USER: "${POSTGRES_USER:-ads}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-ads}"
+    volumes:
+      # PostgreSQL 18 images keep PGDATA at /var/lib/postgresql/18/docker and declare
+      # VOLUME /var/lib/postgresql, so the volume mounts at the parent and PGDATA is never
+      # overridden. A mount at /var/lib/postgresql/data would hold no data directory.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      # $$ defers expansion to the container's shell, where the POSTGRES_* values are set.
+      # Both values are double-quoted, so a name with spaces or glob characters stays one
+      # argument. The database goes through PGDATABASE rather than -d, because libpq reads a
+      # -d value containing "=" or a postgres:// or postgresql:// prefix as a connection string.
+      # -h 127.0.0.1 probes TCP, which only the final server (not the init server) accepts.
+      test: ["CMD-SHELL", 'PGDATABASE="$$POSTGRES_DB" pg_isready -U "$$POSTGRES_USER" -h 127.0.0.1']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+    # No privilege gain through a setuid or setgid binary, and no Linux capability: PostgreSQL
+    # runs as postgres from the start and needs none (Containers, above).
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "${DB_CPU_LIMIT:-1}"
+          memory: "${DB_MEMORY_LIMIT:-1g}"
+
+  migrate:
+    <<: *backend
+    # The only build of the backend image, for migrate, api and worker (x-backend, above).
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["sh", "-c", "ads-engine migrate && ads-engine ensure-admin"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+    deploy:
+      resources:
+        limits:
+          cpus: "${MIGRATE_CPU_LIMIT:-1}"
+          memory: "${MIGRATE_MEMORY_LIMIT:-512m}"
+
+  api:
+    <<: *backend
+    # Runs the image migrate builds; the tag is local only, so it is never pulled.
+    pull_policy: never
+    # Behind nginx. The login limit (5 attempts per minute per IP) keys on the client address
+    # uvicorn takes from X-Forwarded-For. `--forwarded-allow-ips *` overrides the image's
+    # loopback-only FORWARDED_ALLOW_IPS, so that address is the client nginx served, not
+    # nginx's own container address, which every client would otherwise share as one key.
+    # Trusting every peer is safe only because api publishes no port, so nginx is its only
+    # client-facing peer, and nginx overwrites X-Forwarded-For with exactly one entry,
+    # $remote_addr. Never publish port 8000 with this command: a client could then write its
+    # own X-Forwarded-For and claim a fresh address on every attempt.
+    command:
+      - uvicorn
+      - ads_engine.api.app:create_app
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --proxy-headers
+      - --forwarded-allow-ips
+      - "*"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # The slim Python base has no curl; the image's own Python probes the endpoint.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/healthz', timeout=3).status == 200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+    # Time after SIGTERM for the shutdown to wait, up to 15 s, for requests answered 503 at the
+    # request deadline to finish their cleanup before it closes the database pool. Docker's
+    # 10 s default would send SIGKILL first.
+    stop_grace_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "${API_CPU_LIMIT:-1}"
+          memory: "${API_MEMORY_LIMIT:-1g}"
+
+  worker:
+    <<: *backend
+    # Runs the image migrate builds; the tag is local only, so it is never pulled.
+    pull_policy: never
+    command: ["python", "-m", "ads_engine.worker.main"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    # Time after SIGTERM to cancel the lanes, finish the batch commit in flight and release
+    # the advisory locks before Docker sends SIGKILL.
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "${WORKER_CPU_LIMIT:-1}"
+          memory: "${WORKER_MEMORY_LIMIT:-2g}"
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    # IPv4 loopback only: http://localhost:8080 (APP_BASE_URL) works on this machine, and
+    # nothing else on the network can reach this plain-HTTP port. Remote access goes through a
+    # TLS terminator (docs/runbook.md, Hosting beyond localhost).
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    # No privilege gain through a setuid or setgid binary, and no Linux capability: nginx runs
+    # as 101 and listens on 8080, above 1024, so it needs none (Containers, above).
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "${WEB_CPU_LIMIT:-1}"
+          memory: "${WEB_MEMORY_LIMIT:-256m}"
+
+volumes:
+  pgdata: {}

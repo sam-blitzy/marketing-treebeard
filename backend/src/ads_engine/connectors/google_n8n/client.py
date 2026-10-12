@@ -1,0 +1,1174 @@
+"""``GoogleAdsWebhookClient``: one n8n webhook call per GAQL query, metered by the call budget.
+
+Google Ads is reached only through the existing n8n Cloud webhook, exactly as the user prescribed.
+Each call is one ``POST {N8N_GOOGLE_ADS_WEBHOOK_URL}`` with the shared-secret header
+``{N8N_WEBHOOK_SECRET_HEADER}: {N8N_WEBHOOK_SECRET}``, ``Content-Type: application/json`` and
+exactly this body, three keys in this order and no others::
+
+    {"customer_id": "<10 digits, no dashes>", "query": "<GAQL>", "page_token": null}
+
+n8n's already-authenticated Google Ads node runs the query as ``googleAds:search`` v25 and
+answers synchronously with ``{results[], fieldMask, queryResourceConsumption}``: REST
+``GoogleAdsRow`` objects with camelCase keys and int64 values as strings. The request and the
+response follow ``backend/tests/contracts/google/search.json``; the simulator validates requests
+against the same file, so a malformed request fails in simulated mode too.
+
+What this module does, and what it leaves to others:
+
+* **One call** (:meth:`GoogleAdsWebhookClient.search_page`): builds the body, sends it through
+  :func:`ads_engine.connectors.http.send_json` and validates the envelope. ``send_json`` owns the
+  retry policy (3 attempts, 2 s exponential base, jitter, ``Retry-After`` honoured) and the
+  error classification, including Google denials, quota exhaustion and query errors that n8n
+  relays inside HTTP 200. This module never re-classifies; it only adds envelope validation, so
+  a body that is neither a result page nor an error is a ``QueryDefect``, never an empty page.
+  A present ``fieldMask`` must list exactly the query's selected fields as camelCase paths, in
+  any order; a wrong or truncated projection is a ``QueryDefect``, never a page whose omitted
+  metrics would read as zero.
+* **Paging** (:meth:`GoogleAdsWebhookClient.run_query`, :meth:`GoogleAdsWebhookClient.search`):
+  renders one template of :data:`~ads_engine.connectors.google_n8n.queries.QUERIES` and follows
+  a ``nextPageToken`` at once when one is returned, because page tokens expire after a few
+  hours. The specified n8n response carries no token, and nothing here depends on one. A relay
+  may also return a token it does not honour: the live n8n workflow answers a follow-up call
+  with page 1 again and a fresh token. Pages of one ``googleAds:search`` result are disjoint and
+  every Q-G* row is unique, so a follow-up page that repeats a row of page 1 or of the page
+  before it, or that carries a token but no row, proves the token did not advance. That page is
+  discarded, the token is abandoned and the result reported capped, so ``partition.py`` narrows
+  the query by date and id ranges instead. The client then remembers that this relay ignores
+  tokens (:attr:`GoogleAdsWebhookClient.page_tokens_ignored`) and stops following them for the
+  rest of its life, saving one call per capped partition.
+* **Completeness** is ``partition.py``'s job. A last page of exactly
+  :data:`~ads_engine.connectors.google_n8n.queries.PAGE_SIZE` (10,000) rows with no token, or an
+  abandoned token, means the result may be truncated; :attr:`QueryResult.capped` reports it and
+  ``partition.PartitionedFetcher.partitioned_fetch`` narrows the query until no partition is
+  capped.
+* **Call budget**: every POST attempt (first pages, next pages, partition calls and retries)
+  first awaits :meth:`CallBudget.acquire`. ``sync`` injects
+  ``ads_engine.sync.budget_guard.GoogleCallBudget`` for live calls and :data:`UNMETERED` for
+  simulated ones, so this module never imports ``sync`` and the dependency stays one-way.
+
+Errors leave only as ``AccessDenied``, ``TransientError`` (including ``CallBudgetExhausted``) or
+``QueryDefect`` from :mod:`ads_engine.connectors.errors`, plus ``ValueError`` for a programming
+error caught before any call (an unknown query id, an invalid scope or configuration, or GAQL
+text without a readable ``SELECT`` list).
+``ads_engine.sync.mode`` alone decides the consequence of each kind.
+
+The product holds only the webhook URL, the header name and the secret. Google's own client
+credentials stay in n8n's credential store, the connector never writes to Google Ads, and no
+streaming search variant is used. Logs never carry the secret, the header value, the webhook URL
+or its path, the customer id, the GAQL text, a page token or an ``IN`` id list (only its
+length).
+
+Example:
+    ``sync`` owns the HTTP client and the budget, and reads one query to its last page::
+
+        async with build_client("google") as http:
+            budget = GoogleCallBudget(settings)
+            client = GoogleAdsWebhookClient.from_settings(settings, http, budget)
+            result = await client.run_query("Q-G1")
+            if result.capped:
+                ...  # never for Q-G1; partition.py narrows capped queries
+            async for row in client.search("Q-G4", {"last_id": 0}):
+                ...
+"""
+
+import hashlib
+import json
+import re
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterable,
+    Mapping,
+    Sequence,
+)
+from contextlib import aclosing
+from dataclasses import dataclass
+from typing import Final, Protocol, Self, runtime_checkable
+from urllib.parse import urlsplit
+
+import httpx
+from pydantic import SecretStr
+
+from ads_engine.connectors.errors import QueryDefect, unwrap_single_item
+from ads_engine.connectors.google_n8n.parser import GoogleAdsRow
+from ads_engine.connectors.google_n8n.queries import IDS, PAGE_SIZE, QUERIES, rest_path
+from ads_engine.connectors.http import DEFAULT_RETRY, JsonResponse, RetryPolicy, send_json
+from ads_engine.logging import get_logger
+from ads_engine.settings import Settings, Source
+
+__all__ = [
+    "SIMULATED_SECRET",
+    "SIMULATED_WEBHOOK_URL",
+    "UNMETERED",
+    "CallBudget",
+    "GoogleAdsRow",
+    "GoogleAdsWebhookClient",
+    "QueryResult",
+    "SearchPage",
+]
+
+log = get_logger(__name__)
+
+# ---------------------------------------------------------------------------------------------
+# Simulated identity
+# ---------------------------------------------------------------------------------------------
+
+SIMULATED_WEBHOOK_URL: Final = "https://n8n.sim.invalid/webhook/google-ads"
+"""Webhook URL the client is given when Google is simulated and no live URL is configured.
+
+``sync/mode.py`` passes it with :data:`SIMULATED_SECRET` and :data:`UNMETERED`; the simulation's
+``httpx.MockTransport`` answers it without opening a socket. The ``.invalid`` top-level domain is
+reserved (RFC 2606), so the URL can never reach a real host."""
+
+# A fixed, publicly documented placeholder sent only to the simulated transport; it unlocks
+# nothing, which is why the hardcoded-password rule (S105) does not apply.
+SIMULATED_SECRET: Final = "simulated"  # noqa: S105 - simulated identity, not a credential
+"""Shared-secret header value sent to the simulated webhook, which checks only its presence."""
+
+# ---------------------------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------------------------
+
+_SOURCE: Final[Source] = "google"
+# The contract surface name of every call (backend/tests/contracts/google/search.json); errors
+# and logs name a call as "search {query_id}", for example "search Q-G2".
+_SURFACE: Final = "search"
+_JSON_CONTENT_TYPE: Final = "application/json"
+_HTTP_SCHEMES: Final = frozenset({"http", "https"})
+
+# GOOGLE_ADS_CUSTOMER_ID as the webhook body needs it: exactly 10 ASCII digits, no dashes.
+_CUSTOMER_ID_RE: Final = re.compile(r"[0-9]{10}")
+# RFC 7230 "token" characters of a header field name, matched with fullmatch.
+_HEADER_TOKEN_RE: Final = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+# Headers the request itself sets or that frame the message; the secret header may not replace
+# them. Authorization stays allowed: an n8n Header Auth credential may well be named that.
+_RESERVED_HEADERS: Final = frozenset(
+    {"content-type", "content-length", "transfer-encoding", "host", "connection"}
+)
+# A header value that survives transmission unchanged: visible ASCII with inner spaces allowed,
+# no control characters (no CR/LF header injection) and no surrounding whitespace, which HTTP
+# strips and n8n would then never match.
+_SECRET_VALUE_RE: Final = re.compile(r"[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?")
+# A query id labels a call in errors and logs. Restricting it to a short identifier keeps GAQL
+# text, which can carry id lists, out of both even when a caller passes the wrong argument.
+_QUERY_ID_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+# queryResourceConsumption is an int64, sent as a decimal string (proto3 JSON) or a number.
+_INT64_TEXT_RE: Final = re.compile(r"[0-9]{1,19}")
+# The SELECT list of caller-supplied GAQL text, matched from the start: everything between the
+# leading SELECT and the first FROM, keywords in any case. A GAQL field name is lowercase
+# snake_case segments, so it can never contain a whitespace-delimited FROM.
+_SELECT_LIST_RE: Final = re.compile(
+    r"\s*SELECT\s+(?P<fields>.+?)\s+FROM\s+\S", re.IGNORECASE | re.DOTALL
+)
+# Selected paths a fieldMask mismatch names in its error before summarising the rest as a count.
+_MASK_PATHS_SHOWN: Final = 5
+
+# Defensive bound on next-page calls of one query: 1,000 pages is 10 million rows, far beyond
+# any query the product issues (partition.py keeps every partition below one page). It stops a
+# misbehaving relay that keeps returning fresh tokens, even under the unmetered budget.
+_MAX_PAGES_PER_QUERY: Final = 1_000
+# Bytes of a row fingerprint (BLAKE2b): 128 bits, so two different rows of one query never
+# share one in practice, at 16 bytes a row held for page 1 and the previous page only.
+_FINGERPRINT_BYTES: Final = 16
+
+
+# ---------------------------------------------------------------------------------------------
+# Call budget
+# ---------------------------------------------------------------------------------------------
+
+
+@runtime_checkable
+class CallBudget(Protocol):
+    """The product's own cap on n8n webhook calls, consulted before every POST attempt.
+
+    ``ads_engine.sync.budget_guard.GoogleCallBudget`` satisfies this protocol structurally and is
+    injected by ``sync`` for live calls; :data:`UNMETERED` is injected for simulated calls and in
+    tests. Declaring the protocol here, rather than importing ``budget_guard``, keeps the
+    dependency one-way: ``sync`` imports connectors, never the reverse.
+    """
+
+    async def acquire(self) -> None:
+        """Count one webhook POST attempt against the cap, or refuse it.
+
+        The cap is ``GOOGLE_DAILY_CALL_BUDGET`` (1,000 webhook calls per sliding 24 h by
+        default), the product's own limit below the Google quota that every n8n workflow using
+        the same credential shares. Every attempt counts: first pages, next pages, partition
+        calls and retries.
+
+        Raises:
+            ads_engine.connectors.errors.CallBudgetExhausted: When the cap is used up. No POST
+                is sent, and ``connectors/http.py`` never retries the refusal; the remaining
+                pages are deferred to a later window.
+        """
+
+
+class _Unmetered:
+    """A :class:`CallBudget` that admits every call and counts nothing.
+
+    Used when Google is simulated, because a simulated n8n call is not a live Google call and
+    must never consume ``GOOGLE_DAILY_CALL_BUDGET``, and by tests.
+    """
+
+    __slots__ = ()
+
+    async def acquire(self) -> None:
+        """Admit the call: an unmetered budget never refuses and records nothing."""
+        return
+
+    def __repr__(self) -> str:
+        """Return ``UNMETERED``, the name the instance is exported under."""
+        return "UNMETERED"
+
+
+UNMETERED: Final[CallBudget] = _Unmetered()
+"""The call budget of simulated runs and tests: every call is admitted and nothing is counted."""
+
+
+# ---------------------------------------------------------------------------------------------
+# Result types
+# ---------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class SearchPage:
+    """One webhook response: one page of one GAQL query.
+
+    Attributes:
+        rows: The page's REST ``GoogleAdsRow`` objects, in the order returned; at most
+            :data:`~ads_engine.connectors.google_n8n.queries.PAGE_SIZE` (10,000). Empty when the
+            response carried ``fieldMask`` without ``results`` (Google omits an empty repeated
+            field).
+        next_page_token: The ``nextPageToken`` to send back at once as ``page_token``, or
+            ``None`` when the response carried none (always, for the specified n8n response).
+        field_mask: The comma-joined camelCase paths of the selected fields as returned, or
+            ``None`` when the response omitted them. When present, it was checked to list
+            exactly the query's selected fields, in any order.
+    """
+
+    rows: tuple[GoogleAdsRow, ...]
+    next_page_token: str | None
+    field_mask: str | None
+
+    @property
+    def capped(self) -> bool:
+        """Whether the page may be truncated: exactly ``PAGE_SIZE`` rows and no page token."""
+        return self.next_page_token is None and len(self.rows) == PAGE_SIZE
+
+
+@dataclass(frozen=True, slots=True)
+class QueryResult:
+    """Every page of one GAQL query, read to its last page or to an abandoned page token.
+
+    Attributes:
+        query_id: The template id, such as ``"Q-G2"``.
+        rows: The rows of every page kept, in page order and, within a page, in the order
+            returned; empty when the pages were handed to ``run_query``'s ``on_page`` instead.
+        pages: Pages kept, the first included; at least 1. A follow-up page discarded because
+            its token did not advance is not counted; its call is in :attr:`calls`.
+        calls: POST attempts made for this query: one per page plus every retry, a discarded
+            page included. Each was counted against the call budget.
+        capped: Whether the result may be truncated: the last page held exactly ``PAGE_SIZE``
+            (10,000) rows and carried no page token, or a page token was abandoned
+            (:attr:`token_abandoned`). The caller must then partition the query
+            (``partition.PartitionedFetcher.partitioned_fetch``) instead of trusting it as
+            complete.
+        token_abandoned: Whether a returned ``nextPageToken`` was not followed to its end: a
+            follow-up page proved that the relay ignored the token (it repeated a row of page 1
+            or of the page before it, or carried a token but no row), or the client had already
+            learned that it does (:attr:`GoogleAdsWebhookClient.page_tokens_ignored`). The rows
+            beyond the last page kept were never read.
+    """
+
+    query_id: str
+    rows: tuple[GoogleAdsRow, ...]
+    pages: int
+    calls: int
+    capped: bool
+    token_abandoned: bool = False
+
+
+@dataclass(slots=True)
+class _CallContext:
+    """Mutable bookkeeping of one query's webhook calls.
+
+    One context per query keeps per-query counts exact when several queries share one client
+    concurrently; the client's lifetime total is kept separately.
+
+    Attributes:
+        query_id: The template id that labels the calls in errors and logs.
+        page: The ordinal of the page being read, the first being 1; ``None`` for a single
+            :meth:`GoogleAdsWebhookClient.search_page` continuation whose ordinal only the
+            caller knows.
+        selected: The camelCase REST paths of the fields the query selects, such as
+            ``"campaignBudget.amountMicros"``: the projection a response's ``fieldMask`` must
+            list exactly.
+        ids_count: Length of the scope's ``IN`` id list, logged instead of the ids themselves.
+        attempts: POST attempts made so far for this query, retries included.
+        abandoned: Whether the paging loop stopped before a returned ``nextPageToken`` was
+            followed to its end (:attr:`QueryResult.token_abandoned`).
+    """
+
+    query_id: str
+    page: int | None
+    selected: frozenset[str]
+    ids_count: int | None = None
+    attempts: int = 0
+    abandoned: bool = False
+
+
+# ---------------------------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------------------------
+
+
+class GoogleAdsWebhookClient:
+    """Reads Google Ads through the n8n webhook: one POST per GAQL query page.
+
+    The client is stateless apart from its lifetime call count and what it learned about the
+    relay's page tokens (:attr:`page_tokens_ignored`), so one instance may serve concurrent
+    queries. It never opens or closes its ``httpx.AsyncClient``: the caller builds it
+    with ``connectors.http.build_client("google", transport)`` (no base URL, the 120 s per-call
+    deadline, redacting logging hooks) and owns its lifecycle. The transport is the only thing
+    that differs between live and simulated runs.
+
+    Example:
+        A simulated client, as ``sync/mode.py`` builds it::
+
+            client = GoogleAdsWebhookClient(
+                http=http,
+                budget=UNMETERED,
+                webhook_url=SIMULATED_WEBHOOK_URL,
+                secret_header=settings.n8n_webhook_secret_header,
+                secret=SecretStr(SIMULATED_SECRET),
+                customer_id="1234567890",
+            )
+            page = await client.search_page("Q-G1", QUERIES["Q-G1"].render())
+    """
+
+    __slots__ = (
+        "_budget",
+        "_calls_made",
+        "_customer_id",
+        "_http",
+        "_page_tokens_ignored",
+        "_retry",
+        "_secret",
+        "_secret_header",
+        "_webhook_url",
+    )
+
+    def __init__(
+        self,
+        *,
+        http: httpx.AsyncClient,
+        budget: CallBudget,
+        webhook_url: str,
+        secret_header: str,
+        secret: SecretStr,
+        customer_id: str,
+        retry: RetryPolicy = DEFAULT_RETRY,
+    ) -> None:
+        """Configure the client; nothing is sent until the first query.
+
+        Args:
+            http: The Google client from ``connectors.http.build_client("google", ...)``.
+            budget: Consulted before every POST attempt: ``GoogleCallBudget`` for live calls,
+                :data:`UNMETERED` for simulated calls and tests.
+            webhook_url: The absolute ``http://`` or ``https://`` n8n webhook URL
+                (``N8N_GOOGLE_ADS_WEBHOOK_URL``, or :data:`SIMULATED_WEBHOOK_URL`). Surrounding
+                whitespace is ignored.
+            secret_header: The header name n8n's Header Auth credential expects
+                (``N8N_WEBHOOK_SECRET_HEADER``). Surrounding whitespace is ignored.
+            secret: The shared secret sent in that header (``N8N_WEBHOOK_SECRET``).
+            customer_id: The Google Ads customer id, exactly 10 digits with no dashes
+                (``GOOGLE_ADS_CUSTOMER_ID``, already normalised by settings).
+            retry: The retry policy of every call; the plan's policy by default.
+
+        Raises:
+            ValueError: When ``customer_id`` is not 10 digits, ``webhook_url`` is not an
+                absolute ``http(s)`` URL with a host, ``secret_header`` is not an HTTP header
+                name or names a header the request itself sets (``Content-Type``,
+                ``Content-Length``, ``Transfer-Encoding``, ``Host``, ``Connection``), or
+                ``secret`` is empty, holds control or non-ASCII characters, or has surrounding
+                whitespace. The message never contains the URL, the secret or the customer id.
+        """
+        self._http: httpx.AsyncClient = http
+        self._budget: CallBudget = budget
+        self._webhook_url: str = _checked_webhook_url(webhook_url)
+        self._secret_header: str = _checked_secret_header(secret_header)
+        self._secret: SecretStr = _checked_secret(secret)
+        self._customer_id: str = _checked_customer_id(customer_id)
+        self._retry: RetryPolicy = retry
+        self._calls_made: int = 0
+        self._page_tokens_ignored: bool = False
+
+    @classmethod
+    def from_settings(
+        cls,
+        settings: Settings,
+        http: httpx.AsyncClient,
+        budget: CallBudget,
+        *,
+        retry: RetryPolicy = DEFAULT_RETRY,
+    ) -> Self:
+        """Build the live client from the configured webhook credentials.
+
+        Reads ``N8N_GOOGLE_ADS_WEBHOOK_URL``, ``N8N_WEBHOOK_SECRET_HEADER`` (the plan's default
+        is ``X-Webhook-Secret``, because the name on n8n's Header Auth credential is not
+        stated), ``N8N_WEBHOOK_SECRET`` and ``GOOGLE_ADS_CUSTOMER_ID``. Mode resolution sends a
+        source without them to simulated data first, so a missing value here is a programming
+        error rather than a fallback.
+
+        Args:
+            settings: The process settings.
+            http: The Google client from ``connectors.http.build_client("google")``.
+            budget: The live call budget, ``GoogleCallBudget(settings)``.
+            retry: The retry policy of every call; the plan's policy by default.
+
+        Returns:
+            A client posting to the configured webhook.
+
+        Raises:
+            ValueError: When the webhook URL, the secret or the customer id is unset (the
+                message names the missing environment variables, never a value), or a value
+                fails the checks of :meth:`__init__`.
+        """
+        webhook_url = settings.n8n_google_ads_webhook_url
+        secret = settings.n8n_webhook_secret
+        customer_id = settings.google_ads_customer_id
+        if webhook_url is None or secret is None or customer_id is None:
+            missing = [
+                name
+                for name, value in (
+                    ("N8N_GOOGLE_ADS_WEBHOOK_URL", webhook_url),
+                    ("N8N_WEBHOOK_SECRET", secret),
+                    ("GOOGLE_ADS_CUSTOMER_ID", customer_id),
+                )
+                if value is None
+            ]
+            raise ValueError("the Google Ads webhook is not configured; set " + ", ".join(missing))
+        return cls(
+            http=http,
+            budget=budget,
+            webhook_url=webhook_url,
+            secret_header=settings.n8n_webhook_secret_header,
+            secret=secret,
+            customer_id=customer_id,
+            retry=retry,
+        )
+
+    @property
+    def calls_made(self) -> int:
+        """POST attempts made over the client's lifetime, retries and next pages included.
+
+        Every attempt was admitted by the call budget first. ``sync`` logs the total, and
+        ``partition.PartitionedFetcher.partitioned_fetch`` derives a fetch's calls from the
+        difference before and after it.
+        """
+        return self._calls_made
+
+    @property
+    def page_tokens_ignored(self) -> bool:
+        """Whether this client has seen the relay ignore a ``page_token``; read-only.
+
+        Set once a follow-up page proved that its token did not advance (it repeated a row of
+        page 1 or of the page before it, or carried a token but no row). From then on, for the
+        rest of the client's life (one job or one build), a page that carries a
+        ``nextPageToken`` is kept but its token is not followed: the result is reported capped
+        (:attr:`QueryResult.token_abandoned`), so ``partition.py`` narrows the query at once
+        instead of spending a call on a page that would be discarded.
+        """
+        return self._page_tokens_ignored
+
+    def __repr__(self) -> str:
+        """Return the class name and the call count; never the URL, secret or customer id."""
+        return f"{type(self).__name__}(calls_made={self._calls_made})"
+
+    # -- one webhook call ---------------------------------------------------------------------
+
+    async def search_page(
+        self, query_id: str, query: str, page_token: str | None = None
+    ) -> SearchPage:
+        """Send one webhook call: one page of one GAQL query.
+
+        The body is exactly ``{"customer_id", "query", "page_token"}`` in that order, serialised
+        once with :func:`json.dumps` and sent as raw content, so its bytes are deterministic.
+        Before every attempt, retries included, the call budget's ``acquire`` is awaited and
+        the call counters are incremented. Classification of the response, including Google
+        errors that n8n relays inside HTTP 200, is ``send_json``'s. The fields of the text's
+        ``SELECT`` list are the projection a returned ``fieldMask`` must list exactly.
+
+        Args:
+            query_id: The template id that labels the call in errors and logs, such as
+                ``"Q-G2"``: a short identifier, never GAQL text.
+            query: The GAQL text, normally ``QUERIES[query_id].render(...)``; never logged. It
+                starts with ``SELECT <fields> FROM`` (keywords in any case), each field a
+                snake_case GAQL name.
+            page_token: ``None`` for a first page; otherwise the previous page's
+                ``nextPageToken``, sent back at once because tokens expire after a few hours.
+
+        Returns:
+            The validated page.
+
+        Raises:
+            AccessDenied: The webhook or Google refused the credentials, including a Google
+                ``PERMISSION_DENIED``, ``UNAUTHENTICATED``, ``AuthorizationError`` or
+                ``AuthenticationError`` inside an HTTP 200 from n8n.
+            TransientError: HTTP 429 or 5xx, a timeout, a network failure or Google
+                ``RESOURCE_EXHAUSTED`` that survived every retry.
+            CallBudgetExhausted: The call budget refused an attempt; that attempt sent no POST.
+            QueryDefect: The request was rejected as malformed (HTTP 400, a GAQL
+                ``QueryError``), or the response is not a valid result envelope: not a JSON
+                object, neither ``results`` nor ``fieldMask``, ``results`` not a list of
+                objects, more than 10,000 rows, a non-string ``fieldMask`` or
+                ``nextPageToken``, or a ``fieldMask`` that does not list exactly the selected
+                fields (an empty entry, a selected path missing, or an unselected path). It
+                always carries ``query_id``; the response is not re-requested.
+            ValueError: When ``query_id`` is not a short identifier, ``query`` is blank or has
+                no readable ``SELECT <fields> FROM`` clause of GAQL field names, or
+                ``page_token`` is an empty string; nothing is sent, and the message never
+                quotes the query text.
+        """
+        context = _CallContext(
+            query_id=_checked_query_id(query_id),
+            page=1 if page_token is None else None,
+            selected=_selected_in_text(query),
+        )
+        return await self._fetch_page(query, page_token, context)
+
+    async def _fetch_page(
+        self, query: str, page_token: str | None, context: _CallContext
+    ) -> SearchPage:
+        """Send one webhook call for ``context`` and validate its envelope.
+
+        The envelope's ``fieldMask``, when present, must list exactly ``context.selected``;
+        otherwise the call ends in a ``QueryDefect`` without another attempt, because a page
+        whose projection differs from the request cannot say which omitted metrics are zero.
+
+        Args:
+            query: The GAQL text.
+            page_token: ``None`` for a first page, else the token to send back.
+            context: The query's bookkeeping; its ``attempts`` grows by every POST attempt, and
+                its ``selected`` paths are the projection the ``fieldMask`` is checked against.
+
+        Returns:
+            The validated page.
+
+        Raises:
+            AccessDenied: As :meth:`search_page`.
+            TransientError: As :meth:`search_page`.
+            CallBudgetExhausted: As :meth:`search_page`.
+            QueryDefect: As :meth:`search_page`.
+            ValueError: When ``query`` is blank or ``page_token`` is an empty string.
+        """
+        if not query.strip():
+            raise ValueError("query must be a non-empty GAQL string")
+        if page_token is not None and not page_token:
+            raise ValueError("page_token must be None or a non-empty nextPageToken")
+        endpoint = f"{_SURFACE} {context.query_id}"
+        # Serialised once: every attempt sends the same bytes, keys in the contract's order.
+        content = json.dumps(
+            {"customer_id": self._customer_id, "query": query, "page_token": page_token}
+        ).encode("utf-8")
+        attempts_before = context.attempts
+
+        def build_request() -> httpx.Request:
+            """Build the POST of one attempt; the secret is read only here."""
+            return self._http.build_request(
+                "POST",
+                self._webhook_url,
+                content=content,
+                headers={
+                    self._secret_header: self._secret.get_secret_value(),
+                    "Content-Type": _JSON_CONTENT_TYPE,
+                },
+            )
+
+        async def before_attempt() -> None:
+            """Admit the attempt through the call budget, then count it."""
+            await self._budget.acquire()
+            self._calls_made += 1
+            context.attempts += 1
+
+        try:
+            response: JsonResponse = await send_json(
+                self._http,
+                build_request,
+                source=_SOURCE,
+                endpoint=endpoint,
+                policy=self._retry,
+                before_attempt=before_attempt,
+            )
+        except QueryDefect as defect:
+            if defect.query_id is not None:
+                raise
+            # Every defect leaving the client names its query, so the failed job is logged
+            # with the query id even when the endpoint label could not supply it.
+            raise QueryDefect(
+                defect.message,
+                source=defect.source,
+                endpoint=defect.endpoint,
+                code=defect.code,
+                http_status=defect.http_status,
+                query_id=context.query_id,
+            ) from defect
+
+        page, resource_units = _read_envelope(
+            response.body,
+            query_id=context.query_id,
+            http_status=response.status,
+            selected=context.selected,
+        )
+        fields: dict[str, object] = {
+            "source": _SOURCE,
+            "query_id": context.query_id,
+            "page": context.page,
+            "rows": len(page.rows),
+            "capped": page.capped,
+            "has_next_page": page.next_page_token is not None,
+            "resource_consumption": resource_units,
+            "attempts": context.attempts - attempts_before,
+            "calls_made": self._calls_made,
+        }
+        if context.ids_count is not None:
+            fields["ids_count"] = context.ids_count
+        log.info("google.search", **fields)
+        return page
+
+    # -- paging -------------------------------------------------------------------------------
+
+    async def run_query(
+        self,
+        query_id: str,
+        scope: Mapping[str, object] | None = None,
+        *,
+        on_page: Callable[[SearchPage], Awaitable[None]] | None = None,
+    ) -> QueryResult:
+        """Read one GAQL query to its last page, or until its page token proves ignored.
+
+        Renders ``QUERIES[query_id].render(**scope)``, sends the first page with
+        ``page_token=None`` and, while a page returns a ``nextPageToken``, sends it back at once.
+        A follow-up page that repeats a row of page 1 or of the page before it, or that carries
+        a token but no row, shows the relay ignored the token: that page is discarded, the
+        token abandoned and the result reported capped, and the client learns that this relay
+        ignores tokens (:attr:`page_tokens_ignored`), after which a returned token is not
+        followed at all. The rows of a query that fails are discarded by the caller, who
+        re-reads the whole query, because page tokens expire. Completeness of a capped result
+        is the caller's to establish, through ``partition.PartitionedFetcher.partitioned_fetch``.
+
+        Args:
+            query_id: A key of :data:`~ads_engine.connectors.google_n8n.queries.QUERIES`, such
+                as ``"Q-G2"``.
+            scope: Narrowing values for the template's ``render``, keyed by the scope-key
+                constants of ``queries.py`` (``last_id``, ``ids``, ``start``, ``end``, id
+                ranges); ``None`` for none.
+            on_page: When given, each kept page (validated, and for a follow-up page proven to
+                advance) is awaited into it as soon as it is read, in page order, instead of
+                being accumulated, so a long query never holds more than one page; the result's
+                ``rows`` is then empty. An error it raises propagates unchanged and stops the
+                query.
+
+        Returns:
+            Every row kept in page order (none with ``on_page``), the pages kept, the POST
+            attempts made and whether the result may be truncated.
+
+        Raises:
+            AccessDenied: As :meth:`search_page`, unchanged.
+            TransientError: As :meth:`search_page`, unchanged.
+            CallBudgetExhausted: As :meth:`search_page`, unchanged.
+            QueryDefect: As :meth:`search_page`; also when a page token is returned twice in
+                one query, or the query runs past 1,000 pages.
+            ValueError: When ``query_id`` is unknown or ``scope`` is invalid for its template;
+                nothing is sent.
+        """
+        query, context = _prepare(query_id, scope)
+        rows: list[GoogleAdsRow] = []
+        pages = 0
+        last_capped = False
+        async with aclosing(self._pages(query, context)) as stream:
+            async for page in stream:
+                pages += 1
+                last_capped = page.capped
+                if on_page is None:
+                    rows.extend(page.rows)
+                else:
+                    await on_page(page)
+        return QueryResult(
+            query_id=context.query_id,
+            rows=tuple(rows),
+            pages=pages,
+            calls=context.attempts,
+            capped=last_capped or context.abandoned,
+            token_abandoned=context.abandoned,
+        )
+
+    async def search(
+        self, query_id: str, scope: Mapping[str, object] | None = None
+    ) -> AsyncIterator[GoogleAdsRow]:
+        """Stream the rows of one GAQL query, page by page.
+
+        The same paging loop as :meth:`run_query`, yielding each page's rows as soon as the page
+        is validated. It does not partition and reports no completeness: when a page token is
+        abandoned because the relay ignores it, the stream ends quietly after the last page
+        kept, and rows beyond it are never read.
+        ``partition.PartitionedFetcher.partitioned_fetch`` is the completeness-aware entry point
+        that ``sync`` uses. Validation and the first call happen on the first iteration.
+
+        Args:
+            query_id: A key of :data:`~ads_engine.connectors.google_n8n.queries.QUERIES`.
+            scope: Narrowing values for the template's ``render``; ``None`` for none.
+
+        Yields:
+            Each REST ``GoogleAdsRow``, in page order.
+
+        Raises:
+            AccessDenied: As :meth:`run_query`.
+            TransientError: As :meth:`run_query`.
+            CallBudgetExhausted: As :meth:`run_query`.
+            QueryDefect: As :meth:`run_query`.
+            ValueError: As :meth:`run_query`.
+        """
+        query, context = _prepare(query_id, scope)
+        async with aclosing(self._pages(query, context)) as stream:
+            async for page in stream:
+                for row in page.rows:
+                    yield row
+
+    async def _pages(self, query: str, context: _CallContext) -> AsyncGenerator[SearchPage]:
+        """Yield every page of ``query``, following each returned token while it advances.
+
+        A page's token is checked before the page is yielded, so a relay that repeats a token
+        fails the query before any row of the looping page is handed out; the 1,000-page cap
+        and that check come first. A follow-up page (one requested with a token) then has to
+        advance: pages of one ``googleAds:search`` result are disjoint and every Q-G* row is
+        unique, so a follow-up page holding a row of page 1 or of the page before it, or one
+        that carries a token but no row, shows the relay re-ran the query instead of resuming
+        it. Such a page is discarded (never yielded), the loop stops with the query marked
+        abandoned, and the client learns that the relay ignores tokens. While it knows that, a
+        page that carries a token is yielded but its token is not followed. Only the row
+        fingerprints of page 1 and of the previous page are kept, so the check is bounded.
+
+        Args:
+            query: The rendered GAQL text.
+            context: The query's bookkeeping; ``page`` is set to each page's ordinal and
+                ``abandoned`` once a returned token is not followed to its end.
+
+        Yields:
+            Each validated page, the first included.
+
+        Raises:
+            QueryDefect: When a token repeats or the query runs past 1,000 pages, besides every
+                error of :meth:`search_page`.
+        """
+        seen_tokens: set[str] = set()
+        page_token: str | None = None
+        page_number = 0
+        first_prints: frozenset[bytes] = frozenset()
+        previous_prints: frozenset[bytes] = frozenset()
+        while True:
+            if page_number >= _MAX_PAGES_PER_QUERY:
+                raise _defect(
+                    f"query returned page tokens beyond {_MAX_PAGES_PER_QUERY} pages",
+                    query_id=context.query_id,
+                    http_status=None,
+                )
+            page_number += 1
+            context.page = page_number
+            page = await self._fetch_page(query, page_token, context)
+            next_token = page.next_page_token
+            if next_token is not None:
+                if next_token in seen_tokens:
+                    raise _defect(
+                        "page token repeated", query_id=context.query_id, http_status=None
+                    )
+                seen_tokens.add(next_token)
+            if page_token is None:
+                # Page 1: its fingerprints are needed only when its token will be followed.
+                if next_token is not None and not self._page_tokens_ignored:
+                    first_prints = previous_prints = frozenset(_fingerprints(page.rows))
+            else:
+                prints = _fingerprints(page.rows)
+                repeated = sum(
+                    1 for digest in prints if digest in first_prints or digest in previous_prints
+                )
+                if repeated or (next_token is not None and not page.rows):
+                    self._abandon_ignored_token(context, rows=len(page.rows), repeated=repeated)
+                    return
+                previous_prints = frozenset(prints)
+            yield page
+            if next_token is None:
+                return
+            if self._page_tokens_ignored:
+                context.abandoned = True
+                log.info(
+                    "google.page_token_not_followed",
+                    source=_SOURCE,
+                    query_id=context.query_id,
+                    page=page_number,
+                    rows=len(page.rows),
+                    calls_made=self._calls_made,
+                )
+                return
+            page_token = next_token
+
+    def _abandon_ignored_token(self, context: _CallContext, *, rows: int, repeated: int) -> None:
+        """Record a follow-up page whose token did not advance, and learn it for the client.
+
+        Logs ``google.page_token_ignored`` at warning level with the source, the query id, the
+        discarded page's ordinal and row count, how many of its rows repeated an earlier page,
+        and the client's call count; never the token, which is a credential-like cursor.
+        """
+        context.abandoned = True
+        self._page_tokens_ignored = True
+        log.warning(
+            "google.page_token_ignored",
+            source=_SOURCE,
+            query_id=context.query_id,
+            page=context.page,
+            rows=rows,
+            repeated=repeated,
+            calls_made=self._calls_made,
+        )
+
+
+# ---------------------------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------------------------
+
+
+def _prepare(query_id: str, scope: Mapping[str, object] | None) -> tuple[str, _CallContext]:
+    """Render the template of ``query_id`` for ``scope`` and open the query's bookkeeping.
+
+    The bookkeeping's expected projection is the template's own ``select`` list, the fields the
+    rendered text requests, as camelCase REST paths.
+
+    Raises:
+        ValueError: When ``query_id`` is not a template id or ``scope`` fails its ``render``.
+    """
+    try:
+        template = QUERIES[query_id]
+    except KeyError:
+        # Echo the id only when it looks like one: a caller passing GAQL text by mistake must
+        # not put that text, and the id lists it can carry, into an error message.
+        shown = repr(query_id) if _QUERY_ID_RE.fullmatch(query_id) else "(not an identifier)"
+        raise ValueError(
+            f"unknown Google Ads query id {shown}; expected one of {', '.join(QUERIES)}"
+        ) from None
+    narrowing: Mapping[str, object] = scope if scope is not None else {}
+    query = template.render(**narrowing)
+    return query, _CallContext(
+        query_id=template.query_id,
+        page=None,
+        selected=_selected_paths(template.select),
+        ids_count=_ids_count(narrowing),
+    )
+
+
+def _selected_paths(fields: Iterable[str]) -> frozenset[str]:
+    """Return the camelCase REST paths of snake_case GAQL ``fields``, as ``fieldMask`` names them.
+
+    ``campaign_budget.amount_micros`` becomes ``campaignBudget.amountMicros``.
+
+    Raises:
+        ValueError: When a field is not dot-separated lowercase snake_case segments; the field
+            is not echoed.
+    """
+    return frozenset(".".join(rest_path(name)) for name in fields)
+
+
+def _selected_in_text(query: str) -> frozenset[str]:
+    """Return the projection GAQL text requests: the camelCase paths of its ``SELECT`` list.
+
+    The list is everything between the leading ``SELECT`` and the first ``FROM``, keywords in
+    any case, split on commas; each stripped entry must be a GAQL field name.
+
+    Raises:
+        ValueError: When the text has no ``SELECT <fields> FROM <resource>`` start, or an entry
+            of the list is empty or not a GAQL field name. The message never quotes the text,
+            which can carry id lists.
+    """
+    match = _SELECT_LIST_RE.match(query)
+    if match is None:
+        raise ValueError(
+            "query must be GAQL starting with SELECT <fields> FROM <resource>; no SELECT list "
+            "could be read from it"
+        )
+    try:
+        return _selected_paths(entry.strip() for entry in match.group("fields").split(","))
+    except ValueError:
+        raise ValueError(
+            "query's SELECT list must name GAQL fields, dot-separated lowercase snake_case "
+            "segments separated by commas"
+        ) from None
+
+
+def _fingerprints(rows: Sequence[GoogleAdsRow]) -> list[bytes]:
+    """Return a 16-byte BLAKE2b fingerprint of each row, in order.
+
+    A row is serialised canonically (keys sorted, no whitespace, non-ASCII kept), so two rows
+    share a fingerprint exactly when they hold the same values. Decimal numbers, which the
+    JSON decoder returns for every non-integer value, are serialised as their text.
+    """
+    return [
+        hashlib.blake2b(
+            json.dumps(
+                row, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str
+            ).encode("utf-8"),
+            digest_size=_FINGERPRINT_BYTES,
+        ).digest()
+        for row in rows
+    ]
+
+
+def _ids_count(scope: Mapping[str, object]) -> int | None:
+    """Return the length of the scope's ``IN`` id list, or ``None`` without one."""
+    ids = scope.get(IDS)
+    if isinstance(ids, Collection) and not isinstance(ids, str | bytes):
+        return len(ids)
+    return None
+
+
+def _defect(message: str, *, query_id: str, http_status: int | None) -> QueryDefect:
+    """Build the validation ``QueryDefect`` of a call labelled ``query_id``, and log it.
+
+    ``send_json`` logs the errors it raises; envelope and paging defects are raised here, after
+    it returned, so they are logged here, with the same sanitised fields.
+    """
+    defect = QueryDefect(
+        message,
+        source=_SOURCE,
+        endpoint=f"{_SURFACE} {query_id}",
+        code="validation",
+        http_status=http_status,
+        query_id=query_id,
+    )
+    log.warning("google.search_rejected", **defect.log_fields)
+    return defect
+
+
+def _read_envelope(
+    body: object, *, query_id: str, http_status: int, selected: frozenset[str]
+) -> tuple[SearchPage, int | None]:
+    """Validate a webhook response body and turn it into a page.
+
+    ``send_json`` has already raised for every error body it recognises, so what reaches this
+    function is either a result envelope or something unrecognised. An unrecognised body is a
+    defect, never an empty page: an empty Q-G2 page would let ``sync`` infer false removals.
+
+    A present ``fieldMask`` must list exactly the ``selected`` paths. Google omits a zero or
+    unset field from a row, and the parser reads such an omitted metric as zero, which is only
+    true when the response carries the requested projection; a wrong or truncated mask would
+    otherwise turn missing metrics into zero-valued facts. Rows are not compared with the mask,
+    because a row legitimately omits its zero-valued fields.
+
+    Args:
+        body: The decoded JSON body, possibly n8n's one-element array wrapping the envelope.
+        query_id: The template id, for errors.
+        http_status: The accepted HTTP status, for errors.
+        selected: The camelCase paths the query selected, which a ``fieldMask`` must list.
+
+    Returns:
+        The page, and the ``queryResourceConsumption`` units (``None`` when absent or not an
+        int64), which are only logged.
+
+    Raises:
+        QueryDefect: With code ``validation`` when the body is not a JSON object, carries
+            neither ``results`` nor ``fieldMask``, has ``results`` that is not a list of objects
+            or holds more than 10,000 rows, has a ``fieldMask`` or ``nextPageToken`` that is
+            not a string, or has a ``fieldMask`` that is not exactly ``selected``: an empty
+            entry (an empty-string mask included), a selected path missing, or an unselected
+            path. A ``null`` value counts as absent.
+    """
+    envelope = unwrap_single_item(body)
+    if not isinstance(envelope, Mapping):
+        raise _defect(
+            "webhook response is not a JSON object", query_id=query_id, http_status=http_status
+        )
+    raw_results = envelope.get("results")
+    raw_mask = envelope.get("fieldMask")
+    if raw_results is None and raw_mask is None:
+        raise _defect(
+            "webhook response carries neither results nor fieldMask",
+            query_id=query_id,
+            http_status=http_status,
+        )
+    if raw_mask is not None and not isinstance(raw_mask, str):
+        raise _defect(
+            "webhook response fieldMask is not a string", query_id=query_id, http_status=http_status
+        )
+    if isinstance(raw_mask, str):
+        _check_field_mask(raw_mask, selected, query_id=query_id, http_status=http_status)
+    rows: list[GoogleAdsRow] = []
+    if raw_results is not None:
+        if not isinstance(raw_results, list):
+            raise _defect(
+                "webhook response results is not a JSON array",
+                query_id=query_id,
+                http_status=http_status,
+            )
+        if len(raw_results) > PAGE_SIZE:
+            raise _defect(
+                f"webhook response holds {len(raw_results)} rows, more than the "
+                f"{PAGE_SIZE}-row page size",
+                query_id=query_id,
+                http_status=http_status,
+            )
+        for index, row in enumerate(raw_results):
+            if not isinstance(row, dict):
+                raise _defect(
+                    f"webhook response results[{index}] is not a JSON object",
+                    query_id=query_id,
+                    http_status=http_status,
+                )
+            rows.append(row)
+    raw_token = envelope.get("nextPageToken")
+    if raw_token is not None and not isinstance(raw_token, str):
+        raise _defect(
+            "webhook response nextPageToken is not a string",
+            query_id=query_id,
+            http_status=http_status,
+        )
+    page = SearchPage(rows=tuple(rows), next_page_token=raw_token or None, field_mask=raw_mask)
+    return page, _resource_units(envelope.get("queryResourceConsumption"))
+
+
+def _check_field_mask(
+    mask: str, selected: frozenset[str], *, query_id: str, http_status: int
+) -> None:
+    """Require ``mask`` to list exactly the ``selected`` paths, in any order.
+
+    The mask is split on commas and each entry stripped. The error names the selected paths
+    that are missing, which are the product's own field names, and only counts the empty and
+    unselected entries: the relay's text never reaches the message or the log.
+
+    Raises:
+        QueryDefect: With code ``validation`` when an entry is empty, a selected path is
+            missing, or an entry is not a selected path.
+    """
+    entries = [entry.strip() for entry in mask.split(",")]
+    returned = {entry for entry in entries if entry}
+    missing = sorted(selected - returned)
+    empty = sum(1 for entry in entries if not entry)
+    unexpected = sum(1 for entry in entries if entry and entry not in selected)
+    if not missing and not empty and not unexpected:
+        return
+    problems: list[str] = []
+    if missing:
+        shown = ", ".join(missing[:_MASK_PATHS_SHOWN])
+        more = len(missing) - _MASK_PATHS_SHOWN
+        problems.append(
+            f"{len(missing)} of {len(selected)} selected fields missing ({shown}"
+            + (f" and {more} more)" if more > 0 else ")")
+        )
+    if unexpected:
+        problems.append(f"{unexpected} unselected {_plural(unexpected, 'entry', 'entries')}")
+    if empty:
+        problems.append(f"{empty} empty {_plural(empty, 'entry', 'entries')}")
+    raise _defect(
+        "webhook response fieldMask does not list exactly the selected fields: "
+        + "; ".join(problems),
+        query_id=query_id,
+        http_status=http_status,
+    )
+
+
+def _plural(count: int, singular: str, plural: str) -> str:
+    return singular if count == 1 else plural
+
+
+def _resource_units(value: object) -> int | None:
+    """Read ``queryResourceConsumption``: an int64 as a decimal string or a JSON integer."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and _INT64_TEXT_RE.fullmatch(value):
+        return int(value)
+    return None
+
+
+def _checked_query_id(query_id: str) -> str:
+    """Return ``query_id`` when it is a short identifier such as ``Q-G2``.
+
+    Raises:
+        ValueError: Otherwise; the value is not echoed, because it could be GAQL text.
+    """
+    if _QUERY_ID_RE.fullmatch(query_id) is None:
+        raise ValueError(
+            "query_id must be a short identifier such as 'Q-G2' (letters, digits, '_', '.', "
+            "'-'; at most 64 characters), never GAQL text"
+        )
+    return query_id
+
+
+def _checked_customer_id(customer_id: str) -> str:
+    """Return ``customer_id`` when it is exactly 10 ASCII digits.
+
+    Raises:
+        ValueError: Otherwise; the value is not echoed.
+    """
+    if _CUSTOMER_ID_RE.fullmatch(customer_id) is None:
+        raise ValueError("customer_id must be exactly 10 digits with no dashes")
+    return customer_id
+
+
+def _checked_webhook_url(webhook_url: str) -> str:
+    """Return the stripped ``webhook_url`` when it is an absolute ``http(s)`` URL with a host.
+
+    Raises:
+        ValueError: Otherwise. The message never contains the URL, and the parser's own error,
+            which could quote part of it, is suppressed rather than chained.
+    """
+    message = "webhook_url must be an absolute http:// or https:// URL with a host"
+    candidate = webhook_url.strip()
+    if not candidate or any(char.isspace() or not char.isprintable() for char in candidate):
+        raise ValueError(message)
+    try:
+        parts = urlsplit(candidate)
+        port = parts.port  # reading .port raises ValueError for a malformed port
+        httpx.URL(candidate)
+    except ValueError, httpx.InvalidURL:
+        raise ValueError(message) from None
+    if parts.scheme not in _HTTP_SCHEMES or not parts.hostname or port == 0:
+        raise ValueError(message)
+    return candidate
+
+
+def _checked_secret_header(secret_header: str) -> str:
+    """Return the stripped header name when it is a token the request does not set itself.
+
+    Raises:
+        ValueError: When the name has characters outside the RFC 7230 token set, or is one of
+            ``Content-Type``, ``Content-Length``, ``Transfer-Encoding``, ``Host`` or
+            ``Connection`` (in any case).
+    """
+    name = secret_header.strip()
+    if _HEADER_TOKEN_RE.fullmatch(name) is None:
+        raise ValueError(
+            "secret_header must be an HTTP header name made of RFC 7230 token characters, "
+            "such as X-Webhook-Secret"
+        )
+    if name.lower() in _RESERVED_HEADERS:
+        raise ValueError(
+            "secret_header must not be Content-Type, Content-Length, Transfer-Encoding, Host "
+            "or Connection, which the request itself sets"
+        )
+    return name
+
+
+def _checked_secret(secret: SecretStr) -> SecretStr:
+    """Return ``secret`` when its value can be sent unchanged as a header value.
+
+    Raises:
+        ValueError: When the value is empty, holds a control or non-ASCII character, or starts
+            or ends with whitespace. The value is never echoed.
+    """
+    if _SECRET_VALUE_RE.fullmatch(secret.get_secret_value()) is None:
+        raise ValueError(
+            "secret must be non-empty visible ASCII text without control characters or "
+            "surrounding whitespace"
+        )
+    return secret

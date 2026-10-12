@@ -1,0 +1,38 @@
+{
+  "request": {
+    "body": {
+      "customer_id": "9900000001",
+      "page_token": null,
+      "query": "SELECT customer.id, customer.descriptive_name, customer.currency_code, customer.time_zone FROM customer"
+    },
+    "headers": {
+      "Content-Type": "application/json",
+      "X-Webhook-Secret": "<redacted>"
+    },
+    "method": "POST",
+    "query": [],
+    "url": "https://n8n.sim.invalid/webhook/google-ads"
+  },
+  "response": {
+    "body": {
+      "fieldMask": "customer.id,customer.descriptiveName,customer.currencyCode,customer.timeZone",
+      "queryResourceConsumption": "1",
+      "results": [
+        {
+          "customer": {
+            "currencyCode": "USD",
+            "descriptiveName": "Simulated Ads - Google",
+            "id": "9900000001",
+            "resourceName": "customers/9900000001",
+            "timeZone": "America/New_York"
+          }
+        }
+      ]
+    },
+    "status": 200
+  },
+  "scenario": "default",
+  "seed": 42,
+  "source": "google",
+  "surface": "google.search"
+}

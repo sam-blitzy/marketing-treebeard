@@ -1,0 +1,68 @@
+{
+  "request": {
+    "body": {
+      "customer_id": "9900000001",
+      "page_token": null,
+      "query": "SELECT conversion_action.id, conversion_action.name, conversion_action.status, conversion_action.include_in_conversions_metric, conversion_action.counting_type, conversion_action.attribution_model_settings.attribution_model FROM conversion_action"
+    },
+    "headers": {
+      "Content-Type": "application/json",
+      "X-Webhook-Secret": "<redacted>"
+    },
+    "method": "POST",
+    "query": [],
+    "url": "https://n8n.sim.invalid/webhook/google-ads"
+  },
+  "response": {
+    "body": {
+      "fieldMask": "conversionAction.id,conversionAction.name,conversionAction.status,conversionAction.includeInConversionsMetric,conversionAction.countingType,conversionAction.attributionModelSettings.attributionModel",
+      "queryResourceConsumption": "1",
+      "results": [
+        {
+          "conversionAction": {
+            "attributionModelSettings": {
+              "attributionModel": "GOOGLE_ADS_LAST_CLICK"
+            },
+            "countingType": "ONE_PER_CLICK",
+            "id": "990400000000",
+            "includeInConversionsMetric": true,
+            "name": "Demo request",
+            "resourceName": "customers/9900000001/conversionActions/990400000000",
+            "status": "ENABLED"
+          }
+        },
+        {
+          "conversionAction": {
+            "attributionModelSettings": {
+              "attributionModel": "GOOGLE_SEARCH_ATTRIBUTION_DATA_DRIVEN"
+            },
+            "countingType": "MANY_PER_CLICK",
+            "id": "990400000001",
+            "includeInConversionsMetric": false,
+            "name": "Newsletter signup",
+            "resourceName": "customers/9900000001/conversionActions/990400000001",
+            "status": "ENABLED"
+          }
+        },
+        {
+          "conversionAction": {
+            "attributionModelSettings": {
+              "attributionModel": "GOOGLE_ADS_LAST_CLICK"
+            },
+            "countingType": "ONE_PER_CLICK",
+            "id": "990400000002",
+            "includeInConversionsMetric": true,
+            "name": "Legacy form",
+            "resourceName": "customers/9900000001/conversionActions/990400000002",
+            "status": "REMOVED"
+          }
+        }
+      ]
+    },
+    "status": 200
+  },
+  "scenario": "default",
+  "seed": 42,
+  "source": "google",
+  "surface": "google.search"
+}

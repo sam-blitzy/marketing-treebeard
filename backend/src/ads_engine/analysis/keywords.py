@@ -1,0 +1,2540 @@
+"""Rules K1, K2 and K3: the Keywords to adjust section (Google).
+
+AAP 0.5.4.3, 0.2.4 and FR-4, after the user's directives:
+
+* **K1 Block / negative candidate** (group ``block``): "Search terms that have spent money with
+  no conversions → flagged as block/negative-keyword candidates, with spend-wasted shown".
+* **K2 Expansion candidate** (group ``expand``): "Terms that are converting well → flagged as
+  expansion candidates, with suggested adjacent/related terms to try".
+* **K3 Review** (group ``review``): "Keywords with declining quality score or rising
+  cost-per-click without a matching rise in conversion → flagged for review".
+
+Every item shows, in this order, the term (or keyword text), spend, conversions and
+cost/conversion ("—" when conversions are 0), with its campaign and ad group in
+``evidence.extra``, and a reason sentence rendered from a per-rule template that reads only the
+item's own evidence, so the text can never drift from the numbers (AAP 0.5.4).
+
+The section also carries one ``search_term_coverage`` finding per Google account: search-term
+spend divided by keyword spend over the window. Google withholds low-volume search terms for
+privacy, so search-term totals fall below keyword totals; below
+``keywords.min_search_term_coverage`` every K1, K2 and K3 item of the account carries the
+``search_term_coverage`` flag.
+
+Every K1, K2 and K3 item is a Google item, so without the verified Google-to-CRM link it also
+carries ``no_crm_link``, after its other flags (AAP 0.3.3, 0.5.4.1). The gap is decided once
+per run by :func:`~ads_engine.analysis.context.google_link_gap`, the same definition every
+Google item reads. The section emits no ``no_crm_link`` finding: AAP 0.5.4.3 defines its
+section finding as search-term coverage, and the ``no_crm_link`` finding belongs to the
+Campaigns and Budget sections.
+
+Adjacent terms (K2) come from the account's own search-term report, because Google's Keyword
+Planner is not reachable through the n8n webhook (AAP 0.2.4, 0.7.2), and are labelled so.
+
+Arithmetic (decision 6): every threshold comparison is exact, on :class:`fractions.Fraction`
+values built from the stored ``Decimal`` amounts, so decimal rounding can neither create nor
+hide an item. Evidence shows ``Decimal`` display values: money at the currency's minor unit,
+ratios to four places, rates to four significant digits and quality-score means to two places.
+Conversions are decimals throughout: data-driven attribution makes them fractional.
+
+Displayed gate values never contradict the comparison they report. A reason cites a gate that
+scales a baseline by a configured multiple other than 1 at the scaled value stored in evidence
+(K1's ``min_spend`` floor, K2's ``max_cost_per_conversion``), never as that multiple of a
+rounded baseline, and money rounds half up, monotonically, on both sides of the comparison.
+Search-term coverage shows ``keywords.min_search_term_coverage`` exactly as configured, and the
+share (four places) and percentage (one place) gain places only where fewer would put them on
+the other side of it. Counts take a singular noun only at exactly 1 ("1 click", "1 day").
+
+Purity: no database, network, settings or logging access. The module imports only the rule
+contract (``context``), pure helpers of ``metrics``, the text primitives of ``text``, the
+``Thresholds`` type and the pure ISO 4217 money helpers of ``ads_engine.decisions``
+(``minor_unit_exponent``, the unit decisions are validated to and every rule renders money at,
+and ``round_to_minor_unit``, the half-up rounding every rule renders money with); it never
+imports ``precedence`` or ``runner``. Every threshold is read from ``ctx.thresholds``
+and copied into ``evidence.thresholds``.
+
+Example:
+    >>> from decimal import Decimal
+    >>> k1_min_clicks(Decimal("0.01"), floor=10, rule_of_three=3)
+    300
+    >>> k1_min_clicks(Decimal("1.4"), floor=10, rule_of_three=3)
+    10
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from decimal import ROUND_05UP, ROUND_HALF_EVEN, Context, Decimal
+from fractions import Fraction
+from typing import Any, Final, Literal
+
+from ads_engine.analysis.context import (
+    ENTITY_ACCOUNT,
+    ENTITY_KEYWORD,
+    ENTITY_SEARCH_TERM,
+    FINDING_K1_NO_BASELINE,
+    FINDING_SEARCH_TERM_COVERAGE,
+    FLAG_INCOMPLETE,
+    FLAG_SEARCH_TERM_COVERAGE,
+    GROUP_BLOCK,
+    GROUP_EXPAND,
+    GROUP_REVIEW,
+    K1,
+    K2,
+    K3,
+    KEYWORDS,
+    AnalysisContext,
+    Baseline,
+    CampaignInfo,
+    Candidate,
+    DecisionSubject,
+    EntityRef,
+    Evidence,
+    Finding,
+    Flag,
+    KeywordDay,
+    KeywordInfo,
+    Metric,
+    RateBaseline,
+    RuleResult,
+    Sample,
+    SearchTermRow,
+    Withheld,
+    google_link_gap,
+    keyword_external_id,
+    no_crm_link_flag,
+    search_term_external_id,
+)
+from ads_engine.analysis.metrics import Totals, window_totals
+from ads_engine.analysis.text import TermIndex, tokenize
+from ads_engine.analysis.thresholds import Thresholds
+from ads_engine.decisions import minor_unit_exponent, round_to_minor_unit
+
+__all__ = [
+    "ADJACENT_TERMS_LABEL",
+    "COVERAGE_THRESHOLD_KEY",
+    "K1_ACTION",
+    "K1_DATASETS",
+    "K1_STATUSES",
+    "K1_THRESHOLD_KEYS",
+    "K2_ACTION_TEMPLATE",
+    "K2_DATASETS",
+    "K2_THRESHOLD_KEYS",
+    "K3_ACTION",
+    "K3_DATASETS",
+    "K3_THRESHOLD_KEYS",
+    "MIN_CLICKS_LABEL",
+    "SECTION_DATASETS",
+    "evaluate",
+    "k1_min_clicks",
+]
+
+# ---------------------------------------------------------------------------
+# Rule constants: actions, labels, datasets and threshold keys
+# ---------------------------------------------------------------------------
+
+K1_ACTION: Final = "Add as exact-match negative"
+"""K1's action: always a block candidate; K1 never recommends pausing a keyword."""
+
+K2_ACTION_TEMPLATE: Final = "Add as phrase-match keyword in {ad_group}"
+"""K2's action, filled with the term's ad group name."""
+
+K3_ACTION: Final = "Review keyword: bid, match type or landing page"
+"""K3's action."""
+
+MIN_CLICKS_LABEL: Final = "Minimum clicks for the account's conversion rate"
+"""Label of K1's click gate n*: a heuristic on the rule-of-three scale; no statistical claim."""
+
+ADJACENT_TERMS_LABEL: Final = "from your search-term report"
+"""Label of K2's adjacent terms: Keyword Planner is unreachable through the n8n webhook."""
+
+K1_STATUSES: Final[frozenset[str]] = frozenset({"NONE", "ADDED"})
+"""Search-term statuses K1 evaluates; ``EXCLUDED`` and ``ADDED_EXCLUDED`` are already blocked."""
+
+_K2_STATUSES: Final[frozenset[str]] = frozenset({"NONE"})
+"""K2 evaluates terms that are neither keywords nor excluded."""
+
+_EXCLUDED_STATUSES: Final[frozenset[str]] = frozenset({"EXCLUDED", "ADDED_EXCLUDED"})
+"""Statuses that never qualify as an adjacent term."""
+
+K1_DATASETS: Final[tuple[str, ...]] = ("google.search_terms", "google.metrics_daily")
+"""The datasets K1 reads; its items' ``stale`` and ``incomplete`` flags derive from them."""
+
+K2_DATASETS: Final[tuple[str, ...]] = (
+    "google.search_terms",
+    "google.metrics_daily",
+    "google.entities",
+)
+"""The datasets K2 reads: search terms and their adjacent terms, campaign daily facts for the
+campaign cost/conversion, and the Q-G7 keywords that adjacent terms must not already be."""
+
+K3_DATASETS: Final[tuple[str, ...]] = (
+    "google.metrics_daily",
+    "google.entities",
+    "google.search_terms",
+)
+"""The datasets K3 reads: keyword daily facts, the Q-G7 keyword snapshots, and search-term
+spend for the account's search-term coverage."""
+
+SECTION_DATASETS: Final[tuple[str, ...]] = tuple(
+    dict.fromkeys((*K1_DATASETS, *K2_DATASETS, *K3_DATASETS))
+)
+"""Every dataset the Keywords section reads: the union of K1's, K2's and K3's, first-seen order.
+
+Precedence judges these over the run's window when the section stores no item, so an empty
+section says which of its datasets do not cover the window (AAP 0.5.5 "Each section shows an
+EmptyState with the reason").
+"""
+
+COVERAGE_THRESHOLD_KEY: Final = "keywords.min_search_term_coverage"
+"""The share of keyword spend below which every keyword item carries ``search_term_coverage``."""
+
+K1_THRESHOLD_KEYS: Final[tuple[str, ...]] = (
+    "k1.baseline_days",
+    "k1.min_clicks_floor",
+    "k1.rule_of_three",
+    "k1.min_baseline_conversions",
+    "k1.min_spend_cpa_multiple",
+    COVERAGE_THRESHOLD_KEY,
+)
+"""Every threshold K1 applies, copied into each K1 item's ``evidence.thresholds``."""
+
+K2_THRESHOLD_KEYS: Final[tuple[str, ...]] = (
+    "k2.min_conversions",
+    "k2.max_cpa_ratio",
+    "k2.adjacent_jaccard",
+    "k2.adjacent_max_terms",
+    "k2.adjacent_min_clicks",
+    COVERAGE_THRESHOLD_KEY,
+)
+"""Every threshold K2 applies."""
+
+K3_THRESHOLD_KEYS: Final[tuple[str, ...]] = (
+    "k3.min_window_days",
+    "window.sustained_min_days",
+    "k3.min_clicks_per_half",
+    "k3.qs_span_days",
+    "k3.min_qs_days_per_span",
+    "k3.qs_drop",
+    "k3.rise_ratio",
+    "k3.min_first_half_conversions",
+    COVERAGE_THRESHOLD_KEY,
+)
+"""Every threshold K3 applies."""
+
+_GOOGLE: Final = "google"
+
+# ---------------------------------------------------------------------------
+# Exact arithmetic and display values
+# ---------------------------------------------------------------------------
+
+_WIDE: Final = Context(prec=60, rounding=ROUND_HALF_EVEN)
+"""Wide enough that converting and quantizing any stored amount or ratio is exact or correctly
+rounded, independent of the caller's decimal context."""
+
+_STICKY: Final = Context(prec=60, rounding=ROUND_05UP)
+"""Converts a money ``Fraction`` for :func:`ads_engine.decisions.round_to_minor_unit` without
+losing a digit that rounding reads: an inexact quotient keeps a last digit other than 0 and 5
+(``ROUND_05UP``), so it never reads as a tie or as an exact amount it is not."""
+
+_RATIO_PLACES: Final = 4
+"""Decimal places of a displayed ratio (CPC ratio, cost/conversion ratio, coverage share)."""
+
+_MEAN_PLACES: Final = 2
+"""Decimal places of a displayed quality-score mean."""
+
+_RATE_DIGITS: Final = 4
+"""Significant digits of the displayed K1 baseline rate (conversions per click)."""
+
+_PERCENT_PLACES: Final = 1
+"""Decimal places of a displayed percentage."""
+
+_DASH: Final = "—"
+"""A cost/conversion whose known conversion count is 0 (AAP 0.5.4.3, 0.5.5): a zero denominator,
+never a finite value and never "unavailable", which is reserved for unreported conversions."""
+
+
+def _exact(value: Decimal | int) -> Fraction:
+    return Fraction(value)
+
+
+def _to_decimal(value: Fraction | Decimal | int) -> Decimal:
+    """Return ``value`` as a ``Decimal``, correctly rounded at 60 significant digits."""
+    if isinstance(value, Fraction):
+        return _WIDE.divide(Decimal(value.numerator), Decimal(value.denominator))
+    return Decimal(value)
+
+
+def _plain(value: Decimal) -> Decimal:
+    """Strip trailing zeros without exponent notation: ``3.000000`` → ``3``, ``300`` → ``300``."""
+    normalized = value.normalize(_WIDE)
+    exponent = normalized.as_tuple().exponent
+    if isinstance(exponent, int) and exponent > 0:
+        return normalized.quantize(Decimal(1), context=_WIDE)
+    return normalized
+
+
+def _round(value: Fraction | Decimal | int, places: int) -> Decimal:
+    """Round ``value`` half-even to ``places`` decimal places."""
+    return _to_decimal(value).quantize(Decimal(1).scaleb(-places), context=_WIDE)
+
+
+def _money(value: Fraction | Decimal | int, currency: str) -> Decimal:
+    """Return a money value at the currency's minor unit: ``Decimal("61")`` → ``61.00`` (USD).
+
+    The minor unit is ISO 4217's, from :func:`ads_engine.decisions.minor_unit_exponent`, and
+    the rounding is :func:`ads_engine.decisions.round_to_minor_unit`'s, half up (a tie rounds
+    away from zero): the one rule decisions are validated to and every rule and the web client
+    render money with, so an amount reads alike on a keyword card and on every other card.
+    Ratios, means, rates and shares keep their half-even rounding (:func:`_round`).
+
+    The tie is decided on the exact amount. A ``Decimal`` or ``int`` is passed as it is. A
+    ``Fraction`` is first divided out to one place past the minor unit under :data:`_STICKY`:
+    exact when the quotient ends there, and otherwise off every tie and every exact amount, so
+    a quotient just below a tie still rounds down.
+
+    Example:
+        >>> _money(Decimal("89.225"), "USD"), _money(Fraction(-1, 8), "USD")
+        (Decimal('89.23'), Decimal('-0.13'))
+        >>> _money(Fraction(89_225, 1_000) - Fraction(1, 10**70), "USD")
+        Decimal('89.22')
+        >>> _money(Fraction(5, 2), "JPY"), _money(Fraction(2, 3), "KWD")
+        (Decimal('3'), Decimal('0.667'))
+
+    Raises:
+        decimal.InvalidOperation: When the amount does not fit 60 significant digits at one
+            place past its minor unit (a ``Fraction``) or at its minor unit (otherwise).
+        ValueError: When a ``Decimal`` amount is not finite.
+    """
+    if isinstance(value, Fraction):
+        quantum = Decimal(1).scaleb(-(minor_unit_exponent(currency) + 1))
+        quotient = _STICKY.divide(Decimal(value.numerator), Decimal(value.denominator))
+        return round_to_minor_unit(quotient.quantize(quantum, context=_STICKY), currency)
+    return round_to_minor_unit(Decimal(value), currency)
+
+
+def _ratio(value: Fraction) -> Decimal:
+    """Return a displayed ratio: four places, trailing zeros stripped (``6/5`` → ``1.2``)."""
+    return _plain(_round(value, _RATIO_PLACES))
+
+
+def _mean(value: Fraction) -> Decimal:
+    """Return a displayed quality-score mean: two places, trailing zeros stripped."""
+    return _plain(_round(value, _MEAN_PLACES))
+
+
+def _beside_minimum(value: Fraction, minimum: Decimal, places: int) -> Decimal:
+    """Return ``value`` for display beside the configured ``minimum`` it was compared with.
+
+    ``value`` is rounded half-even to ``places`` decimal places, and to one more place at a
+    time until the shown value sits on the same side of ``minimum`` as ``value`` itself
+    (``value < minimum`` exactly when ``shown < minimum``), so text that calls the value below
+    its minimum, or not below it, never shows figures that say otherwise. Trailing zeros are
+    stripped, as :func:`_ratio` strips them.
+
+    The places stop growing: a value off the minimum lands on its own side once half a unit of
+    the last place is smaller than the gap, and a value equal to ``minimum``, a finite decimal,
+    is shown exactly at the minimum's own places.
+
+    Example:
+        >>> _beside_minimum(Fraction(791, 1000), Decimal("0.8"), 1)
+        Decimal('0.79')
+        >>> _beside_minimum(Fraction(88465, 1000), Decimal("88.48"), 1)
+        Decimal('88.46')
+        >>> _beside_minimum(Fraction(566100, 7161), Decimal("80"), 1)
+        Decimal('79.1')
+    """
+    target = _exact(minimum)
+    below = value < target
+    shown = _round(value, places)
+    while (_exact(shown) < target) is not below:
+        places += 1
+        shown = _round(value, places)
+    return _plain(shown)
+
+
+def _significant(value: Fraction, digits: int = _RATE_DIGITS) -> Decimal:
+    """Return ``value`` to ``digits`` significant digits: ``280/5661`` → ``0.04946``."""
+    exact = _to_decimal(value)
+    if exact == 0:
+        return Decimal(0)
+    exponent = exact.adjusted() - (digits - 1)
+    return _plain(exact.quantize(Decimal(1).scaleb(exponent), context=_WIDE))
+
+
+def _count(value: Decimal) -> Decimal:
+    """Return a conversion count for display: exact, trailing zeros stripped (``0.3`` stays)."""
+    return _plain(value)
+
+
+def _money_text(value: Decimal, currency: str | None) -> str:
+    """Render money as ``"USD 1,234.50"``; the value is already at the minor unit."""
+    if currency is None:
+        return format(value, ",f")
+    places = minor_unit_exponent(currency)
+    return f"{currency} {value:,.{places}f}"
+
+
+def _number_text(value: Decimal | int) -> str:
+    """Render a count or ratio with thousands separators and no exponent: ``3000`` → ``3,000``."""
+    if isinstance(value, int):
+        return f"{value:,}"
+    return format(value, ",f")
+
+
+def _counted(value: Decimal | int, singular: str, plural: str) -> str:
+    """Render a count with the noun that agrees with it: ``1 click``, ``5,661 clicks``.
+
+    Only a count of exactly 1 takes ``singular``; 0, fractional counts such as ``0.5`` and every
+    other count take ``plural``. ``value`` is rendered as :func:`_number_text` renders it, so a
+    conversion count passes through :func:`_count` first.
+    """
+    return f"{_number_text(value)} {singular if value == 1 else plural}"
+
+
+def _render(metric: Metric) -> str:
+    """Render a metric value for a reason sentence: ``—`` for ``None``, money with currency."""
+    value = metric.value
+    if value is None:
+        return "—"
+    if isinstance(value, str):
+        return value
+    if metric.unit == "currency":
+        return _money_text(Decimal(value), metric.currency)
+    return _number_text(value)
+
+
+def _baseline(evidence: Evidence, key: str) -> Baseline:
+    """Return the evidence baseline with ``key``.
+
+    Raises:
+        KeyError: When no baseline has that key.
+    """
+    for item in evidence.baselines:
+        if item.key == key:
+            return item
+    raise KeyError(key)
+
+
+def _number(value: object) -> Decimal:
+    """Return an evidence value a reason cites as a ``Decimal``.
+
+    Raises:
+        TypeError: When the value is not a ``Decimal`` or ``int`` (a reason never cites an
+            unavailable figure as a number).
+    """
+    if isinstance(value, bool) or not isinstance(value, Decimal | int):
+        raise TypeError(f"a cited evidence number must be a Decimal or int, found {value!r}")
+    return Decimal(value)
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _Config:
+    """Every keyword threshold, read once per run from ``ctx.thresholds``.
+
+    Numeric thresholds are exact fractions for comparisons; the configured values themselves
+    reach evidence through ``ctx.make_evidence(threshold_keys=…)``.
+    """
+
+    min_coverage: Fraction
+    k1_baseline_days: int
+    k1_floor: int
+    k1_rule_of_three: Decimal
+    k1_min_baseline_conversions: Decimal
+    k1_spend_multiple: Decimal
+    k2_min_conversions: Fraction
+    k2_max_cpa_ratio: Fraction
+    k2_jaccard: Decimal
+    k2_max_terms: int
+    k2_min_clicks: int
+    k3_min_window_days: int
+    k3_min_clicks_per_half: int
+    k3_span_days: int
+    k3_min_qs_days: int
+    k3_qs_drop: Fraction
+    k3_rise_ratio: Fraction
+    k3_min_first_half_conversions: Fraction
+
+    @classmethod
+    def load(cls, thresholds: Thresholds) -> _Config:
+        """Read the keyword thresholds.
+
+        Raises:
+            ConfigError: When a key is missing or has the wrong kind; ``Thresholds.load``
+                already validates every key, so this only fails on a hand-built configuration.
+        """
+        return cls(
+            min_coverage=_exact(thresholds.ratio(COVERAGE_THRESHOLD_KEY)),
+            k1_baseline_days=thresholds.int("k1.baseline_days"),
+            k1_floor=thresholds.int("k1.min_clicks_floor"),
+            k1_rule_of_three=thresholds.decimal("k1.rule_of_three"),
+            k1_min_baseline_conversions=thresholds.decimal("k1.min_baseline_conversions"),
+            k1_spend_multiple=thresholds.ratio("k1.min_spend_cpa_multiple"),
+            k2_min_conversions=_exact(thresholds.decimal("k2.min_conversions")),
+            k2_max_cpa_ratio=_exact(thresholds.ratio("k2.max_cpa_ratio")),
+            k2_jaccard=thresholds.ratio("k2.adjacent_jaccard"),
+            k2_max_terms=thresholds.int("k2.adjacent_max_terms"),
+            k2_min_clicks=thresholds.int("k2.adjacent_min_clicks"),
+            k3_min_window_days=thresholds.int("k3.min_window_days"),
+            k3_min_clicks_per_half=thresholds.int("k3.min_clicks_per_half"),
+            k3_span_days=thresholds.int("k3.qs_span_days"),
+            k3_min_qs_days=thresholds.int("k3.min_qs_days_per_span"),
+            k3_qs_drop=_exact(thresholds.decimal("k3.qs_drop")),
+            k3_rise_ratio=_exact(thresholds.ratio("k3.rise_ratio")),
+            k3_min_first_half_conversions=_exact(
+                thresholds.decimal("k3.min_first_half_conversions")
+            ),
+        )
+
+
+# ---------------------------------------------------------------------------
+# K1's click gate
+# ---------------------------------------------------------------------------
+
+
+def _min_clicks_exact(rate: Fraction, floor: int, rule_of_three: Fraction) -> int:
+    """Return ``max(floor, ceil(rule_of_three / rate))`` on exact fractions."""
+    return max(floor, math.ceil(rule_of_three / rate))
+
+
+def k1_min_clicks(r: Decimal | Fraction, *, floor: int, rule_of_three: Decimal | int) -> int:
+    """Return K1's click gate n* = max(floor, ceil(rule_of_three ÷ r)), with no upper cap.
+
+    AAP 0.5.4.3 and 0.2.4 ("Spent with no conversions"). ``r`` is the account's conversions ÷
+    clicks over ``k1.baseline_days``: a rate, which can reach or exceed 1 when data-driven
+    attribution splits credit fractionally or ``MANY_PER_CLICK`` actions count several
+    conversions per click. The gate is a heuristic on the rule-of-three scale, labelled
+    :data:`MIN_CLICKS_LABEL`; it makes no statistical claim.
+
+    The quotient is computed exactly (``Decimal`` → ``Fraction``), so an exact integer quotient
+    is never pushed up by decimal rounding, and any ``r`` at or above ``rule_of_three ÷ floor``
+    (0.3 with the defaults, including ``r`` = 1 and 1.4) gives the floor without error.
+
+    Args:
+        r: The baseline rate, conversions per click; must be positive.
+        floor: ``k1.min_clicks_floor``, the gate's minimum (10).
+        rule_of_three: ``k1.rule_of_three``, the scale (3).
+
+    Returns:
+        The minimum clicks a zero-conversion term needs before K1 flags it.
+
+    Raises:
+        TypeError: When ``r`` or ``rule_of_three`` is not a ``Decimal``, ``Fraction`` or
+            ``int``, or ``floor`` is not an ``int`` (``bool`` and ``float`` are rejected).
+        ValueError: When ``r`` or ``rule_of_three`` is not a positive finite number, or
+            ``floor`` is negative.
+
+    Example:
+        >>> [k1_min_clicks(Decimal(r), floor=10, rule_of_three=3) for r in ("0.01", "0.001")]
+        [300, 3000]
+        >>> [k1_min_clicks(Decimal(r), floor=10, rule_of_three=3) for r in ("0.047", "1", "1.4")]
+        [64, 10, 10]
+    """
+    rate = _positive_fraction(r, "r")
+    scale = _positive_fraction(rule_of_three, "rule_of_three")
+    if isinstance(floor, bool) or not isinstance(floor, int):
+        raise TypeError(f"floor must be an int, found {floor!r}")
+    if floor < 0:
+        raise ValueError(f"floor must be >= 0, found {floor}")
+    return _min_clicks_exact(rate, floor, scale)
+
+
+def _positive_fraction(value: object, what: str) -> Fraction:
+    """Return a positive finite ``Decimal``, ``Fraction`` or ``int`` as an exact fraction.
+
+    Raises:
+        TypeError: For any other type (``bool`` and ``float`` included).
+        ValueError: When the value is not finite or not positive.
+    """
+    if isinstance(value, bool) or not isinstance(value, Decimal | Fraction | int):
+        raise TypeError(f"{what} must be a Decimal, Fraction or int, found {value!r}")
+    if isinstance(value, Decimal) and not value.is_finite():
+        raise ValueError(f"{what} must be finite, found {value}")
+    exact = Fraction(value)
+    if exact <= 0:
+        raise ValueError(f"{what} must be positive, found {value}")
+    return exact
+
+
+# ---------------------------------------------------------------------------
+# Google accounts and search-term coverage
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _Account:
+    """One Google account: its reference, currency and campaigns in the context."""
+
+    id: int
+    ref: EntityRef
+    currency: str
+    campaign_ids: tuple[int, ...]
+
+
+def _google_active(ctx: AnalysisContext) -> bool:
+    """Whether Google has an active dataset or campaigns in this run."""
+    return ctx.dataset(_GOOGLE) is not None or any(
+        campaign.source == _GOOGLE for campaign in ctx.campaigns.values()
+    )
+
+
+def _google_accounts(ctx: AnalysisContext) -> dict[int, _Account]:
+    """Return every Google account of the context, keyed by id, ascending.
+
+    An account is listed when ``ctx.accounts`` holds it or a Google campaign references it, so
+    a campaign whose account row is not loaded still has a currency (the campaign's own).
+    """
+    campaigns: dict[int, list[CampaignInfo]] = {}
+    for campaign in ctx.campaigns.values():
+        if campaign.source == _GOOGLE:
+            campaigns.setdefault(campaign.account_id, []).append(campaign)
+    ids = {info.id for info in ctx.accounts.values() if info.source == _GOOGLE} | set(campaigns)
+    accounts: dict[int, _Account] = {}
+    for account_id in sorted(ids):
+        members = sorted(campaigns.get(account_id, []), key=lambda item: item.id)
+        info = ctx.accounts.get(account_id)
+        if info is not None:
+            ref = EntityRef(_GOOGLE, ENTITY_ACCOUNT, info.id, info.external_id, info.name)
+            currency = info.currency
+        elif members:
+            ref = EntityRef(
+                _GOOGLE,
+                ENTITY_ACCOUNT,
+                account_id,
+                str(account_id),
+                f"Google account #{account_id}",
+            )
+            currency = members[0].currency
+        else:
+            continue
+        accounts[account_id] = _Account(
+            account_id, ref, currency, tuple(member.id for member in members)
+        )
+    return accounts
+
+
+def _google_campaign(ctx: AnalysisContext, campaign_id: int) -> CampaignInfo | None:
+    """Return a Google campaign of the context, or ``None``.
+
+    ``metrics.load_context`` loads every campaign of the active dataset, so a search term or
+    keyword always finds its campaign; a row that does not cannot be placed in an account and
+    currency, and is left out rather than compared against another account's figures.
+    """
+    campaign = ctx.campaigns.get(campaign_id)
+    if campaign is None or campaign.source != _GOOGLE:
+        return None
+    return campaign
+
+
+@dataclass(frozen=True, slots=True)
+class _Coverage:
+    """Search-term coverage of one Google account over the window.
+
+    The displayed share and percentage are computed once, beside the configured minimum
+    (:func:`_beside_minimum`), so the finding, its evidence, every item's flag and
+    ``evidence.extra`` show the same figures, each on the side of the minimum that
+    ``below_minimum`` states.
+
+    Attributes:
+        account: The account.
+        search_term_spend: Σ window search-term spend (exact).
+        keyword_spend: Σ window keyword spend (exact).
+        share: ``search_term_spend / keyword_spend``; ``None`` without keyword spend.
+        below_minimum: Whether ``share`` is below ``keywords.min_search_term_coverage``.
+        shown_share: ``share`` for display: four places or more, beside the minimum share;
+            ``None`` without keyword spend.
+        percent: ``share`` as a percentage for display: one place or more, beside the
+            minimum percentage; ``None`` without keyword spend.
+    """
+
+    account: _Account
+    search_term_spend: Decimal
+    keyword_spend: Decimal
+    share: Fraction | None
+    below_minimum: bool
+    shown_share: Decimal | None
+    percent: Decimal | None
+
+    def flag(self) -> Flag | None:
+        """Return the ``search_term_coverage`` flag for this account's keyword items, if low."""
+        if not self.below_minimum or self.percent is None:
+            return None
+        percent = format(self.percent, "f")
+        return Flag(
+            FLAG_SEARCH_TERM_COVERAGE, f"Low search-term coverage: {percent}% of keyword spend"
+        )
+
+    def extra(self) -> dict[str, Any]:
+        """Return the coverage summary an item's ``evidence.extra`` carries."""
+        currency = self.account.currency
+        return {
+            "search_term_spend": _money(self.search_term_spend, currency),
+            "keyword_spend": _money(self.keyword_spend, currency),
+            "percent": self.percent,
+            "below_minimum": self.below_minimum,
+        }
+
+
+def _coverage(
+    ctx: AnalysisContext, cfg: _Config, accounts: Mapping[int, _Account]
+) -> dict[int, _Coverage]:
+    """Compute search-term coverage per Google account (AAP 0.5.4.3, 0.2.4).
+
+    Search-term spend is Σ ``ctx.search_terms`` cost (already window totals) and keyword spend
+    Σ ``ctx.keyword_days`` cost on window dates, each over the account's campaigns. Coverage is
+    a ratio within one account, so no amount crosses a currency. The comparison with
+    ``keywords.min_search_term_coverage`` is exact; the displayed share (four places) and
+    percentage (one place) take more places only where fewer would put them on the other
+    side of the configured minimum (:func:`_beside_minimum`).
+    """
+    term_spend = dict.fromkeys(accounts, Decimal(0))
+    keyword_spend = dict.fromkeys(accounts, Decimal(0))
+    for row in ctx.search_terms:
+        campaign = _google_campaign(ctx, row.campaign_id)
+        if campaign is not None and campaign.account_id in term_spend:
+            term_spend[campaign.account_id] += row.cost
+    window = ctx.window
+    for keyword_id, days in ctx.keyword_days.items():
+        keyword = ctx.keywords.get(keyword_id)
+        campaign = None if keyword is None else _google_campaign(ctx, keyword.campaign_id)
+        if campaign is None or campaign.account_id not in keyword_spend:
+            continue
+        keyword_spend[campaign.account_id] += sum(
+            (day.cost for day in days if window.start <= day.date <= window.end), Decimal(0)
+        )
+    # The configured minimum is a finite decimal, so both conversions are exact.
+    min_share = _to_decimal(cfg.min_coverage)
+    min_percent = _to_decimal(cfg.min_coverage * 100)
+    coverage: dict[int, _Coverage] = {}
+    for account_id, account in accounts.items():
+        terms, keywords = term_spend[account_id], keyword_spend[account_id]
+        share = _exact(terms) / _exact(keywords) if keywords > 0 else None
+        coverage[account_id] = _Coverage(
+            account=account,
+            search_term_spend=terms,
+            keyword_spend=keywords,
+            share=share,
+            below_minimum=share is not None and share < cfg.min_coverage,
+            shown_share=None if share is None else _beside_minimum(share, min_share, _RATIO_PLACES),
+            percent=(
+                None
+                if share is None
+                else _beside_minimum(share * 100, min_percent, _PERCENT_PLACES)
+            ),
+        )
+    return coverage
+
+
+def _coverage_finding(ctx: AnalysisContext, cfg: _Config, item: _Coverage) -> Finding:
+    """Return the section finding ``search_term_coverage`` for one account.
+
+    The message cites the coverage percentage and, when coverage is below
+    ``keywords.min_search_term_coverage``, the minimum exactly as configured (0.80 → "80%",
+    0.8858 → "88.58%"); the percentage is the one :func:`_coverage` placed on the minimum's
+    side, so "below the minimum" never cites a percentage at or above it. The evidence carries
+    the same displayed share and percentage with the configured ``min_share``.
+    """
+    currency = item.account.currency
+    terms = _money(item.search_term_spend, currency)
+    keywords = _money(item.keyword_spend, currency)
+    days = ctx.window.days
+    privacy = (
+        "Google withholds low-volume search terms for privacy, so search-term totals fall "
+        "below keyword totals."
+    )
+    minimum = _plain(_to_decimal(cfg.min_coverage * 100))
+    if item.percent is None:
+        message = (
+            f"Search-term coverage unavailable: no keyword spend over the {days}-day window. "
+            f"{privacy}"
+        )
+    else:
+        percent = item.percent
+        message = (
+            f"Search terms cover {format(percent, 'f')}% of keyword spend "
+            f"({_money_text(terms, currency)} of {_money_text(keywords, currency)}) over the "
+            f"{days}-day window. {privacy}"
+        )
+        if item.below_minimum:
+            message += (
+                f" Coverage is below the {format(minimum, 'f')}% minimum, so every keyword "
+                "item carries the low-coverage flag."
+            )
+    return Finding(
+        code=FINDING_SEARCH_TERM_COVERAGE,
+        section=KEYWORDS,
+        entity=item.account.ref,
+        message=message,
+        evidence={
+            "currency": currency,
+            "search_term_spend": terms,
+            "keyword_spend": keywords,
+            "coverage_share": item.shown_share,
+            "coverage_percent": item.percent,
+            "min_share": _plain(_to_decimal(cfg.min_coverage)),
+            "below_minimum": item.below_minimum,
+            "window": ctx.window.to_json(),
+            "thresholds": ctx.thresholds.subset(COVERAGE_THRESHOLD_KEY),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Shared item parts: entities, names and the common metrics
+# ---------------------------------------------------------------------------
+
+
+def _ad_group_name(ctx: AnalysisContext, ad_group_id: int) -> str:
+    """Return an ad group's display name, or ``Ad group #{id}`` when it is not loaded."""
+    group = ctx.ad_groups.get(ad_group_id)
+    return f"Ad group #{ad_group_id}" if group is None else group.name
+
+
+def _search_term_ref(ctx: AnalysisContext, row: SearchTermRow) -> EntityRef:
+    """Return a search term's entity: keyed by ad group, matched criterion and term.
+
+    The key is built from platform ids (:func:`search_term_external_id`), so feedback on the
+    term matches it across runs and dataset transitions.
+    """
+    group = ctx.ad_groups.get(row.ad_group_id)
+    group_external = str(row.ad_group_id) if group is None else group.external_id
+    return EntityRef(
+        source=_GOOGLE,
+        type=ENTITY_SEARCH_TERM,
+        id=None,
+        external_id=search_term_external_id(
+            group_external, row.matched_criterion_id, row.search_term
+        ),
+        name=row.search_term,
+    )
+
+
+def _keyword_ref(ctx: AnalysisContext, keyword: KeywordInfo) -> EntityRef:
+    """Return a keyword's entity: keyed by its ad group and Google criterion id.
+
+    A criterion id is unique only within its ad group, so the key is built from both platform
+    ids (:func:`keyword_external_id`): feedback on one keyword never matches a keyword with the
+    same criterion id in another ad group, and still matches it across runs and dataset
+    transitions.
+    """
+    group = ctx.ad_groups.get(keyword.ad_group_id)
+    group_external = str(keyword.ad_group_id) if group is None else group.external_id
+    return EntityRef(
+        source=_GOOGLE,
+        type=ENTITY_KEYWORD,
+        id=keyword.id,
+        external_id=keyword_external_id(group_external, keyword.criterion_id),
+        name=keyword.text,
+    )
+
+
+def _matched_keyword(row: SearchTermRow) -> str | None:
+    """Return the matched keyword as ``"text (MATCH_TYPE)"``, or ``None`` without one."""
+    text = (row.matched_keyword_text or "").strip()
+    if not text:
+        return None
+    match_type = (row.matched_match_type or "").strip()
+    return f"{text} ({match_type})" if match_type else text
+
+
+def _common_metrics(
+    *,
+    term_label: str,
+    term: str,
+    spend: Decimal,
+    conversions: Decimal | None,
+    cost_per_conversion: Decimal | str | None,
+    currency: str,
+) -> list[Metric]:
+    """Return the four fields every keyword item shows first, in the user's order.
+
+    Term (or keyword text), spend, conversions and cost/conversion (AAP 0.5.4.3, "Each item
+    shows: term, spend, conversions, cost/conversion"). The cost/conversion comes from
+    :func:`_cost_per_conversion_value`: "—" at a known 0 conversions, ``None`` ("unavailable")
+    only when the conversions are unreported. ``None`` conversions mean the platform did not
+    report them.
+    """
+    return [
+        Metric("term", term_label, term, "text"),
+        Metric("spend", "Spend", spend, "currency", currency=currency),
+        Metric("conversions", "Conversions", conversions, "conversions"),
+        Metric(
+            "cost_per_conversion",
+            "Cost/conversion",
+            cost_per_conversion,
+            "currency",
+            currency=currency,
+        ),
+    ]
+
+
+def _cost_per_conversion_value(
+    cost_per: Fraction | None, conversions: Decimal | None, currency: str
+) -> Decimal | str | None:
+    """Return a cost/conversion for display (AAP 0.5.4.3 "—" when conversions are 0, 0.5.5).
+
+    ``cost_per`` is the exact ``cost ÷ conversions`` (:func:`_cost_per`) and ``conversions``
+    the count it divides by. A known count of 0 gives "—", a zero denominator rendered as such
+    and never flagged unavailable; an unreported count (``None``) gives ``None``, which
+    :meth:`Metric.to_json` marks unavailable (AAP 0.11.1: absent values are ``None``).
+    Otherwise the exact cost/conversion at the currency's minor unit. Only the displayed value
+    is built here: every comparison keeps its exact :class:`~fractions.Fraction`.
+    """
+    if conversions is None:
+        return None
+    if conversions == 0:
+        return _DASH
+    return _optional_money(cost_per, currency)
+
+
+def _campaign_extra(
+    ctx: AnalysisContext, campaign: CampaignInfo, ad_group_id: int
+) -> dict[str, Any]:
+    return {
+        "campaign": campaign.name,
+        "campaign_external_id": campaign.external_id,
+        "ad_group": _ad_group_name(ctx, ad_group_id),
+    }
+
+
+def _flags(flag: Flag | None) -> tuple[Flag, ...]:
+    return () if flag is None else (flag,)
+
+
+# ---------------------------------------------------------------------------
+# K1 Block / negative candidate
+# ---------------------------------------------------------------------------
+
+
+def _k1_missing(cfg: _Config) -> tuple[str, str]:
+    """Return ``(withheld reason, finding detail)`` for a run without any baseline facts."""
+    detail = (
+        f"no Google campaign facts in the trailing {_counted(cfg.k1_baseline_days, 'day', 'days')}"
+    )
+    return f"baseline unavailable: {detail}", detail
+
+
+def _k1_unusable(baseline: RateBaseline, cfg: _Config) -> tuple[str, str] | None:
+    """Return ``(withheld reason, finding detail)`` when K1's baseline is unusable, else ``None``.
+
+    Unusable: fewer than ``k1.min_baseline_conversions`` conversions (which covers a rate of
+    0) or no clicks (rate unavailable).
+    """
+    span = cfg.k1_baseline_days
+    required = _number_text(_plain(cfg.k1_min_baseline_conversions))
+    conversions = _counted(_count(baseline.conversions), "conversion", "conversions")
+    if baseline.conversions < cfg.k1_min_baseline_conversions:
+        return (
+            f"baseline conversions {_count(baseline.conversions):f} of "
+            f"{_plain(cfg.k1_min_baseline_conversions):f} required",
+            f"the trailing {span}-day baseline has {conversions} over "
+            f"{_counted(baseline.clicks, 'click', 'clicks')}, below the {required} required",
+        )
+    # ``k1.min_baseline_conversions`` is validated positive, so a rate of 0 (no conversions)
+    # always fails the check above; only a baseline without clicks is left to reject.
+    if baseline.clicks <= 0:
+        detail = f"the trailing {span}-day baseline has {conversions} but no clicks"
+        return f"baseline rate unavailable: {detail}", detail
+    return None
+
+
+_K1_BASELINE_DATASET: Final = "google.metrics_daily"
+"""The dataset K1's account rate baseline is read from (Google daily campaign metrics)."""
+
+
+@dataclass(frozen=True, slots=True)
+class _BaselineCoverage:
+    """How far ``google.metrics_daily`` covers K1's baseline span (AAP 0.3.2, 0.5.4.8).
+
+    The span runs ``k1.baseline_days`` back from the window end whether or not daily metrics
+    exist for all of it, so a window near the start of the backfill reads its rate from only
+    part of the span. The span is fully assessed only when the dataset's freshness row is
+    ``complete`` and its covered range holds every day of the span; anything else, a missing
+    row or an unknown covered date included, is reported as not assessed, never assumed.
+
+    Attributes:
+        start: First native date of the baseline span.
+        end: Last native date of the span (the window end).
+        days: ``k1.baseline_days``, the span's configured length.
+        recorded: Whether the dataset has a freshness row.
+        covered_from: The row's first covered date; ``None`` when unknown or without a row.
+        covered_through: The row's last covered date; ``None`` when unknown or without a row.
+        completeness: The row's completeness; ``None`` without a row.
+        reason: The row's reason for not being complete, when it records one.
+    """
+
+    start: date
+    end: date
+    days: int
+    recorded: bool
+    covered_from: date | None
+    covered_through: date | None
+    completeness: str | None
+    reason: str | None
+
+    @property
+    def span_days(self) -> int:
+        """Days in the baseline span, both ends included."""
+        return (self.end - self.start).days + 1
+
+    @property
+    def covered_days(self) -> int | None:
+        """Days of the span inside the covered range; ``None`` when a covered date is unknown."""
+        if self.covered_from is None or self.covered_through is None:
+            return None
+        first = max(self.start, self.covered_from)
+        last = min(self.end, self.covered_through)
+        return max((last - first).days + 1, 0)
+
+    @property
+    def complete(self) -> bool:
+        """Whether the span is fully assessed: a ``complete`` row covering start to end."""
+        return (
+            self.completeness == "complete"
+            and self.covered_from is not None
+            and self.covered_through is not None
+            and self.covered_from <= self.start
+            and self.covered_through >= self.end
+        )
+
+    def _state(self) -> str | None:
+        """Describe a recorded row that is not ``complete``, with its reason; else ``None``."""
+        if self.completeness is None or self.completeness == "complete":
+            return None
+        if self.completeness == "incomplete":
+            state = "the dataset is incomplete"
+        else:
+            state = f"the dataset's completeness is {self.completeness}"
+        return f"{state}: {self.reason}" if self.reason else state
+
+    def flag(self) -> Flag | None:
+        """Return the ``incomplete`` flag naming the actual coverage, or ``None`` when assessed."""
+        if self.complete:
+            return None
+        span = (
+            f"the {self.span_days}-day baseline {self.start.isoformat()} to {self.end.isoformat()}"
+        )
+        covered = self.covered_days
+        if not self.recorded:
+            detail = f"no Google daily metrics coverage is recorded for {span}"
+        elif self.covered_from is None or self.covered_through is None:
+            first = "unknown" if self.covered_from is None else self.covered_from.isoformat()
+            last = "unknown" if self.covered_through is None else self.covered_through.isoformat()
+            detail = (
+                f"Google daily metrics coverage of {span} is unknown (covered from {first} "
+                f"through {last})"
+            )
+        else:
+            detail = (
+                f"Google daily metrics cover {self.covered_from.isoformat()} to "
+                f"{self.covered_through.isoformat()} of {span} ({covered} of "
+                f"{_counted(self.span_days, 'day', 'days')} covered)"
+            )
+        state = self._state()
+        if state is not None:
+            detail = f"{detail}; {state}"
+        return Flag(FLAG_INCOMPLETE, f"Baseline incomplete: {detail}")
+
+    def label_note(self) -> str:
+        """Return the baseline label's suffix: ``""`` when assessed, else what the rate lacks."""
+        if self.complete:
+            return ""
+        notes: list[str] = []
+        if self.covered_from is None or self.covered_through is None:
+            notes.append("coverage unknown")
+        else:
+            first, last = self.covered_from.isoformat(), self.covered_through.isoformat()
+            short_start = self.covered_from > self.start
+            short_end = self.covered_through < self.end
+            if short_start and short_end:
+                notes.append(f"data {first} to {last}")
+            elif short_start:
+                notes.append(f"data from {first}")
+            elif short_end:
+                notes.append(f"data through {last}")
+        if self.completeness == "incomplete":
+            notes.append("daily metrics incomplete")
+        elif self.completeness is not None and self.completeness != "complete":
+            notes.append(f"daily metrics completeness {self.completeness}")
+        return f" (incomplete: {', '.join(notes)})"
+
+    def extra(self) -> dict[str, Any]:
+        """Return the baseline span with its assessed coverage, for ``evidence.extra``."""
+        covered = self.covered_days
+        return {
+            "start": self.start,
+            "end": self.end,
+            "days": self.days,
+            "covered_from": self.covered_from,
+            "covered_through": self.covered_through,
+            "completeness": self.completeness,
+            "coverage_reason": self.reason,
+            "complete": self.complete,
+            "covered_days": covered,
+            "uncovered_days": None if covered is None else self.span_days - covered,
+        }
+
+
+def _k1_baseline_coverage(
+    ctx: AnalysisContext, cfg: _Config, start: date, end: date
+) -> _BaselineCoverage:
+    """Assess ``google.metrics_daily`` over K1's baseline span ``[start, end]``, once per run."""
+    row = ctx.freshness_for(
+        _K1_BASELINE_DATASET, ctx.dataset_id_for(_K1_BASELINE_DATASET, crm_scope=None)
+    )
+    return _BaselineCoverage(
+        start=start,
+        end=end,
+        days=cfg.k1_baseline_days,
+        recorded=row is not None,
+        covered_from=None if row is None else row.covered_from,
+        covered_through=None if row is None else row.covered_through,
+        completeness=None if row is None else row.completeness,
+        reason=None if row is None else row.reason,
+    )
+
+
+def _k1_no_baseline(ctx: AnalysisContext, cfg: _Config, reasons: tuple[str, str]) -> RuleResult:
+    """Withhold K1 account-wide: a ``k1_no_baseline`` finding and one withheld line, no items."""
+    reason, detail = reasons
+    baseline = ctx.k1_baseline
+    rate = None
+    if baseline is not None and baseline.clicks > 0:
+        rate = _significant(_exact(baseline.conversions) / baseline.clicks)
+    if baseline is not None:
+        span = (baseline.start, baseline.end)
+    else:
+        # No facts at all: assess the span the baseline would have read.
+        span = (ctx.window.end - timedelta(days=cfg.k1_baseline_days - 1), ctx.window.end)
+    coverage = _k1_baseline_coverage(ctx, cfg, *span)
+    minimum = _counted(
+        _plain(cfg.k1_min_baseline_conversions), "baseline conversion", "baseline conversions"
+    )
+    finding = Finding(
+        code=FINDING_K1_NO_BASELINE,
+        section=KEYWORDS,
+        entity=None,
+        message=(
+            f"Block candidates withheld account-wide: {detail}. K1 sets its minimum clicks "
+            f"from the account's conversion rate, which needs at least {minimum} and a rate "
+            "above 0."
+        ),
+        evidence={
+            "baseline_conversions": None if baseline is None else _count(baseline.conversions),
+            "baseline_clicks": None if baseline is None else baseline.clicks,
+            "baseline_rate": rate,
+            "baseline_start": None if baseline is None else baseline.start,
+            "baseline_end": None if baseline is None else baseline.end,
+            "baseline_coverage": coverage.extra(),
+            "required": _plain(cfg.k1_min_baseline_conversions),
+            "window": ctx.window.to_json(),
+            "thresholds": ctx.thresholds.subset(*K1_THRESHOLD_KEYS),
+        },
+    )
+    withheld = Withheld(
+        rule_id=K1,
+        section=KEYWORDS,
+        entity=None,
+        reason=reason,
+        observed=None if baseline is None else _count(baseline.conversions),
+        required=_plain(cfg.k1_min_baseline_conversions),
+        unit="conversions",
+    )
+    return RuleResult(findings=(finding,), withheld=(withheld,))
+
+
+def _k1_reason(evidence: Evidence) -> str:
+    """Render K1's reason from its evidence only (AAP 0.5.4: the text cannot drift).
+
+    The spend gate is cited at the values it was compared at. With ``k1.min_spend_cpa_multiple``
+    at 1 the reason says "at least 1x the account cost/conversion of {cost/conversion}"; with
+    any other multiple it cites the ``min_spend`` baseline, "at or above the spend floor of
+    {floor} ({multiple}x the account cost/conversion)", because a multiple of the displayed
+    cost/conversion can exceed the displayed spend that cleared the exact floor. Spend, the
+    floor and the cost/conversion are each rounded half up at the minor unit, and rounding is
+    monotone, so the displayed spend is never below the displayed value it is said to reach.
+
+    An ``ADDED`` term always names its matched keyword criterion and warns that an exact-match
+    negative also blocks that keyword's exact-match traffic. Each part of the matched keyword
+    the evidence lacks (text, match type or criterion) is labelled unavailable, never dropped.
+    Any other term names its matched keyword when the evidence has one.
+    """
+    days = _counted(_number(evidence.window["days"]), "day", "days")
+    spend = _render(evidence.metric("wasted_spend"))
+    clicks = _counted(_number(evidence.metric("clicks").value), "click", "clicks")
+    n_star = _counted(_number(evidence.metric("min_clicks").value), "click", "clicks")
+    rate = _number(_baseline(evidence, "baseline_rate").value)
+    currency = evidence.metric("spend").currency
+    multiple = _number(evidence.extra["min_spend_cpa_multiple"])
+    if multiple == 1:
+        cpa = _number(_baseline(evidence, "account_cost_per_conversion").value)
+        spend_floor = (
+            f"at least {_number_text(multiple)}x the account cost/conversion of "
+            f"{_money_text(cpa, currency)}"
+        )
+    else:
+        # Any other multiple of the displayed cost/conversion is not the floor compared
+        # (14 x 1.43 = 20.02 against an exact floor of 20.00), so the floor itself is cited.
+        floor = _number(_baseline(evidence, "min_spend").value)
+        spend_floor = (
+            f"at or above the spend floor of {_money_text(floor, currency)} "
+            f"({_number_text(multiple)}x the account cost/conversion)"
+        )
+    reason = (
+        f"Spent {spend} over {days} with 0 conversions across {clicks}, at or "
+        f"above the minimum of {n_star} for the account's conversion rate of "
+        f"{_number_text(rate)} (conversions ÷ clicks), and {spend_floor}."
+    )
+    if evidence.extra.get("term_status") == "ADDED":
+        # Q-G6 may omit any part of the matched keyword: the criterion is named whenever it is
+        # present, and the exact-match caution never depends on the keyword text.
+        text, match_type, criterion = (
+            str(evidence.extra.get(key) or "").strip() or unavailable
+            for key, unavailable in (
+                ("matched_keyword_text", "keyword text unavailable"),
+                ("matched_match_type", "match type unavailable"),
+                ("matched_criterion_id", "unavailable"),
+            )
+        )
+        reason += (
+            f" The term is already a keyword: {text} ({match_type}, criterion {criterion}). "
+            "An exact-match negative also blocks that keyword's exact-match traffic."
+        )
+    elif "matched_keyword" in {metric.key for metric in evidence.metrics}:
+        reason += f" Matched keyword: {_render(evidence.metric('matched_keyword'))}."
+    return reason
+
+
+def _k1_candidate(
+    ctx: AnalysisContext,
+    cfg: _Config,
+    row: SearchTermRow,
+    campaign: CampaignInfo,
+    account_totals: Totals,
+    baseline: RateBaseline,
+    n_star: int,
+    coverage: _Coverage,
+    baseline_coverage: _BaselineCoverage,
+    crm_link: Flag | None,
+) -> Candidate:
+    """Build one K1 item: a zero-conversion term that cleared the click and spend gates.
+
+    Rule K1 (AAP 0.5.4.3), gated by :func:`_evaluate_k1`. Threshold keys:
+    :data:`K1_THRESHOLD_KEYS`, copied into ``evidence.thresholds``. The click gate ``n_star`` is
+    max(``k1.min_clicks_floor``, ceil(``k1.rule_of_three`` ÷ r)), r being the account rate over
+    the trailing ``k1.baseline_days``, which holds at least ``k1.min_baseline_conversions``
+    conversions; the spend floor is ``k1.min_spend_cpa_multiple`` x the account
+    cost/conversion, shown as the ``min_spend`` baseline; ``keywords.min_search_term_coverage``
+    sets the coverage flag.
+
+    Rationale: ``n_star`` is a heuristic labelled "minimum clicks for the account's conversion
+    rate" and claims no probability, and the spend floor requires at least one typical
+    conversion's cost to have been spent, so a zero-conversion term becomes a block candidate
+    only once it has had a fair chance to convert.
+
+    ``baseline_coverage`` is the run's assessment of the baseline span: when it is not fully
+    assessed the item carries the ``incomplete`` flag and the baseline label says so.
+    ``crm_link`` is the run's ``no_crm_link`` flag, appended last; ``None`` while the
+    Google-to-CRM link is verified.
+    """
+    currency = coverage.account.currency
+    spend = _money(row.cost, currency)
+    outcomes = account_totals.outcomes if account_totals.outcomes is not None else Decimal(0)
+    account_cpa = _exact(account_totals.spend) / _exact(outcomes)
+    rate = _exact(baseline.conversions) / baseline.clicks
+    metrics = _common_metrics(
+        term_label="Search term",
+        term=row.search_term,
+        spend=spend,
+        conversions=_count(row.conversions),
+        cost_per_conversion=_cost_per_conversion_value(
+            _cost_per(row.cost, row.conversions), row.conversions, currency
+        ),
+        currency=currency,
+    )
+    metrics += [
+        Metric("wasted_spend", "Wasted spend", spend, "currency", currency=currency),
+        Metric("clicks", "Clicks", row.clicks, "clicks"),
+        Metric("min_clicks", MIN_CLICKS_LABEL, n_star, "clicks"),
+    ]
+    matched = _matched_keyword(row)
+    if matched is not None:
+        metrics.append(Metric("matched_keyword", "Matched keyword", matched, "text"))
+    baselines = (
+        Baseline(
+            "account_cost_per_conversion",
+            f"Account cost/conversion ({currency})",
+            _money(account_cpa, currency),
+        ),
+        # The floor the spend was compared with, rounded to the nearest minor unit like the
+        # spend and never up to the next one: spend is stored at micros, so a spend of 20.002
+        # clears an exact floor of 20.0015 yet would show 20.00 against a rounded-up 20.01.
+        # Rounding is monotone, so a spend at or above the floor never shows below it.
+        Baseline(
+            "min_spend",
+            f"Spend floor ({currency})",
+            _money(_exact(cfg.k1_spend_multiple) * account_cpa, currency),
+        ),
+        Baseline(
+            "baseline_rate",
+            f"Account conversions per click, {baseline.start.isoformat()} to "
+            f"{baseline.end.isoformat()}{baseline_coverage.label_note()}",
+            _significant(rate),
+        ),
+        Baseline("baseline_conversions", "Baseline conversions", _count(baseline.conversions)),
+        Baseline("baseline_clicks", "Baseline clicks", baseline.clicks),
+    )
+    extra: dict[str, Any] = _campaign_extra(ctx, campaign, row.ad_group_id)
+    extra |= {
+        "term_status": row.term_status,
+        "matched_criterion_id": row.matched_criterion_id,
+        "matched_keyword_text": row.matched_keyword_text,
+        "matched_match_type": row.matched_match_type,
+        "negative_match_type": "EXACT",
+        "min_spend_cpa_multiple": _plain(cfg.k1_spend_multiple),
+        "min_clicks_label": MIN_CLICKS_LABEL,
+        "baseline_window": baseline_coverage.extra(),
+        "search_term_coverage": coverage.extra(),
+    }
+    evidence = ctx.make_evidence(
+        required_datasets=K1_DATASETS,
+        crm_scope=None,
+        metrics=metrics,
+        baselines=baselines,
+        sample=Sample(observed=row.clicks, required=n_star, unit="clicks"),
+        threshold_keys=K1_THRESHOLD_KEYS,
+        extra=extra,
+        # AAP 0.1.2: K1's headline number is the wasted spend.
+        headline="wasted_spend",
+    )
+    return Candidate(
+        rule_id=K1,
+        section=KEYWORDS,
+        group=GROUP_BLOCK,
+        entity_ref=_search_term_ref(ctx, row),
+        action=K1_ACTION,
+        reason=_k1_reason(evidence),
+        evidence=evidence,
+        rank_key=(-row.cost,),
+        flags=(
+            *_flags(coverage.flag()),
+            *_flags(baseline_coverage.flag()),
+            *_flags(crm_link),
+        ),
+        required_datasets=K1_DATASETS,
+        increases_spend_on=(),
+        # Keyword items offer "Mark done", never "Record decision" (AAP 0.5.5).
+        decision_subject=None,
+        depends_on=(DecisionSubject("campaign", campaign.id),),
+    )
+
+
+def _account_totals(
+    ctx: AnalysisContext, account: _Account, cache: dict[int, Totals | None]
+) -> Totals | None:
+    """Return the account's window totals over its Google campaigns (memoised per run)."""
+    if account.id not in cache:
+        cache[account.id] = (
+            window_totals(ctx, account.campaign_ids) if account.campaign_ids else None
+        )
+    return cache[account.id]
+
+
+def _k1_without_cpa(ctx: AnalysisContext, account: _Account, totals: Totals | None) -> Withheld:
+    """The account-wide K1 line when the account cost/conversion is unavailable.
+
+    Three states, each described as it is, never as a default zero (AAP 0.11.1):
+
+    - some campaign day did not report conversions, so the account total is unknown rather
+      than a partial count; the line shows the days with conversions reported against the
+      days with metrics;
+    - the window reported a known total of 0 conversions; the line shows that count;
+    - no conversion data was recorded at all, because the account has no Google campaign or
+      no campaign day fell in the window; the line says so and carries no sample.
+    """
+    if totals is not None and totals.unreported_days > 0:
+        return Withheld(
+            rule_id=K1,
+            section=KEYWORDS,
+            entity=account.ref,
+            reason=(
+                "account cost/conversion unavailable: conversions unavailable on "
+                f"{totals.unreported_days} of {_counted(totals.days, 'day', 'days')} in the "
+                f"{ctx.window.days}-day window"
+            ),
+            observed=totals.days - totals.unreported_days,
+            required=totals.days,
+            unit="days with conversions reported",
+        )
+    if totals is not None and totals.outcomes is not None:
+        return Withheld(
+            rule_id=K1,
+            section=KEYWORDS,
+            entity=account.ref,
+            reason=(
+                "account cost/conversion unavailable: "
+                f"{_number_text(_count(totals.outcomes))} conversions in the "
+                f"{ctx.window.days}-day window"
+            ),
+            observed=totals.outcomes,
+            required=None,
+            unit="conversions",
+        )
+    return Withheld(
+        rule_id=K1,
+        section=KEYWORDS,
+        entity=account.ref,
+        reason=(
+            "account cost/conversion unavailable: no conversion data recorded for the "
+            f"account in the {ctx.window.days}-day window"
+        ),
+        observed=None,
+        required=None,
+        unit="conversions",
+    )
+
+
+def _evaluate_k1(
+    ctx: AnalysisContext,
+    cfg: _Config,
+    accounts: Mapping[int, _Account],
+    coverage: Mapping[int, _Coverage],
+    crm_link: Flag | None,
+) -> RuleResult:
+    """Rule K1 Block / negative candidate: spend with exactly zero conversions.
+
+    AAP 0.5.4.3 K1, 0.2.4, FR-4 (a). A search term with status ``NONE`` or ``ADDED`` fires
+    when it has exactly 0 conversions in the window (any fractional conversion, such as 0.3,
+    counts as converting), clicks ≥ n* and spend ≥ ``k1.min_spend_cpa_multiple`` x the
+    account cost/conversion. ``EXCLUDED`` and ``ADDED_EXCLUDED`` terms are already blocked
+    and skipped. The action is always "Add as exact-match negative"; for an ``ADDED`` term the
+    item names the matched keyword criterion and notes that an exact negative also blocks that
+    keyword's exact-match traffic. K1 never recommends pausing a keyword; keyword-level
+    problems belong to K3.
+
+    Threshold keys: ``k1.baseline_days``, ``k1.min_clicks_floor``, ``k1.rule_of_three``,
+    ``k1.min_baseline_conversions``, ``k1.min_spend_cpa_multiple`` and
+    ``keywords.min_search_term_coverage``.
+
+    Rationale: r = conversions ÷ clicks over the trailing ``k1.baseline_days`` (90) ending at
+    the window end; n* = max(``k1.min_clicks_floor``, ceil(``k1.rule_of_three`` ÷ r)) with no
+    upper cap (300 clicks at r = 1%, 3,000 at r = 0.1%). r is a rate that can reach or exceed
+    1, so n* is a heuristic labelled "minimum clicks for the account's conversion rate" and
+    makes no statistical claim (:func:`k1_min_clicks`). With fewer than
+    ``k1.min_baseline_conversions`` baseline conversions, or no usable rate, K1 is withheld
+    account-wide with the ``k1_no_baseline`` finding. The spend floor requires at least one
+    typical conversion's cost to have been spent; each item's evidence carries it as the
+    ``min_spend`` baseline beside the account cost/conversion. A term at the spend floor but
+    below n* is listed as withheld with its clicks observed and required.
+
+    Baseline coverage: the baseline spans ``k1.baseline_days`` whether or not
+    ``google.metrics_daily`` covers all of it, for example a custom window near the start of
+    the backfill. The span is assessed once per run and is fully assessed only when that
+    dataset's freshness row is ``complete`` and covers the span from start to end. Otherwise
+    K1 still evaluates, because only the conversion minimum and an unusable rate withhold it,
+    but every K1 item carries the ``incomplete`` flag naming the actual coverage, the baseline
+    label says the rate is partial, and ``evidence.extra["baseline_window"]`` records
+    ``covered_from``, ``covered_through``, ``completeness``, ``complete`` and the covered and
+    uncovered days. A missing freshness row or an unknown covered date counts as not assessed,
+    never as complete (AAP 0.3.2, 0.5.4.8). The ``k1_no_baseline`` finding carries the same
+    assessment as ``baseline_coverage``.
+
+    CRM link: without the verified Google-to-CRM link every K1 item also carries
+    ``crm_link``, the run's ``no_crm_link`` flag (AAP 0.3.3, 0.5.4.1).
+
+    Returns:
+        Items in group ``block`` ranked by spend descending (``rank_key = (-spend,)``), the
+        withheld lines, and the ``k1_no_baseline`` finding when the baseline is unusable.
+    """
+    baseline = ctx.k1_baseline
+    if baseline is None:
+        return _k1_no_baseline(ctx, cfg, _k1_missing(cfg))
+    unusable = _k1_unusable(baseline, cfg)
+    if unusable is not None:
+        return _k1_no_baseline(ctx, cfg, unusable)
+    baseline_coverage = _k1_baseline_coverage(ctx, cfg, baseline.start, baseline.end)
+    rate = _exact(baseline.conversions) / baseline.clicks
+    n_star = _min_clicks_exact(rate, cfg.k1_floor, _exact(cfg.k1_rule_of_three))
+    multiple = _exact(cfg.k1_spend_multiple)
+    totals_cache: dict[int, Totals | None] = {}
+    without_cpa: set[int] = set()
+    candidates: list[Candidate] = []
+    withheld: list[Withheld] = []
+    for row in ctx.search_terms:
+        # Exactly zero: a fractional conversion under data-driven attribution is converting.
+        if row.term_status not in K1_STATUSES or row.conversions != 0 or row.cost <= 0:
+            continue
+        campaign = _google_campaign(ctx, row.campaign_id)
+        account = None if campaign is None else accounts.get(campaign.account_id)
+        if campaign is None or account is None:
+            continue
+        totals = _account_totals(ctx, account, totals_cache)
+        if totals is None or totals.outcomes is None or totals.outcomes <= 0:
+            if account.id not in without_cpa:
+                without_cpa.add(account.id)
+                withheld.append(_k1_without_cpa(ctx, account, totals))
+            continue
+        # spend ≥ multiple x (account spend ÷ account conversions), cross-multiplied exactly.
+        if _exact(row.cost) * _exact(totals.outcomes) < multiple * _exact(totals.spend):
+            continue
+        if row.clicks < n_star:
+            withheld.append(
+                Withheld(
+                    rule_id=K1,
+                    section=KEYWORDS,
+                    entity=_search_term_ref(ctx, row),
+                    reason=f"clicks {row.clicks} of {n_star} required",
+                    observed=row.clicks,
+                    required=n_star,
+                    unit="clicks",
+                )
+            )
+            continue
+        candidates.append(
+            _k1_candidate(
+                ctx,
+                cfg,
+                row,
+                campaign,
+                totals,
+                baseline,
+                n_star,
+                coverage[account.id],
+                baseline_coverage,
+                crm_link,
+            )
+        )
+    return RuleResult(candidates=tuple(candidates), withheld=tuple(withheld))
+
+
+# ---------------------------------------------------------------------------
+# K2 Expansion candidate
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _TermTotals:
+    """One distinct search term's window totals within an account (K2 adjacent terms)."""
+
+    term: str
+    spend: Decimal
+    clicks: int
+    conversions: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class _AdjacentPool:
+    """An account's eligible adjacent terms, already in K2's order, with a token index.
+
+    Attributes:
+        by_term: The totals of each eligible term: not a keyword, never excluded and with at
+            least ``k2.adjacent_min_clicks`` clicks.
+        index: The eligible terms ordered by conversions descending, then clicks descending,
+            then term, each tokenised once (:class:`~ads_engine.analysis.text.TermIndex`).
+            ``k2.adjacent_jaccard`` is above 0, so a term sharing no token with the converting
+            term can never be adjacent; the index compares each converting term only with the
+            terms that can be, without changing the result, and returns matches in that
+            order, best ranked first.
+    """
+
+    by_term: Mapping[str, _TermTotals]
+    index: TermIndex
+
+
+def _adjacent_pool(ctx: AnalysisContext, cfg: _Config, account: _Account) -> _AdjacentPool:
+    """Build an account's adjacent-term pool from its own search-term report (AAP 0.2.4).
+
+    Rows of one term across ad groups and matched criteria are summed. A term is ineligible
+    when any of its rows is ``EXCLUDED`` or ``ADDED_EXCLUDED`` (the advertiser already blocked
+    it), when its tokens equal a keyword's tokens (already a keyword, exact normalised match),
+    or when it has fewer than ``k2.adjacent_min_clicks`` clicks.
+    """
+    members = frozenset(account.campaign_ids)
+    keyword_tokens = {
+        tokenize(keyword.text)
+        for keyword in ctx.keywords.values()
+        # A keyword whose campaign is not loaded still counts: excluding a term too often is
+        # harmless, suggesting an existing keyword is not.
+        if keyword.campaign_id in members or keyword.campaign_id not in ctx.campaigns
+    }
+    sums: dict[str, list[Any]] = {}
+    excluded: set[str] = set()
+    for row in ctx.search_terms:
+        if row.campaign_id not in members:
+            continue
+        if row.term_status in _EXCLUDED_STATUSES:
+            excluded.add(row.search_term)
+        entry = sums.setdefault(row.search_term, [Decimal(0), 0, Decimal(0)])
+        entry[0] += row.cost
+        entry[1] += row.clicks
+        entry[2] += row.conversions
+    eligible: list[_TermTotals] = []
+    for term, (spend, clicks, conversions) in sums.items():
+        # The cheap tests run first, so only a term that passes them is tokenised here.
+        if term in excluded or clicks < cfg.k2_min_clicks or tokenize(term) in keyword_tokens:
+            continue
+        eligible.append(_TermTotals(term, spend, clicks, conversions))
+    eligible.sort(key=lambda item: (-item.conversions, -item.clicks, item.term))
+    return _AdjacentPool(
+        by_term={item.term: item for item in eligible},
+        index=TermIndex([item.term for item in eligible]),
+    )
+
+
+def _adjacent(pool: _AdjacentPool, cfg: _Config, term: str) -> list[_TermTotals]:
+    """Return up to ``k2.adjacent_max_terms`` adjacent terms for a converting ``term``.
+
+    The pool's index returns, in the pool's order, the terms other than ``term`` itself at or
+    above the exact ``k2.adjacent_jaccard`` threshold, and stops at the
+    ``k2.adjacent_max_terms``-th match, so the matches are the best ranked.
+    """
+    matches = pool.index.similar(term, threshold=cfg.k2_jaccard, limit=cfg.k2_max_terms)
+    return [pool.by_term[name] for name in matches]
+
+
+def _k2_reason(evidence: Evidence) -> str:
+    """Render K2's reason from its evidence only.
+
+    The efficiency gate is cited at the values it was compared at. With ``k2.max_cpa_ratio``
+    at 1 the reason says "at or below 1x the campaign's {cost/conversion} per conversion";
+    with any other ratio it cites the ``max_cost_per_conversion`` baseline, "at or below the
+    highest qualifying cost/conversion of {max} ({ratio}x the campaign's cost/conversion)",
+    because a multiple of the displayed campaign cost/conversion can fall below the displayed
+    term cost/conversion that met the exact maximum. Each value is rounded half up at the
+    minor unit, and rounding is monotone, so the displayed term cost/conversion never exceeds
+    the displayed value it is said to stay within.
+    """
+    days = _counted(_number(evidence.window["days"]), "day", "days")
+    conversions = _counted(
+        _number(evidence.metric("conversions").value), "conversion", "conversions"
+    )
+    cpa = _render(evidence.metric("cost_per_conversion"))
+    currency = evidence.metric("spend").currency
+    ratio = _number(evidence.extra["max_cpa_ratio"])
+    label = evidence.extra["adjacent_terms_label"]
+    if ratio == 1:
+        campaign_cpa = _number(_baseline(evidence, "campaign_cost_per_conversion").value)
+        maximum = (
+            f"{_number_text(ratio)}x the campaign's {_money_text(campaign_cpa, currency)} per "
+            "conversion"
+        )
+    else:
+        highest = _number(_baseline(evidence, "max_cost_per_conversion").value)
+        maximum = (
+            f"the highest qualifying cost/conversion of {_money_text(highest, currency)} "
+            f"({_number_text(ratio)}x the campaign's cost/conversion)"
+        )
+    reason = f"{conversions} at {cpa} per conversion over {days}, at or below {maximum}."
+    terms = [str(item["term"]) for item in evidence.extra["adjacent_terms"]]
+    if terms:
+        reason += f" Adjacent terms to try, {label}: {', '.join(terms)}."
+    else:
+        reason += f" No adjacent terms {label} qualified."
+    return reason
+
+
+def _k2_candidate(
+    ctx: AnalysisContext,
+    cfg: _Config,
+    row: SearchTermRow,
+    campaign: CampaignInfo,
+    campaign_totals: Totals,
+    adjacent: Sequence[_TermTotals],
+    coverage: _Coverage,
+    crm_link: Flag | None,
+) -> Candidate:
+    """Build one K2 item: a converting ``NONE`` term at or better than campaign efficiency.
+
+    Rule K2 (AAP 0.5.4.3), gated by :func:`_evaluate_k2`. Threshold keys:
+    :data:`K2_THRESHOLD_KEYS`, copied into ``evidence.thresholds``. The term reached
+    ``k2.min_conversions``, the sample's required count, with a cost/conversion at most
+    ``k2.max_cpa_ratio`` x the campaign's, shown as the ``max_cost_per_conversion`` baseline.
+    ``adjacent`` was selected with ``k2.adjacent_jaccard``, ``k2.adjacent_max_terms`` and
+    ``k2.adjacent_min_clicks``; ``keywords.min_search_term_coverage`` sets the coverage flag.
+
+    Rationale: ``k2.min_conversions`` (3) avoids one-off conversions, and ``k2.max_cpa_ratio``
+    (1.0) keeps only terms at or better than campaign efficiency.
+
+    ``crm_link`` is the run's ``no_crm_link`` flag, appended after the coverage flag; ``None``
+    while the Google-to-CRM link is verified.
+    """
+    currency = coverage.account.currency
+    term_cpa = _exact(row.cost) / _exact(row.conversions)
+    outcomes = campaign_totals.outcomes if campaign_totals.outcomes is not None else Decimal(0)
+    campaign_cpa = _exact(campaign_totals.spend) / _exact(outcomes)
+    ad_group = _ad_group_name(ctx, row.ad_group_id)
+    metrics = _common_metrics(
+        term_label="Search term",
+        term=row.search_term,
+        spend=_money(row.cost, currency),
+        conversions=_count(row.conversions),
+        cost_per_conversion=_money(term_cpa, currency),
+        currency=currency,
+    )
+    metrics.append(Metric("clicks", "Clicks", row.clicks, "clicks"))
+    matched = _matched_keyword(row)
+    if matched is not None:
+        metrics.append(Metric("matched_keyword", "Matched keyword", matched, "text"))
+    baselines = (
+        Baseline(
+            "campaign_cost_per_conversion",
+            f"Campaign cost/conversion ({currency})",
+            _money(campaign_cpa, currency),
+        ),
+        Baseline(
+            "max_cost_per_conversion",
+            f"Highest qualifying cost/conversion ({currency})",
+            _money(cfg.k2_max_cpa_ratio * campaign_cpa, currency),
+        ),
+    )
+    extra: dict[str, Any] = _campaign_extra(ctx, campaign, row.ad_group_id)
+    extra |= {
+        "term_status": row.term_status,
+        "matched_criterion_id": row.matched_criterion_id,
+        "matched_keyword_text": row.matched_keyword_text,
+        "matched_match_type": row.matched_match_type,
+        "suggested_match_type": "PHRASE",
+        "max_cpa_ratio": _plain(_to_decimal(cfg.k2_max_cpa_ratio)),
+        "adjacent_terms": [
+            {
+                "term": item.term,
+                "spend": _money(item.spend, currency),
+                "currency": currency,
+                "clicks": item.clicks,
+                "conversions": _count(item.conversions),
+            }
+            for item in adjacent
+        ],
+        "adjacent_terms_label": ADJACENT_TERMS_LABEL,
+        "search_term_coverage": coverage.extra(),
+    }
+    evidence = ctx.make_evidence(
+        required_datasets=K2_DATASETS,
+        crm_scope=None,
+        metrics=metrics,
+        baselines=baselines,
+        sample=Sample(
+            observed=_count(row.conversions),
+            required=_plain(_to_decimal(cfg.k2_min_conversions)),
+            unit="conversions",
+        ),
+        threshold_keys=K2_THRESHOLD_KEYS,
+        extra=extra,
+        # An expansion rests on the term's conversions.
+        headline="conversions",
+    )
+    return Candidate(
+        rule_id=K2,
+        section=KEYWORDS,
+        group=GROUP_EXPAND,
+        entity_ref=_search_term_ref(ctx, row),
+        action=K2_ACTION_TEMPLATE.format(ad_group=ad_group),
+        reason=_k2_reason(evidence),
+        evidence=evidence,
+        rank_key=(-row.conversions, _to_decimal(term_cpa)),
+        flags=(*_flags(coverage.flag()), *_flags(crm_link)),
+        required_datasets=K2_DATASETS,
+        increases_spend_on=(),
+        decision_subject=None,
+        depends_on=(DecisionSubject("campaign", campaign.id),),
+    )
+
+
+def _evaluate_k2(
+    ctx: AnalysisContext,
+    cfg: _Config,
+    accounts: Mapping[int, _Account],
+    coverage: Mapping[int, _Coverage],
+    crm_link: Flag | None,
+) -> RuleResult:
+    """Rule K2 Expansion candidate: a converting term at or better than campaign efficiency.
+
+    AAP 0.5.4.3 K2, FR-4 (b). A search term with status ``NONE`` fires when it has
+    conversions ≥ ``k2.min_conversions`` and cost/conversion ≤ ``k2.max_cpa_ratio`` x its
+    campaign's window cost/conversion. The action is "Add as phrase-match keyword in {ad
+    group}". ``evidence.extra.adjacent_terms`` lists up to ``k2.adjacent_max_terms`` other
+    window search terms of the same account with token Jaccard ≥ ``k2.adjacent_jaccard``
+    (lowercased, stopwords removed), not already keywords, never excluded and with at least
+    ``k2.adjacent_min_clicks`` clicks, ordered by conversions then clicks, labelled "from your
+    search-term report".
+
+    Threshold keys: ``k2.min_conversions``, ``k2.max_cpa_ratio``, ``k2.adjacent_jaccard``,
+    ``k2.adjacent_max_terms``, ``k2.adjacent_min_clicks`` and
+    ``keywords.min_search_term_coverage``.
+
+    Rationale: three conversions avoid one-off conversions, and a ratio of 1.0 keeps only terms
+    at or better than campaign efficiency. Adjacent terms come from the account's own report,
+    because Keyword Planner is not reachable through the n8n webhook.
+
+    Sample withholding (P6): a ``NONE`` term with some conversions, at or better than campaign
+    efficiency, but below ``k2.min_conversions`` is listed as withheld with its conversions
+    observed and required, for example "conversions 2 of 3 required" (fractional conversions
+    shown exactly, such as 2.5). Terms above the campaign's cost/conversion, and terms with no
+    conversions, are not K2 patterns and are not listed.
+
+    CRM link: without the verified Google-to-CRM link every K2 item also carries
+    ``crm_link``, the run's ``no_crm_link`` flag (AAP 0.3.3, 0.5.4.1).
+
+    Returns:
+        Items in group ``expand`` ranked by conversions descending, then cost/conversion
+        ascending (``rank_key = (-conversions, cost_per_conversion)``), and the withheld lines.
+    """
+    pools: dict[int, _AdjacentPool] = {}
+    totals_cache: dict[int, Totals] = {}
+    candidates: list[Candidate] = []
+    withheld: list[Withheld] = []
+    for row in ctx.search_terms:
+        if row.term_status not in _K2_STATUSES or row.conversions <= 0:
+            continue
+        campaign = _google_campaign(ctx, row.campaign_id)
+        account = None if campaign is None else accounts.get(campaign.account_id)
+        if campaign is None or account is None:
+            continue
+        if campaign.id not in totals_cache:
+            totals_cache[campaign.id] = window_totals(ctx, (campaign.id,))
+        totals = totals_cache[campaign.id]
+        if totals.outcomes is None or totals.outcomes <= 0:
+            continue
+        # term cost ÷ term conversions ≤ ratio x campaign spend ÷ campaign conversions.
+        if _exact(row.cost) * _exact(totals.outcomes) > (
+            cfg.k2_max_cpa_ratio * _exact(totals.spend) * _exact(row.conversions)
+        ):
+            continue
+        if _exact(row.conversions) < cfg.k2_min_conversions:
+            observed = _count(row.conversions)
+            minimum = _plain(_to_decimal(cfg.k2_min_conversions))
+            withheld.append(
+                Withheld(
+                    rule_id=K2,
+                    section=KEYWORDS,
+                    entity=_search_term_ref(ctx, row),
+                    reason=(
+                        f"conversions {_number_text(observed)} of {_number_text(minimum)} required"
+                    ),
+                    observed=observed,
+                    required=minimum,
+                    unit="conversions",
+                )
+            )
+            continue
+        if account.id not in pools:
+            pools[account.id] = _adjacent_pool(ctx, cfg, account)
+        adjacent = _adjacent(pools[account.id], cfg, row.search_term)
+        candidates.append(
+            _k2_candidate(ctx, cfg, row, campaign, totals, adjacent, coverage[account.id], crm_link)
+        )
+    return RuleResult(candidates=tuple(candidates), withheld=tuple(withheld))
+
+
+# ---------------------------------------------------------------------------
+# K3 Review: declining quality score, or CPC rising without a matching conversion rise
+# ---------------------------------------------------------------------------
+
+type _QsBasis = Literal["daily", "snapshots"]
+
+
+@dataclass(frozen=True, slots=True)
+class _Half:
+    """One half of the window for one keyword: its dates and summed facts.
+
+    ``conversions`` is known only when every day of the half reported them. It is ``None``
+    (unavailable) when any day left conversions unreported, or no day falls in the half, so
+    an unknown day never turns into a zero or a partial sum.
+    """
+
+    start: date
+    end: date
+    cost: Decimal
+    clicks: int
+    conversions: Decimal | None
+
+
+def _half(days: Sequence[KeywordDay], start: date, end: date) -> _Half:
+    """Sum a keyword's days from ``start`` to ``end`` inclusive.
+
+    Cost and clicks sum over every included day. Conversions sum only when every included day
+    reported them; one unreported day makes the half's conversions ``None``.
+    """
+    cost = Decimal(0)
+    clicks = 0
+    conversions = Decimal(0)
+    reported = False
+    unreported = False
+    for day in days:
+        if start <= day.date <= end:
+            cost += day.cost
+            clicks += day.clicks
+            if day.conversions is None:
+                unreported = True
+            else:
+                conversions += day.conversions
+                reported = True
+    known = reported and not unreported
+    return _Half(start, end, cost, clicks, conversions if known else None)
+
+
+@dataclass(frozen=True, slots=True)
+class _QualityScore:
+    """K3 branch (a): the quality-score comparison of one keyword.
+
+    Attributes:
+        basis: ``daily`` (means of ``historical_quality_score`` over the first and last
+            ``k3.qs_span_days``), ``snapshots`` (Q-G7 snapshots at window start and end), or
+            ``None`` when neither is available.
+        first: The earlier score (a mean for ``daily``, a snapshot score otherwise).
+        last: The later score.
+        days_first: Days with a daily score in the first span.
+        days_last: Days with a daily score in the last span.
+        first_at: The earlier snapshot's instant (``snapshots`` only).
+        last_at: The later snapshot's instant (``snapshots`` only).
+        fires: Whether ``last ≤ first - k3.qs_drop``.
+        shortfall: ``(span, days)`` of the sparser span when daily scores exist but fall short
+            of ``k3.min_qs_days_per_span``; the branch then does not fire and no snapshot
+            fallback applies.
+    """
+
+    basis: _QsBasis | None
+    first: Fraction | None
+    last: Fraction | None
+    days_first: int
+    days_last: int
+    first_at: datetime | None
+    last_at: datetime | None
+    fires: bool
+    shortfall: tuple[str, int] | None
+
+
+def _google_zone(ctx: AnalysisContext, campaign: CampaignInfo) -> str:
+    """Return the Google native-day zone: the window's Google boundary, else the account's."""
+    try:
+        return ctx.window.boundary(_GOOGLE)
+    except KeyError:
+        account = ctx.accounts.get(campaign.account_id)
+        if account is not None and account.timezone:
+            return account.timezone
+        return "UTC"
+
+
+def _daily_quality_score(
+    ctx: AnalysisContext, cfg: _Config, scored: Sequence[KeywordDay]
+) -> _QualityScore:
+    """Compare mean daily quality scores of the first and last ``k3.qs_span_days``."""
+    window = ctx.window
+    span = cfg.k3_span_days
+    if span > window.days:
+        return _QualityScore(None, None, None, 0, 0, None, None, False, None)
+    first_start, first_end = window.first_n(span)
+    last_start, last_end = window.last_n(span)
+    first = [day.historical_quality_score for day in scored if first_start <= day.date <= first_end]
+    last = [day.historical_quality_score for day in scored if last_start <= day.date <= last_end]
+    first_scores = [score for score in first if score is not None]
+    last_scores = [score for score in last if score is not None]
+    minimum = cfg.k3_min_qs_days
+    if len(first_scores) < minimum or len(last_scores) < minimum:
+        sparse = (
+            ("first", len(first_scores))
+            if len(first_scores) <= len(last_scores)
+            else ("last", len(last_scores))
+        )
+        return _QualityScore(
+            None, None, None, len(first_scores), len(last_scores), None, None, False, sparse
+        )
+    mean_first = Fraction(sum(first_scores), len(first_scores))
+    mean_last = Fraction(sum(last_scores), len(last_scores))
+    return _QualityScore(
+        basis="daily",
+        first=mean_first,
+        last=mean_last,
+        days_first=len(first_scores),
+        days_last=len(last_scores),
+        first_at=None,
+        last_at=None,
+        fires=mean_last <= mean_first - cfg.k3_qs_drop,
+        shortfall=None,
+    )
+
+
+def _snapshot_quality_score(
+    ctx: AnalysisContext, cfg: _Config, keyword: KeywordInfo, campaign: CampaignInfo
+) -> _QualityScore:
+    """Compare the keyword's Q-G7 quality-score snapshots at window start and end.
+
+    The first observation at or after the window's first instant and the last at or before
+    its last, in Google's native day, each carrying a score; ``metrics.load_context`` reads
+    exactly these two per keyword.
+    """
+    window = ctx.window
+    zone = _google_zone(ctx, campaign)
+    lower, _ = window.day_bounds(window.start, zone)
+    _, upper = window.day_bounds(window.end, zone)
+    observed = sorted(
+        (
+            item
+            for item in ctx.observations.get((ENTITY_KEYWORD, keyword.id), ())
+            if lower <= item.captured_at <= upper and item.quality_score is not None
+        ),
+        key=lambda item: item.captured_at,
+    )
+    if len(observed) < 2 or observed[0].captured_at >= observed[-1].captured_at:
+        return _QualityScore(None, None, None, 0, 0, None, None, False, None)
+    start, end = observed[0], observed[-1]
+    if start.quality_score is None or end.quality_score is None:  # filtered above
+        return _QualityScore(None, None, None, 0, 0, None, None, False, None)
+    first, last = Fraction(start.quality_score), Fraction(end.quality_score)
+    return _QualityScore(
+        basis="snapshots",
+        first=first,
+        last=last,
+        days_first=0,
+        days_last=0,
+        first_at=start.captured_at,
+        last_at=end.captured_at,
+        fires=last <= first - cfg.k3_qs_drop,
+        shortfall=None,
+    )
+
+
+def _quality_score(
+    ctx: AnalysisContext,
+    cfg: _Config,
+    keyword: KeywordInfo,
+    campaign: CampaignInfo,
+    days: Sequence[KeywordDay],
+) -> _QualityScore:
+    """K3 branch (a): daily scores when the keyword has any, else the snapshot fallback."""
+    scored = [day for day in days if day.historical_quality_score is not None]
+    if scored:
+        return _daily_quality_score(ctx, cfg, scored)
+    return _snapshot_quality_score(ctx, cfg, keyword, campaign)
+
+
+@dataclass(frozen=True, slots=True)
+class _CpcRise:
+    """K3 branch (b): CPC and cost/conversion by half for one keyword.
+
+    Attributes:
+        cpc_first: First-half spend ÷ clicks.
+        cpc_second: Second-half spend ÷ clicks.
+        cpc_ratio: ``cpc_second ÷ cpc_first``; ``None`` when the first-half CPC is 0.
+        cpa_first: First-half cost/conversion; ``None`` at 0 conversions or when the half's
+            conversions are unknown (any day unreported). The evidence tells the two apart:
+            "—" at a known 0, unavailable when unknown (:func:`_cost_per_conversion_value`).
+        cpa_second: Second-half cost/conversion; ``None`` at 0 conversions or when the half's
+            conversions are unknown (any day unreported), shown the same way as ``cpa_first``.
+        cpa_ratio: ``cpa_second ÷ cpa_first`` when both exist and ``cpa_first`` is positive;
+            otherwise ``None`` (unavailable), so a zero-spend first half never divides by 0.
+        conversions_fell: Second-half conversions are known to be 0 while the first half's
+            known conversions are at least ``k3.min_first_half_conversions``; unknown
+            conversions in either half never count as a fall.
+        fires: ``cpc_ratio ≥ k3.rise_ratio`` and either ``cpa_ratio ≥ k3.rise_ratio`` or
+            ``conversions_fell``: CPC rose without a matching rise in conversion.
+    """
+
+    cpc_first: Fraction
+    cpc_second: Fraction
+    cpc_ratio: Fraction | None
+    cpa_first: Fraction | None
+    cpa_second: Fraction | None
+    cpa_ratio: Fraction | None
+    conversions_fell: bool
+    fires: bool
+
+
+def _cost_per(cost: Decimal, count: Decimal | int | None) -> Fraction | None:
+    """Return ``cost ÷ count`` exactly, or ``None`` at a zero or unreported count."""
+    if count is None or count <= 0:
+        return None
+    return _exact(cost) / _exact(count)
+
+
+def _cpc_rise(cfg: _Config, first: _Half, second: _Half) -> _CpcRise:
+    """Evaluate K3 branch (b) on two halves that each have at least one click."""
+    cpc_first = _exact(first.cost) / first.clicks
+    cpc_second = _exact(second.cost) / second.clicks
+    cpc_ratio = cpc_second / cpc_first if cpc_first > 0 else None
+    cpa_first = _cost_per(first.cost, first.conversions)
+    cpa_second = _cost_per(second.cost, second.conversions)
+    cpa_ratio = (
+        cpa_second / cpa_first
+        if cpa_first is not None and cpa_first > 0 and cpa_second is not None
+        else None
+    )
+    conversions_fell = (
+        second.conversions is not None
+        and second.conversions == 0
+        and first.conversions is not None
+        and _exact(first.conversions) >= cfg.k3_min_first_half_conversions
+    )
+    rise = cfg.k3_rise_ratio
+    fires = (
+        cpc_ratio is not None
+        and cpc_ratio >= rise
+        and ((cpa_ratio is not None and cpa_ratio >= rise) or conversions_fell)
+    )
+    return _CpcRise(
+        cpc_first,
+        cpc_second,
+        cpc_ratio,
+        cpa_first,
+        cpa_second,
+        cpa_ratio,
+        conversions_fell,
+        fires,
+    )
+
+
+def _qs_value(value: Fraction | None, basis: _QsBasis | None) -> Decimal | int | None:
+    """Return a quality score for display: a snapshot's integer, or a mean to two places."""
+    if value is None:
+        return None
+    if basis == "snapshots" and value.denominator == 1:
+        return value.numerator
+    return _mean(value)
+
+
+def _qs_labels(basis: _QsBasis | None, span: int) -> tuple[str, str]:
+    """Return the labels of the two quality-score metrics for a basis."""
+    if basis == "snapshots":
+        return (
+            "Quality score at window start (keyword snapshot)",
+            "Quality score at window end (keyword snapshot)",
+        )
+    days = _counted(span, "day", "days")
+    return (
+        f"Quality score, first {days} (mean of daily scores)",
+        f"Quality score, last {days} (mean of daily scores)",
+    )
+
+
+def _optional_money(value: Fraction | None, currency: str) -> Decimal | None:
+    return None if value is None else _money(value, currency)
+
+
+def _optional_ratio(value: Fraction | None) -> Decimal | None:
+    return None if value is None else _ratio(value)
+
+
+def _optional_count(value: Decimal | None) -> Decimal | None:
+    """Return a displayed conversion count, or ``None`` when unreported."""
+    return None if value is None else _count(value)
+
+
+def _span_json(start: date, end: date) -> dict[str, date]:
+    return {"start": start, "end": end}
+
+
+def _k3_reason(evidence: Evidence) -> str:
+    """Render K3's reason from its evidence only.
+
+    Rule K3 (AAP 0.5.4.3), gated by :func:`_evaluate_k3`. Threshold keys:
+    :data:`K3_THRESHOLD_KEYS`. Every item rendered passed the window gate
+    (``k3.min_window_days``, ``window.sustained_min_days``) and the click gate
+    (``k3.min_clicks_per_half`` in each half). The reason cites each trigger that fired: the
+    quality-score fall of at least ``k3.qs_drop``, between the first and last
+    ``k3.qs_span_days`` (each scored on at least ``k3.min_qs_days_per_span`` days) or between
+    the window's keyword snapshots; the CPC rise of at least ``k3.rise_ratio`` between halves.
+
+    Rationale: 30 clicks per half give a stable CPC, a one-point drop on the integer 1-10
+    quality-score scale is material, and 15% is above normal auction noise. A CPC rise is always
+    cited with its cost/conversion rise of at least ``k3.rise_ratio``, or with conversions
+    falling to 0 from at least ``k3.min_first_half_conversions``, because K3 flags CPC that rose
+    without a matching rise in conversion.
+    """
+    extra = evidence.extra
+    triggers = extra["triggers"]
+    sentences: list[str] = []
+    if "quality_score" in triggers:
+        first = _render(evidence.metric("qs_first"))
+        last = _render(evidence.metric("qs_last"))
+        if extra["qs_basis"] == "snapshots":
+            sentences.append(
+                f"Quality score fell from {first} to {last} between the keyword snapshots at "
+                "window start and end."
+            )
+        else:
+            spans = extra["qs_spans"]
+            sentences.append(
+                f"Quality score fell from a mean of {first} ({spans['first']['start']} to "
+                f"{spans['first']['end']}) to {last} ({spans['last']['start']} to "
+                f"{spans['last']['end']})."
+            )
+    if "cpc" in triggers:
+        halves = extra["halves"]
+        sentence = (
+            f"CPC rose from {_render(evidence.metric('cpc_first_half'))} in the first half "
+            f"({halves['first']['start']} to {halves['first']['end']}) to "
+            f"{_render(evidence.metric('cpc_second_half'))} in the second half "
+            f"({halves['second']['start']} to {halves['second']['end']}), "
+            f"{_render(evidence.metric('cpc_ratio'))}x, "
+        )
+        if extra["conversions_fell"]:
+            sentence += (
+                f"while conversions fell from {_render(evidence.metric('conversions_first_half'))}"
+                " to 0."
+            )
+        else:
+            sentence += (
+                "while cost/conversion rose from "
+                f"{_render(evidence.metric('cost_per_conversion_first_half'))} to "
+                f"{_render(evidence.metric('cost_per_conversion_second_half'))}, "
+                f"{_render(evidence.metric('cpa_ratio'))}x."
+            )
+        sentences.append(sentence)
+    return " ".join(sentences)
+
+
+def _k3_candidate(
+    ctx: AnalysisContext,
+    cfg: _Config,
+    keyword: KeywordInfo,
+    campaign: CampaignInfo,
+    days: Sequence[KeywordDay],
+    halves: tuple[_Half, _Half],
+    quality: _QualityScore,
+    cpc: _CpcRise,
+    coverage: _Coverage,
+    crm_link: Flag | None,
+) -> Candidate:
+    """Build one K3 item from the branches that fired, with its account's coverage flag.
+
+    Rule K3 (AAP 0.5.4.3), gated by :func:`_evaluate_k3`. Threshold keys:
+    :data:`K3_THRESHOLD_KEYS`, copied into ``evidence.thresholds``. The window reached
+    ``k3.min_window_days`` and ``window.sustained_min_days``, and each half reached
+    ``k3.min_clicks_per_half``, the sample's required clicks. ``quality`` compared daily scores
+    over the first and last ``k3.qs_span_days`` (each scored on at least
+    ``k3.min_qs_days_per_span`` days), or the Q-G7 snapshots, against ``k3.qs_drop``;
+    ``k3.qs_span_days`` also labels the quality-score metrics and spans. ``cpc`` applied
+    ``k3.rise_ratio`` and ``k3.min_first_half_conversions``;
+    ``keywords.min_search_term_coverage`` sets the coverage flag.
+
+    Rationale: ``k3.min_clicks_per_half`` (30) gives a stable CPC, a ``k3.qs_drop`` of 1 on the
+    integer 1-10 scale is material, and ``k3.rise_ratio`` (1.15) is above normal auction noise.
+    Requiring cost/conversion to rise as well, or conversions to fall to 0, means CPC rose
+    without a matching rise in conversion.
+
+    ``crm_link`` is the run's ``no_crm_link`` flag, appended after the coverage flag; ``None``
+    while the Google-to-CRM link is verified.
+    """
+    currency = ctx.account_currency(campaign.id)
+    whole = _half(days, ctx.window.start, ctx.window.end)
+    first, second = halves
+    qs_first_label, qs_last_label = _qs_labels(quality.basis, cfg.k3_span_days)
+    metrics = _common_metrics(
+        term_label="Keyword",
+        term=keyword.text,
+        spend=_money(whole.cost, currency),
+        conversions=_optional_count(whole.conversions),
+        cost_per_conversion=_cost_per_conversion_value(
+            _cost_per(whole.cost, whole.conversions), whole.conversions, currency
+        ),
+        currency=currency,
+    )
+    metrics += [
+        Metric("clicks", "Clicks", whole.clicks, "clicks"),
+        Metric("qs_first", qs_first_label, _qs_value(quality.first, quality.basis), "score"),
+        Metric("qs_last", qs_last_label, _qs_value(quality.last, quality.basis), "score"),
+        Metric(
+            "cpc_first_half",
+            "CPC, first half",
+            _money(cpc.cpc_first, currency),
+            "currency",
+            currency=currency,
+        ),
+        Metric(
+            "cpc_second_half",
+            "CPC, second half",
+            _money(cpc.cpc_second, currency),
+            "currency",
+            currency=currency,
+        ),
+        Metric("cpc_ratio", "CPC, second ÷ first half", _optional_ratio(cpc.cpc_ratio), "ratio"),
+        Metric(
+            "cost_per_conversion_first_half",
+            "Cost/conversion, first half",
+            _cost_per_conversion_value(cpc.cpa_first, first.conversions, currency),
+            "currency",
+            currency=currency,
+        ),
+        Metric(
+            "cost_per_conversion_second_half",
+            "Cost/conversion, second half",
+            _cost_per_conversion_value(cpc.cpa_second, second.conversions, currency),
+            "currency",
+            currency=currency,
+        ),
+        Metric(
+            "cpa_ratio",
+            "Cost/conversion, second ÷ first half",
+            _optional_ratio(cpc.cpa_ratio),
+            "ratio",
+        ),
+        Metric(
+            "conversions_first_half",
+            "Conversions, first half",
+            _optional_count(first.conversions),
+            "conversions",
+        ),
+        Metric(
+            "conversions_second_half",
+            "Conversions, second half",
+            _optional_count(second.conversions),
+            "conversions",
+        ),
+        Metric("clicks_first_half", "Clicks, first half", first.clicks, "clicks"),
+        Metric("clicks_second_half", "Clicks, second half", second.clicks, "clicks"),
+    ]
+    triggers = [
+        name for name, fired in (("quality_score", quality.fires), ("cpc", cpc.fires)) if fired
+    ]
+    first_span = ctx.window.first_n(min(cfg.k3_span_days, ctx.window.days))
+    last_span = ctx.window.last_n(min(cfg.k3_span_days, ctx.window.days))
+    extra: dict[str, Any] = _campaign_extra(ctx, campaign, keyword.ad_group_id)
+    extra |= {
+        "criterion_id": keyword.criterion_id,
+        "match_type": keyword.match_type,
+        "triggers": triggers,
+        "qs_basis": quality.basis,
+        "qs_days_first": quality.days_first,
+        "qs_days_last": quality.days_last,
+        "qs_spans": {"first": _span_json(*first_span), "last": _span_json(*last_span)},
+        "qs_snapshots": (
+            {"start_at": quality.first_at, "end_at": quality.last_at}
+            if quality.basis == "snapshots"
+            else None
+        ),
+        "halves": {
+            "first": _span_json(first.start, first.end),
+            "second": _span_json(second.start, second.end),
+        },
+        "conversions_fell": cpc.conversions_fell,
+        "search_term_coverage": coverage.extra(),
+    }
+    evidence = ctx.make_evidence(
+        required_datasets=K3_DATASETS,
+        crm_scope=None,
+        metrics=metrics,
+        sample=Sample(
+            observed=min(first.clicks, second.clicks),
+            required=cfg.k3_min_clicks_per_half,
+            unit="clicks per half",
+        ),
+        threshold_keys=K3_THRESHOLD_KEYS,
+        extra=extra,
+        # The branch that fired: the latest quality score when it dropped, else the CPC rise.
+        headline="qs_last" if "quality_score" in triggers else "cpc_ratio",
+    )
+    return Candidate(
+        rule_id=K3,
+        section=KEYWORDS,
+        group=GROUP_REVIEW,
+        entity_ref=_keyword_ref(ctx, keyword),
+        action=K3_ACTION,
+        reason=_k3_reason(evidence),
+        evidence=evidence,
+        rank_key=(-whole.cost,),
+        flags=(*_flags(coverage.flag()), *_flags(crm_link)),
+        required_datasets=K3_DATASETS,
+        increases_spend_on=(),
+        decision_subject=None,
+        depends_on=(DecisionSubject("campaign", campaign.id),),
+    )
+
+
+def _k3_required_days(ctx: AnalysisContext, cfg: _Config) -> int:
+    """Return K3's minimum window: ``k3.min_window_days``, the sustained minimum, and 2 halves."""
+    return max(cfg.k3_min_window_days, ctx.window.sustained_min_days, 2)
+
+
+def _evaluate_k3(
+    ctx: AnalysisContext,
+    cfg: _Config,
+    accounts: Mapping[int, _Account],
+    coverage: Mapping[int, _Coverage],
+    crm_link: Flag | None,
+) -> RuleResult:
+    """Rule K3 Review: declining quality score, or CPC rising without a matching conversion rise.
+
+    AAP 0.5.4.3 K3, FR-4 (c). The window must reach ``k3.min_window_days`` and
+    ``window.sustained_min_days``; otherwise K3 is withheld with the observed and required
+    days. A keyword with at least ``k3.min_clicks_per_half`` clicks in each half of the window
+    fires on either branch:
+
+    * (a) quality score: the mean daily ``historical_quality_score`` (Q-G5) of the last
+      ``k3.qs_span_days`` is at most the first span's mean - ``k3.qs_drop``, with scores on at
+      least ``k3.min_qs_days_per_span`` days in each span. When the keyword has no daily
+      scores, its Q-G7 snapshots at window start and end are compared instead. Daily scores on
+      too few days withhold the branch (no snapshot fallback).
+    * (b) CPC: second-half CPC ÷ first-half CPC ≥ ``k3.rise_ratio`` and either cost/conversion
+      second ÷ first half ≥ ``k3.rise_ratio``, or second-half conversions are 0 with at least
+      ``k3.min_first_half_conversions`` in the first half.
+
+    Each item carries the ``search_term_coverage`` flag when its account's search-term coverage
+    is below ``keywords.min_search_term_coverage``, and ``crm_link``, the run's ``no_crm_link``
+    flag, without the verified Google-to-CRM link (AAP 0.3.3, 0.5.4.1).
+
+    Sample withholding (P6): a keyword with fewer than ``k3.min_clicks_per_half`` clicks in
+    either half is withheld when a branch would otherwise fire, with the smaller half's clicks
+    observed against the minimum in clicks per half. The reason names each short half with its
+    clicks and dates, for example "clicks 29 of 30 required in the first half (2026-09-04 to
+    2026-09-17)"; the CPC branch is evaluated only when both halves have a click. A keyword
+    showing no pattern is not listed. A keyword clearing the click gate whose daily quality
+    scores fall short of ``k3.min_qs_days_per_span`` is withheld with the quality-score days
+    observed and required, unless the CPC branch fires.
+
+    Threshold keys: ``k3.min_window_days``, ``window.sustained_min_days``,
+    ``k3.min_clicks_per_half``, ``k3.qs_span_days``, ``k3.min_qs_days_per_span``,
+    ``k3.qs_drop``, ``k3.rise_ratio``, ``k3.min_first_half_conversions`` and
+    ``keywords.min_search_term_coverage``.
+
+    Rationale: 30 clicks per half give a stable CPC; a one-point drop on the integer 1-10
+    quality-score scale is material; 15% is above normal auction noise, and requiring
+    cost/conversion to rise as well means CPC rose without a matching rise in conversion.
+
+    Returns:
+        Items in group ``review`` ranked by window spend descending (``rank_key =
+        (-spend,)``), and the withheld lines.
+    """
+    window = ctx.window
+    required = _k3_required_days(ctx, cfg)
+    if window.days < required:
+        if not any(ctx.keyword_days.values()):
+            return RuleResult()
+        return RuleResult(
+            withheld=(
+                Withheld(
+                    rule_id=K3,
+                    section=KEYWORDS,
+                    entity=None,
+                    reason=f"window {_counted(window.days, 'day', 'days')} of {required} required",
+                    observed=window.days,
+                    required=required,
+                    unit="days",
+                ),
+            )
+        )
+    (first_start, first_end), (second_start, second_end) = window.halves()
+    candidates: list[Candidate] = []
+    withheld: list[Withheld] = []
+    minimum = cfg.k3_min_clicks_per_half
+    for keyword_id in sorted(ctx.keyword_days):
+        keyword = ctx.keywords.get(keyword_id)
+        campaign = None if keyword is None else _google_campaign(ctx, keyword.campaign_id)
+        account = None if campaign is None else accounts.get(campaign.account_id)
+        if keyword is None or campaign is None or account is None:
+            continue
+        days = [
+            day for day in ctx.keyword_days[keyword_id] if window.start <= day.date <= window.end
+        ]
+        first = _half(days, first_start, first_end)
+        second = _half(days, second_start, second_end)
+        quality = _quality_score(ctx, cfg, keyword, campaign, days)
+        if min(first.clicks, second.clicks) < minimum:
+            # P6: a pattern below the click minimum is withheld, and a keyword showing no
+            # pattern is not listed. CPC needs a click in each half, so it never divides by 0.
+            cpc_fires = (
+                first.clicks > 0 and second.clicks > 0 and _cpc_rise(cfg, first, second).fires
+            )
+            if quality.fires or cpc_fires:
+                withheld.append(
+                    Withheld(
+                        rule_id=K3,
+                        section=KEYWORDS,
+                        entity=_keyword_ref(ctx, keyword),
+                        reason="; ".join(
+                            f"clicks {half.clicks} of {minimum} required in the {name} half "
+                            f"({half.start} to {half.end})"
+                            for name, half in (("first", first), ("second", second))
+                            if half.clicks < minimum
+                        ),
+                        observed=min(first.clicks, second.clicks),
+                        required=minimum,
+                        unit="clicks per half",
+                    )
+                )
+            continue
+        cpc = _cpc_rise(cfg, first, second)
+        if quality.fires or cpc.fires:
+            candidates.append(
+                _k3_candidate(
+                    ctx,
+                    cfg,
+                    keyword,
+                    campaign,
+                    days,
+                    (first, second),
+                    quality,
+                    cpc,
+                    coverage[account.id],
+                    crm_link,
+                )
+            )
+        elif quality.shortfall is not None:
+            span_name, observed = quality.shortfall
+            withheld.append(
+                Withheld(
+                    rule_id=K3,
+                    section=KEYWORDS,
+                    entity=_keyword_ref(ctx, keyword),
+                    reason=(
+                        f"quality score on {observed} of "
+                        f"{_counted(cfg.k3_min_qs_days, 'required day', 'required days')} in "
+                        f"the {span_name} {_counted(cfg.k3_span_days, 'day', 'days')}"
+                    ),
+                    observed=observed,
+                    required=cfg.k3_min_qs_days,
+                    unit="days",
+                )
+            )
+    return RuleResult(candidates=tuple(candidates), withheld=tuple(withheld))
+
+
+# ---------------------------------------------------------------------------
+# The section
+# ---------------------------------------------------------------------------
+
+
+def evaluate(ctx: AnalysisContext) -> RuleResult:
+    """Evaluate the Keywords to adjust section: K1, K2, K3 and search-term coverage.
+
+    AAP 0.5.4.3 and FR-4. Pure: reads only ``ctx`` and performs no I/O. When Google has no
+    active dataset and no campaigns in the run, the section has nothing to evaluate and the
+    result is empty. Otherwise the result holds one ``search_term_coverage`` finding per
+    Google account, then the K1, K2 and K3 results in that order (:func:`_evaluate_k1`,
+    :func:`_evaluate_k2`, :func:`_evaluate_k3`). Precedence (holds, P2 suppression,
+    stale/incomplete/short-window flags, feedback and ranking) is applied by the runner.
+
+    The Google-to-CRM link gap is decided once here
+    (:func:`~ads_engine.analysis.context.google_link_gap`): while the link is not verified,
+    every K1, K2 and K3 item carries the ``no_crm_link`` flag after its other flags, and while
+    it is verified none does (AAP 0.3.3, 0.5.4.1). The section emits no ``no_crm_link``
+    finding: AAP 0.5.4.3 defines its section finding as search-term coverage.
+
+    Args:
+        ctx: The analysis context.
+
+    Returns:
+        The section's candidates, findings and withheld lines; no suppression counts.
+
+    Raises:
+        ConfigError: When a keyword threshold is missing from the configuration.
+    """
+    if not _google_active(ctx):
+        return RuleResult()
+    cfg = _Config.load(ctx.thresholds)
+    accounts = _google_accounts(ctx)
+    coverage = _coverage(ctx, cfg, accounts)
+    gap = google_link_gap(ctx)
+    crm_link = None if gap is None else no_crm_link_flag(gap)
+    findings = tuple(_coverage_finding(ctx, cfg, item) for item in coverage.values())
+    return RuleResult(findings=findings).merge(
+        _evaluate_k1(ctx, cfg, accounts, coverage, crm_link),
+        _evaluate_k2(ctx, cfg, accounts, coverage, crm_link),
+        _evaluate_k3(ctx, cfg, accounts, coverage, crm_link),
+    )

@@ -1,0 +1,90 @@
+{
+  "request": {
+    "body": null,
+    "headers": {
+      "Authorization": "Bearer <redacted>"
+    },
+    "method": "GET",
+    "query": [],
+    "url": "https://api.hubapi.com/crm/properties/2026-09/contacts/lifecyclestage"
+  },
+  "response": {
+    "body": {
+      "calculated": false,
+      "description": "",
+      "fieldType": "radio",
+      "groupName": "contactinformation",
+      "hidden": false,
+      "label": "Lifecycle Stage",
+      "name": "lifecyclestage",
+      "options": [
+        {
+          "displayOrder": 0,
+          "hidden": false,
+          "label": "Subscriber",
+          "value": "subscriber"
+        },
+        {
+          "displayOrder": 1,
+          "hidden": false,
+          "label": "Lead",
+          "value": "lead"
+        },
+        {
+          "displayOrder": 2,
+          "hidden": false,
+          "label": "First meeting booked",
+          "value": "990100000"
+        },
+        {
+          "displayOrder": 3,
+          "hidden": false,
+          "label": "Qualified Lead",
+          "value": "990100001"
+        },
+        {
+          "displayOrder": 4,
+          "hidden": false,
+          "label": "Marketing Qualified Lead",
+          "value": "marketingqualifiedlead"
+        },
+        {
+          "displayOrder": 5,
+          "hidden": false,
+          "label": "Sales Qualified Lead",
+          "value": "salesqualifiedlead"
+        },
+        {
+          "displayOrder": 6,
+          "hidden": false,
+          "label": "Opportunity",
+          "value": "opportunity"
+        },
+        {
+          "displayOrder": 7,
+          "hidden": false,
+          "label": "Customer",
+          "value": "customer"
+        },
+        {
+          "displayOrder": 8,
+          "hidden": false,
+          "label": "Evangelist",
+          "value": "evangelist"
+        },
+        {
+          "displayOrder": 9,
+          "hidden": false,
+          "label": "Other",
+          "value": "other"
+        }
+      ],
+      "type": "enumeration"
+    },
+    "status": 200
+  },
+  "scenario": "default",
+  "seed": 42,
+  "source": "hubspot",
+  "surface": "hubspot.properties"
+}

@@ -1,0 +1,99 @@
+{
+  "surface": "google.row_ad_group",
+  "source": "google",
+  "reference_url": "https://developers.google.com/google-ads/api/fields/v25/ad_group",
+  "api_version": "v25",
+  "last_modified": null,
+  "request": {
+    "method": "POST",
+    "url": "{N8N_GOOGLE_ADS_WEBHOOK_URL}",
+    "required_headers": [],
+    "required_query": [],
+    "optional_query": [],
+    "fields": null,
+    "body": null,
+    "gaql": {
+      "query_id": "Q-G4",
+      "resource": "ad_group",
+      "select": [
+        "ad_group.id",
+        "ad_group.name",
+        "ad_group.status",
+        "campaign.id"
+      ]
+    },
+    "limits": {}
+  },
+  "response": {
+    "status": [
+      200
+    ],
+    "body": {
+      "type": "object",
+      "description": "One REST GoogleAdsRow of Q-G4, the ad_group keyset scan (AAP 0.3.3): SELECT ad_group.id, ad_group.name, ad_group.status, campaign.id FROM ad_group, filtered to ad_group.status != 'REMOVED' and ad_group.id > {last_id}, ORDER BY ad_group.id LIMIT 9999. Each page holds at most 9,999 rows, below the 10,000-row page size, so no page can be silently truncated. The scan continues from the last ad_group.id while a page returns exactly 9,999 rows and ends on the first shorter page; ids strictly increase, so it terminates, and its union is the complete set of non-removed ad groups. Safe absence: sync infers that a tracked ad group was removed or disappeared only from a complete scan (ended on a short page, with no failed or deferred page); otherwise google.entities is incomplete for that sync and the previous snapshot stands. Used for keyword context and for C3b, which checks a cluster's head tokens against ad group names. The rows arrive in results[] of the search.json envelope, which governs the request body, headers and paging. Keys are camelCase and int64 values arrive as strings. Every resource with a selected field also returns its resourceName, the attributed campaign included. Undeclared keys fail validation, so a field added to the query must be declared here from the reference page first.",
+      "properties": {
+        "adGroup": {
+          "type": "object",
+          "description": "The ad_group resource named in the FROM clause. Field types are transcribed from the v25 ad_group fields page and the v25 AdGroup reference.",
+          "properties": {
+            "resourceName": {
+              "type": "string",
+              "description": "Immutable. The resource name of the ad group (RESOURCE_NAME), of the form customers/{customer_id}/adGroups/{ad_group_id}. Returned with every row although it is not selected."
+            },
+            "id": {
+              "type": "string",
+              "description": "Output only. The ID of the ad group (INT64), rendered as a JSON string; the parser converts it to an integer. Filterable and sortable, which makes it the keyset field: each next page filters ad_group.id > the last id seen."
+            },
+            "name": {
+              "type": "string",
+              "description": "The name of the ad group (STRING). Fewer than 255 UTF-8 full-width characters, with no null (0x0), line feed (0xA) or carriage return (0xD) characters. C3b tests a keyword cluster's head tokens against these names."
+            },
+            "status": {
+              "type": "string",
+              "description": "The status of the ad group (ENUM google.ads.googleads.v25.enums.AdGroupStatusEnum.AdGroupStatus). Q-G4 excludes REMOVED, but the enum keeps the reference page's full list, so a live capture or an unfiltered read still validates. UNKNOWN is a response-only value not known in this API version; UNSPECIFIED means no value was specified.",
+              "enum": [
+                "ENABLED",
+                "PAUSED",
+                "REMOVED",
+                "UNKNOWN",
+                "UNSPECIFIED"
+              ]
+            }
+          },
+          "required": [
+            "resourceName",
+            "id",
+            "name",
+            "status"
+          ],
+          "additionalProperties": false
+        },
+        "campaign": {
+          "type": "object",
+          "description": "The campaign the ad group belongs to. campaign is an attributed resource of ad_group, so its fields are selectable with it and do not segment the rows. campaign.id is selected, so the row also carries campaign.resourceName.",
+          "properties": {
+            "resourceName": {
+              "type": "string",
+              "description": "The resource name of the campaign (RESOURCE_NAME), of the form customers/{customer_id}/campaigns/{campaign_id}."
+            },
+            "id": {
+              "type": "string",
+              "description": "Output only. The ID of the campaign (INT64), rendered as a JSON string; the parser converts it to an integer. Links the ad group to its campaign row from Q-G2."
+            }
+          },
+          "required": [
+            "resourceName",
+            "id"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "adGroup",
+        "campaign"
+      ],
+      "additionalProperties": false
+    },
+    "documented_sample": null
+  }
+}

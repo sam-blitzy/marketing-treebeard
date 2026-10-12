@@ -1,0 +1,149 @@
+{
+  "surface": "google.row_keyword_view",
+  "source": "google",
+  "reference_url": "https://developers.google.com/google-ads/api/fields/v25/keyword_view",
+  "api_version": "v25",
+  "last_modified": "2026-09-30",
+  "request": {
+    "method": "POST",
+    "url": "{N8N_GOOGLE_ADS_WEBHOOK_URL}",
+    "required_headers": [],
+    "required_query": [],
+    "optional_query": [],
+    "fields": null,
+    "body": null,
+    "gaql": {
+      "query_id": "Q-G5",
+      "resource": "keyword_view",
+      "select": [
+        "ad_group_criterion.criterion_id",
+        "ad_group.id",
+        "segments.date",
+        "metrics.historical_quality_score",
+        "metrics.average_cpc",
+        "metrics.cost_micros",
+        "metrics.clicks",
+        "metrics.impressions",
+        "metrics.conversions"
+      ]
+    },
+    "limits": {}
+  },
+  "response": {
+    "status": [
+      200
+    ],
+    "body": {
+      "type": "object",
+      "description": "One REST GoogleAdsRow of Q-G5: one row per keyword (ad group criterion) per segments.date, for keywords with traffic on that day. The webhook envelope, its headers and its {customer_id, query, page_token} body are governed by search.json; these rows arrive in its results[] array. The query carries no status filter and is bounded only by segments.date BETWEEN the fetch range, so a keyword or ad group removed during the range still reports its days. Keys are camelCase and every INT64 value (ids, costMicros, clicks, impressions, historicalQualityScore) arrives as a JSON string; DOUBLE values arrive as JSON numbers. keywordView.resourceName is always returned for the FROM resource; adGroupCriterion.resourceName and adGroup.resourceName accompany their selected fields. Completeness: a page of exactly 10,000 rows with no nextPageToken is halved by date, then by numeric campaign.id ranges, then by numeric ad_group.id ranges; a single ad group and day that still returns 10,000 rows is read by keyset on ad_group_criterion.criterion_id (ORDER BY ad_group_criterion.criterion_id, criterion_id > last, LIMIT 9999). Keywords with no traffic have no keyword_view rows; their current state and quality score come from Q-G7 (row_ad_group_criterion.json). Source: Google Ads API v25 fields reference (keyword_view, metrics, ad_group_criterion, ad_group), last updated 2026-09-30; key shapes and types also observed in a live v25 response through the n8n webhook on 2026-10-07.",
+      "properties": {
+        "keywordView": {
+          "type": "object",
+          "description": "The FROM resource. keyword_view itself contains only its resource name.",
+          "properties": {
+            "resourceName": {
+              "type": "string",
+              "description": "Form customers/{customer_id}/keywordViews/{ad_group_id}~{criterion_id}."
+            }
+          },
+          "required": [
+            "resourceName"
+          ],
+          "additionalProperties": false
+        },
+        "adGroupCriterion": {
+          "type": "object",
+          "description": "Attributed ad_group_criterion of the keyword. Attributed fields do not segment the metrics.",
+          "properties": {
+            "resourceName": {
+              "type": "string",
+              "description": "Form customers/{customer_id}/adGroupCriteria/{ad_group_id}~{criterion_id}."
+            },
+            "criterionId": {
+              "type": "string",
+              "description": "ad_group_criterion.criterion_id, INT64 as a string. Unique only within its ad group, so a keyword is keyed by (adGroup.id, criterionId); it is also the keyset column for a single ad group and day at the result limit."
+            }
+          },
+          "required": [
+            "resourceName",
+            "criterionId"
+          ],
+          "additionalProperties": false
+        },
+        "adGroup": {
+          "type": "object",
+          "description": "Attributed ad_group of the keyword.",
+          "properties": {
+            "resourceName": {
+              "type": "string",
+              "description": "Form customers/{customer_id}/adGroups/{ad_group_id}."
+            },
+            "id": {
+              "type": "string",
+              "description": "ad_group.id, INT64 as a string. The partition column for numeric ad_group.id range halving."
+            }
+          },
+          "required": [
+            "resourceName",
+            "id"
+          ],
+          "additionalProperties": false
+        },
+        "segments": {
+          "type": "object",
+          "description": "Segment fields of the row.",
+          "properties": {
+            "date": {
+              "type": "string",
+              "description": "segments.date, DATE in yyyy-MM-dd format, in the customer account's time zone (customer.time_zone). Kept as the native day and never rebucketed."
+            }
+          },
+          "required": [
+            "date"
+          ],
+          "additionalProperties": false
+        },
+        "metrics": {
+          "type": "object",
+          "description": "Metrics of the keyword on segments.date. REST JSON omits zero or unset values, so any metric, or the whole object, may be absent. Absent additive metrics (costMicros, clicks, impressions, conversions) are zero; absent historicalQualityScore or averageCpc is unavailable, never zero.",
+          "properties": {
+            "historicalQualityScore": {
+              "type": "string",
+              "description": "metrics.historical_quality_score, INT64 1-10 as a string. Absent on days without a score, which is common; never defaulted to 0. Feeds the K3 quality-score comparison of the window's first and last spans, each k3.qs_span_days in config/thresholds.yaml (default 7) days long."
+            },
+            "averageCpc": {
+              "type": "number",
+              "description": "metrics.average_cpc, DOUBLE: total cost of all clicks divided by total clicks, in micros of the account currency (equals costMicros / clicks), so a JSON number that may be fractional or whole. Absent when there are no clicks."
+            },
+            "costMicros": {
+              "type": "string",
+              "description": "metrics.cost_micros, INT64 as a string, in micros of the account currency."
+            },
+            "clicks": {
+              "type": "string",
+              "description": "metrics.clicks, INT64 as a string."
+            },
+            "impressions": {
+              "type": "string",
+              "description": "metrics.impressions, INT64 as a string."
+            },
+            "conversions": {
+              "type": "number",
+              "description": "metrics.conversions, DOUBLE: counts only conversion actions with include_in_conversions_metric = true. Fractional under data-driven attribution and possibly several per click under MANY_PER_CLICK, so never assumed integral. Google returns at most six decimal places (observed live 2026-10-07); a value finer than six places cannot be stored exactly in numeric(18,6) and is a parse defect."
+            }
+          },
+          "required": [],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "keywordView",
+        "adGroupCriterion",
+        "adGroup",
+        "segments"
+      ],
+      "additionalProperties": false
+    },
+    "documented_sample": null
+  }
+}

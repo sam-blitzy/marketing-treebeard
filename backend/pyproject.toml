@@ -1,0 +1,240 @@
+# Ads Action Engine backend: package manifest and tool configuration.
+#
+# Lockfile policy
+# - backend/uv.lock is generated from this file with `uv lock` (uv 0.12.21) and committed.
+#   It is never edited by hand.
+# - Every change to a dependency below regenerates and commits uv.lock in the same change.
+# - CI and `make test` install with `uv sync --frozen`; the Docker image installs with
+#   `uv sync --locked --no-dev`, which checks the lock against this file, so a stale lock
+#   fails the image build instead of drifting.
+#
+# Version policy
+# - `~=X.Y.Z` admits patch releases only. Bounded ranges (`>=A,<B`) are used where a
+#   patch-level pin was not verified. The lockfile records the exact versions resolved.
+#
+# Commands (run from backend/)
+#   uv sync --frozen                 install runtime + dev group from the lock
+#   uv run ruff format --check .     formatting
+#   uv run ruff check .              lint
+#   uv run mypy --strict src         type check
+#   uv run pytest                    full suite with the coverage gates below
+#   uv run pytest --no-cov <path>    focused run; both coverage gates are skipped when
+#                                    coverage is inactive
+
+[build-system]
+requires = ["uv_build>=0.12.21,<0.13"]
+build-backend = "uv_build"
+
+[project]
+name = "ads-engine"
+version = "0.1.0"
+description = "Ads Action Engine: ranked, evidence-backed actions from LinkedIn Ads, Google Ads (via n8n) and HubSpot"
+requires-python = ">=3.14,<3.15"
+# Runtime dependencies are exactly the stack selected for the product; connectors are
+# hand-written on httpx, so no Google Ads, LinkedIn or HubSpot SDK is ever added here.
+dependencies = [
+    "fastapi ~=0.142.2",
+    "pydantic ~=2.13.5",
+    "pydantic-settings >=2.10,<3",
+    "uvicorn[standard] ~=0.54.0",
+    # The asyncio extra installs greenlet, which SQLAlchemy 2.1 no longer pulls in by
+    # default; without it `sqlalchemy.ext.asyncio` (async sessions, AsyncAttrs) fails to import.
+    "sqlalchemy[asyncio] ~=2.1.2",
+    "alembic ~=1.20.0",
+    "psycopg[binary] ~=3.3.6",
+    # Stays below 1.0, which exists only as pre-releases.
+    "httpx ~=0.28.1",
+    # 9.2.0 is tagged upstream but not published to PyPI.
+    "tenacity ~=9.1.4",
+    "scipy ~=1.18.1",
+    "statsmodels ~=0.15.0",
+    "argon2-cffi ~=25.1.0",
+    # Signs the Starlette SessionMiddleware cookie.
+    "itsdangerous >=2.2,<3",
+    "structlog ~=26.1.0",
+    # Loads config/thresholds.yaml, config/content_assets.yaml, config/hubspot_mapping.yaml.
+    "pyyaml >=6.0.2,<7",
+]
+
+[project.scripts]
+# hash-password, migrate, ensure-admin, sync, analyze, seed-simulated, capture-fixtures
+ads-engine = "ads_engine.cli:main"
+
+[dependency-groups]
+# Installed by default by `uv sync`; excluded by `uv sync --no-dev` (Docker image).
+# Async tests use anyio's pytest plugin (`@pytest.mark.anyio`); anyio arrives
+# transitively with httpx and Starlette, so no pytest-asyncio.
+dev = [
+    "pytest ~=9.1.1",
+    "ruff ~=0.16.10",
+    "mypy ~=2.3.1",
+    # pytest-cov 7.1 requires coverage >=7.10.6.
+    "pytest-cov ~=7.1.0",
+    "coverage >=7.10.6,<8",
+    # Supplies `--timeout`, which the CI gate and the validation commands pass
+    # (`uv run pytest --timeout=300`); without it pytest rejects the argument.
+    "pytest-timeout ~=2.4.0",
+    "types-pyyaml >=6.0.12,<7",
+]
+
+[tool.uv]
+# uv is pinned at exactly 0.12.21 in backend/Dockerfile and CI; this exact pin makes a
+# local uv of any other version, 0.12.x patch releases included, refuse to lock or sync.
+required-version = "==0.12.21"
+
+[tool.uv.build-backend]
+module-name = "ads_engine"
+module-root = "src"
+
+# ---------------------------------------------------------------------------
+# Ruff: lint and format
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "B",     # flake8-bugbear
+    "UP",    # pyupgrade
+    "N",     # pep8-naming
+    "S",     # flake8-bandit
+    "ASYNC", # flake8-async
+    "DTZ",   # timezone-aware datetimes only; instants are stored as timestamptz
+    "SIM",   # flake8-simplify
+    "C4",    # flake8-comprehensions
+    "PT",    # flake8-pytest-style
+    "RUF",   # ruff-specific
+    "BLE",   # no blind or bare except
+    "T20",   # no print
+    "TID",   # flake8-tidy-imports
+    "D",     # docstrings on every public module, class, function and route
+]
+ignore = [
+    "D104", # package __init__ docstrings
+    "D107", # __init__ is documented on the class
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.flake8-tidy-imports]
+# Absolute `ads_engine.…` imports everywhere.
+ban-relative-imports = "all"
+
+[tool.ruff.lint.isort]
+known-first-party = ["ads_engine"]
+
+[tool.ruff.lint.flake8-bugbear]
+# Routes prefer `Annotated[...]`; these remain allowed as argument defaults.
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Query",
+    "fastapi.Path",
+    "fastapi.Body",
+    "fastapi.Header",
+    "fastapi.Cookie",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests: plain asserts, fixture tokens and passwords, no docstring requirement.
+"tests/**" = ["S101", "S105", "S106", "D"]
+# Alembic revisions such as 0001_initial_schema.py start with a digit.
+"migrations/**" = ["D", "N999"]
+# `ads-engine hash-password` prints only the computed hash to stdout.
+"src/ads_engine/cli.py" = ["T201"]
+# The simulator uses random.Random(MOCK_SEED) deliberately for reproducible,
+# non-cryptographic mock data.
+"src/ads_engine/simulation/**" = ["S311"]
+# GAQL templates look like SQL to S608, but they interpolate only validated integers
+# (customer, campaign, ad group and criterion ids, limits) and ISO dates, never user text.
+"src/ads_engine/connectors/google_n8n/queries.py" = ["S608"]
+"src/ads_engine/connectors/google_n8n/partition.py" = ["S608"]
+
+[tool.ruff.format]
+quote-style = "double"
+docstring-code-format = true
+
+# ---------------------------------------------------------------------------
+# mypy: `uv run mypy --strict src` resolves modules as ads_engine.*
+# ---------------------------------------------------------------------------
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+warn_unreachable = true
+mypy_path = "src"
+explicit_package_bases = true
+plugins = ["pydantic.mypy"]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[[tool.mypy.overrides]]
+# SciPy and statsmodels ship no complete type information. Nothing else is ignored.
+module = ["scipy", "scipy.*", "statsmodels", "statsmodels.*"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+minversion = "9.1"
+testpaths = ["tests"]
+xfail_strict = true
+# importlib mode: tests/ holds no __init__.py files, and duplicate test basenames are safe.
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--import-mode=importlib",
+    "--cov",
+    "--cov-report=term-missing:skip-covered",
+]
+markers = [
+    "db: needs the PostgreSQL 18 test database at TEST_DATABASE_URL",
+    "acceptance: rule/guard/precedence acceptance tests (AAP 0.11.2)",
+    "integration: connector contracts, datasets, API, end-to-end simulated",
+    "contract: validates against backend/tests/contracts",
+]
+# Warnings raised from our own package fail the test; third-party warnings are not escalated.
+filterwarnings = ["error:::ads_engine"]
+# TEST_DATABASE_URL is read by tests/conftest.py, not configured here.
+
+# ---------------------------------------------------------------------------
+# Coverage: targets are line coverage
+# ---------------------------------------------------------------------------
+
+[tool.coverage.run]
+source = ["ads_engine"]
+branch = false
+
+[tool.coverage.report]
+# Backend overall >= 80% (AAP 0.11.2). pytest-cov enforces this value on the total rounded to
+# `precision`, so it alone would pass 79.96%; the pytest_sessionfinish hook in tests/conftest.py
+# also decides it on the unrounded total. --cov-fail-under overrides it for both.
+fail_under = 80
+show_missing = true
+precision = 1
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@overload",
+    "if __name__ == .__main__.:",
+]
+
+[tool.ads_engine.coverage_gates]
+# coverage include-pattern = minimum line-coverage percent (AAP 0.11.2)
+# Coverage.py has no per-path fail_under; tests/conftest.py reads this table with tomllib
+# and enforces it in a pytest_sessionfinish hook through the coverage API.
+"*/ads_engine/analysis/*" = 90
+"*/ads_engine/connectors/*/parser.py" = 90

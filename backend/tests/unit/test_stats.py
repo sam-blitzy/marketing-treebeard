@@ -1,0 +1,2099 @@
+"""Unit tests for ``ads_engine.analysis.stats``, the statistics behind CR1-CR3, B3 and B4.
+
+They pin each wrapper to the library method it names, with every reference value computed here
+from SciPy or statsmodels (the Holm and Wilson boundary values are also checked by hand):
+
+* CR1: Fisher's exact test when any expected cell is below ``fisher_min_expected`` (5), the
+  pooled two-proportion z-test otherwise, the Holm step-down correction, and the extra sample
+  a pair needs at its observed difference;
+* CR2: Wilson score intervals; CR3: Cohen's h and the per-variant sample of a two-variant test,
+  including samples of 1 and 2 per group, which the library solver cannot size, and tiny
+  levels and effects, where it fails;
+* B4: the two-sample Poisson score test on unweighted counts; B3: the linear-interpolation
+  percentile of daily spend, exact in ``Decimal``;
+* the one p-value wording of the B4 and CR1 texts (``p_relation``), held to the table
+  ``p_value_relations.json`` that the web's test-line formatter is held to as well.
+
+Degenerate input returns ``None`` ("not estimable"), invalid input raises, and no result
+depends on the caller's decimal context. Everything here is pure and synchronous: no database
+and no network; the one file read is that table.
+"""
+
+import ast
+import doctest
+import inspect
+import json
+import math
+import sys
+import warnings
+from collections.abc import Sequence
+from dataclasses import FrozenInstanceError
+from decimal import ROUND_DOWN, ROUND_HALF_EVEN, Context, Decimal, localcontext
+from fractions import Fraction
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, SupportsFloat
+
+import numpy as np
+import pytest
+from scipy.stats import fisher_exact, norm
+from scipy.stats.contingency import expected_freq
+from statsmodels.stats.multitest import multipletests
+from statsmodels.stats.power import NormalIndPower
+from statsmodels.stats.proportion import (
+    proportion_confint,
+    proportion_effectsize,
+    proportions_ztest,
+)
+from statsmodels.stats.rates import test_poisson_2indep as poisson_2indep_reference
+from statsmodels.tools.rootfinding import brentq_expanding
+from statsmodels.tools.sm_exceptions import ConvergenceWarning
+
+from ads_engine.analysis import stats
+from ads_engine.analysis.stats import (
+    DEFAULT_ALPHA,
+    DEFAULT_CONFIDENCE,
+    FISHER_MIN_EXPECTED,
+    POISSON_RATE_METHOD,
+    Interval,
+    ProportionTest,
+    RateTest,
+    additional_n_for_difference,
+    cohens_h,
+    compare_proportions,
+    holm,
+    p_relation,
+    percentile,
+    poisson_rate_test,
+    required_n,
+    wilson,
+)
+
+QUANTUM = Decimal("0.000001")
+# The p-value table web/src/lib/format.test.ts holds formatPValue and formatTestLine to as well.
+P_VALUE_RELATIONS = Path(__file__).with_name("p_value_relations.json")
+ZERO = Decimal("0.000000")
+ONE = Decimal("1.000000")
+ALPHA = Decimal("0.05")
+POWER = Decimal("0.8")
+HALF = Decimal("0.5")
+TWO_SIDED = "two-sided"
+
+ZERO_RATE_RATIO_WARNING = pytest.mark.filterwarnings(
+    "ignore:divide by zero encountered in scalar divide:RuntimeWarning:statsmodels"
+)
+
+# Rates that differ exactly (1/3 and 10**20 / (3 * 10**20 - 1)) but are equal as floats, so
+# the power analysis sees no effect at all.
+FLOAT_EQUAL_RATES = (1, 3, 10**20, 3 * 10**20 - 1)
+
+
+# --- reference helpers ----------------------------------------------------------------------
+
+
+def six(value: SupportsFloat) -> Decimal:
+    """Reference conversion of a library float: its repr, rounded half-even to 6 places."""
+    return Decimal(repr(float(value))).quantize(QUANTUM, rounding=ROUND_HALF_EVEN)
+
+
+def probability(value: SupportsFloat) -> Decimal:
+    """Reference conversion of a library probability, clamped to [0, 1]."""
+    return min(max(six(value), ZERO), ONE)
+
+
+def exact_ratio(numerator: int | Decimal, denominator: int | Decimal) -> Decimal:
+    """Reference ``numerator / denominator`` at 6 places, at a precision no ratio here exceeds."""
+    with localcontext(Context(prec=50)):
+        quotient = Decimal(numerator) / Decimal(denominator)
+        return quotient.quantize(QUANTUM, rounding=ROUND_HALF_EVEN)
+
+
+def floor_six(value: Fraction) -> Decimal:
+    """``value`` rounded down to 6 places, exactly."""
+    return Decimal(math.floor(value * 1_000_000)) / Decimal(1_000_000)
+
+
+def table_of(x_a: int, n_a: int, x_b: int, n_b: int) -> list[list[int]]:
+    """The CR1 2x2 table: successes and failures of each variant."""
+    return [[x_a, n_a - x_a], [x_b, n_b - x_b]]
+
+
+def expected_min_reference(table: list[list[int]]) -> Fraction:
+    """Smallest expected cell under independence, row total * column total / grand total."""
+    rows = [sum(row) for row in table]
+    columns = [sum(column) for column in zip(*table, strict=True)]
+    total = sum(rows)
+    return min(Fraction(row * column, total) for row in rows for column in columns)
+
+
+def fisher_p(x_a: int, n_a: int, x_b: int, n_b: int) -> float:
+    """SciPy's two-sided Fisher exact p-value of the CR1 table, as the library float."""
+    return float(fisher_exact(table_of(x_a, n_a, x_b, n_b), alternative=TWO_SIDED).pvalue)
+
+
+def z_p(x_a: int, n_a: int, x_b: int, n_b: int) -> float:
+    """statsmodels' two-sided pooled two-proportion z-test p-value, as the library float."""
+    _, p_value = proportions_ztest([x_a, x_b], [n_a, n_b], alternative=TWO_SIDED)
+    return float(p_value)
+
+
+def fisher_reference(x_a: int, n_a: int, x_b: int, n_b: int) -> Decimal:
+    """SciPy's two-sided Fisher exact p-value of the CR1 table, as :func:`p_value_probability`."""
+    return p_value_probability(fisher_p(x_a, n_a, x_b, n_b))
+
+
+def z_reference(x_a: int, n_a: int, x_b: int, n_b: int) -> Decimal:
+    """statsmodels' two-sided pooled z-test p-value, as :func:`p_value_probability`."""
+    return p_value_probability(z_p(x_a, n_a, x_b, n_b))
+
+
+def solver_n(rate_1: float, rate_2: float, *, alpha: float = 0.05, power: float = 0.8) -> int:
+    """statsmodels' per-group sample for Cohen's h, two-sided, equal groups, rounded up."""
+    effect = abs(proportion_effectsize(rate_2, rate_1))
+    solved = NormalIndPower().solve_power(
+        effect_size=effect, nobs1=None, alpha=alpha, power=power, ratio=1.0, alternative=TWO_SIDED
+    )
+    return math.ceil(float(solved))
+
+
+def power_at(
+    rate_1: float, rate_2: float, nobs: int, *, alpha: float = 0.05, ratio: float = 1.0
+) -> float:
+    """statsmodels' power of the two-sided two-sample normal test, ``nobs`` and ``ratio * nobs``."""
+    effect = abs(proportion_effectsize(rate_2, rate_1))
+    return float(
+        NormalIndPower().power(
+            effect_size=effect, nobs1=nobs, alpha=alpha, ratio=ratio, alternative=TWO_SIDED
+        )
+    )
+
+
+def common_increment_power(x_a: int, n_a: int, x_b: int, n_b: int, extra: int) -> float:
+    """Power at the observed rates once each variant has ``extra`` more trials (unequal groups)."""
+    low, high = sorted((x_a / n_a, x_b / n_b))
+    smaller, larger = sorted((n_a, n_b))
+    grown = smaller + extra
+    return power_at(low, high, grown, ratio=(larger + extra) / grown)
+
+
+def library_solver_fails(rate_1: float, rate_2: float, *, alpha: float) -> bool:
+    """Whether statsmodels' ``solve_power`` returns NaN with a ConvergenceWarning (power 0.8)."""
+    effect = abs(proportion_effectsize(rate_2, rate_1))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        solved = NormalIndPower().solve_power(
+            effect_size=effect, nobs1=None, alpha=alpha, power=0.8, ratio=1.0, alternative=TWO_SIDED
+        )
+    warned = any(issubclass(w.category, ConvergenceWarning) for w in caught)
+    return math.isnan(float(solved)) and warned
+
+
+def p_value_probability(value: SupportsFloat) -> Decimal:
+    """Reference conversion of a library p-value: a positive value below the 6-place quantum
+    keeps 6 significant digits (half even), any other value is :func:`probability`."""
+    exact = Decimal(repr(float(value)))
+    if Decimal(0) < exact < QUANTUM:
+        return Context(prec=6, rounding=ROUND_HALF_EVEN).create_decimal(exact)
+    return probability(value)
+
+
+def poisson_p(count_a: int, spend_a: Decimal, count_b: int, spend_b: Decimal) -> float:
+    """statsmodels' two-sided score-test p-value of a rate ratio of 1, as the library float."""
+    result = poisson_2indep_reference(
+        count_a,
+        float(spend_a),
+        count_b,
+        float(spend_b),
+        value=1.0,
+        method="score",
+        compare="ratio",
+        alternative=TWO_SIDED,
+    )
+    return float(result.pvalue)
+
+
+def poisson_reference(count_a: int, spend_a: Decimal, count_b: int, spend_b: Decimal) -> Decimal:
+    """statsmodels' two-sided score test of a rate ratio of 1, as :func:`p_value_probability`."""
+    return p_value_probability(poisson_p(count_a, spend_a, count_b, spend_b))
+
+
+def type7_reference(values: Sequence[Decimal | int], q: Decimal) -> Decimal:
+    """Hyndman and Fan type 7 (NumPy ``"linear"``) percentile, exact, then 6 places."""
+    ordered = sorted(Fraction(value) for value in values)
+    position = (len(ordered) - 1) * Fraction(q)
+    lower = math.floor(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    exact = ordered[lower] + (position - lower) * (ordered[upper] - ordered[lower])
+    return exact_ratio(Decimal(exact.numerator), Decimal(exact.denominator))
+
+
+# --- compare_proportions: Fisher or z-test (CR1) ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("x_a", "n_a", "x_b", "n_b", "method"),
+    [
+        (1, 20, 4, 20, "fisher_exact"),  # expected 2.5
+        (1, 40, 6, 40, "fisher_exact"),  # expected 40 * 7 / 80 = 3.5
+        (4, 10, 5, 10, "fisher_exact"),  # expected 4.5
+        (5, 999, 5, 1000, "fisher_exact"),  # expected 9990/1999, just below 5
+        (48, 50, 50, 50, "fisher_exact"),  # the failure column is the small one
+        (4, 10, 6, 10, "two_proportion_z"),  # expected exactly 5: not below the threshold
+        (10, 10, 0, 10, "two_proportion_z"),  # expected exactly 5, rates 1 and 0
+        (0, 1000, 12, 1000, "two_proportion_z"),  # expected 6, one variant without successes
+        (3, 1500, 9, 1200, "two_proportion_z"),  # expected 1200 * 12 / 2700
+        (60, 1000, 90, 1000, "two_proportion_z"),  # expected 75
+        (120, 1000, 150, 1000, "two_proportion_z"),  # expected 135
+    ],
+)
+def test_compare_proportions_chooses_fisher_below_five_expected_and_z_otherwise(
+    x_a: int, n_a: int, x_b: int, n_b: int, method: str
+) -> None:
+    """CR1: Fisher's test runs when an expected cell is below 5, the pooled z-test otherwise.
+
+    The p-value equals SciPy's ``fisher_exact`` or statsmodels' ``proportions_ztest``, the
+    rates are exact, and ``expected_min`` is the exact smallest expected cell (checked against
+    SciPy's ``expected_freq``) rounded down to 6 places.
+    """
+    result = compare_proportions(x_a, n_a, x_b, n_b)
+
+    expected = expected_min_reference(table_of(x_a, n_a, x_b, n_b))
+    assert result is not None
+    assert result.method == method
+    assert (expected < FISHER_MIN_EXPECTED) == (method == "fisher_exact")
+    reference = fisher_reference if method == "fisher_exact" else z_reference
+    assert result.p_value == reference(x_a, n_a, x_b, n_b)
+    assert result.rate_a == exact_ratio(x_a, n_a)
+    assert result.rate_b == exact_ratio(x_b, n_b)
+    assert result.expected_min == floor_six(expected)
+    assert math.isclose(
+        float(expected), float(expected_freq(np.array(table_of(x_a, n_a, x_b, n_b))).min())
+    )
+
+
+def test_compare_proportions_docstring_case() -> None:
+    """CR1: the module example, 1 of 20 against 4 of 20, is Fisher's test with SciPy's p-value.
+
+    Its rates are 0.05 and 0.20 and its smallest expected cell is 2.5.
+    """
+    assert compare_proportions(1, 20, 4, 20) == ProportionTest(
+        method="fisher_exact",
+        p_value=fisher_reference(1, 20, 4, 20),
+        rate_a=Decimal("0.050000"),
+        rate_b=Decimal("0.200000"),
+        expected_min=Decimal("2.500000"),
+    )
+
+
+def test_cr1_fisher_chosen_when_an_expected_cell_is_below_five() -> None:
+    """CR1: 1 of 40 against 6 of 40 has an expected success cell of 3.5, so Fisher's test runs."""
+    result = compare_proportions(1, 40, 6, 40)
+
+    _, reference_p = fisher_exact([[1, 39], [6, 34]], alternative=TWO_SIDED)
+    assert result is not None
+    assert result.method == "fisher_exact"
+    assert result.expected_min == Decimal("3.5")
+    assert result.p_value == probability(reference_p)
+    assert (result.rate_a, result.rate_b) == (Decimal("0.025"), Decimal("0.15"))
+
+
+def test_cr1_z_test_chosen_for_large_samples() -> None:
+    """CR1: 120 of 1,000 against 150 of 1,000 has no small cell, so the pooled z-test runs."""
+    result = compare_proportions(120, 1000, 150, 1000)
+
+    _, reference_p = proportions_ztest([120, 150], [1000, 1000])
+    assert result is not None
+    assert result.method == "two_proportion_z"
+    assert result.p_value == probability(reference_p)
+    assert float(result.p_value) == pytest.approx(float(reference_p), abs=5e-7)
+    assert result.rate_a == Decimal("0.12")
+    assert result.rate_b == Decimal("0.15")
+
+
+def test_cr1_identical_inputs_give_p_one() -> None:
+    """CR1: two variants with the same counts are never distinguishable: p is exactly 1."""
+    result = compare_proportions(50, 1000, 50, 1000)
+
+    assert result is not None
+    assert result.method == "two_proportion_z"
+    assert result.p_value == ONE
+    assert result.p_value.is_finite()
+
+
+def test_expected_min_is_rounded_down_so_it_never_shows_the_threshold() -> None:
+    """CR1: an expected cell of 9990/1999 shows as 4.997498, rounded down, so never as 5."""
+    result = compare_proportions(5, 999, 5, 1000)
+
+    # 9990 / 1999 = 4.99749874...: half-up rounding at 6 places would still be below 5, but
+    # rounding down is what guarantees the shown value never crosses the threshold.
+    assert result is not None
+    assert result.method == "fisher_exact"
+    assert result.expected_min == Decimal("4.997498")
+    assert result.expected_min < FISHER_MIN_EXPECTED
+
+
+@pytest.mark.parametrize(
+    ("threshold", "method"),
+    [
+        (100, "fisher_exact"),  # expected 75 < 100
+        (Decimal("75.000001"), "fisher_exact"),
+        (Decimal(75), "two_proportion_z"),  # 75 is not below 75
+        (Decimal("74.5"), "two_proportion_z"),
+        (0, "two_proportion_z"),
+    ],
+)
+def test_fisher_min_expected_is_configurable(threshold: Decimal | int, method: str) -> None:
+    """CR1: at an expected cell of 75, a threshold above 75 picks Fisher, 75 or less the z-test.
+
+    Either way the p-value equals SciPy's Fisher or statsmodels' z-test reference.
+    """
+    result = compare_proportions(60, 1000, 90, 1000, fisher_min_expected=threshold)
+
+    assert result is not None
+    assert result.method == method
+    reference = fisher_reference if method == "fisher_exact" else z_reference
+    assert result.p_value == reference(60, 1000, 90, 1000)
+    assert result.expected_min == Decimal("75.000000")
+
+
+def test_default_fisher_threshold_is_five() -> None:
+    """CR1: the default Fisher threshold is 5, and omitting it equals passing 5 explicitly."""
+    assert FISHER_MIN_EXPECTED == 5
+    for case in [(4, 10, 5, 10), (4, 10, 6, 10), (60, 1000, 90, 1000)]:
+        assert compare_proportions(*case) == compare_proportions(*case, fisher_min_expected=5)
+
+
+def test_identical_rates_under_the_z_test_give_p_one_without_calling_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CR1: identical rates on the z-test path, zero successes included, give p = 1 untested.
+
+    50 of 1,000 against 100 of 2,000, and 0 of 10 against 0 of 10 with a threshold of 0, take
+    the z-test path with p exactly 1, and ``proportions_ztest`` is never called.
+    """
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        """Stand-in z-test that fails the test if compare_proportions calls it."""
+        raise AssertionError("proportions_ztest must not run for identical rates")
+
+    monkeypatch.setattr(stats, "proportions_ztest", forbidden)
+
+    result = compare_proportions(50, 1000, 100, 2000)
+    zero_successes = compare_proportions(0, 10, 0, 10, fisher_min_expected=0)
+
+    assert result is not None
+    assert result.method == "two_proportion_z"
+    assert result.p_value == ONE
+    assert result.rate_a == result.rate_b == Decimal("0.050000")
+    assert zero_successes is not None
+    assert zero_successes.method == "two_proportion_z"
+    assert zero_successes.p_value == ONE
+    assert zero_successes.expected_min == ZERO
+
+
+def test_identical_rates_with_a_small_expected_cell_use_fisher() -> None:
+    """CR1: 0 of 10 against 0 of 10 has an expected cell of 0, so Fisher runs and SciPy's p is 1."""
+    result = compare_proportions(0, 10, 0, 10)
+
+    assert result is not None
+    assert result.method == "fisher_exact"
+    assert result.p_value == fisher_reference(0, 10, 0, 10) == ONE
+    assert result.expected_min == ZERO
+
+
+@pytest.mark.parametrize(
+    ("x_a", "n_a", "x_b", "n_b", "method", "shown"),
+    [
+        # 1% against 0.5% at 20,000 impressions each: p about 6.8e-9, the evidence example.
+        (200, 20000, 100, 20000, "two_proportion_z", "6.82090E-9"),
+        (300, 20000, 100, 20000, "two_proportion_z", "9.15156E-24"),
+        (12, 1000, 0, 5000, "fisher_exact", "4.34702E-10"),  # expected cell 2
+        # Just below half the quantum, which 6 places alone would record as 0.000000.
+        (9, 1000, 0, 4000, "fisher_exact", "4.97416E-7"),  # expected cell 1.8
+    ],
+)
+def test_compare_proportions_keeps_six_significant_digits_below_the_quantum(
+    x_a: int, n_a: int, x_b: int, n_b: int, method: str, shown: str
+) -> None:
+    """CR1: a positive p-value below 0.000001 is recorded at 6 significant digits, never as 0.
+
+    The test choice, the rates and the rounded-down expected cell are unchanged.
+    """
+    library = fisher_p(x_a, n_a, x_b, n_b) if method == "fisher_exact" else z_p(x_a, n_a, x_b, n_b)
+
+    result = compare_proportions(x_a, n_a, x_b, n_b)
+
+    assert 0.0 < library < 5e-7
+    assert result is not None
+    assert result.method == method
+    assert str(result.p_value) == shown
+    assert result.p_value > 0
+    assert result.p_value == Decimal(f"{library:.5e}")
+    assert len(result.p_value.as_tuple().digits) == 6
+    assert math.isclose(float(result.p_value), library, rel_tol=5e-6)
+    assert format(result.p_value, "f") not in ("0.000000", "0.000001")
+    reference = fisher_reference if method == "fisher_exact" else z_reference
+    assert result.p_value == reference(x_a, n_a, x_b, n_b)
+    assert result.rate_a == exact_ratio(x_a, n_a)
+    assert result.rate_b == exact_ratio(x_b, n_b)
+    assert result.expected_min == floor_six(expected_min_reference(table_of(x_a, n_a, x_b, n_b)))
+    swapped = compare_proportions(x_b, n_b, x_a, n_a)
+    assert swapped is not None
+    assert swapped.p_value == result.p_value
+
+
+@pytest.mark.parametrize(
+    ("x_a", "n_a", "x_b", "n_b", "method"),
+    [
+        (3000, 20000, 100, 20000, "two_proportion_z"),
+        (500, 1000, 0, 1000000, "fisher_exact"),  # expected cell 0.4995...
+    ],
+)
+def test_compare_proportions_keeps_a_library_p_value_of_exactly_zero(
+    x_a: int, n_a: int, x_b: int, n_b: int, method: str
+) -> None:
+    """CR1: a library p-value that underflowed to exactly 0.0 has no digit to keep: it is 0."""
+    library = fisher_p(x_a, n_a, x_b, n_b) if method == "fisher_exact" else z_p(x_a, n_a, x_b, n_b)
+
+    result = compare_proportions(x_a, n_a, x_b, n_b)
+
+    assert library == 0.0
+    assert result is not None
+    assert result.method == method
+    assert result.p_value == ZERO
+    assert str(result.p_value) == "0.000000"
+
+
+@pytest.mark.parametrize(
+    ("x_a", "n_a", "x_b", "n_b"),
+    [(1, 20, 4, 20), (5, 999, 5, 1000), (60, 1000, 90, 1000), (3, 1500, 9, 1200)],
+)
+def test_compare_proportions_is_symmetric_in_the_variants(
+    x_a: int, n_a: int, x_b: int, n_b: int
+) -> None:
+    """CR1: swapping the variants keeps the method, p-value and expected cell, and swaps rates."""
+    forward = compare_proportions(x_a, n_a, x_b, n_b)
+    backward = compare_proportions(x_b, n_b, x_a, n_a)
+
+    assert forward is not None
+    assert backward is not None
+    assert (forward.method, forward.p_value, forward.expected_min) == (
+        backward.method,
+        backward.p_value,
+        backward.expected_min,
+    )
+    assert (forward.rate_a, forward.rate_b) == (backward.rate_b, backward.rate_a)
+
+
+@pytest.mark.parametrize(
+    ("x_a", "n_a", "x_b", "n_b"),
+    [(0, 0, 5, 10), (5, 10, 0, 0), (0, 0, 0, 0), (3, 0, 5, 10)],
+)
+def test_compare_proportions_without_trials_is_not_estimable(
+    x_a: int, n_a: int, x_b: int, n_b: int
+) -> None:
+    """CR1: a variant with zero impressions makes the comparison not estimable (None)."""
+    assert compare_proportions(x_a, n_a, x_b, n_b) is None
+
+
+def test_compare_proportions_with_a_non_finite_library_p_value_is_not_estimable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CR1: a NaN p-value from Fisher's test makes the comparison not estimable (None)."""
+
+    def nan_fisher(table: object, alternative: str) -> SimpleNamespace:
+        """Stand-in fisher_exact that returns a NaN p-value."""
+        return SimpleNamespace(pvalue=math.nan)
+
+    monkeypatch.setattr(stats, "fisher_exact", nan_fisher)
+
+    assert compare_proportions(1, 20, 4, 20) is None
+
+
+@pytest.mark.parametrize(
+    ("args", "kwargs", "error", "match"),
+    [
+        ((1.0, 20, 4, 20), {}, TypeError, "x_a must be an int count, got float"),
+        ((1, 20.0, 4, 20), {}, TypeError, "n_a must be an int count, got float"),
+        ((1, 20, True, 20), {}, TypeError, "x_b must be an int count, got bool"),
+        ((1, 20, 4, Decimal(20)), {}, TypeError, "n_b must be an int count, got Decimal"),
+        ((1, 20, 4, 20), {"fisher_min_expected": 5.0}, TypeError, "must be a Decimal"),
+        ((1, 20, 4, 20), {"fisher_min_expected": True}, TypeError, "must be a Decimal"),
+        ((-1, 20, 4, 20), {}, ValueError, r"x_a must be >= 0, got -1"),
+        ((1, 20, 4, -5), {}, ValueError, r"n_b must be >= 0, got -5"),
+        ((21, 20, 4, 20), {}, ValueError, r"x_a \(21\) must not exceed n_a \(20\)"),
+        ((1, 20, 11, 10), {}, ValueError, r"x_b \(11\) must not exceed n_b \(10\)"),
+        ((1, 20, 4, 20), {"fisher_min_expected": -1}, ValueError, "must be >= 0"),
+        ((1, 20, 4, 20), {"fisher_min_expected": Decimal("NaN")}, ValueError, "finite"),
+        ((1, 20, 4, 20), {"fisher_min_expected": Decimal("Infinity")}, ValueError, "finite"),
+        # Invalid input raises even where the result would be "not estimable".
+        ((1, 0, 4, 20), {"fisher_min_expected": -1}, ValueError, "must be >= 0"),
+    ],
+)
+def test_compare_proportions_rejects_invalid_input(
+    args: tuple[Any, ...], kwargs: dict[str, Any], error: type[Exception], match: str
+) -> None:
+    """CR1: invalid input raises TypeError or ValueError, even where the result would be None.
+
+    Non-int counts and a float or bool threshold raise TypeError; negative counts, more
+    successes than trials, and a negative or non-finite threshold raise ValueError.
+    """
+    with pytest.raises(error, match=match):
+        compare_proportions(*args, **kwargs)
+
+
+# --- holm (CR1) ----------------------------------------------------------------------------
+
+
+def test_holm_hand_checked_step_down() -> None:
+    """CR1: Holm of 0.01, 0.04 and 0.03 is 0.03, 0.06 and 0.06 in input order, hand-checked."""
+    # Sorted 0.01, 0.03, 0.04 times 3, 2, 1 gives 0.03, 0.06, 0.04; the running maximum makes
+    # the last 0.06. Results come back in input order.
+    assert holm([Decimal("0.01"), Decimal("0.04"), Decimal("0.03")]) == [
+        Decimal("0.030000"),
+        Decimal("0.060000"),
+        Decimal("0.060000"),
+    ]
+
+
+def test_holm_four_pairs_hand_checked_and_equal_to_statsmodels() -> None:
+    """CR1: Holm step-down over four pairs, with monotonicity, returned in input order."""
+    raw = [Decimal("0.01"), Decimal("0.04"), Decimal("0.03"), Decimal("0.005")]
+
+    adjusted = holm(raw)
+
+    # Sorted 0.005, 0.01, 0.03, 0.04 times 4, 3, 2, 1 gives 0.02, 0.03, 0.06, 0.04; the running
+    # maximum lifts the last to 0.06.
+    assert adjusted == [Decimal("0.03"), Decimal("0.06"), Decimal("0.06"), Decimal("0.02")]
+    _, corrected, _, _ = multipletests([float(p) for p in raw], alpha=0.05, method="holm")
+    assert adjusted == [probability(value) for value in corrected]
+
+
+def test_holm_flips_two_raw_significant_pairs_to_not_distinguishable() -> None:
+    """CR1: raw p-values 0.04 and 0.03, both below 0.05, adjust to 0.06: not distinguishable."""
+    adjusted = holm([Decimal("0.04"), Decimal("0.03")])
+
+    assert adjusted == [Decimal("0.060000"), Decimal("0.060000")]
+    assert all(p >= DEFAULT_ALPHA for p in adjusted)
+
+
+def test_holm_flips_a_raw_significant_pair_among_three() -> None:
+    """CR1: a raw p of 0.02 is below 0.05, but its Holm-adjusted 0.06 is not distinguishable."""
+    raw = [Decimal("0.02"), Decimal("0.5"), Decimal("0.6")]
+
+    adjusted = holm(raw)
+
+    assert raw[0] < DEFAULT_ALPHA
+    assert adjusted[0] == Decimal("0.06")
+    assert adjusted[0] > DEFAULT_ALPHA
+    assert adjusted == [Decimal("0.06"), ONE, ONE]
+
+
+def test_holm_caps_adjusted_values_at_one() -> None:
+    """CR1: Holm-adjusted p-values never exceed 1: 0.5, 0.6 and 0.9 all adjust to exactly 1."""
+    assert holm([Decimal("0.5"), Decimal("0.6"), Decimal("0.9")]) == [ONE, ONE, ONE]
+    assert holm([Decimal("0.6"), Decimal("0.7")]) == [ONE, ONE]
+
+
+def test_holm_ties_and_single_values() -> None:
+    """CR1: tied 0.02s both adjust to 0.04, a lone p-value is unchanged, and ints 0, 1 are kept."""
+    assert holm([Decimal("0.02"), Decimal("0.02")]) == [Decimal("0.040000"), Decimal("0.040000")]
+    assert holm([Decimal("0.0123")]) == [Decimal("0.012300")]
+    # The module accepts an exact int wherever its signature names a Decimal.
+    whole_p_values: list[Any] = [0, 1]
+    assert holm(whole_p_values) == [ZERO, ONE]
+
+
+@pytest.mark.parametrize(
+    "p_values",
+    [
+        ["0.001", "0.2", "0.013", "0.04", "0.5"],
+        ["0.0004", "0.0004", "0.049", "0.051", "0.9", "1"],
+        ["0.31415926", "0.0271828", "0.000001"],
+    ],
+)
+def test_holm_matches_statsmodels(p_values: list[str]) -> None:
+    """CR1: Holm equals statsmodels' ``multipletests`` Holm correction at 6 places, in order."""
+    raw = [Decimal(p) for p in p_values]
+
+    _, corrected, _, _ = multipletests([float(p) for p in raw], alpha=0.05, method="holm")
+
+    assert holm(raw) == [probability(value) for value in corrected]
+
+
+@pytest.mark.parametrize(
+    ("p_values", "shown"),
+    [
+        # The three Fisher and z-test p-values of one campaign, at their recorded scale: the
+        # third adjusts to 1.49407e-05, which keeps 6 places.
+        (
+            ["4.34702E-10", "4.97416E-7", "1.49407E-5"],
+            ["1.30411E-9", "9.94832E-7", "0.000015"],
+        ),
+        (["6.82090E-9", "0.04"], ["1.36418E-8", "0.040000"]),
+        # 4e-7 times 3 is 1.2e-6, from the quantum up, so 6 places; the others cap at 1.
+        (["4E-7", "0.6", "0.9"], ["0.000001", "1.000000", "1.000000"]),
+        (["6.82090E-9", "0", "1"], ["1.36418E-8", "0.000000", "1.000000"]),
+    ],
+)
+def test_holm_keeps_six_significant_digits_below_the_quantum(
+    p_values: list[str], shown: list[str]
+) -> None:
+    """CR1: a positive adjusted p-value below 0.000001 keeps 6 significant digits, never 0.
+
+    Inputs in exponent notation validate like any other ``Decimal`` in [0, 1]; adjusted values
+    from 0.000001 up keep 6 places, values cap at exactly 1, and an exact 0 stays 0.
+    """
+    raw = [Decimal(p) for p in p_values]
+
+    adjusted = holm(raw)
+
+    _, corrected, _, _ = multipletests([float(p) for p in raw], alpha=0.05, method="holm")
+    assert [str(p) for p in adjusted] == shown
+    assert adjusted == [p_value_probability(value) for value in corrected]
+    for value, library in zip(adjusted, corrected, strict=True):
+        assert Decimal(0) <= value <= ONE
+        if 0.0 < float(library) < 1e-6:
+            assert value > 0
+            assert len(value.as_tuple().digits) == 6
+            assert math.isclose(float(value), float(library), rel_tol=5e-6)
+        else:
+            assert value.as_tuple().exponent == -6
+
+
+def test_holm_of_compare_proportions_p_values_below_the_quantum() -> None:
+    """CR1: tiny p-values from :func:`compare_proportions` pass through Holm and stay positive.
+
+    The single-pair adjustment returns the p-value unchanged, as a campaign of one pair does.
+    """
+    tests = [compare_proportions(200, 20000, 100, 20000), compare_proportions(12, 1000, 0, 5000)]
+    raw = [test.p_value for test in tests if test is not None]
+
+    adjusted = holm(raw)
+
+    # Sorted 4.34702e-10 and 6.82090e-9 times 2 and 1; the larger keeps its own value.
+    assert raw == [Decimal("6.82090E-9"), Decimal("4.34702E-10")]
+    assert adjusted == [Decimal("6.82090E-9"), Decimal("8.69404E-10")]
+    assert all(DEFAULT_ALPHA > p > 0 for p in adjusted)
+    assert holm(raw[:1]) == raw[:1]
+
+
+def test_holm_adjusted_values_do_not_depend_on_alpha() -> None:
+    """CR1: Holm-adjusted p-values are the same at alpha 0.01 and at the default alpha 0.05."""
+    raw = [Decimal("0.001"), Decimal("0.2"), Decimal("0.013"), Decimal("0.04")]
+
+    assert holm(raw, Decimal("0.01")) == holm(raw) == holm(raw, DEFAULT_ALPHA)
+    assert Decimal("0.05") == DEFAULT_ALPHA
+
+
+def test_holm_of_nothing_is_empty() -> None:
+    """CR1: Holm of no p-values is an empty list."""
+    assert holm([]) == []
+
+
+@pytest.mark.parametrize(
+    ("p_values", "alpha", "error", "match"),
+    [
+        ([Decimal("0.1"), 0.2], ALPHA, TypeError, r"p_values\[1\] must be a Decimal, got float"),
+        ([True], ALPHA, TypeError, r"p_values\[0\] must be a Decimal, got bool"),
+        ([Decimal("1.01")], ALPHA, ValueError, r"p_values\[0\] must be in \[0, 1\]"),
+        ([Decimal("-0.01")], ALPHA, ValueError, r"p_values\[0\] must be in \[0, 1\]"),
+        ([Decimal("NaN")], ALPHA, ValueError, "must be finite"),
+        ([Decimal("0.1")], 0.05, TypeError, "alpha must be a Decimal, got float"),
+        ([Decimal("0.1")], Decimal(0), ValueError, r"alpha must be in \(0, 1\)"),
+        ([Decimal("0.1")], Decimal(1), ValueError, r"alpha must be in \(0, 1\)"),
+        ([], Decimal(1), ValueError, r"alpha must be in \(0, 1\)"),
+        (
+            [Decimal("0.1")],
+            Decimal("1e-1000"),
+            ValueError,
+            r"alpha \(1E-1000\) is not representable strictly inside \(0, 1\) as a float",
+        ),
+        ([], Decimal("0.99999999999999999999"), ValueError, r"alpha \(0.99999999999999999999\)"),
+    ],
+)
+def test_holm_rejects_invalid_input(
+    p_values: list[Any], alpha: Any, error: type[Exception], match: str
+) -> None:
+    """CR1: Holm rejects invalid p-values and levels, even for an empty list.
+
+    A float or bool p-value or a float alpha raises TypeError; a p-value outside [0, 1] or
+    NaN, and an alpha outside (0, 1) or not strictly inside it as a float, raise ValueError.
+    """
+    with pytest.raises(error, match=match):
+        holm(p_values, alpha)
+
+
+# --- wilson (CR2) ----------------------------------------------------------------------------
+
+
+def test_wilson_hand_checked_bounds_at_zero_and_full_rates() -> None:
+    """CR2: 0 of 50 gives [0, 0.071348] and 50 of 50 [0.928652, 1], the closed-form bounds."""
+    z_squared = float(norm.ppf(0.975)) ** 2
+
+    none_of_fifty = wilson(0, 50)
+    all_of_fifty = wilson(50, 50)
+
+    # Wilson at x = 0: [0, z^2 / (n + z^2)]; at x = n: [n / (n + z^2), 1].
+    assert none_of_fifty == Interval(point=ZERO, low=ZERO, high=Decimal("0.071348"))
+    assert none_of_fifty.high == six(z_squared / (50 + z_squared))
+    assert all_of_fifty == Interval(point=ONE, low=Decimal("0.928652"), high=ONE)
+    assert all_of_fifty.low == six(50 / (50 + z_squared))
+
+
+def test_cr2_wilson_of_zero_in_ten_is_hand_checked_and_equal_to_statsmodels() -> None:
+    """CR2: a stage with no successes in 10 trials keeps a real upper bound of about 27.75%."""
+    result = wilson(0, 10)
+
+    low, high = proportion_confint(0, 10, alpha=0.05, method="wilson")
+    assert result is not None
+    assert result.low == 0
+    assert result.point == 0
+    assert float(result.high) == pytest.approx(0.27753, abs=5e-6)
+    # Wilson at x = 0 has the closed-form upper bound z^2 / (n + z^2).
+    z_squared = float(norm.ppf(0.975)) ** 2
+    assert result.high == six(z_squared / (10 + z_squared))
+    assert (result.low, result.high) == (probability(low), probability(high))
+
+
+@pytest.mark.parametrize(
+    ("successes", "trials"),
+    [
+        (7, 120),
+        (0, 10),
+        (5, 20),
+        (10, 10),
+        (1, 3),
+        (1, 2),
+        (3, 1000),
+        (412, 1000),
+        (1, 1_000_000),
+        (999_999, 1_000_000),
+    ],
+)
+def test_wilson_matches_statsmodels_and_the_closed_form(successes: int, trials: int) -> None:
+    """CR2: bounds equal statsmodels' Wilson interval and the closed form; the point is exact."""
+    result = wilson(successes, trials)
+
+    low, high = proportion_confint(successes, trials, alpha=0.05, method="wilson")
+    assert result == Interval(
+        point=exact_ratio(successes, trials), low=probability(low), high=probability(high)
+    )
+    z = float(norm.ppf(0.975))
+    share = successes / trials
+    centre = (share + z * z / (2 * trials)) / (1 + z * z / trials)
+    half = (
+        z / (1 + z * z / trials) * math.sqrt(share * (1 - share) / trials + z * z / trials**2 / 4)
+    )
+    assert abs(result.low - Decimal(repr(centre - half))) <= QUANTUM
+    assert abs(result.high - Decimal(repr(centre + half))) <= QUANTUM
+
+
+@pytest.mark.parametrize(
+    ("successes", "trials"),
+    [
+        (0, 1),
+        (1, 1),
+        (0, 10),
+        (5, 20),
+        (10, 10),
+        (0, 1_000_000),
+        (1, 1_000_000),
+        (2, 7),
+        (999_999, 1_000_000),
+        (5, 5),
+    ],
+)
+def test_wilson_bounds_stay_ordered_within_zero_and_one(successes: int, trials: int) -> None:
+    """CR2: 0 <= low <= point <= high <= 1 in every case, each value at exactly 6 places."""
+    result = wilson(successes, trials)
+
+    assert result is not None
+    assert ZERO <= result.low <= result.point <= result.high <= ONE
+    for value in (result.point, result.low, result.high):
+        assert value.as_tuple().exponent == -6
+
+
+def test_wilson_default_confidence_is_ninety_five_percent() -> None:
+    """CR2: the default confidence is 0.95, and omitting it equals passing 0.95 explicitly."""
+    assert Decimal("0.95") == DEFAULT_CONFIDENCE
+    assert wilson(7, 120) == wilson(7, 120, confidence=Decimal("0.95"))
+
+
+def test_wilson_confidence_level_widens_the_interval() -> None:
+    """CR2: a 99% interval for 7 of 120 matches statsmodels and strictly contains the 95% one."""
+    narrow = wilson(7, 120)
+    wide = wilson(7, 120, confidence=Decimal("0.99"))
+
+    low, high = proportion_confint(7, 120, alpha=0.01, method="wilson")
+    assert narrow is not None
+    assert wide is not None
+    assert (wide.low, wide.high) == (probability(low), probability(high))
+    assert wide.low < narrow.low <= narrow.point <= narrow.high < wide.high
+
+
+@pytest.mark.parametrize(("successes", "trials"), [(0, 0), (5, 0)])
+def test_wilson_without_trials_is_not_estimable(successes: int, trials: int) -> None:
+    """CR2: a stage with zero trials has no interval: not estimable (None)."""
+    assert wilson(successes, trials) is None
+
+
+def test_wilson_interval_is_immutable() -> None:
+    """CR2: a Wilson interval is frozen: assigning a bound raises FrozenInstanceError."""
+    result = wilson(7, 120)
+
+    assert result is not None
+    with pytest.raises(FrozenInstanceError):
+        result.low = ZERO  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("successes", "trials", "confidence", "error", "match"),
+    [
+        (1.0, 10, DEFAULT_CONFIDENCE, TypeError, "successes must be an int count, got float"),
+        (1, 10.0, DEFAULT_CONFIDENCE, TypeError, "trials must be an int count, got float"),
+        (False, 10, DEFAULT_CONFIDENCE, TypeError, "successes must be an int count, got bool"),
+        (-1, 10, DEFAULT_CONFIDENCE, ValueError, "successes must be >= 0"),
+        (1, -10, DEFAULT_CONFIDENCE, ValueError, "trials must be >= 0"),
+        (11, 10, DEFAULT_CONFIDENCE, ValueError, r"successes \(11\) must not exceed trials"),
+        (1, 10, 0.95, TypeError, "confidence must be a Decimal, got float"),
+        (1, 10, Decimal(0), ValueError, r"confidence must be in \(0, 1\)"),
+        (1, 10, Decimal(1), ValueError, r"confidence must be in \(0, 1\)"),
+        (1, 10, Decimal("Infinity"), ValueError, "confidence must be finite"),
+        # The level is validated even when there are no trials.
+        (0, 0, Decimal("1.5"), ValueError, r"confidence must be in \(0, 1\)"),
+        # Inside (0, 1), but 1 - confidence is no float strictly inside it.
+        (
+            1,
+            10,
+            Decimal("1e-20"),
+            ValueError,
+            r"1 - confidence \(0.99999999999999999999\) is not representable strictly inside",
+        ),
+        (
+            1,
+            10,
+            Decimal("0." + "9" * 1000),
+            ValueError,
+            r"1 - confidence \(1E-1000\) is not representable strictly inside \(0, 1\)",
+        ),
+        (0, 0, Decimal("1e-20"), ValueError, r"1 - confidence \(0.99999999999999999999\)"),
+    ],
+)
+def test_wilson_rejects_invalid_input(
+    successes: Any, trials: Any, confidence: Any, error: type[Exception], match: str
+) -> None:
+    """CR2: Wilson rejects invalid counts and confidence levels, even with zero trials.
+
+    Non-int counts or a float level raise TypeError; negative counts, more successes than
+    trials, and a level outside (0, 1), non-finite, or whose complement is no float strictly
+    inside (0, 1), raise ValueError.
+    """
+    with pytest.raises(error, match=match):
+        wilson(successes, trials, confidence=confidence)
+
+
+# --- cohens_h (CR1, CR3) --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("p1", "p2"),
+    [("0.024", "0.02"), ("0.02", "0.024"), ("0.5", "0.1"), ("0.999", "0.001"), ("0.3", "0.3")],
+)
+def test_cohens_h_matches_statsmodels_and_the_arcsine_formula(p1: str, p2: str) -> None:
+    """CR3: h equals statsmodels' ``proportion_effectsize`` and the arcsine closed form.
+
+    The closed form is 2 asin(sqrt(p1)) - 2 asin(sqrt(p2)), matched to within 0.000001.
+    """
+    result = cohens_h(Decimal(p1), Decimal(p2))
+
+    assert result == six(proportion_effectsize(float(p1), float(p2)))
+    formula = 2 * math.asin(math.sqrt(float(p1))) - 2 * math.asin(math.sqrt(float(p2)))
+    assert abs(result - Decimal(repr(formula))) <= QUANTUM
+
+
+def test_cohens_h_docstring_case_and_sign() -> None:
+    """CR3: h of 0.024 against 0.02 is statsmodels' 0.027297, and swapping flips only the sign."""
+    reference = six(proportion_effectsize(0.024, 0.02))
+    assert cohens_h(Decimal("0.024"), Decimal("0.02")) == reference == Decimal("0.027297")
+    assert cohens_h(Decimal("0.02"), Decimal("0.024")) == Decimal("-0.027297")
+
+
+def test_cohens_h_extremes_are_plus_and_minus_pi() -> None:
+    """CR3: h of 1 against 0 is pi at 6 places, and h of 0 against 1 is -pi, ints accepted."""
+    assert cohens_h(Decimal(1), Decimal(0)) == six(math.pi) == Decimal("3.141593")
+    zero: Any = 0
+    one: Any = 1
+    assert cohens_h(zero, one) == Decimal("-3.141593")
+
+
+def test_cohens_h_never_returns_a_negative_zero() -> None:
+    """CR3: statsmodels' tiny negative h for 0.3 against 0.3000000001 renders as 0.000000."""
+    tiny_negative = cohens_h(Decimal("0.3"), Decimal("0.3000000001"))
+
+    assert proportion_effectsize(0.3, 0.3000000001) < 0
+    assert str(tiny_negative) == "0.000000"
+    assert str(cohens_h(Decimal("0.3"), Decimal("0.3"))) == "0.000000"
+
+
+@pytest.mark.parametrize(
+    ("p1", "p2", "error", "match"),
+    [
+        (0.5, Decimal("0.1"), TypeError, "p1 must be a Decimal, got float"),
+        (Decimal("0.5"), True, TypeError, "p2 must be a Decimal, got bool"),
+        (Decimal("1.1"), Decimal("0.1"), ValueError, r"p1 must be in \[0, 1\]"),
+        (Decimal("0.5"), Decimal("-0.1"), ValueError, r"p2 must be in \[0, 1\]"),
+        (Decimal("NaN"), Decimal("0.1"), ValueError, "p1 must be finite"),
+    ],
+)
+def test_cohens_h_rejects_invalid_input(
+    p1: Any, p2: Any, error: type[Exception], match: str
+) -> None:
+    """CR3: a float or bool rate raises TypeError; a rate outside [0, 1] or NaN, ValueError."""
+    with pytest.raises(error, match=match):
+        cohens_h(p1, p2)
+
+
+# --- required_n (CR3) ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("p_base", "p_target"),
+    [("0.02", "0.024"), ("0.1", "0.12"), ("0.3", "0.36"), ("0.05", "0.06"), ("0.5", "1")],
+)
+def test_required_n_matches_the_statsmodels_power_solver(p_base: str, p_target: str) -> None:
+    """CR3: n is ceil of statsmodels' ``solve_power``, the least n whose power reaches 0.8."""
+    result = required_n(Decimal(p_base), Decimal(p_target), alpha=ALPHA, power=POWER)
+
+    expected = solver_n(float(p_base), float(p_target))
+    assert result == expected
+    # The smallest whole sample that reaches the target power.
+    assert power_at(float(p_base), float(p_target), expected) >= 0.8
+    assert power_at(float(p_base), float(p_target), expected - 1) < 0.8
+
+
+def test_required_n_docstring_cases() -> None:
+    """CR3: the documented 2% -> 2.4% and 10% -> 12% need 21067 and 3835, as statsmodels solves."""
+    two_percent = required_n(Decimal("0.02"), Decimal("0.024"), alpha=ALPHA, power=POWER)
+    ten_percent = required_n(Decimal("0.1"), Decimal("0.12"), alpha=ALPHA, power=POWER)
+
+    assert two_percent == solver_n(0.02, 0.024) == 21067
+    assert ten_percent == solver_n(0.1, 0.12) == 3835
+
+
+def test_cr3_required_n_for_a_five_percent_baseline_matches_the_library_solver() -> None:
+    """CR3: 5% -> 6% equals ceil(NormalIndPower.solve_power) on |Cohen's h|, two-sided, ratio 1."""
+    result = required_n(Decimal("0.05"), Decimal("0.06"), alpha=ALPHA, power=POWER)
+
+    effect = abs(proportion_effectsize(0.06, 0.05))
+    solved = NormalIndPower().solve_power(
+        effect_size=effect, alpha=0.05, power=0.8, ratio=1.0, alternative=TWO_SIDED
+    )
+    assert type(result) is int
+    assert result == math.ceil(float(solved))
+
+
+def test_cr3_a_larger_lift_needs_fewer_samples() -> None:
+    """CR3: doubling the rate (5% -> 10%) needs far fewer trials than a 20% lift (5% -> 6%)."""
+    small_lift = required_n(Decimal("0.05"), Decimal("0.06"), alpha=ALPHA, power=POWER)
+    large_lift = required_n(Decimal("0.05"), Decimal("0.10"), alpha=ALPHA, power=POWER)
+
+    assert small_lift is not None
+    assert large_lift is not None
+    assert 0 < large_lift < small_lift
+    assert large_lift == solver_n(0.05, 0.10)
+
+
+def test_required_n_uses_the_given_alpha_and_power() -> None:
+    """CR3: alpha 0.01 and power 0.9 give statsmodels' n at those levels, above the default n."""
+    result = required_n(
+        Decimal("0.1"), Decimal("0.12"), alpha=Decimal("0.01"), power=Decimal("0.9")
+    )
+
+    assert result == solver_n(0.1, 0.12, alpha=0.01, power=0.9)
+    assert result is not None
+    assert result > solver_n(0.1, 0.12)
+
+
+def test_required_n_does_not_depend_on_the_direction_of_the_change() -> None:
+    """CR3: a rise from 10% to 12% and the fall back need the same n, equal to statsmodels'."""
+    up = required_n(Decimal("0.1"), Decimal("0.12"), alpha=ALPHA, power=POWER)
+    down = required_n(Decimal("0.12"), Decimal("0.1"), alpha=ALPHA, power=POWER)
+
+    assert up == down == solver_n(0.1, 0.12)
+
+
+def test_samples_of_one_and_two_per_group_are_sized_before_the_solver_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CR3: samples of 1 and 2 per group come from the power function, not the root finder.
+
+    At 0.0001 against 1, where statsmodels' ``solve_power`` returns NaN with a
+    ConvergenceWarning, power 0.5 needs 1 per group and power 0.8 needs 2 in either
+    direction, with no warning raised.
+    """
+    effect = abs(proportion_effectsize(1.0, 0.0001))
+    # The library solver brackets from 2 upwards and cannot size these effects at all.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        unsolved = NormalIndPower().solve_power(
+            effect_size=effect, nobs1=None, alpha=0.05, power=0.8, ratio=1.0, alternative=TWO_SIDED
+        )
+    assert math.isnan(float(unsolved))
+    assert any(issubclass(w.category, ConvergenceWarning) for w in caught)
+    # One observation per group reaches power 0.5 but not 0.8; two reach 0.8.
+    assert power_at(0.0001, 1.0, 1) >= 0.5
+    assert power_at(0.0001, 1.0, 1) < 0.8 <= power_at(0.0001, 1.0, 2)
+
+    def no_root_finder(*args: object, **kwargs: object) -> object:
+        """Stand-in brentq_expanding that fails the test if required_n calls it."""
+        raise AssertionError("the root finder must not run for samples of 1 or 2 per group")
+
+    monkeypatch.setattr(stats, "brentq_expanding", no_root_finder)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        one = required_n(Decimal("0.0001"), Decimal(1), alpha=ALPHA, power=Decimal("0.5"))
+        two = required_n(Decimal("0.0001"), Decimal(1), alpha=ALPHA, power=POWER)
+        two_down = required_n(Decimal(1), Decimal("0.0001"), alpha=ALPHA, power=POWER)
+
+    assert (one, two, two_down) == (1, 2, 2)
+
+
+def test_three_per_group_comes_from_the_solver() -> None:
+    """CR3: 5% against 100% needs 3 per group, sized by the root finder as statsmodels sizes it."""
+    result = required_n(Decimal("0.05"), Decimal(1), alpha=ALPHA, power=POWER)
+
+    assert result == solver_n(0.05, 1.0) == 3
+
+
+@pytest.mark.parametrize(
+    ("p_base", "p_target"),
+    [
+        ("0", "0.1"),  # baseline rate of 0
+        ("-0.1", "0.1"),
+        ("0.9", "1.08"),  # baseline x 1.2 above 100%
+        ("0.1", "0"),
+        ("0.1", "-0.2"),
+        ("1.5", "0.5"),  # baseline is not a proportion
+        ("0.1", "0.1"),  # no difference to detect
+        ("0.1", "0.10000000000000000001"),  # different, but equal as floats: no effect
+    ],
+)
+def test_required_n_not_estimable(p_base: str, p_target: str) -> None:
+    """CR3: n is None (not estimable) for a rate outside (0, 1] or no float-visible difference.
+
+    That covers a baseline of 0, a target of 0.9 x 1.2 = 1.08, equal rates, and rates that
+    differ only beyond float precision.
+    """
+    assert required_n(Decimal(p_base), Decimal(p_target), alpha=ALPHA, power=POWER) is None
+
+
+def test_required_n_allows_a_target_of_exactly_one_and_a_baseline_of_one() -> None:
+    """CR3: a target of exactly 1 and a baseline of exactly 1 get statsmodels' n."""
+    assert required_n(Decimal("0.5"), Decimal(1), alpha=ALPHA, power=POWER) == solver_n(0.5, 1.0)
+    assert required_n(Decimal(1), Decimal("0.8"), alpha=ALPHA, power=POWER) == solver_n(1.0, 0.8)
+
+
+@pytest.mark.parametrize("alpha", [Decimal("1e-30"), Decimal("1e-300")])
+def test_required_n_at_a_tiny_alpha_is_sized_where_the_library_solver_fails(
+    alpha: Decimal,
+) -> None:
+    """CR3: at alpha 1e-30 and 1e-300, where ``solve_power`` fails, n still reaches power 0.8.
+
+    n is the least whole sample whose statsmodels power reaches 0.8, and no warning is raised.
+    """
+    # solve_power infers the direction from the power at 2 and at 50, equal here in floats.
+    assert library_solver_fails(0.1, 0.12, alpha=float(alpha))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        result = required_n(Decimal("0.1"), Decimal("0.12"), alpha=alpha, power=POWER)
+
+    assert result is not None
+    assert power_at(0.1, 0.12, result, alpha=float(alpha)) >= 0.8
+    assert power_at(0.1, 0.12, result - 1, alpha=float(alpha)) < 0.8
+
+
+def test_required_n_for_a_tiny_effect_is_sized_where_the_library_solver_fails() -> None:
+    """CR3: an h of about 2e-11, which ``solve_power`` cannot size, still gets a sample.
+
+    It exceeds 10**22 per group, reaches power 0.8 by statsmodels' power function while a
+    millionth less falls short, and no warning is raised.
+    """
+    # h is about 2e-11, below what the power at 2 and at 50 can tell apart in floats.
+    assert library_solver_fails(0.5, 0.50000000001, alpha=0.05)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        result = required_n(Decimal("0.5"), Decimal("0.50000000001"), alpha=ALPHA, power=POWER)
+
+    assert result is not None
+    assert result > 10**22
+    # Whole samples this large differ by less than float resolution; a millionth less fails.
+    assert power_at(0.5, 0.50000000001, result) >= 0.8
+    assert power_at(0.5, 0.50000000001, result - result // 1_000_000) < 0.8
+
+
+def test_required_n_for_an_unreachable_power_is_not_estimable_without_a_warning() -> None:
+    """CR3: an unreachable power is not estimable, and no warning is raised.
+
+    At 1e-200 against 2e-200 (h about 8e-101) statsmodels' power stays below 0.8 up to
+    5e102 per group, so required_n and additional_n_for_difference both return None.
+    """
+    # h is about 8e-101: the power stays below 0.8 up to the root finder's 5e102 per group.
+    assert power_at(1e-200, 2e-200, 5 * 10**102) < 0.8
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        result = required_n(Decimal("1e-200"), Decimal("2e-200"), alpha=ALPHA, power=POWER)
+        extra = additional_n_for_difference(1, 10**200, 2, 10**200, alpha=ALPHA, power=POWER)
+
+    assert result is None
+    assert extra is None
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        ValueError("f(a) and f(b) must have different signs"),
+        RuntimeError("Failed to converge after 100 iterations"),
+        (3834.2, SimpleNamespace(converged=False)),
+        (math.inf, SimpleNamespace(converged=True)),
+        (-1.0, SimpleNamespace(converged=True)),
+    ],
+)
+def test_required_n_without_a_usable_root_is_not_estimable(
+    monkeypatch: pytest.MonkeyPatch, outcome: Exception | tuple[float, SimpleNamespace]
+) -> None:
+    """CR3: an unusable root makes required_n and additional_n_for_difference None.
+
+    The root finder raises ValueError or RuntimeError, does not converge, or returns an
+    infinite or negative root.
+    """
+
+    def root_finder(*args: object, **kwargs: object) -> object:
+        """Stand-in brentq_expanding that raises or returns the case's outcome."""
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(stats, "brentq_expanding", root_finder)
+
+    assert required_n(Decimal("0.1"), Decimal("0.12"), alpha=ALPHA, power=POWER) is None
+    assert additional_n_for_difference(10, 100, 12, 100, alpha=ALPHA, power=POWER) is None
+
+
+@pytest.mark.parametrize(
+    ("p_base", "p_target", "alpha", "power", "error", "match"),
+    [
+        (0.1, Decimal("0.12"), ALPHA, POWER, TypeError, "p_base must be a Decimal, got float"),
+        (Decimal("0.1"), 0.12, ALPHA, POWER, TypeError, "p_target must be a Decimal, got float"),
+        (Decimal("0.1"), Decimal("0.12"), 0.05, POWER, TypeError, "alpha must be a Decimal"),
+        (Decimal("0.1"), Decimal("0.12"), ALPHA, True, TypeError, "power must be a Decimal"),
+        (Decimal("NaN"), Decimal("0.12"), ALPHA, POWER, ValueError, "p_base must be finite"),
+        (Decimal("0.1"), Decimal("-Infinity"), ALPHA, POWER, ValueError, "p_target must be"),
+        (Decimal("0.1"), Decimal("0.12"), Decimal(0), POWER, ValueError, r"alpha must be in"),
+        (Decimal("0.1"), Decimal("0.12"), Decimal(1), POWER, ValueError, r"alpha must be in"),
+        (Decimal("0.1"), Decimal("0.12"), ALPHA, Decimal(1), ValueError, r"power must be in"),
+        (Decimal("0.1"), Decimal("0.12"), ALPHA, ALPHA, ValueError, r"power \(0.05\) must exceed"),
+        (Decimal("0.1"), Decimal("0.12"), Decimal("0.5"), Decimal("0.4"), ValueError, "exceed"),
+        # A configuration error is never masked as "not estimable".
+        (Decimal(0), Decimal("0.1"), ALPHA, ALPHA, ValueError, "must exceed alpha"),
+        # Levels inside (0, 1) as Decimals, but not as the floats the power analysis takes.
+        (
+            Decimal("0.1"),
+            Decimal("0.12"),
+            Decimal("1e-1000"),
+            POWER,
+            ValueError,
+            r"alpha \(1E-1000\) is not representable strictly inside \(0, 1\) as a float",
+        ),
+        (
+            Decimal("0.1"),
+            Decimal("0.12"),
+            ALPHA,
+            Decimal("0.99999999999999999999"),
+            ValueError,
+            r"power \(0.99999999999999999999\) is not representable strictly inside \(0, 1\)",
+        ),
+        (
+            Decimal("0.1"),
+            Decimal("0.12"),
+            Decimal("0.3"),
+            Decimal("0.30000000000000000001"),
+            ValueError,
+            r"must exceed alpha \(0.3\) as a float; both convert to 0.3",
+        ),
+    ],
+)
+def test_required_n_rejects_invalid_input(
+    p_base: Any, p_target: Any, alpha: Any, power: Any, error: type[Exception], match: str
+) -> None:
+    """CR3: required_n rejects invalid rates and levels, never masking them as not estimable.
+
+    Float or bool arguments raise TypeError; non-finite rates, levels outside (0, 1) or not
+    strictly inside it as floats, and power not above alpha (as a Decimal or as a float)
+    raise ValueError.
+    """
+    with pytest.raises(error, match=match):
+        required_n(p_base, p_target, alpha=alpha, power=power)
+
+
+# --- additional_n_for_difference (CR1) -----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("x_a", "n_a", "x_b", "n_b"),
+    [
+        (20, 1000, 30, 1000),
+        (1, 1000, 2, 1000),
+        (0, 50, 1, 50),  # a variant without leads still has an observed rate of 0
+        (12, 800, 30, 1500),  # unequal samples: each variant grows by the same increment
+        (45, 3000, 40, 2000),
+        (20, 1000, 3000, 100000),  # the larger sample alone exceeds the equal-group sample
+    ],
+)
+def test_additional_n_is_the_smallest_common_increment_that_reaches_the_power(
+    x_a: int, n_a: int, x_b: int, n_b: int
+) -> None:
+    """CR1: the extra n is the least common increment whose statsmodels power reaches 0.8.
+
+    It is positive, at most the equal-group sample less the smaller variant's, and the same
+    with the variants swapped.
+    """
+    result = additional_n_for_difference(x_a, n_a, x_b, n_b, alpha=ALPHA, power=POWER)
+
+    assert result is not None
+    assert result > 0
+    assert common_increment_power(x_a, n_a, x_b, n_b, result) >= 0.8
+    assert common_increment_power(x_a, n_a, x_b, n_b, result - 1) < 0.8
+    # Growing both variants to the equal-group sample always suffices.
+    low, high = sorted((x_a / n_a, x_b / n_b))
+    assert result <= solver_n(low, high) - min(n_a, n_b)
+    assert additional_n_for_difference(x_b, n_b, x_a, n_a, alpha=ALPHA, power=POWER) == result
+
+
+@pytest.mark.parametrize(
+    ("x_a", "n_a", "x_b", "n_b"),
+    [(20, 1000, 30, 1000), (1, 1000, 2, 1000), (0, 50, 1, 50), (2, 1000, 9, 1000)],
+)
+def test_additional_n_for_equal_samples_is_the_solver_sample_minus_the_observed_one(
+    x_a: int, n_a: int, x_b: int, n_b: int
+) -> None:
+    """CR1: with equal samples of n, the extra n is statsmodels' per-group sample minus n."""
+    result = additional_n_for_difference(x_a, n_a, x_b, n_b, alpha=ALPHA, power=POWER)
+
+    low, high = sorted((x_a / n_a, x_b / n_b))
+    assert result == solver_n(low, high) - n_a
+    assert result is not None
+    assert result > 0
+
+
+def test_imbalanced_delivery_still_needs_more_impressions_per_variant() -> None:
+    """CR1: 2% on 1,000 against 3% on 100,000 is not distinguishable and needs 931 more each.
+
+    931 is the least increment at which statsmodels' unequal-group power reaches 0.8, though
+    the larger variant alone holds far more than the equal-group 3,789.
+    """
+    # 2% on 1,000 impressions against 3% on 100,000: the larger variant alone holds far more
+    # than the equal-group sample, yet the pair is not distinguishable.
+    comparison = compare_proportions(20, 1000, 3000, 100000)
+    result = additional_n_for_difference(20, 1000, 3000, 100000, alpha=ALPHA, power=POWER)
+
+    assert comparison is not None
+    assert comparison.p_value > Decimal("0.05")
+    assert solver_n(0.02, 0.03) == 3789
+    assert result == 931
+    assert power_at(0.02, 0.03, 1931, ratio=100931 / 1931) >= 0.8
+    assert power_at(0.02, 0.03, 1930, ratio=100930 / 1930) < 0.8
+
+
+def test_additional_n_uses_the_given_alpha_and_power() -> None:
+    """CR1: at alpha 0.01 and power 0.9 the extra n is statsmodels' n at those levels less 1,000."""
+    result = additional_n_for_difference(
+        20, 1000, 30, 1000, alpha=Decimal("0.01"), power=Decimal("0.9")
+    )
+
+    assert result == solver_n(0.02, 0.03, alpha=0.01, power=0.9) - 1000
+
+
+@pytest.mark.parametrize(
+    ("x_a", "n_a", "x_b", "n_b"),
+    [
+        (0, 10, 10, 10),
+        (0, 1000, 5, 1000),
+        (300, 1000, 30, 1000),
+        (90, 100, 10, 100),
+        # The smaller variant holds fewer than the equal-group 3,789; the larger makes up for it.
+        (40, 2000, 30000, 1000000),
+    ],
+)
+def test_additional_n_is_zero_when_the_samples_already_suffice(
+    x_a: int, n_a: int, x_b: int, n_b: int
+) -> None:
+    """CR1: samples whose statsmodels power already reaches 0.8 need 0 more, never a negative n."""
+    # Power grows with either variant's sample, so observed samples that already reach the
+    # target power need no common increment, and the result is never negative.
+    assert common_increment_power(x_a, n_a, x_b, n_b, 0) >= 0.8
+
+    assert additional_n_for_difference(x_a, n_a, x_b, n_b, alpha=ALPHA, power=POWER) == 0
+
+
+def test_a_larger_variant_can_make_up_for_a_smaller_one() -> None:
+    """CR1: 2% on 2,000 against 3% on 1,000,000 needs 0 more: the larger variant makes it up."""
+    # The smaller variant alone falls short of the equal-group sample at 2% against 3%.
+    assert solver_n(0.02, 0.03) > 2000
+    assert additional_n_for_difference(40, 2000, 30000, 1000000, alpha=ALPHA, power=POWER) == 0
+    assert additional_n_for_difference(30000, 1000000, 40, 2000, alpha=ALPHA, power=POWER) == 0
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        ValueError("f(a) and f(b) must have different signs"),
+        RuntimeError("Failed to converge after 100 iterations"),
+        (931.5, SimpleNamespace(converged=False)),
+        (math.nan, SimpleNamespace(converged=True)),
+        # A root no whole increment next to it confirms, as floating-point noise could give.
+        (0.5, SimpleNamespace(converged=True)),
+    ],
+)
+def test_additional_n_falls_back_to_the_equal_group_bound_when_the_root_is_unusable(
+    monkeypatch: pytest.MonkeyPatch, outcome: Exception | tuple[float, SimpleNamespace]
+) -> None:
+    """CR1: an unusable increment root falls back to the equal-group bound of 2789, which suffices.
+
+    The bound is statsmodels' 3,789 per group less the 1,000 the smaller variant holds.
+    """
+
+    def root_finder(function: Any, **kwargs: Any) -> Any:
+        """Stand-in root finder: real for the equal-group sample, the case's outcome otherwise."""
+        if kwargs["upp"] is None:  # the equal-group sample, sized by the real root finder
+            return brentq_expanding(function, **kwargs)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(stats, "brentq_expanding", root_finder)
+
+    result = additional_n_for_difference(20, 1000, 3000, 100000, alpha=ALPHA, power=POWER)
+
+    # Both variants at the equal-group sample: always enough, if far more than needed.
+    assert result == solver_n(0.02, 0.03) - 1000 == 2789
+    assert common_increment_power(20, 1000, 3000, 100000, 2789) >= 0.8
+
+
+@pytest.mark.parametrize(
+    ("x_a", "n_a", "x_b", "n_b"),
+    [
+        (5, 100, 10, 200),  # identical rates: no observed difference
+        (0, 100, 0, 200),
+        (0, 0, 5, 10),  # a variant without impressions
+        (5, 10, 0, 0),
+        (3, 0, 5, 10),
+        FLOAT_EQUAL_RATES,  # exactly different, but no effect in floating point
+    ],
+)
+def test_additional_n_not_estimable(x_a: int, n_a: int, x_b: int, n_b: int) -> None:
+    """CR1: identical rates, a variant without impressions, or float-equal rates give None."""
+    assert additional_n_for_difference(x_a, n_a, x_b, n_b, alpha=ALPHA, power=POWER) is None
+
+
+def test_float_equal_rates_really_differ_exactly() -> None:
+    """CR1: the FLOAT_EQUAL_RATES case differs as exact fractions yet is equal as floats."""
+    x_a, n_a, x_b, n_b = FLOAT_EQUAL_RATES
+
+    assert Fraction(x_a, n_a) != Fraction(x_b, n_b)
+    assert x_a / n_a == x_b / n_b
+
+
+@pytest.mark.parametrize(
+    ("args", "alpha", "power", "error", "match"),
+    [
+        ((1.0, 10, 2, 10), ALPHA, POWER, TypeError, "x_a must be an int count, got float"),
+        ((1, 10, 2, True), ALPHA, POWER, TypeError, "n_b must be an int count, got bool"),
+        ((11, 10, 2, 10), ALPHA, POWER, ValueError, r"x_a \(11\) must not exceed n_a \(10\)"),
+        ((1, 10, -2, 10), ALPHA, POWER, ValueError, "x_b must be >= 0"),
+        ((1, 10, 2, 10), 0.05, POWER, TypeError, "alpha must be a Decimal, got float"),
+        ((1, 10, 2, 10), ALPHA, Decimal("1.2"), ValueError, r"power must be in \(0, 1\)"),
+        ((1, 10, 2, 10), Decimal("0.2"), Decimal("0.1"), ValueError, "must exceed alpha"),
+        ((1, 0, 2, 10), ALPHA, ALPHA, ValueError, "must exceed alpha"),
+        ((1, 10, 2, 10), Decimal("1e-1000"), POWER, ValueError, r"alpha \(1E-1000\) is not"),
+        (
+            (1, 10, 2, 10),
+            ALPHA,
+            Decimal("0.99999999999999999999"),
+            ValueError,
+            r"power \(0.99999999999999999999\) is not representable strictly inside \(0, 1\)",
+        ),
+        (
+            (1, 0, 2, 10),
+            Decimal("0.3"),
+            Decimal("0.30000000000000000001"),
+            ValueError,
+            r"must exceed alpha \(0.3\) as a float",
+        ),
+    ],
+)
+def test_additional_n_rejects_invalid_input(
+    args: tuple[Any, ...], alpha: Any, power: Any, error: type[Exception], match: str
+) -> None:
+    """CR1: the extra-n sizing rejects invalid counts and levels, even with zero trials.
+
+    Non-int counts or a float level raise TypeError; impossible counts, a level outside
+    (0, 1) or not strictly inside it as a float, and power not above alpha raise ValueError.
+    """
+    with pytest.raises(error, match=match):
+        additional_n_for_difference(*args, alpha=alpha, power=power)
+
+
+# --- poisson_rate_test (B4) ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("count_a", "spend_a", "count_b", "spend_b"),
+    [
+        (30, Decimal(1000), 10, Decimal(1000)),
+        (4, Decimal("812.40"), 15, Decimal("2950.15")),
+        # One side without outcomes is still a rate. statsmodels' own ratio estimate then
+        # divides by a zero rate, which never reaches the score test's p-value.
+        pytest.param(0, Decimal(500), 12, Decimal(1500), marks=ZERO_RATE_RATIO_WARNING),
+        pytest.param(12, Decimal(1500), 0, Decimal(500), marks=ZERO_RATE_RATIO_WARNING),
+        (10, Decimal(1000), 20, Decimal(2000)),  # equal rates
+        (20, Decimal(100), 20, Decimal(100)),  # equal counts and exposures
+        (40, Decimal(100), 10, Decimal(100)),  # clearly different rates
+        (3, Decimal("0.75"), 17, Decimal("123456.789012")),
+    ],
+)
+def test_poisson_rate_test_matches_the_statsmodels_score_test(
+    count_a: int, spend_a: Decimal, count_b: int, spend_b: Decimal
+) -> None:
+    """B4: p is statsmodels' two-sided score test, the rates are exact, and swapping keeps p."""
+    result = poisson_rate_test(count_a, spend_a, count_b, spend_b)
+
+    assert result == RateTest(
+        method=POISSON_RATE_METHOD,
+        p_value=poisson_reference(count_a, spend_a, count_b, spend_b),
+        rate_a=exact_ratio(count_a, spend_a),
+        rate_b=exact_ratio(count_b, spend_b),
+    )
+    swapped = poisson_rate_test(count_b, spend_b, count_a, spend_a)
+    assert swapped is not None
+    assert swapped.p_value == result.p_value
+
+
+def test_poisson_rate_test_docstring_case_and_equal_rates() -> None:
+    """B4: 30 against 10 outcomes on 1,000 spend each give statsmodels' p of 0.001565.
+
+    The method is the two-sample Poisson score test, the rates are 0.03 and 0.01, and equal
+    rates (10 on 1,000 against 20 on 2,000) give p of exactly 1.
+    """
+    result = poisson_rate_test(30, Decimal(1000), 10, Decimal(1000))
+    equal = poisson_rate_test(10, Decimal(1000), 20, Decimal(2000))
+
+    assert result is not None
+    assert result.method == POISSON_RATE_METHOD == "two_sample_poisson_score"
+    assert result.p_value == poisson_reference(30, Decimal(1000), 10, Decimal(1000))
+    assert result.p_value == Decimal("0.001565")
+    assert (result.rate_a, result.rate_b) == (Decimal("0.030000"), Decimal("0.010000"))
+    assert result.p_value < Decimal("0.05")
+    assert equal is not None
+    assert equal.p_value == ONE
+
+
+def test_b4_equal_counts_and_exposures_are_not_a_pattern() -> None:
+    """B4: 20 outcomes on 100 spend against the same gives p of about 1, never a pattern."""
+    result = poisson_rate_test(20, Decimal(100), 20, Decimal(100))
+
+    assert result is not None
+    assert result.p_value >= Decimal("0.9")
+    assert result.rate_a == result.rate_b == Decimal("0.2")
+
+
+def test_b4_clearly_different_rates_are_a_pattern() -> None:
+    """B4: 40 outcomes on 100 spend against 10 on 100 gives p below 0.001, rates as Decimals."""
+    result = poisson_rate_test(40, Decimal(100), 10, Decimal(100))
+
+    reference = poisson_2indep_reference(40, 100.0, 10, 100.0, method="score")
+    assert result is not None
+    assert result.p_value < Decimal("0.001")
+    assert float(result.p_value) == pytest.approx(float(reference.pvalue), abs=5e-7)
+    assert isinstance(result.rate_a, Decimal)
+    assert isinstance(result.rate_b, Decimal)
+    assert (result.rate_a, result.rate_b) == (Decimal("0.4"), Decimal("0.1"))
+
+
+def test_b4_decimal_spend_exposures_keep_their_exact_rates() -> None:
+    """B4: spend with cents enters as Decimal; rates are exact and the p-value tracks the float."""
+    spend_a, spend_b = Decimal("1234.56"), Decimal("4321.09")
+
+    result = poisson_rate_test(12, spend_a, 30, spend_b)
+
+    assert result is not None
+    assert result.rate_a == exact_ratio(12, spend_a)
+    assert result.rate_b == exact_ratio(30, spend_b)
+    reference = poisson_2indep_reference(12, float(spend_a), 30, float(spend_b), method="score")
+    assert float(result.p_value) == pytest.approx(float(reference.pvalue), abs=5e-7)
+
+
+def test_poisson_rate_test_accepts_int_exposure() -> None:
+    """B4: an int exposure gives the same result as the equal Decimal exposure."""
+    whole_spend: Any = 1000
+    assert poisson_rate_test(30, whole_spend, 10, whole_spend) == poisson_rate_test(
+        30, Decimal(1000), 10, Decimal(1000)
+    )
+
+
+@pytest.mark.parametrize(
+    ("count_a", "spend_a", "count_b", "spend_b"),
+    [
+        (16, Decimal(800), 200, Decimal(2000)),  # the catalogue's B4 card, p about 5.8e-12
+        (60, Decimal(1000), 5, Decimal(1000)),
+        # Between half the quantum and the quantum, which 6 places would show as 0.000001.
+        (37, Decimal(100), 5, Decimal(100)),
+    ],
+)
+def test_poisson_rate_test_keeps_six_significant_digits_below_the_quantum(
+    count_a: int, spend_a: Decimal, count_b: int, spend_b: Decimal
+) -> None:
+    """B4: a positive p-value below 0.000001 is recorded at 6 significant digits, never as 0."""
+    library = poisson_p(count_a, spend_a, count_b, spend_b)
+
+    result = poisson_rate_test(count_a, spend_a, count_b, spend_b)
+
+    assert 0.0 < library < 1e-6
+    assert result is not None
+    assert result.p_value > 0
+    assert result.p_value == Decimal(f"{library:.5e}")
+    assert len(result.p_value.as_tuple().digits) == 6
+    assert result.p_value == poisson_reference(count_a, spend_a, count_b, spend_b)
+    assert format(result.p_value, "f") not in ("0.000000", "0.000001")
+    swapped = poisson_rate_test(count_b, spend_b, count_a, spend_a)
+    assert swapped is not None
+    assert swapped.p_value == result.p_value
+
+
+@pytest.mark.parametrize(
+    ("count_a", "spend_a", "count_b", "spend_b"),
+    [
+        (36, Decimal(100), 5, Decimal(100)),  # p about 1.29e-6, just above the quantum
+        (35, Decimal(100), 5, Decimal(100)),
+        (40, Decimal(100), 10, Decimal(100)),
+        (30, Decimal(1000), 10, Decimal(1000)),
+        (4, Decimal("812.40"), 15, Decimal("2950.15")),
+        (10, Decimal(1000), 20, Decimal(2000)),
+    ],
+)
+def test_poisson_rate_test_keeps_six_places_from_the_quantum_up(
+    count_a: int, spend_a: Decimal, count_b: int, spend_b: Decimal
+) -> None:
+    """B4: from 0.000001 up the p-value is exactly the 6-place half-even figure."""
+    library = poisson_p(count_a, spend_a, count_b, spend_b)
+
+    result = poisson_rate_test(count_a, spend_a, count_b, spend_b)
+
+    assert library >= 1e-6
+    assert result is not None
+    assert result.p_value == probability(library)
+    assert result.p_value.as_tuple().exponent == -6
+
+
+@pytest.mark.parametrize(
+    ("library", "expected"),
+    [
+        (5.7664369391539194e-12, "5.76644E-12"),
+        (4.9999995e-07, "5.00000E-7"),  # 6 places alone would round it to 0.000000
+        (9.9999996e-07, "0.00000100000"),  # rounds up to the quantum, still at 6 digits
+        (5e-324, "5E-324"),  # the smallest positive double
+        (1e-06, "0.000001"),  # the quantum itself keeps 6 places
+        (0.001565402258002548, "0.001565"),
+        (0.0, "0.000000"),  # an underflow to exactly 0.0 has no digit to keep
+        (-0.0, "0.000000"),
+        (-1e-300, "0.000000"),  # clamped to [0, 1]
+        (1.0000000000000002, "1.000000"),
+        (math.nan, None),
+        (math.inf, None),
+    ],
+)
+def test_p_value_conversion(library: float, expected: str | None) -> None:
+    """The p-value conversion of CR1 and B4: 6 significant digits only for (0, 0.000001)."""
+    result = stats._p_value_from_float(np.float64(library))
+
+    assert (None if result is None else str(result)) == expected
+    if result is not None:
+        assert result == p_value_probability(library)
+        assert Decimal(0) <= result <= Decimal(1)
+
+
+@pytest.mark.parametrize(
+    ("count_a", "spend_a", "count_b", "spend_b"),
+    [
+        (0, Decimal(1000), 0, Decimal(1000)),  # no outcome on either side
+        (5, Decimal(0), 5, Decimal(1000)),  # no exposure
+        (5, Decimal(1000), 5, Decimal("0.00")),
+        (5, Decimal(1000), 5, Decimal("-1")),
+        (0, Decimal(0), 0, Decimal(0)),
+    ],
+)
+def test_poisson_rate_test_not_estimable(
+    count_a: int, spend_a: Decimal, count_b: int, spend_b: Decimal
+) -> None:
+    """B4: zero outcomes on both sides, or a side with zero or negative spend, give None."""
+    assert poisson_rate_test(count_a, spend_a, count_b, spend_b) is None
+
+
+def test_poisson_rate_test_with_a_non_finite_library_p_value_is_not_estimable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B4: a NaN p-value from statsmodels' rate test makes the result not estimable (None)."""
+
+    def nan_test(*args: object, **kwargs: object) -> SimpleNamespace:
+        """Stand-in test_poisson_2indep that returns a NaN p-value."""
+        return SimpleNamespace(pvalue=math.nan)
+
+    monkeypatch.setattr(stats, "_poisson_2indep", nan_test)
+
+    assert poisson_rate_test(30, Decimal(1000), 10, Decimal(1000)) is None
+
+
+@pytest.mark.parametrize(
+    ("count_a", "spend_a", "count_b", "spend_b", "error", "match"),
+    [
+        # Weighted conversions are never rounded into the test: non-int counts are rejected.
+        (3.0, Decimal(1000), 10, Decimal(1000), TypeError, "count_a must be an int count"),
+        (3, Decimal(1000), Decimal(10), Decimal(1000), TypeError, "count_b must be an int count"),
+        (True, Decimal(1000), 10, Decimal(1000), TypeError, "count_a must be an int count"),
+        (3, 1000.0, 10, Decimal(1000), TypeError, "exposure_a must be a Decimal, got float"),
+        (3, Decimal(1000), 10, False, TypeError, "exposure_b must be a Decimal, got bool"),
+        (-3, Decimal(1000), 10, Decimal(1000), ValueError, "count_a must be >= 0"),
+        (3, Decimal("NaN"), 10, Decimal(1000), ValueError, "exposure_a must be finite"),
+        (3, Decimal(1000), 10, Decimal("Infinity"), ValueError, "exposure_b must be finite"),
+        # Invalid input raises even where the result would be "no exposure".
+        (3.5, Decimal(0), 10, Decimal(1000), TypeError, "count_a must be an int count"),
+    ],
+)
+def test_poisson_rate_test_rejects_invalid_input(
+    count_a: Any, spend_a: Any, count_b: Any, spend_b: Any, error: type[Exception], match: str
+) -> None:
+    """B4: non-int counts, weighted ones included, are rejected, never rounded into the test.
+
+    Non-int or bool counts and float or bool exposures raise TypeError, even with zero spend;
+    a negative count or a non-finite exposure raises ValueError.
+    """
+    with pytest.raises(error, match=match):
+        poisson_rate_test(count_a, spend_a, count_b, spend_b)
+
+
+# --- percentile (B3) -----------------------------------------------------------------------
+
+SPEND_DAYS = [
+    [Decimal("12.34"), Decimal("56.78"), Decimal("90.12"), Decimal("3.45"), Decimal("67.89")],
+    [Decimal(10), Decimal(20), Decimal(30), Decimal(40)],
+    [Decimal("7.5"), Decimal("7.5"), Decimal("7.5"), Decimal("0"), Decimal("100.01")],
+    [Decimal("0.1"), Decimal("0.2"), Decimal("0.3"), Decimal("0.4"), Decimal("0.5"), Decimal(0)],
+    [Decimal("42.42")],
+]
+
+
+@pytest.mark.parametrize("values", SPEND_DAYS)
+@pytest.mark.parametrize("q", ["0", "0.25", "0.5", "0.9", "0.95", "1"])
+def test_percentile_is_numpys_linear_method_exactly(values: list[Decimal], q: str) -> None:
+    """B3: the exact Hyndman-Fan type 7 value at 6 places, within 0.000001 of NumPy's result."""
+    result = percentile(values, Decimal(q))
+
+    assert result == type7_reference(values, Decimal(q))
+    assert result is not None
+    numpy_value = np.quantile([float(v) for v in values], float(q), method="linear")
+    assert abs(result - Decimal(repr(float(numpy_value)))) <= QUANTUM
+    assert result.as_tuple().exponent == -6
+
+
+def test_percentile_docstring_cases() -> None:
+    """B3: of daily spend 10, 20, 30 and 40 in any order, the median is 25 and the p90 is 37."""
+    four_days = [Decimal(40), Decimal(10), Decimal(30), Decimal(20)]
+
+    assert percentile(four_days, Decimal("0.5")) == Decimal("25.000000")
+    assert percentile(sorted(four_days), Decimal("0.9")) == Decimal("37.000000")
+
+
+def test_percentile_ends_are_the_minimum_and_maximum() -> None:
+    """B3: q of 0 gives the minimum, q of 1 the maximum, and one value is every percentile."""
+    values = [Decimal("5.5"), Decimal("-1.25"), Decimal("3")]
+
+    assert percentile(values, Decimal(0)) == Decimal("-1.250000")
+    assert percentile(values, Decimal(1)) == Decimal("5.500000")
+    assert percentile([Decimal("42.42")], Decimal("0.37")) == Decimal("42.420000")
+
+
+def test_percentile_keeps_money_exact_beyond_float_precision() -> None:
+    """B3: the median of 1000000000.000001 and 1000000000.000003 is exactly 1000000000.000002."""
+    values = [Decimal("1000000000.000001"), Decimal("1000000000.000003")]
+
+    assert percentile(values, Decimal("0.5")) == Decimal("1000000000.000002")
+    assert float(values[0]) == float(Decimal("1000000000.000001")) != float(values[1])
+
+
+def test_percentile_rounds_half_to_even_at_six_places() -> None:
+    """B3: halfway results round half to even: 0.0000005 gives 0 and 0.0000015 gives 0.000002."""
+    assert percentile([Decimal(0), Decimal("0.000001")], Decimal("0.5")) == ZERO
+    assert percentile([Decimal(0), Decimal("0.000003")], Decimal("0.5")) == Decimal("0.000002")
+
+
+def test_percentile_accepts_ints_and_leaves_its_input_unchanged() -> None:
+    """B3: int values and an int q match the exact type 7 reference; the input is not reordered."""
+    values: list[Any] = [Decimal(30), 10, Decimal(20)]
+    whole_q: Any = 1
+
+    assert percentile(values, Decimal("0.9")) == type7_reference(values, Decimal("0.9"))
+    assert values == [Decimal(30), 10, Decimal(20)]
+    assert percentile((Decimal(1), Decimal(3)), whole_q) == Decimal("3.000000")
+
+
+def test_percentile_of_no_values_is_none() -> None:
+    """B3: the percentile of no values is None."""
+    assert percentile([], Decimal("0.9")) is None
+
+
+@pytest.mark.parametrize(
+    ("values", "q", "error", "match"),
+    [
+        ([Decimal(1)], Decimal(90), ValueError, r"q must be a fraction in \[0, 1\]"),
+        ([Decimal(1)], Decimal("-0.1"), ValueError, r"q must be a fraction in \[0, 1\]"),
+        ([Decimal(1)], Decimal("1.000001"), ValueError, r"q must be a fraction in \[0, 1\]"),
+        ([], Decimal(90), ValueError, r"q must be a fraction in \[0, 1\]"),
+        ([Decimal(1)], 0.9, TypeError, "q must be a Decimal, got float"),
+        ([Decimal(1)], Decimal("NaN"), ValueError, "q must be finite"),
+        ([Decimal(1), 2.5], Decimal("0.9"), TypeError, r"values\[1\] must be a Decimal"),
+        ([True], Decimal("0.9"), TypeError, r"values\[0\] must be a Decimal, got bool"),
+        ([Decimal(1), Decimal("Infinity")], Decimal("0.9"), ValueError, r"values\[1\] must be"),
+    ],
+)
+def test_percentile_rejects_invalid_input(
+    values: list[Any], q: Any, error: type[Exception], match: str
+) -> None:
+    """B3: invalid values and fractions raise, even for no values.
+
+    A float or bool raises TypeError; a q outside [0, 1], such as 90 for the 90th
+    percentile, and a non-finite q or value raise ValueError.
+    """
+    with pytest.raises(error, match=match):
+        percentile(values, q)
+
+
+# --- p_relation (B4, CR1 texts; the web's test line) ----------------------------------------
+
+
+def _p_value_relation_cases() -> list[tuple[str, str, str, bool]]:
+    """The shared table of ``p_value_relations.json``: (p, alpha, relation, pathological)."""
+    table = json.loads(P_VALUE_RELATIONS.read_text(encoding="utf-8"))
+    return [
+        (case["p"], case["alpha"], case["relation"], case.get("pathological", False))
+        for case in table["cases"]
+    ]
+
+
+@pytest.mark.parametrize(("p", "alpha", "relation", "pathological"), _p_value_relation_cases())
+def test_p_relation_matches_the_table_the_web_test_line_shares(
+    p: str, alpha: str, relation: str, pathological: bool
+) -> None:
+    """B4/CR1: every case of the table ``web/src/lib/format.test.ts`` also holds formatPValue to.
+
+    Each ``p`` is in the fixed-point form the API emits for ``evidence.test``, at any depth, so
+    the backend's sentence and the web's test line word the same evidence the same way. A
+    pathological ``p`` is in exponent notation instead, which the API never emits.
+    """
+    if pathological:
+        assert "e" in p.lower()
+    else:
+        assert format(Decimal(p), "f") == p
+    assert p_relation(Decimal(p), Decimal(alpha)) == relation
+
+
+@pytest.mark.parametrize(
+    ("weekday_outcomes", "p_value"),
+    [(1390, "3.12936E-304"), (1400, "2.10101E-306"), (1410, "1.41063E-308")],
+)
+def test_p_relation_bounds_the_deepest_p_values_the_poisson_rate_test_gives(
+    weekday_outcomes: int, p_value: str
+) -> None:
+    """B4: p-values with digits past the 10^-307 place read ``< 0.0001`` against alpha 0.05.
+
+    Their fixed-point text, as the API sends it, is a case of the shared table, so the web's
+    test line is held to reading them as the reason does.
+    """
+    result = poisson_rate_test(0, Decimal(1000), weekday_outcomes, Decimal(1000))
+
+    assert result is not None
+    assert result.p_value == Decimal(p_value)
+    assert p_relation(result.p_value, ALPHA) == "< 0.0001"
+    shared = {case[:3] for case in _p_value_relation_cases()}
+    assert (format(result.p_value, "f"), "0.05", "< 0.0001") in shared
+
+
+def test_p_relation_states_the_findings_values_one_way() -> None:
+    """B4 and CR1 values: 4 padded places, the 0.0001 bound, and a figure on alpha's side."""
+    assert p_relation(Decimal("1.27560E-11"), ALPHA) == "< 0.0001"
+    assert p_relation(Decimal("0.0176"), ALPHA) == "= 0.0176"
+    assert p_relation(Decimal("0.956521"), ALPHA) == "= 0.9565"
+    assert p_relation(Decimal("0.04996"), ALPHA) == "= 0.04996"
+    assert p_relation(Decimal("0.05"), ALPHA) == "= 0.0500"
+    assert p_relation(Decimal("0.0001"), ALPHA) == "= 0.0001"
+    assert p_relation(Decimal("0.00009999"), ALPHA) == "< 0.0001"
+    assert p_relation(1, ALPHA) == "= 1.0000"
+    assert p_relation(0, ALPHA) == "< 0.0001"
+    # Half even at the fourth place, as every Decimal here rounds: 0.01245 keeps its even 4.
+    assert p_relation(Decimal("0.01245"), ALPHA) == "= 0.0124"
+    assert p_relation(Decimal("0.01235"), ALPHA) == "= 0.0124"
+
+
+@pytest.mark.parametrize("alpha", ["0.05", "0.05005", "0.2", "0.01", "0.0001", "0.00001"])
+def test_p_relation_never_reads_on_the_wrong_side_of_alpha(alpha: str) -> None:
+    """A shown figure is below alpha exactly when the p-value is; a bound never exceeds alpha."""
+    level = Decimal(alpha)
+    step = Decimal("0.000001")
+    values = {level + step * offset for offset in range(-150, 151)} | {ZERO, ONE, level}
+    for value in sorted(value for value in values if ZERO <= value <= ONE):
+        relation = p_relation(value, level)
+        sign, _, figure = relation.partition(" ")
+        shown = Decimal(figure)
+        if sign == "<":
+            assert value < shown <= level, (value, relation)
+            continue
+        assert sign == "="
+        assert (shown < level) == (value < level), (value, relation)
+        assert -shown.as_tuple().exponent >= 4, (value, relation)
+
+
+def test_p_relation_bound_moves_below_a_small_alpha() -> None:
+    """Below alpha 0.0001 the bound is the first smaller power of ten not above alpha."""
+    assert p_relation(Decimal("0.000041"), Decimal("0.00001")) == "= 0.00004"
+    assert p_relation(Decimal("0.000009"), Decimal("0.00001")) == "< 0.00001"
+    assert p_relation(Decimal("0.000004"), Decimal("0.00005")) == "< 0.00001"
+    assert p_relation(Decimal("0.5"), Decimal("1E-8")) == "= 0.50000000"
+
+
+@pytest.mark.parametrize(
+    ("value", "alpha", "error", "match"),
+    [
+        (Decimal("1.5"), ALPHA, ValueError, r"value must be in \[0, 1\]"),
+        (Decimal("-0.01"), ALPHA, ValueError, r"value must be in \[0, 1\]"),
+        (Decimal("NaN"), ALPHA, ValueError, "value must be finite"),
+        (0.05, ALPHA, TypeError, "value must be a Decimal, got float"),
+        (Decimal("0.5"), Decimal(0), ValueError, r"alpha must be in \(0, 1\)"),
+        (Decimal("0.5"), Decimal(1), ValueError, r"alpha must be in \(0, 1\)"),
+        (Decimal("0.5"), 0.05, TypeError, "alpha must be a Decimal, got float"),
+    ],
+)
+def test_p_relation_rejects_invalid_input(
+    value: Any, alpha: Any, error: type[Exception], match: str
+) -> None:
+    """A p-value outside [0, 1] or an alpha outside (0, 1) raises, as every function here does."""
+    with pytest.raises(error, match=match):
+        p_relation(value, alpha)
+
+
+# --- conversion helpers --------------------------------------------------------------------
+
+
+def test_library_floats_convert_through_repr_with_numpy_scalars_unwrapped() -> None:
+    """Library floats, NumPy scalars included, round half even to 6 places; NaN and inf: None.
+
+    A tiny negative float converts to 0.000000, never to a negative zero.
+    """
+    assert stats._from_float(np.float64(0.25)) == Decimal("0.250000")
+    assert stats._from_float(0.0000005) == ZERO  # half-even at the sixth place
+    assert stats._from_float(0.0000015) == Decimal("0.000002")
+    assert str(stats._from_float(-0.0000001)) == "0.000000"
+    assert stats._from_float(math.nan) is None
+    assert stats._from_float(math.inf) is None
+    assert stats._from_float(-math.inf) is None
+
+
+def test_library_probabilities_are_clamped_to_zero_and_one() -> None:
+    """Library probabilities are clamped to [0, 1], and a NaN probability gives None."""
+    assert stats._probability_from_float(1.0000000000000002) == ONE
+    assert stats._probability_from_float(1.5) == ONE
+    assert stats._probability_from_float(-0.2) == ZERO
+    assert stats._probability_from_float(math.nan) is None
+
+
+def test_a_non_finite_result_for_valid_input_raises() -> None:
+    """A finite library result passes through; a missing (non-finite) one raises ArithmeticError."""
+    assert stats._require_finite(Decimal("0.5"), "library") == Decimal("0.5")
+    with pytest.raises(ArithmeticError, match="library returned a non-finite value"):
+        stats._require_finite(None, "library")
+
+
+@pytest.mark.parametrize(
+    ("function", "target", "replacement"),
+    [
+        (lambda: wilson(7, 120), "proportion_confint", lambda *a, **k: (math.nan, 0.1)),
+        (lambda: holm([Decimal("0.1")]), "multipletests", lambda *a, **k: (0, [math.inf], 0, 0)),
+        (
+            lambda: cohens_h(Decimal("0.2"), Decimal("0.1")),
+            "proportion_effectsize",
+            lambda *a, **k: math.nan,
+        ),
+    ],
+)
+def test_non_finite_library_results_raise_rather_than_vanish(
+    monkeypatch: pytest.MonkeyPatch, function: Any, target: str, replacement: Any
+) -> None:
+    """NaN or inf from the libraries behind wilson, holm and cohens_h raises ArithmeticError."""
+    monkeypatch.setattr(stats, target, replacement)
+
+    with pytest.raises(ArithmeticError, match="non-finite value for valid input"):
+        function()
+
+
+def test_per_group_sample_without_a_finite_effect_is_not_estimable() -> None:
+    """The per-group power solver gives None for a NaN rate or equal rates: no usable effect."""
+    assert stats._per_group_n(math.nan, 0.5, alpha=0.05, power=0.8) is None
+    assert stats._per_group_n(0.5, 0.5, alpha=0.05, power=0.8) is None
+
+
+# --- module contract ----------------------------------------------------------------------
+
+
+def test_results_do_not_depend_on_the_callers_decimal_context() -> None:
+    """Every public function gives the same result under a 2-digit, ROUND_DOWN caller context."""
+
+    def every_result() -> list[object]:
+        """One result from each public function on fixed inputs, under the active context."""
+        return [
+            compare_proportions(5, 999, 5, 1000),
+            compare_proportions(60, 1000, 90, 1000, fisher_min_expected=Decimal("74.5")),
+            holm([Decimal("0.001"), Decimal("0.2"), Decimal("0.013")]),
+            wilson(7, 120),
+            cohens_h(Decimal("0.024"), Decimal("0.02")),
+            required_n(Decimal("0.02"), Decimal("0.024"), alpha=ALPHA, power=POWER),
+            additional_n_for_difference(12, 800, 30, 1500, alpha=ALPHA, power=POWER),
+            poisson_rate_test(3, Decimal("0.75"), 17, Decimal("123456.789012")),
+            poisson_rate_test(16, Decimal(800), 200, Decimal(2000)),
+            percentile([Decimal("1000000000.000001"), Decimal("1000000000.000003")], HALF),
+            p_relation(Decimal("0.04996"), ALPHA),
+            p_relation(Decimal("0.012350"), ALPHA),
+            p_relation(Decimal("0.5"), Decimal("1E-60")),
+        ]
+
+    baseline = every_result()
+    with localcontext() as context:
+        context.prec = 2
+        context.rounding = ROUND_DOWN
+        constrained = every_result()
+
+    assert constrained == baseline
+
+
+def test_every_numeric_output_is_a_finite_decimal_or_an_int_sample_size() -> None:
+    """Boundary types: rates and p-values are finite Decimals, sample sizes plain ints."""
+    proportions = [
+        compare_proportions(1, 40, 6, 40),
+        compare_proportions(120, 1000, 150, 1000),
+        compare_proportions(50, 1000, 50, 1000),
+    ]
+    intervals = [wilson(0, 10), wilson(5, 20), wilson(10, 10)]
+    rates = [
+        poisson_rate_test(20, Decimal(100), 20, Decimal(100)),
+        poisson_rate_test(40, Decimal(100), 10, Decimal(100)),
+    ]
+    decimals: list[object] = [
+        *holm([Decimal("0.01"), Decimal("0.04"), Decimal("0.03"), Decimal("0.005")]),
+        cohens_h(Decimal("0.06"), Decimal("0.05")),
+        percentile([Decimal("12.34"), Decimal("56.78"), Decimal("90.12")], Decimal("0.9")),
+    ]
+    for proportion in proportions:
+        assert proportion is not None
+        decimals += [proportion.p_value, proportion.rate_a, proportion.rate_b]
+        decimals.append(proportion.expected_min)
+    for interval in intervals:
+        assert interval is not None
+        decimals += [interval.point, interval.low, interval.high]
+    for rate in rates:
+        assert rate is not None
+        decimals += [rate.p_value, rate.rate_a, rate.rate_b]
+    sizes = [
+        required_n(Decimal("0.05"), Decimal("0.06"), alpha=ALPHA, power=POWER),
+        additional_n_for_difference(20, 1000, 30, 1000, alpha=ALPHA, power=POWER),
+        additional_n_for_difference(0, 10, 10, 10, alpha=ALPHA, power=POWER),
+    ]
+
+    for value in decimals:
+        assert isinstance(value, Decimal), value
+        assert value.is_finite(), value
+    for size in sizes:
+        assert type(size) is int, size
+        assert size >= 0
+
+
+def test_results_are_immutable() -> None:
+    """ProportionTest and RateTest are frozen: assigning a field raises FrozenInstanceError."""
+    proportion = compare_proportions(1, 20, 4, 20)
+    rate = poisson_rate_test(30, Decimal(1000), 10, Decimal(1000))
+
+    assert proportion is not None
+    assert rate is not None
+    with pytest.raises(FrozenInstanceError):
+        proportion.p_value = ZERO  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        rate.p_value = ZERO  # type: ignore[misc]
+
+
+def test_docstring_examples_hold() -> None:
+    """Every docstring example in ads_engine.analysis.stats runs under doctest without failure."""
+    results = doctest.testmod(stats, report=False)
+
+    assert results.attempted > 0
+    assert results.failed == 0
+
+
+def test_module_is_pure_and_uses_only_the_standard_library_scipy_and_statsmodels() -> None:
+    """The stats module imports only the standard library, SciPy and statsmodels, no logging.
+
+    Every import is absolute, and SciPy's stats and statsmodels' rates modules are among them.
+    """
+    imported: set[str] = set()
+    for node in ast.walk(ast.parse(inspect.getsource(stats))):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            assert node.level == 0, "relative import"
+            assert node.module is not None
+            imported.add(node.module)
+
+    assert {"scipy.stats", "statsmodels.stats.rates"} <= imported
+    for module in imported:
+        root = module.partition(".")[0]
+        assert root in sys.stdlib_module_names or root in {"scipy", "statsmodels"}, module
+    assert "logging" not in imported
+
+
+def test_module_namespace_holds_no_collectable_test_name() -> None:
+    """No name in the stats module starts with test, so pytest never collects one of them."""
+    assert [name for name in vars(stats) if name.startswith("test")] == []
+
+
+def test_public_names_are_exactly_the_documented_api() -> None:
+    """The stats module's __all__ is exactly the 17 documented names, each of them defined."""
+    assert sorted(stats.__all__) == [
+        "DEFAULT_ALPHA",
+        "DEFAULT_CONFIDENCE",
+        "FISHER_MIN_EXPECTED",
+        "Interval",
+        "POISSON_RATE_METHOD",
+        "ProportionMethod",
+        "ProportionTest",
+        "RateTest",
+        "additional_n_for_difference",
+        "cohens_h",
+        "compare_proportions",
+        "holm",
+        "p_relation",
+        "percentile",
+        "poisson_rate_test",
+        "required_n",
+        "wilson",
+    ]
+    for name in stats.__all__:
+        assert hasattr(stats, name), name
