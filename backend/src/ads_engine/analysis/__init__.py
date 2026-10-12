@@ -15,6 +15,7 @@ Module map:
     shortfall: the dated Q-G6 finest-partition reason grammar, shared with sync.freshness.
     stats: Fisher's exact, two-proportion z-test, Holm, Wilson, power, Poisson rate test.
     text: search-term tokeniser, token Jaccard similarity, single-linkage clustering.
+    segment_labels: LinkedIn's standardized names of the stored demographic segment URNs.
     metrics: SQL aggregation into `AnalysisContext`, budget days, utilization, efficiency, G1.
     attribution: white paper attribution chain and the CRM pipeline-veto population.
     keywords: rules K1-K3 (negative, expansion and review candidates).

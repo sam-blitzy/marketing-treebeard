@@ -953,7 +953,10 @@ subject, and never one on its members.
     been fetched;
   - a custom window whose length is not a preset or whose end is not the default end: "Segment
     data exists only for the preset windows {list} ending {end}".
-- **Action**: "Launch a campaign targeting {facet}: {value} with {campaign}'s offer".
+- **Action**: "Launch a campaign targeting {facet}: {value} with {campaign}'s offer", where
+  {value} is LinkedIn's standardized name for the stored segment URN (`urn:li:seniority:6`
+  reads "Director"), or the URN itself when LinkedIn names none; `extra.value` keeps the URN
+  and `extra.value_label` carries the name.
 - **Reason and extra output**: segment leads, spend and cost per lead against the campaign's cost
   per lead; segment and campaign impressions and the impression share; campaign spend and leads;
   the campaign group in `extra.campaign_group`.

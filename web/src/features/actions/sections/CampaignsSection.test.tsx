@@ -2286,6 +2286,36 @@ describe('launch idea cards', () => {
     expect(within(article).queryByRole('table', { name: CLUSTER_TERMS_CAPTION })).toBeNull();
   });
 
+  it("names a C3a segment by LinkedIn's name, else by the URN an older run stored", async () => {
+    mockApi({});
+    const segmentCard = (id: number, campaign: string, extra: Record<string, unknown>) =>
+      makeItem({
+        id,
+        rule_id: 'C3a',
+        action: `Launch a campaign targeting seniority: ${campaign}`,
+        evidence: makeEvidence({
+          metrics: [metric('segment_leads', 'Segment leads', 20, 'leads')],
+          extra: { facet: 'seniority', facet_label: 'seniority', ...extra },
+        }),
+      });
+    const named = segmentCard(3012, 'Director', {
+      value: 'urn:li:seniority:6',
+      value_label: 'Director',
+    });
+    const frozen = segmentCard(3013, 'urn:li:seniority:6', { value: 'urn:li:seniority:6' });
+    await renderCampaigns(oneGroup('launch', 'Launch ideas', [named, frozen]));
+
+    expect(
+      listLines(card('Launch a campaign targeting seniority: Director'), SEGMENT_GAP_LABEL),
+    ).toEqual(['Segment: seniority: Director', 'Segment leads: 20']);
+    expect(
+      listLines(
+        card('Launch a campaign targeting seniority: urn:li:seniority:6'),
+        SEGMENT_GAP_LABEL,
+      ),
+    ).toEqual(['Segment: seniority: urn:li:seniority:6', 'Segment leads: 20']);
+  });
+
   it('shows a launch idea without gap evidence as its plain card', async () => {
     mockApi({});
     const bare = makeItem({

@@ -2090,6 +2090,23 @@ def test_c2_scale_is_linked_to_the_b1_item_carrying_the_amount(
         (subject,),
     )
     assert evidence_metrics(b1)["proposed_daily_budget"] == proposed
+    # One representation per amount: the C2 card, its link and the B1 card all record the
+    # budgets, spend and outcomes at six places (``120.000000``, never ``120.00`` beside
+    # ``100``), and the link names the B1 card's own amounts exactly.
+    scale_metrics = evidence_metrics(scale)
+    b1_metrics = evidence_metrics(b1)
+    for key in ("spend", "outcomes", "daily_budget", "proposed_daily_budget"):
+        assert cast(Decimal, scale_metrics[key]).as_tuple().exponent == -6, key
+    for amount in (current, proposed):
+        assert amount.as_tuple().exponent == -6
+    assert (str(current), str(proposed)) == (
+        str(b1_metrics["daily_budget"]),
+        str(b1_metrics["proposed_daily_budget"]),
+    )
+    assert (str(scale_metrics["daily_budget"]), str(scale_metrics["proposed_daily_budget"])) == (
+        str(current),
+        str(proposed),
+    )
     assert b1.action == f"Raise daily budget from USD {current:,.2f} to USD {proposed:,.2f}"
     (outcome,) = scale_outcomes(ctx)
     assert isinstance(outcome, ScaleOutcome)
@@ -2282,13 +2299,17 @@ def test_c3a_launches_an_underused_proven_segment_on_a_preset_window(
     extra = item.evidence.extra
     campaign = scenario.ids.name("linkedin", "campaign", "li-seg")
     assert (item.group, item.decision_subject, item.increases_spend_on) == (GROUP_LAUNCH, None, ())
+    # The action names the segment by LinkedIn's standardized name for its stored URN.
     assert item.action == (
-        f"Launch a campaign targeting {extra['facet']}: {extra['value']} with {campaign}'s offer"
+        f"Launch a campaign targeting {extra['facet_label']}: {extra['value_label']} "
+        f"with {campaign}'s offer"
     )
     assert (extra["facet"], extra["value"]) == (
         scenario.expect.values["facet"],
         scenario.expect.values["value"],
     )
+    # extra.value keeps the URN, the segment's identity; extra.value_label carries the name.
+    assert (extra["value"], extra["value_label"]) == ("urn:li:seniority:6", "Director")
     assert dict(extra["segment_window"]) == {"start": ctx.window.start, "end": ctx.window.end}
     metrics = evidence_metrics(item)
     assert cast(int, metrics["segment_leads"]) >= ctx.thresholds.int("c3a.min_leads")

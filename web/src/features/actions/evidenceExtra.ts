@@ -783,7 +783,11 @@ export interface LaunchGap {
   readonly kind: 'segment' | 'cluster' | null;
   /** C3a: the demographic facet as displayed, for example "job function". */
   readonly facet: string | null;
-  /** C3a: the facet value, for example "Finance". */
+  /**
+   * C3a: the facet value as displayed: LinkedIn's standardized name (`extra.value_label`), for
+   * example "Director", else the stored value (`extra.value`, the URN, for example
+   * "urn:li:seniority:6") on runs frozen before the name was recorded.
+   */
   readonly value: string | null;
   /** C3b: the cluster's head tokens. */
   readonly headTokens: readonly string[];
@@ -802,7 +806,9 @@ const NO_LAUNCH_GAP: LaunchGap = Object.freeze({
 
 /**
  * Reads a launch idea's gap evidence. C3a (`campaigns._c3a_candidate`): `extra.facet_label`
- * (else `extra.facet`) and `extra.value`. C3b (`campaigns._c3b_candidate`):
+ * (else `extra.facet`) and `extra.value_label`, LinkedIn's standardized name of the segment
+ * (else `extra.value`, the stored URN, which is all a run frozen before the name was recorded
+ * carries). C3b (`campaigns._c3b_candidate`):
  * `extra.head_tokens` and `extra.members` (`{term, spend, conversions, clicks}`). Shared-budget
  * `extra.members` entries (campaigns, no `term`) are never read as cluster terms.
  *
@@ -815,7 +821,7 @@ export function launchGap(source: MaybeSource): LaunchGap {
     return NO_LAUNCH_GAP;
   }
   const facet = readString(extra.facet_label) ?? readString(extra.facet);
-  const value = readString(extra.value);
+  const value = readString(extra.value_label) ?? readString(extra.value);
   if (facet !== null && value !== null) {
     return { kind: 'segment', facet, value, headTokens: [], terms: [] };
   }

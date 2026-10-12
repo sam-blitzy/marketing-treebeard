@@ -87,6 +87,7 @@ from ads_engine.analysis.context import (
     SubjectKey,
     Withheld,
     google_link_gap,
+    segment_external_id,
 )
 from ads_engine.analysis.metrics import (
     baseline_cpo,
@@ -98,6 +99,7 @@ from ads_engine.analysis.metrics import (
 from ads_engine.analysis.text import cluster_terms, contains_tokens, tokenize
 from ads_engine.analysis.thresholds import CrmBindings, GoogleCrmBinding, ResolvedBinding
 from ads_engine.analysis.window import AnalysisWindow
+from ads_engine.decisions import round_to_minor_unit
 from ads_engine.simulation.scenarios import (
     FIXED_NOW,
     MODULE_CAMPAIGNS,
@@ -2017,18 +2019,29 @@ def test_c3a_launches_an_underused_proven_segment() -> None:
     scenario, ctx = _built("c3a.preset.case")
     campaign_id = _campaign_id(scenario, "linkedin", "li-seg")
     item = _only(campaigns.evaluate(ctx), C3A)
+    # The stored URN urn:li:seniority:6 reads as LinkedIn's standardized name, "Director".
     assert item.action == (
-        "Launch a campaign targeting seniority: urn:li:seniority:6 with "
-        "Pipeline Report - Lead gen's offer"
+        "Launch a campaign targeting seniority: Director with Pipeline Report - Lead gen's offer"
     )
     assert item.group == GROUP_LAUNCH
     assert item.entity_ref.type == ENTITY_SEGMENT
-    assert item.entity_ref.name == "Pipeline Report - Lead gen: seniority urn:li:seniority:6"
+    assert item.entity_ref.name == "Pipeline Report - Lead gen: seniority Director"
+    # The key keeps the URN, the segment's identity, so feedback keys do not change.
+    assert item.entity_ref.external_id == segment_external_id(
+        ctx.campaigns[campaign_id].external_id, "seniority", "urn:li:seniority:6"
+    )
+    extra = item.evidence.extra
+    assert (extra["facet"], extra["facet_label"], extra["value"], extra["value_label"]) == (
+        "seniority",
+        "seniority",
+        "urn:li:seniority:6",
+        "Director",
+    )
     assert (item.decision_subject, item.increases_spend_on, item.flags) == (None, (), ())
     assert item.depends_on == (DecisionSubject("campaign", campaign_id),)
     assert item.rank_key == (-20,)
     assert item.reason == (
-        "Seniority urn:li:seniority:6 produced 20 leads at USD 25.00 per lead, 0.5x the "
+        "Seniority Director produced 20 leads at USD 25.00 per lead, 0.5x the "
         "campaign's USD 50.00, from 10% of its impressions."
     )
     assert item.evidence.extra["segment_window"] == {
@@ -2046,6 +2059,25 @@ def test_c3a_launches_an_underused_proven_segment() -> None:
         "linkedin.analytics_daily",
         "linkedin.entities",
     )
+
+
+@pytest.mark.parametrize(
+    "value", ["urn:li:seniority:999", "Director level"], ids=["unknown-code", "not-a-urn"]
+)
+def test_c3a_shows_a_segment_value_linkedin_names_none_for_as_stored(value: str) -> None:
+    """A value missing from LinkedIn's standardized data is shown as stored, never guessed."""
+    _, ctx = _built("c3a.preset.case")
+    segments = tuple(
+        replace(row, value=value) if row.value == "urn:li:seniority:6" else row
+        for row in ctx.segments
+    )
+    item = _only(campaigns.evaluate(_fresh(ctx, segments=segments)), C3A)
+    assert item.action == (
+        f"Launch a campaign targeting seniority: {value} with Pipeline Report - Lead gen's offer"
+    )
+    assert item.entity_ref.name == f"Pipeline Report - Lead gen: seniority {value}"
+    assert item.reason.startswith(f"Seniority {value} produced 20 leads")
+    assert (item.evidence.extra["value"], item.evidence.extra["value_label"]) == (value, value)
 
 
 @pytest.mark.parametrize(
@@ -2153,7 +2185,7 @@ def test_c3a_does_not_fire_on_a_large_share_or_a_pivot_without_leads(name: str, 
     result = campaigns.evaluate(ctx)
     assert _items(result, C3A) == []
     assert all(
-        line.entity is None or "urn:li:seniority:6" not in line.entity.name
+        line.entity is None or "urn:li:seniority:6" not in line.entity.external_id
         for line in _withheld(result, C3A)
     )
 
@@ -2239,7 +2271,7 @@ def test_c3a_withholds_a_zero_cost_segment_when_the_campaign_has_no_spend() -> N
     )
     assert line.entity is not None
     assert line.entity.type == ENTITY_SEGMENT
-    assert line.entity.name == "Pipeline Report - Lead gen: seniority urn:li:seniority:6"
+    assert line.entity.name == "Pipeline Report - Lead gen: seniority Director"
     fewer = campaigns.evaluate(_tuned(scenario, unspent, {"c3a.min_leads": 21}))
     assert _items(fewer, C3A) == []
     assert [line.reason for line in _withheld(fewer, C3A)] == ["segment leads 20 of 21 required"]
@@ -2708,6 +2740,122 @@ def test_c2_items_and_withheld_lines_are_the_scale_outcomes(name: str) -> None:
             assert item.evidence.extra["b1_link"]["proposed_daily_budget"] == (
                 entry.proposed_daily_budget
             )
+
+
+SIX_PLACE_METRICS: Final[dict[str, tuple[str, ...]]] = {
+    C1: ("spend", "outcomes"),
+    C1B: ("spend", "outcomes"),
+    C2: ("spend", "outcomes", "daily_budget"),
+    C3A: ("segment_spend", "campaign_spend", "campaign_leads"),
+    C3B: ("spend", "conversions"),
+}
+"""Each rule's money amounts and outcome counts, recorded at six places (``campaigns._q``).
+
+A C2 "Scale" also records ``proposed_daily_budget``; a "Hold" has none.
+"""
+
+
+def _six_places(value: object) -> bool:
+    """Whether ``value`` is a ``Decimal`` recorded at six places: ``240.000000``."""
+    return isinstance(value, Decimal) and value.as_tuple().exponent == -6
+
+
+def _shown(item: Candidate) -> dict[str, object]:
+    """The item's metric values as the API renders them, by key."""
+    return {metric["key"]: metric["value"] for metric in item.evidence.to_json()["metrics"]}
+
+
+@pytest.mark.parametrize(
+    ("name", "rules"),
+    [
+        ("default", (C1, C2, C3A, C3B)),
+        ("c2.outcome_scale.case", (C2,)),
+        ("shared.poor_member.does_not_fire", (C2,)),
+        ("c1.expected.fires", (C1,)),
+        ("c1b.eligible.fires", (C1B, C2)),
+        ("c3a.preset.case", (C1B, C3A)),
+        ("c3b.cluster.fires", (C3B,)),
+    ],
+)
+def test_campaign_amounts_and_outcome_counts_read_at_six_places(
+    name: str, rules: tuple[str, ...]
+) -> None:
+    """One representation per metric key, across sources and within one item.
+
+    A Google budget (``micros / 1,000,000``), a LinkedIn one and a proposal at the currency's
+    minor unit all read at six places, as budget cards record them, so a C2 "Scale" and its
+    ``b1_link`` name the B1 item's ``daily_budget`` and ``proposed_daily_budget`` exactly.
+    """
+    _, ctx = _built(name)
+    result = campaigns.evaluate(ctx)
+    assert {item.rule_id for item in result.candidates} >= set(rules)
+    b1_items = {
+        item.decision_subject: item
+        for item in budget.evaluate(ctx).candidates
+        if item.rule_id == B1
+    }
+    linked = 0
+    for item in result.candidates:
+        metrics = _metrics(item)
+        scale = item.rule_id == C2 and item.action == SCALE_ACTION
+        keys = (*SIX_PLACE_METRICS[item.rule_id], *(("proposed_daily_budget",) if scale else ()))
+        for key in keys:
+            assert _six_places(metrics[key]), (item.rule_id, key, metrics[key])
+        if item.rule_id == C3B:
+            for member in item.evidence.extra["members"]:
+                assert _six_places(member["spend"]), member
+                assert _six_places(member["conversions"]), member
+        if not scale:
+            continue
+        link = item.evidence.extra["b1_link"]
+        current, proposed = link["current_daily_budget"], link["proposed_daily_budget"]
+        assert _six_places(current)
+        assert _six_places(proposed)
+        # The B1 value stays the minor-unit proposal; only its representation has six places.
+        currency = item.evidence.metric("proposed_daily_budget").currency
+        assert currency is not None
+        assert proposed == round_to_minor_unit(proposed, currency)
+        b1 = b1_items[item.decision_subject]
+        rendered = item.evidence.to_json()["extra"]["b1_link"]
+        b1_shown = _shown(b1)
+        assert (rendered["current_daily_budget"], rendered["proposed_daily_budget"]) == (
+            b1_shown["daily_budget"],
+            b1_shown["proposed_daily_budget"],
+        )
+        shown = _shown(item)
+        assert (shown["daily_budget"], shown["proposed_daily_budget"]) == (
+            b1_shown["daily_budget"],
+            b1_shown["proposed_daily_budget"],
+        )
+        assert (current, proposed) == (
+            _metrics(b1)["daily_budget"],
+            _metrics(b1)["proposed_daily_budget"],
+        )
+        linked += 1
+    assert linked == sum(
+        1 for item in result.candidates if item.rule_id == C2 and item.action == SCALE_ACTION
+    )
+
+
+def test_c2_records_a_google_budget_from_micros_at_six_places() -> None:
+    """The Google C2 "Scale" of the default world: ``200`` (micros ÷ 10⁶) and ``240.00`` (the
+    minor-unit proposal) are recorded as ``200.000000`` and ``240.000000``, as its B1 item
+    records them, while the reason still renders them at the minor unit."""
+    _, ctx = _built("default")
+    (item,) = [
+        item
+        for item in _items(campaigns.evaluate(ctx), C2)
+        if item.entity_ref.source == "google" and item.action == SCALE_ACTION
+    ]
+    shown = _shown(item)
+    rendered = item.evidence.to_json()["extra"]["b1_link"]
+    assert (shown["daily_budget"], shown["proposed_daily_budget"]) == ("200.000000", "240.000000")
+    assert (rendered["current_daily_budget"], rendered["proposed_daily_budget"]) == (
+        "200.000000",
+        "240.000000",
+    )
+    assert _six_places(_metrics(item)["outcomes"])
+    assert "raise the daily budget from USD 200.00 to USD 240.00 (B1)." in item.reason
 
 
 # ---------------------------------------------------------------------------

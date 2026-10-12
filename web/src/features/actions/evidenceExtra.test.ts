@@ -906,6 +906,32 @@ describe('launchGap', () => {
     });
   });
 
+  it("shows a C3a segment by LinkedIn's name, else by its stored URN", () => {
+    const named = withExtra({
+      facet: 'seniority',
+      facet_label: 'seniority',
+      value: 'urn:li:seniority:6',
+      value_label: 'Director',
+    });
+    expect(launchGap(named)).toEqual({
+      kind: 'segment',
+      facet: 'seniority',
+      value: 'Director',
+      headTokens: [],
+      terms: [],
+    });
+    // A run frozen before value_label was recorded carries only the URN; so does a blank name.
+    for (const valueLabel of [undefined, '', ' ', 6]) {
+      const frozen = withExtra({
+        facet: 'seniority',
+        facet_label: 'seniority',
+        value: 'urn:li:seniority:6',
+        ...(valueLabel === undefined ? {} : { value_label: valueLabel }),
+      });
+      expect(launchGap(frozen)).toMatchObject({ kind: 'segment', value: 'urn:li:seniority:6' });
+    }
+  });
+
   it('reads a cluster from head tokens alone or from member terms alone', () => {
     expect(launchGap(withExtra({ head_tokens: ['crm', ' ', 3] }))).toEqual({
       kind: 'cluster',

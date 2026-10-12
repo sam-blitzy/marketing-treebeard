@@ -119,6 +119,7 @@ from ads_engine.analysis.metrics import (
     subject_totals,
     window_totals,
 )
+from ads_engine.analysis.segment_labels import segment_value_label
 from ads_engine.analysis.text import TermCluster, cluster_terms, tokenize
 from ads_engine.analysis.thresholds import Thresholds
 from ads_engine.decisions import minor_unit_exponent, round_to_minor_unit
@@ -233,7 +234,7 @@ _EXACT: Final = Context(prec=60)
 """Arithmetic context for quantizing evidence values without overflow or rounding surprises."""
 
 _SIX_PLACES: Final = Decimal("0.000001")
-"""Ratios and costs in evidence keep six decimal places, like ``analysis/stats.py`` outputs."""
+"""Ratios, costs, money amounts and outcome counts in evidence keep six places (:func:`_q`)."""
 
 _FOUR_PLACES: Final = Decimal("0.0001")
 """Shares (unresolved, unknown evidence, impression share, ratios) keep four places: 0.01%."""
@@ -349,8 +350,22 @@ class _Settings:
 
 
 def _q(value: Decimal) -> Decimal:
-    """Record a ratio or cost in evidence with six places, half even."""
+    """Record a ratio, cost, money amount or outcome count in evidence with six places, half even.
+
+    Every money amount and ``Decimal`` outcome count a campaign card records goes through here,
+    as every budget card's does in ``budget.py``, so one item and one metric key never mix
+    ``200``, ``240.00`` and ``398.000000``: a Google budget (``micros / 1,000,000``), a
+    LinkedIn one (``numeric(18,6)``) and a proposal rounded to the currency's minor unit all
+    read at six places (``240.00`` is recorded as ``240.000000``, the same value), and a C2
+    "Scale" names the same amounts its B1 item does. Amounts of at most six places keep their
+    exact value; the gates, comparisons and rank keys read the exact values, never these.
+    """
     return value.quantize(_SIX_PLACES, rounding=ROUND_HALF_EVEN, context=_EXACT)
+
+
+def _q_optional(value: Decimal | None) -> Decimal | None:
+    """:func:`_q` of an amount or outcome count that may be unavailable; ``None`` stays ``None``."""
+    return None if value is None else _q(value)
 
 
 def cost_per_outcome_value(
@@ -1298,7 +1313,7 @@ def _day_metrics(history: BudgetHistory, currency: str) -> list[Metric]:
         Metric(
             "daily_budget",
             "Latest effective daily budget",
-            history.latest_daily_budget,
+            _q_optional(history.latest_daily_budget),
             "currency",
             currency,
         ),
@@ -1393,10 +1408,15 @@ def _c2_candidate(
     view = _CrmView(outcome.veto, outcome.crm_scope, outcome.flags)
     notes.note_view(ctx, outcome.entity, view)
     expected = expected_outcomes(outcome.spend, outcome.baseline)
+    # Every amount and outcome count is recorded at six places (:func:`_q`), as the B1 item
+    # records them, so the card and ``b1_link`` name its amounts exactly; the proposal keeps
+    # its minor-unit value. The exact values stay the inputs of every gate and the rank key.
+    current = _q(outcome.current_daily_budget)
+    proposed = _q(outcome.proposed_daily_budget)
     metrics = [
-        Metric("spend", "Window spend", outcome.spend, "currency", currency),
+        Metric("spend", "Window spend", _q(outcome.spend), "currency", currency),
         Metric("window_days", "Window days", ctx.window.days, "days"),
-        Metric("outcomes", f"Window {label}", outcome.outcomes, label),
+        Metric("outcomes", f"Window {label}", _q(outcome.outcomes), label),
         Metric(
             "expected_outcomes",
             f"Expected {label} at the account baseline",
@@ -1417,7 +1437,7 @@ def _c2_candidate(
             Metric(
                 "proposed_daily_budget",
                 "Proposed daily budget (B1)",
-                outcome.proposed_daily_budget,
+                proposed,
                 "currency",
                 currency,
             )
@@ -1434,8 +1454,8 @@ def _c2_candidate(
         extra["b1_link"] = {
             "rule_id": B1,
             "subject": {"type": outcome.subject[0], "id": outcome.subject[1]},
-            "current_daily_budget": outcome.current_daily_budget,
-            "proposed_daily_budget": outcome.proposed_daily_budget,
+            "current_daily_budget": current,
+            "proposed_daily_budget": proposed,
         }
     if outcome.shared:
         extra["members"] = _members_extra(ctx, outcome)
@@ -1710,7 +1730,7 @@ def _c1_candidate(
     view = _campaign_crm(ctx, attribution, campaign)
     notes.note_view(ctx, entity, view)
     metrics = [
-        Metric("spend", "Window spend", spend, "currency", currency),
+        Metric("spend", "Window spend", _q(spend), "currency", currency),
         Metric("spend_days", "Days with spend", spend_days, "days"),
         Metric("window_days", "Window days", days, "days"),
         Metric(
@@ -1719,7 +1739,8 @@ def _c1_candidate(
             _share(Decimal(spend_days) / Decimal(days)),
             "ratio",
         ),
-        Metric("outcomes", f"Window {label}", 0, label),
+        # The zero outcomes read at six places, as C2's and C1b's ``outcomes`` do (:func:`_q`).
+        Metric("outcomes", f"Window {label}", _q(_ZERO), label),
         Metric(
             "expected_outcomes",
             f"Expected {label} at the account baseline",
@@ -1945,8 +1966,8 @@ def _c1b_candidate(
     baseline = baseline_cpo(ctx, campaign.account_id, campaign.objective_group)
     expected = expected_outcomes(spend, baseline)
     metrics = [
-        Metric("spend", "Window spend", spend, "currency", currency),
-        Metric("outcomes", f"Window {label}", totals.outcomes, label),
+        Metric("spend", "Window spend", _q(spend), "currency", currency),
+        Metric("outcomes", f"Window {label}", _q_optional(totals.outcomes), label),
         Metric(
             "expected_outcomes",
             f"Expected {label} at the account baseline",
@@ -2159,14 +2180,18 @@ def _c3a(ctx: AnalysisContext, settings: _Settings) -> RuleResult:
 
 
 def _segment_ref(campaign: CampaignInfo, row: SegmentRow) -> EntityRef:
-    """The entity reference of one demographic segment of a campaign."""
+    """The entity reference of one demographic segment of a campaign.
+
+    The key stays the stored value (LinkedIn's URN), so feedback keys never change; the name
+    shows LinkedIn's standardized name for it (:func:`segment_value_label`).
+    """
     facet = _FACET_LABELS.get(row.facet, row.facet)
     return EntityRef(
         "linkedin",
         ENTITY_SEGMENT,
         None,
         segment_external_id(campaign.external_id, row.facet, row.value),
-        f"{campaign.name}: {facet} {row.value}",
+        f"{campaign.name}: {facet} {segment_value_label(row.facet, row.value)}",
     )
 
 
@@ -2188,17 +2213,22 @@ def _c3a_candidate(
 
     ``campaign_cpl`` must be positive: it divides the segment's cost per lead, so
     :func:`_c3a` withholds a zero-spend campaign's segments before calling this.
+
+    The action and reason name the segment by LinkedIn's standardized name for its stored URN
+    (:func:`segment_value_label`; the URN itself when LinkedIn names none). ``extra.value``
+    keeps the stored URN, the segment's identity, and ``extra.value_label`` carries the name.
     """
     settings = _Settings.of(ctx)
     currency = ctx.account_currency(campaign.id)
     facet = _FACET_LABELS.get(row.facet, row.facet)
+    value_label = segment_value_label(row.facet, row.value)
     segment_leads = row.leads or 0
     segment_cost = row.cost if row.cost is not None else _ZERO
     segment_impressions = row.impressions or 0
     segment_cpl = segment_cost / Decimal(segment_leads)
     metrics = [
         Metric("segment_leads", "Segment leads", segment_leads, "leads"),
-        Metric("segment_spend", "Segment spend", segment_cost, "currency", currency),
+        Metric("segment_spend", "Segment spend", _q(segment_cost), "currency", currency),
         Metric("segment_cpl", "Segment cost per lead", _q(segment_cpl), "currency", currency),
         Metric("campaign_cpl", "Campaign cost per lead", _q(campaign_cpl), "currency", currency),
         Metric(
@@ -2215,8 +2245,8 @@ def _c3a_candidate(
             _share(Decimal(segment_impressions) / Decimal(impressions)),
             "ratio",
         ),
-        Metric("campaign_spend", "Campaign window spend", spend, "currency", currency),
-        Metric("campaign_leads", "Campaign leads", leads, "leads"),
+        Metric("campaign_spend", "Campaign window spend", _q(spend), "currency", currency),
+        Metric("campaign_leads", "Campaign leads", _q_optional(leads), "leads"),
     ]
     evidence = ctx.make_evidence(
         required_datasets=_C3A_DATASETS,
@@ -2236,6 +2266,7 @@ def _c3a_candidate(
             "facet": row.facet,
             "facet_label": facet,
             "value": row.value,
+            "value_label": value_label,
             "campaign_id": campaign.id,
             "campaign_name": campaign.name,
             "segment_window": {"start": row.window_start, "end": row.window_end},
@@ -2246,7 +2277,7 @@ def _c3a_candidate(
     )
     share = _value(evidence, "impression_share")
     reason = (
-        f"{facet.capitalize()} {row.value} produced {_value(evidence, 'segment_leads')} leads "
+        f"{facet.capitalize()} {value_label} produced {_value(evidence, 'segment_leads')} leads "
         f"at {_money_of(evidence, 'segment_cpl')} per lead, "
         f"{_count(_value(evidence, 'cpl_ratio'))}x the campaign's "
         f"{_money_of(evidence, 'campaign_cpl')}, from "
@@ -2257,7 +2288,7 @@ def _c3a_candidate(
         section=CAMPAIGNS,
         group=GROUP_LAUNCH,
         entity_ref=entity,
-        action=f"Launch a campaign targeting {facet}: {row.value} with {campaign.name}'s offer",
+        action=f"Launch a campaign targeting {facet}: {value_label} with {campaign.name}'s offer",
         reason=reason,
         evidence=evidence,
         rank_key=(-segment_leads,),
@@ -2474,8 +2505,8 @@ def _c3b_candidate(
     money_currency = currency or None
     metrics = [
         Metric("members", "Converting search terms", cluster.size, "search terms"),
-        Metric("conversions", "Cluster conversions", conversions, "conversions"),
-        Metric("spend", "Cluster spend", spend, "currency", money_currency),
+        Metric("conversions", "Cluster conversions", _q(conversions), "conversions"),
+        Metric("spend", "Cluster spend", _q(spend), "currency", money_currency),
         Metric("clicks", "Cluster clicks", clicks, "clicks"),
         Metric(
             "cost_per_conversion",
@@ -2496,8 +2527,8 @@ def _c3b_candidate(
             "members": [
                 {
                     "term": term,
-                    "spend": by_term[term].spend,
-                    "conversions": by_term[term].conversions,
+                    "spend": _q(by_term[term].spend),
+                    "conversions": _q(by_term[term].conversions),
                     "clicks": by_term[term].clicks,
                 }
                 for term in members
